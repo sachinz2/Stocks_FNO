@@ -2,13 +2,12 @@ import jwt
 from datetime import datetime, timedelta
 from fastapi import HTTPException, Security, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from src.core.config import Config
-import os
 
-# JWT config
-SECRET_KEY = os.getenv("JWT_SECRET", "super_secret_jwt_key")
+from src.core.config import settings
+
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
+SECRET_KEY = settings.JWT_SECRET
+ACCESS_TOKEN_EXPIRE_MINUTES = settings.JWT_EXPIRY_HOURS * 60
 
 security = HTTPBearer()
 
