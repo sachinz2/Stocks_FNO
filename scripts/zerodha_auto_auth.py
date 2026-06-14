@@ -102,18 +102,65 @@ def zerodha_auto_login() -> str:
 
     logger.info("TOTP accepted. Fetching request token...")
 
-    # Step 3 — Get request_token via KiteConnect login URL redirect
+    # Step 3 — Walk the KiteConnect redirect chain manually.
+    # Zerodha's connect/finish page is a 200 HTML with a JS redirect
+    # (window.location = "http://localhost?request_token=...") that requests
+    # cannot follow. We hop one redirect at a time with allow_redirects=False,
+    # stop before attempting localhost, and parse the token from either the
+    # Location header or the HTML body.
+    import re
+    from urllib.parse import parse_qs, urlparse
     from kiteconnect import KiteConnect
+
     kite = KiteConnect(api_key=api_key)
-    login_url = kite.login_url()
+    current_url = kite.login_url()
+    request_token = None
+    last_resp = None
 
-    resp = session.get(login_url, allow_redirects=True)
-    # Extract request_token from final redirect URL
-    final_url = resp.url
-    if "request_token=" not in final_url:
-        raise RuntimeError(f"request_token not found in redirect URL: {final_url}")
+    for _hop in range(10):
+        last_resp = session.get(current_url, allow_redirects=False)
+        location = last_resp.headers.get("Location", "")
 
-    request_token = final_url.split("request_token=")[1].split("&")[0]
+        # Happy path: request_token is in the Location header (HTTP redirect)
+        if "request_token=" in location:
+            request_token = parse_qs(urlparse(location).query).get("request_token", [""])[0]
+            break
+
+        # Don't try to connect to localhost — it can't be reached from the server.
+        # The request_token should have been in the Location header; if not, fall through.
+        if location and ("localhost" in location or "127.0.0.1" in location):
+            logger.warning(f"Redirect target is localhost but no request_token: {location}")
+            break
+
+        # Follow any other redirect
+        if location:
+            logger.debug(f"Redirect hop {_hop}: {location[:80]}")
+            current_url = location
+            continue
+
+        # 200 response — parse the JS redirect in the finish page HTML
+        if last_resp.status_code == 200:
+            body = last_resp.text
+            match = re.search(r'request_token=([A-Za-z0-9_-]+)', body)
+            if match:
+                request_token = match.group(1)
+                break
+
+            # Fallback: sess_id in the finish URL sometimes equals request_token
+            params = parse_qs(urlparse(last_resp.url).query)
+            sess_id = params.get("sess_id", [""])[0]
+            if sess_id:
+                logger.warning("Falling back to sess_id as request_token — verify this works.")
+                request_token = sess_id
+        break
+
+    if not request_token:
+        raise RuntimeError(
+            f"Could not extract request_token after following the redirect chain. "
+            f"Last URL: {last_resp.url if last_resp else current_url}\n"
+            "Check that ZERODHA_API_KEY redirect URL is set to http://localhost in "
+            "your Kite Connect app settings."
+        )
     logger.info(f"Got request_token: {request_token[:8]}...")
 
     # Step 4 — Exchange for access_token
