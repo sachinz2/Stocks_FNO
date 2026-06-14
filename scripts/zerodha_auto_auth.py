@@ -131,51 +131,79 @@ def zerodha_auto_login() -> str:
     print(f"[step3] Cookies after TOTP: {[(c.name, c.value[:12], c.domain) for c in session.cookies]}", flush=True)
     logger.info("TOTP accepted.")
 
-    # ── Step 4: Retrieve request_token ──────────────────────────────────────
-    # Try A: re-visit the connect/login URL now that we're authenticated —
-    #        Zerodha may redirect us to connect/finish → localhost?request_token=
-    # Try B: visit connect/finish directly with the sess_id from step 1.
+    # ── Step 4: Walk the redirect chain and handle the authorize step ───────
+    # Full flow (now that user is enabled for the app):
+    #   connect/login?sess_id → connect/finish → connect/authorize → localhost?request_token=
+    # The connect/authorize page is an "Allow this app?" confirmation.
+    # In a browser the user clicks Allow; here we POST to it to confirm.
+
+    def _find_token(text: str):
+        m = re.search(r'request_token=([A-Za-z0-9_-]{20,})', text)
+        return m.group(1) if m else None
+
     request_token = None
+    current_url = connect_page_url  # start from the connect/login URL (has sess_id)
 
-    for label, url in [
-        ("4a-reconnect", connect_page_url),
-        ("4b-finish",    f"https://kite.zerodha.com/connect/finish?api_key={api_key}&sess_id={sess_id}"),
-    ]:
-        if request_token:
-            break
-        print(f"[{label}] GET {url[:100]}...", flush=True)
-        r = session.get(url, allow_redirects=False)
+    for hop in range(8):
+        print(f"[hop {hop}] GET {current_url[:110]}...", flush=True)
+        r = session.get(current_url, allow_redirects=False)
         loc = r.headers.get("Location", "")
-        print(f"[{label}] → {r.status_code} | Location: {loc[:140]}", flush=True)
-        if r.status_code not in (200, 302, 301):
-            print(f"[{label}] body: {r.text[:600]}", flush=True)
+        print(f"[hop {hop}] → {r.status_code} | Location: {loc[:140]}", flush=True)
 
-        # Follow one more hop if needed (e.g. connect/login → connect/finish → localhost)
-        if loc and "request_token=" not in loc and "localhost" not in loc and "127.0.0.1" not in loc:
-            print(f"[{label}] Following hop to {loc[:100]}...", flush=True)
-            r2 = session.get(loc, allow_redirects=False)
-            loc2 = r2.headers.get("Location", "")
-            print(f"[{label}] → {r2.status_code} | Location: {loc2[:140]}", flush=True)
-            if r2.status_code not in (200,):
-                print(f"[{label}] body: {r2.text[:600]}", flush=True)
-            loc = loc2
-            r = r2
-
-        t = re.search(r'request_token=([A-Za-z0-9_-]{20,})', loc)
+        # ── Found request_token in Location header ──
+        t = _find_token(loc)
         if t:
-            request_token = t.group(1)
-            print(f"[{label}] request_token from Location: {request_token[:8]}...", flush=True)
-        elif r.status_code == 200:
-            t = re.search(r'request_token=([A-Za-z0-9_-]{20,})', r.text)
+            request_token = t
+            print(f"[hop {hop}] request_token from Location: {t[:8]}...", flush=True)
+            break
+
+        # ── Arrived at connect/authorize → POST to confirm ("Allow") ──
+        if "connect/authorize" in current_url or "connect/authorize" in loc:
+            authorize_url = loc if loc else current_url
+            print(f"[hop {hop}] POSTing to authorize: {authorize_url[:110]}", flush=True)
+            ar = session.post(authorize_url, allow_redirects=False)
+            ar_loc = ar.headers.get("Location", "")
+            print(f"[hop {hop}] authorize POST → {ar.status_code} | Location: {ar_loc[:140]}", flush=True)
+            if ar.status_code not in (200, 301, 302):
+                print(f"[hop {hop}] authorize body: {ar.text[:400]}", flush=True)
+
+            t = _find_token(ar_loc)
             if t:
-                request_token = t.group(1)
-                print(f"[{label}] request_token from HTML: {request_token[:8]}...", flush=True)
+                request_token = t
+                print(f"[hop {hop}] request_token after authorize: {t[:8]}...", flush=True)
+                break
+
+            if ar_loc and "localhost" not in ar_loc and "127.0.0.1" not in ar_loc:
+                current_url = ar_loc
+                continue
+            break
+
+        # ── Stop at localhost (redirect URL) — token must be in Location header ──
+        if loc and ("localhost" in loc or "127.0.0.1" in loc):
+            print(f"[hop {hop}] Reached callback URL without request_token: {loc}", flush=True)
+            break
+
+        # ── Follow any other redirect ──
+        if loc:
+            current_url = loc
+            continue
+
+        # ── 200 response — check body for token ──
+        if r.status_code == 200:
+            t = _find_token(r.text)
+            if t:
+                request_token = t
+                print(f"[hop {hop}] request_token from HTML body: {t[:8]}...", flush=True)
             else:
-                print(f"[{label}] 200 body (first 800):\n{r.text[:800]}", flush=True)
+                print(f"[hop {hop}] 200 body (first 600):\n{r.text[:600]}", flush=True)
+        else:
+            print(f"[hop {hop}] body: {r.text[:400]}", flush=True)
+        break
 
     if not request_token:
         raise RuntimeError(
-            "Cannot get request_token — see [step1] HTML and [step3] cookies above for clues."
+            "Cannot get request_token after completing the OAuth flow. "
+            "Check [hop X] lines above for where it broke."
         )
 
     logger.info(f"Got request_token: {request_token[:8]}...")
