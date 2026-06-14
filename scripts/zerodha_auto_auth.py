@@ -108,71 +108,85 @@ def zerodha_auto_login() -> str:
 
     kite = KiteConnect(api_key=api_key)
 
-    # Use kite.zerodha.com (same domain as our login session cookies) NOT
-    # kite.trade — cross-domain cookies are not sent, causing auth to fail.
+    # Use kite.zerodha.com so our session cookies (same domain) are sent.
     connect_url = f"https://kite.zerodha.com/connect/login?api_key={api_key}&v=3"
 
+    def _find_token(text: str):
+        m = re.search(r'request_token=([A-Za-z0-9_-]{20,})', text)
+        return m.group(1) if m else None
+
     request_token = None
-    current_url = connect_url
-    last_resp = None
+    last_url = connect_url
 
-    for _hop in range(10):
-        last_resp = session.get(current_url, allow_redirects=False)
-        location = last_resp.headers.get("Location", "")
+    # ── Approach A: follow all redirects, catch ConnectionError for localhost ──
+    # If Zerodha sends a 302 to http://localhost?request_token=..., requests
+    # will raise ConnectionError (localhost unreachable on server). The URL —
+    # including request_token — is embedded in the exception message.
+    try:
+        resp = session.get(connect_url, allow_redirects=True)
+        last_url = resp.url
+        print(f"[auth] Approach A — Final URL: {last_url}", flush=True)
+        print(f"[auth] Status: {resp.status_code}", flush=True)
 
-        logger.info(
-            f"[hop {_hop}] GET {current_url[:90]} "
-            f"→ {last_resp.status_code} | Location: {location[:100] or '(none)'}"
-        )
+        t = _find_token(last_url)
+        if t:
+            request_token = t
+            print(f"[auth] request_token found in final URL: {t[:8]}...", flush=True)
+        elif resp.status_code == 200:
+            body = resp.text
+            print(f"[auth] Page body (first 1000 chars):\n{body[:1000]}", flush=True)
+            t = _find_token(body)
+            if t:
+                request_token = t
+                print(f"[auth] request_token found in page body: {t[:8]}...", flush=True)
 
-        # Best case: request_token is already in the Location header
-        if "request_token=" in location:
-            request_token = parse_qs(urlparse(location).query).get("request_token", [""])[0]
-            logger.info(f"[hop {_hop}] request_token found in Location header")
-            break
+    except requests.exceptions.ConnectionError as conn_err:
+        err_str = str(conn_err)
+        print(f"[auth] ConnectionError (expected when Zerodha redirects to localhost):\n{err_str[:500]}", flush=True)
+        t = _find_token(err_str)
+        if t:
+            request_token = t
+            print(f"[auth] request_token extracted from ConnectionError: {t[:8]}...", flush=True)
 
-        # Redirect to our app's callback URL (e.g. http://localhost).
-        # Even if the URL itself has no request_token, try to parse it;
-        # otherwise, fall through to HTML / sess_id extraction below.
-        if location and ("localhost" in location or "127.0.0.1" in location):
-            logger.info(f"[hop {_hop}] Redirect to app callback: {location}")
-            # No request_token in the location — fall through to HTML parse
+    # ── Approach B: hop-by-hop with allow_redirects=False ──
+    if not request_token:
+        print("[auth] Approach A found no token. Trying hop-by-hop...", flush=True)
+        current_url = connect_url
+        last_resp = None
+        for hop in range(10):
+            last_resp = session.get(current_url, allow_redirects=False)
+            loc = last_resp.headers.get("Location", "")
+            print(
+                f"[hop {hop}] {current_url[:80]} → {last_resp.status_code} | "
+                f"Location: {loc[:100] or '(none)'}",
+                flush=True,
+            )
 
-        # Follow any other off-site redirect
-        elif location:
-            current_url = location
-            continue
-
-        # ----- 200 response: parse the HTML body -----
-        if last_resp.status_code == 200:
-            body = last_resp.text
-            logger.info(f"[hop {_hop}] HTML body (first 800 chars):\n{body[:800]}")
-
-            # Most common: window.location = "http://localhost?request_token=XYZ"
-            match = re.search(r'request_token[="\s:]+([A-Za-z0-9_-]{20,})', body)
-            if match:
-                request_token = match.group(1)
-                logger.info(f"[hop {_hop}] request_token found in HTML body")
+            t = _find_token(loc)
+            if t:
+                request_token = t
+                print(f"[hop {hop}] request_token in Location header: {t[:8]}...", flush=True)
                 break
 
-        # ----- Last resort: sess_id from the finish URL -----
-        params = parse_qs(urlparse(last_resp.url).query)
-        sess_id = params.get("sess_id", [""])[0]
-        if sess_id:
-            logger.warning(
-                f"[hop {_hop}] Could not find request_token in redirect or HTML. "
-                f"Trying sess_id as request_token: {sess_id[:8]}..."
-            )
-            request_token = sess_id
+            if loc and "localhost" not in loc and "127.0.0.1" not in loc:
+                current_url = loc
+                continue
 
-        break  # Nothing more to try
+            if last_resp.status_code == 200:
+                body = last_resp.text
+                print(f"[hop {hop}] 200 body (first 800):\n{body[:800]}", flush=True)
+                t = _find_token(body)
+                if t:
+                    request_token = t
+                    print(f"[hop {hop}] request_token in body: {t[:8]}...", flush=True)
+                    break
+            break
 
     if not request_token:
         raise RuntimeError(
-            f"Could not extract request_token after following the redirect chain.\n"
-            f"Last URL: {last_resp.url if last_resp else current_url}\n"
-            "Verify your Kite Connect app's redirect URL is http://localhost "
-            "in the Kite Connect Developer Console."
+            f"Cannot extract request_token. Last URL: {last_url}\n"
+            "Open https://developers.kite.trade and confirm that your app's "
+            "Redirect URL is set to exactly: http://localhost"
         )
 
     logger.info(f"Got request_token: {request_token[:8]}...")
