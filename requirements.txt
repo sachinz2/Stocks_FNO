@@ -45,6 +45,9 @@ tenacity
 kiteconnect
 pyotp
 
+# Market data (historical OHLC — no WebSocket needed on Personal plan)
+yfinance
+
 # ML
 xgboost
 lightgbm

@@ -118,7 +118,7 @@ class LiveTradingEngine:
     async def sync_positions(self) -> None:
         """Called every minute by the scheduler."""
         try:
-            await self.portfolio_manager.sync_positions(self.broker)
+            await self.portfolio_manager.sync_positions()
         except Exception as exc:
             logger.error(f"Position sync failed: {exc}")
 
@@ -155,7 +155,9 @@ class LiveTradingEngine:
             if quantity <= 0:
                 return
 
-            order = await self.order_manager.place_order(symbol, signal.value, quantity, price)
+            # signal may be a SignalType enum or a plain string from strategy.generate_signal()
+            side = signal.value if hasattr(signal, "value") else str(signal)
+            order = await self.order_manager.place_order(symbol, side, quantity, price)
             if order and order.order_status == "OPEN":
                 await self._notify(
                     f"ORDER PLACED\n"

@@ -131,6 +131,23 @@ def zerodha_auto_login() -> str:
     print(f"[step3] Cookies after TOTP: {[(c.name, c.value[:12], c.domain) for c in session.cookies]}", flush=True)
     logger.info("TOTP accepted.")
 
+    # ── Enctoken shortcut ────────────────────────────────────────────────────
+    # After TOTP the session has an 'enctoken' cookie (Zerodha web session
+    # token). Kite's backend accepts it in the standard kiteconnect
+    # 'token API_KEY:ENCTOKEN' format, skipping the OAuth authorize JS page.
+    enctoken = next((c.value for c in session.cookies if c.name == "enctoken"), None)
+    if enctoken:
+        print(f"[enctoken] Found enctoken, testing direct API access...", flush=True)
+        kite.set_access_token(enctoken)
+        try:
+            profile = kite.profile()
+            print(f"[enctoken] Direct API works! user: {profile.get('user_id')}", flush=True)
+            logger.info(f"Access token (enctoken) obtained for {profile.get('user_id')}")
+            return enctoken
+        except Exception as enc_err:
+            print(f"[enctoken] Not accepted ({enc_err}), falling back to OAuth flow...", flush=True)
+            kite.access_token = None
+
     # ── Step 4: Walk the redirect chain and handle the authorize step ───────
     # Full flow (now that user is enabled for the app):
     #   connect/login?sess_id → connect/finish → connect/authorize → localhost?request_token=

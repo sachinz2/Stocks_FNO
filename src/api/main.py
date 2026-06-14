@@ -1,30 +1,135 @@
+import logging
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from src.api.middleware.error_handler import global_exception_handler
 
+from src.api.middleware.error_handler import global_exception_handler
 from src.api.routers import (
-    stocks_router, 
-    market_data_router, 
-    orders_router, 
-    positions_router, 
-    signals_router, 
-    risk_router, 
-    backtest_router, 
-    strategy_router
+    backtest_router,
+    market_data_router,
+    orders_router,
+    positions_router,
+    risk_router,
+    signals_router,
+    stocks_router,
+    strategy_router,
 )
+
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Start trading engine and scheduler; tear down cleanly on shutdown."""
+    import redis.asyncio as aioredis
+    from apscheduler.triggers.interval import IntervalTrigger
+
+    from src.core.config import settings
+    from src.core.constants import FNO_SYMBOLS
+    from src.core.scheduler import (
+        get_scheduler,
+        schedule_trading_jobs,
+        schedule_zerodha_auth,
+        start_scheduler,
+        stop_scheduler,
+    )
+    from src.database.connection import AsyncSessionLocal
+    from src.database.models.audit import AuditLog
+    from src.database.models.order import Order
+    from src.database.models.position import Position
+    from src.database.models.stock import Stock
+    from src.database.repositories.base import BaseRepository
+    from src.live_trading.live_trading_engine import LiveTradingEngine
+    from src.market_data.ltp_poller import LTPPoller
+    from src.notifications.telegram_service import TelegramNotifier
+    from src.orders.order_manager import OrderManager
+    from src.paper_trading.paper_broker import PaperBroker
+    from src.portfolio.portfolio_manager import PortfolioManager
+    from src.risk.risk_manager import RiskManager
+    import src.strategies  # noqa: F401 — importing triggers @StrategyRegistry.register() decorators
+    from src.strategies.base import StrategyRegistry
+
+    # Phase 1: top 5 liquid F&O symbols
+    PHASE1_SYMBOLS = list(FNO_SYMBOLS[:5])
+
+    # ── Ensure all DB tables exist ────────────────────────────────────────────
+    import src.database.models  # noqa: F401 — registers all ORM models with Base
+    from src.database.base import Base
+    from src.database.connection import engine as db_engine
+    async with db_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    logger.info("Database tables verified / created.")
+
+    redis_client = aioredis.from_url(settings.get_redis_url(), decode_responses=True)
+    db_session = AsyncSessionLocal()
+
+    broker = PaperBroker(initial_balance=settings.INITIAL_CAPITAL)
+    risk_mgr = RiskManager(initial_capital=settings.INITIAL_CAPITAL)
+
+    order_repo = BaseRepository(Order, db_session)
+    audit_repo = BaseRepository(AuditLog, db_session)
+    position_repo = BaseRepository(Position, db_session)
+    stock_repo = BaseRepository(Stock, db_session)
+
+    order_mgr = OrderManager(broker, risk_mgr, order_repo, audit_repo)
+    portfolio_mgr = PortfolioManager(broker, position_repo, stock_repo)
+    notifier = TelegramNotifier()
+
+    # Load default strategies (EMA crossover active from day 1)
+    StrategyRegistry.load_strategy("EMA_CROSSOVER", "ema_crossover_v1", {
+        "fast_period": 20,
+        "slow_period": 50,
+        "stop_loss_pct": 0.02,
+        "trailing_stop_pct": 0.01,
+    })
+
+    engine = LiveTradingEngine(broker, risk_mgr, order_mgr, portfolio_mgr, notifier)
+    engine.attach_redis(redis_client)
+    engine.set_symbols(PHASE1_SYMBOLS)
+    await engine.start()
+
+    ltp_poller = LTPPoller(redis_client, PHASE1_SYMBOLS)
+
+    scheduler = get_scheduler()
+    schedule_trading_jobs(engine)
+    schedule_zerodha_auth()
+    scheduler.add_job(
+        ltp_poller.poll,
+        IntervalTrigger(seconds=60),
+        id="ltp_poll",
+        name="LTP Poller",
+        replace_existing=True,
+        misfire_grace_time=30,
+    )
+    start_scheduler()
+
+    app.state.trading_engine = engine
+    app.state.redis = redis_client
+
+    logger.info("Falcon Trader: engine + scheduler started.")
+
+    yield
+
+    # ── Shutdown ──────────────────────────────────────────────────────────────
+    await engine.stop()
+    stop_scheduler()
+    await redis_client.aclose()
+    await db_session.close()
+    logger.info("Falcon Trader: engine + scheduler stopped.")
+
 
 app = FastAPI(
     title="Falcon Quant Platform API",
     version="1.0",
     description="Automated algorithmic trading platform API",
     docs_url="/docs",
-    redoc_url="/redoc"
+    redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
-# Exception Handlers
 app.add_exception_handler(Exception, global_exception_handler)
 
-# CORS Middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -33,15 +138,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.get("/api/v1/health")
 async def health_check():
-    return {
-        "status": "UP",
-        "database": "UP",
-        "redis": "UP"
-    }
+    return {"status": "UP", "database": "UP", "redis": "UP"}
 
-# Include Routers
+
 app.include_router(stocks_router.router, prefix="/api/v1")
 app.include_router(market_data_router.router, prefix="/api/v1")
 app.include_router(orders_router.router, prefix="/api/v1")
