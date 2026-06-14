@@ -89,7 +89,7 @@ def zerodha_auto_login() -> str:
     connect_page_url = init_resp.url
     print(f"[step1] Final URL : {connect_page_url}", flush=True)
     print(f"[step1] Status   : {init_resp.status_code}", flush=True)
-    print(f"[step1] Cookies  : {dict(session.cookies)}", flush=True)
+    print(f"[step1] Cookies  : {[(c.name, c.value[:12], c.domain) for c in session.cookies]}", flush=True)
     print(f"[step1] HTML (first 3000 chars):\n{init_resp.text[:3000]}", flush=True)
 
     page_params = parse_qs(urlparse(connect_page_url).query)
@@ -128,7 +128,7 @@ def zerodha_auto_login() -> str:
     if data.get("status") != "success":
         raise RuntimeError(f"Zerodha TOTP failed: {data.get('message')}")
     print(f"[step3] TOTP response: {resp.text[:300]}", flush=True)
-    print(f"[step3] Cookies after TOTP: {dict(session.cookies)}", flush=True)
+    print(f"[step3] Cookies after TOTP: {[(c.name, c.value[:12], c.domain) for c in session.cookies]}", flush=True)
     logger.info("TOTP accepted.")
 
     # ── Step 4: Retrieve request_token ──────────────────────────────────────
