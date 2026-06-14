@@ -56,8 +56,20 @@ def zerodha_auto_login() -> str:
     api_key = settings.ZERODHA_API_KEY
     api_secret = settings.ZERODHA_API_SECRET
 
-    if not all([user_id, password, totp_secret, api_key, api_secret]):
+    if not all([user_id, password, api_key, api_secret]):
         raise ValueError("Missing Zerodha credentials in .env")
+
+    # Determine 2FA method
+    if totp_secret:
+        twofa_value = generate_totp(totp_secret)
+        twofa_type = "totp"
+        logger.info("Using TOTP for 2FA")
+    else:
+        twofa_value = os.environ.get("ZERODHA_PIN", "")
+        twofa_type = "user_pin"
+        if not twofa_value:
+            raise ValueError("Set either ZERODHA_TOTP_SECRET or ZERODHA_PIN in .env")
+        logger.info("Using static PIN for 2FA")
 
     session = requests.Session()
     session.headers.update(HEADERS)
@@ -72,15 +84,14 @@ def zerodha_auto_login() -> str:
         raise RuntimeError(f"Zerodha login failed: {data.get('message')}")
 
     request_id = data["data"]["request_id"]
-    logger.info("Password accepted. Submitting TOTP...")
+    logger.info("Password accepted. Submitting 2FA...")
 
-    # Step 2 — Submit TOTP (auto-generated)
-    totp_code = generate_totp(totp_secret)
+    # Step 2 — Submit 2FA (TOTP or static PIN)
     resp = session.post(TWOFA_URL, data={
         "user_id": user_id,
         "request_id": request_id,
-        "twofa_value": totp_code,
-        "twofa_type": "totp",
+        "twofa_value": twofa_value,
+        "twofa_type": twofa_type,
         "skip_session": "",
     })
     resp.raise_for_status()
