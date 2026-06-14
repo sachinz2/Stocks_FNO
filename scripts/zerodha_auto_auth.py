@@ -157,25 +157,56 @@ def zerodha_auto_login() -> str:
             print(f"[hop {hop}] request_token from Location: {t[:8]}...", flush=True)
             break
 
-        # ── Arrived at connect/authorize → POST to confirm ("Allow") ──
+        # ── Arrived at connect/authorize ──────────────────────────────────────
+        # This is a React SPA. The "Allow" button calls an internal API endpoint.
+        # Try several candidates to find which one completes the authorization.
         if "connect/authorize" in current_url or "connect/authorize" in loc:
             authorize_url = loc if loc else current_url
-            print(f"[hop {hop}] POSTing to authorize: {authorize_url[:110]}", flush=True)
-            ar = session.post(authorize_url, allow_redirects=False)
-            ar_loc = ar.headers.get("Location", "")
-            print(f"[hop {hop}] authorize POST → {ar.status_code} | Location: {ar_loc[:140]}", flush=True)
-            if ar.status_code not in (200, 301, 302):
-                print(f"[hop {hop}] authorize body: {ar.text[:400]}", flush=True)
+            print(f"[hop {hop}] Reached connect/authorize: {authorize_url[:110]}", flush=True)
 
-            t = _find_token(ar_loc)
+            enctoken = next((c.value for c in session.cookies if c.name == "enctoken"), "")
+            enc_headers = {"Authorization": f"enctoken {enctoken}"} if enctoken else {}
+
+            # Candidate A: GET /api/connect/authorize (internal REST endpoint)
+            ca = session.get(
+                "https://kite.zerodha.com/api/connect/authorize",
+                params={"api_key": api_key, "sess_id": sess_id},
+                headers=enc_headers,
+                allow_redirects=False,
+            )
+            ca_loc = ca.headers.get("Location", "")
+            print(f"[auth-A] GET /api/connect/authorize → {ca.status_code} | loc: {ca_loc[:120]} | body: {ca.text[:200]}", flush=True)
+            t = _find_token(ca_loc) or _find_token(ca.text)
             if t:
                 request_token = t
-                print(f"[hop {hop}] request_token after authorize: {t[:8]}...", flush=True)
+                print(f"[auth-A] request_token: {t[:8]}...", flush=True)
                 break
 
-            if ar_loc and "localhost" not in ar_loc and "127.0.0.1" not in ar_loc:
-                current_url = ar_loc
-                continue
+            # Candidate B: POST /api/connect/authorize
+            cb = session.post(
+                "https://kite.zerodha.com/api/connect/authorize",
+                data={"api_key": api_key, "sess_id": sess_id},
+                headers=enc_headers,
+                allow_redirects=False,
+            )
+            cb_loc = cb.headers.get("Location", "")
+            print(f"[auth-B] POST /api/connect/authorize → {cb.status_code} | loc: {cb_loc[:120]} | body: {cb.text[:200]}", flush=True)
+            t = _find_token(cb_loc) or _find_token(cb.text)
+            if t:
+                request_token = t
+                print(f"[auth-B] request_token: {t[:8]}...", flush=True)
+                break
+
+            # Candidate C: GET connect/authorize with allow_redirects=True
+            cc = session.get(authorize_url, allow_redirects=True)
+            print(f"[auth-C] GET authorize all_redirects → {cc.status_code} | final: {cc.url[:120]}", flush=True)
+            t = _find_token(cc.url) or _find_token(cc.text)
+            if t:
+                request_token = t
+                print(f"[auth-C] request_token: {t[:8]}...", flush=True)
+                break
+
+            print("[authorize] All candidates failed — need browser Network tab to find correct endpoint.", flush=True)
             break
 
         # ── Stop at localhost (redirect URL) — token must be in Location header ──
