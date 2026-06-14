@@ -1,19 +1,55 @@
+# Web framework
 fastapi
-uvicorn
-sqlalchemy
+uvicorn[standard]
+
+# Database
+sqlalchemy[asyncio]
 alembic
+aiomysql
+mysql-connector-python
+cryptography
+
+# Redis
+redis[asyncio]
+
+# Data validation
 pydantic
+pydantic-settings
+
+# HTTP client (Telegram, external APIs)
+httpx
+
+# Scheduler
+apscheduler
+
+# Timezone support
+pytz
+
+# Dashboard
 streamlit
+
+# WebSocket
 websockets
+
+# Auth
 PyJWT
+
+# Data processing
 pandas
 numpy
-asyncio
-mysql-connector-python
-aiomysql
-cryptography
-pytest
+
+# Retry logic
+tenacity
+
+# Zerodha broker
+kiteconnect
+
+# ML
 xgboost
 lightgbm
 scikit-learn
 joblib
+
+# Testing
+pytest
+pytest-asyncio
