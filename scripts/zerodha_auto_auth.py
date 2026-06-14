@@ -81,23 +81,23 @@ def zerodha_auto_login() -> str:
     session.headers.update(HEADERS)
 
     # ── Step 1: Establish the Connect OAuth session ──────────────────────────
-    # Visit connect/login unauthenticated. Zerodha sets a connect-context cookie
-    # and returns a sess_id in the URL. Login must happen inside this context.
     print("[step1] Initiating Kite Connect OAuth session...", flush=True)
     init_resp = session.get(
         f"https://kite.trade/connect/login?api_key={api_key}&v=3",
         allow_redirects=True,
     )
     connect_page_url = init_resp.url
-    print(f"[step1] Connect page: {connect_page_url}", flush=True)
+    print(f"[step1] Final URL : {connect_page_url}", flush=True)
+    print(f"[step1] Status   : {init_resp.status_code}", flush=True)
+    print(f"[step1] Cookies  : {dict(session.cookies)}", flush=True)
+    print(f"[step1] HTML (first 3000 chars):\n{init_resp.text[:3000]}", flush=True)
 
     page_params = parse_qs(urlparse(connect_page_url).query)
     sess_id = page_params.get("sess_id", [""])[0]
     if not sess_id:
-        # Already authenticated (shouldn't happen with fresh session, but handle it)
         if "request_token=" in connect_page_url:
             tok = page_params.get("request_token", [""])[0]
-            print(f"[step1] Surprise: already got request_token={tok[:8]}...", flush=True)
+            print(f"[step1] Already got request_token={tok[:8]}...", flush=True)
             sd = kite.generate_session(tok, api_secret=api_secret)
             return sd["access_token"]
         raise RuntimeError(f"No sess_id in connect page URL: {connect_page_url}")
@@ -127,40 +127,55 @@ def zerodha_auto_login() -> str:
     data = resp.json()
     if data.get("status") != "success":
         raise RuntimeError(f"Zerodha TOTP failed: {data.get('message')}")
+    print(f"[step3] TOTP response: {resp.text[:300]}", flush=True)
+    print(f"[step3] Cookies after TOTP: {dict(session.cookies)}", flush=True)
     logger.info("TOTP accepted.")
 
-    # ── Step 4: Complete connect flow to get request_token ───────────────────
-    # The session now has BOTH the connect context (sess_id cookie from step 1)
-    # AND the authenticated user (from steps 2-3). connect/finish should now
-    # return a 302 to http://localhost?request_token=... instead of 400.
-    finish_url = f"https://kite.zerodha.com/connect/finish?api_key={api_key}&sess_id={sess_id}"
-    print(f"[step4] Visiting connect/finish with sess_id={sess_id[:8]}...", flush=True)
-
-    finish_resp = session.get(finish_url, allow_redirects=False)
-    location = finish_resp.headers.get("Location", "")
-    print(f"[step4] → {finish_resp.status_code} | Location: {location[:140]}", flush=True)
-
+    # ── Step 4: Retrieve request_token ──────────────────────────────────────
+    # Try A: re-visit the connect/login URL now that we're authenticated —
+    #        Zerodha may redirect us to connect/finish → localhost?request_token=
+    # Try B: visit connect/finish directly with the sess_id from step 1.
     request_token = None
 
-    if "request_token=" in location:
-        from urllib.parse import parse_qs, urlparse
-        request_token = parse_qs(urlparse(location).query).get("request_token", [""])[0]
-        print(f"[step4] request_token from Location header: {request_token[:8]}...", flush=True)
-    elif finish_resp.status_code == 200:
-        body = finish_resp.text
-        print(f"[step4] 200 body (first 800 chars):\n{body[:800]}", flush=True)
-        match = re.search(r'request_token=([A-Za-z0-9_-]{20,})', body)
-        if match:
-            request_token = match.group(1)
-            print(f"[step4] request_token from HTML body: {request_token[:8]}...", flush=True)
-    else:
-        print(f"[step4] {finish_resp.status_code} body:\n{finish_resp.text[:400]}", flush=True)
+    for label, url in [
+        ("4a-reconnect", connect_page_url),
+        ("4b-finish",    f"https://kite.zerodha.com/connect/finish?api_key={api_key}&sess_id={sess_id}"),
+    ]:
+        if request_token:
+            break
+        print(f"[{label}] GET {url[:100]}...", flush=True)
+        r = session.get(url, allow_redirects=False)
+        loc = r.headers.get("Location", "")
+        print(f"[{label}] → {r.status_code} | Location: {loc[:140]}", flush=True)
+        if r.status_code not in (200, 302, 301):
+            print(f"[{label}] body: {r.text[:600]}", flush=True)
+
+        # Follow one more hop if needed (e.g. connect/login → connect/finish → localhost)
+        if loc and "request_token=" not in loc and "localhost" not in loc and "127.0.0.1" not in loc:
+            print(f"[{label}] Following hop to {loc[:100]}...", flush=True)
+            r2 = session.get(loc, allow_redirects=False)
+            loc2 = r2.headers.get("Location", "")
+            print(f"[{label}] → {r2.status_code} | Location: {loc2[:140]}", flush=True)
+            if r2.status_code not in (200,):
+                print(f"[{label}] body: {r2.text[:600]}", flush=True)
+            loc = loc2
+            r = r2
+
+        t = re.search(r'request_token=([A-Za-z0-9_-]{20,})', loc)
+        if t:
+            request_token = t.group(1)
+            print(f"[{label}] request_token from Location: {request_token[:8]}...", flush=True)
+        elif r.status_code == 200:
+            t = re.search(r'request_token=([A-Za-z0-9_-]{20,})', r.text)
+            if t:
+                request_token = t.group(1)
+                print(f"[{label}] request_token from HTML: {request_token[:8]}...", flush=True)
+            else:
+                print(f"[{label}] 200 body (first 800):\n{r.text[:800]}", flush=True)
 
     if not request_token:
         raise RuntimeError(
-            f"connect/finish returned {finish_resp.status_code} — cannot get request_token.\n"
-            f"Location header: {location or '(none)'}\n"
-            "Verify redirect URL in Kite Connect app is set to http://localhost"
+            "Cannot get request_token — see [step1] HTML and [step3] cookies above for clues."
         )
 
     logger.info(f"Got request_token: {request_token[:8]}...")
