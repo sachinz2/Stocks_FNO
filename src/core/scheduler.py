@@ -100,3 +100,17 @@ def schedule_trading_jobs(engine) -> None:
     )
 
     logger.info("All trading jobs scheduled.")
+
+
+def schedule_zerodha_auth():
+    """Schedule automated Zerodha login at 8:30 AM IST every weekday."""
+    from scripts.zerodha_auto_auth import run_daily_auth
+    scheduler = get_scheduler()
+    scheduler.add_job(
+        run_daily_auth,
+        CronTrigger(hour=8, minute=30, day_of_week="mon-fri", timezone="Asia/Kolkata"),
+        id="zerodha_daily_auth",
+        name="Zerodha Daily Auth",
+        replace_existing=True,
+    )
+    logger.info("Zerodha daily auth scheduled at 08:30 IST.")

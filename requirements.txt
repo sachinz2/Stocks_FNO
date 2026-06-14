@@ -43,6 +43,7 @@ tenacity
 
 # Zerodha broker
 kiteconnect
+pyotp
 
 # ML
 xgboost
