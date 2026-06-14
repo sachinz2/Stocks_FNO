@@ -1,18 +1,22 @@
-version: '3.8'
-
 services:
   mysql:
     image: mysql:8.0
     container_name: falcon_mysql
     environment:
-      MYSQL_ROOT_PASSWORD: password123
-      MYSQL_DATABASE: falcon_db
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:-password123}
+      MYSQL_DATABASE: ${DB_NAME:-falcon_db}
     volumes:
       - mysql_data:/var/lib/mysql
     ports:
       - "3307:3306"
     networks:
       - falcon_network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${DB_PASSWORD:-password123}"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
   redis:
     image: redis:7-alpine
@@ -23,13 +27,20 @@ services:
       - "6379:6379"
     networks:
       - falcon_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
   api:
     build: .
     container_name: falcon_api
     depends_on:
-      - mysql
-      - redis
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     env_file:
       - .env
     ports:
@@ -39,6 +50,12 @@ services:
       - falcon_network
     volumes:
       - .:/app
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
 
   dashboard:
     build: .
@@ -47,14 +64,22 @@ services:
       - api
     env_file:
       - .env
+    environment:
+      - API_BASE_URL=http://api:8000/api/v1
     ports:
       - "8501:8501"
-    command: streamlit run src/dashboard/app.py
+    command: streamlit run src/dashboard/app.py --server.port 8501 --server.address 0.0.0.0
     networks:
       - falcon_network
     volumes:
       - .:/app
-  
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
   nginx:
     image: nginx:alpine
     container_name: falcon_nginx
