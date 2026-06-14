@@ -1,21 +1,20 @@
+import os
 import streamlit as st
 import requests
 from datetime import datetime
 import pandas as pd
 
-# Basic Streamlit UI configuration
 st.set_page_config(page_title="Falcon Quant Platform", layout="wide", page_icon="🦅")
 
-# Mock API Base URL (Would be fetched from env in production)
-API_BASE_URL = "http://localhost:8000/api/v1"
+API_BASE_URL = os.environ.get("API_BASE_URL", "http://api:8000/api/v1")
+_DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "admin123")
 
-# --- Authentication (Role Based Access) ---
 def check_password():
     """Returns `True` if the user had the correct password."""
     def password_entered():
-        if st.session_state["password"] == "admin123": # Hardcoded for demo
+        if st.session_state["password"] == _DASHBOARD_PASSWORD:
             st.session_state["password_correct"] = True
-            del st.session_state["password"]  # don't store password
+            del st.session_state["password"]
         else:
             st.session_state["password_correct"] = False
 
