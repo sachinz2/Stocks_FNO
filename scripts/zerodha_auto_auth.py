@@ -102,65 +102,79 @@ def zerodha_auto_login() -> str:
 
     logger.info("TOTP accepted. Fetching request token...")
 
-    # Step 3 — Walk the KiteConnect redirect chain manually.
-    # Zerodha's connect/finish page is a 200 HTML with a JS redirect
-    # (window.location = "http://localhost?request_token=...") that requests
-    # cannot follow. We hop one redirect at a time with allow_redirects=False,
-    # stop before attempting localhost, and parse the token from either the
-    # Location header or the HTML body.
     import re
     from urllib.parse import parse_qs, urlparse
     from kiteconnect import KiteConnect
 
     kite = KiteConnect(api_key=api_key)
-    current_url = kite.login_url()
+
+    # Use kite.zerodha.com (same domain as our login session cookies) NOT
+    # kite.trade — cross-domain cookies are not sent, causing auth to fail.
+    connect_url = f"https://kite.zerodha.com/connect/login?api_key={api_key}&v=3"
+
     request_token = None
+    current_url = connect_url
     last_resp = None
 
     for _hop in range(10):
         last_resp = session.get(current_url, allow_redirects=False)
         location = last_resp.headers.get("Location", "")
 
-        # Happy path: request_token is in the Location header (HTTP redirect)
+        logger.info(
+            f"[hop {_hop}] GET {current_url[:90]} "
+            f"→ {last_resp.status_code} | Location: {location[:100] or '(none)'}"
+        )
+
+        # Best case: request_token is already in the Location header
         if "request_token=" in location:
             request_token = parse_qs(urlparse(location).query).get("request_token", [""])[0]
+            logger.info(f"[hop {_hop}] request_token found in Location header")
             break
 
-        # Don't try to connect to localhost — it can't be reached from the server.
-        # The request_token should have been in the Location header; if not, fall through.
+        # Redirect to our app's callback URL (e.g. http://localhost).
+        # Even if the URL itself has no request_token, try to parse it;
+        # otherwise, fall through to HTML / sess_id extraction below.
         if location and ("localhost" in location or "127.0.0.1" in location):
-            logger.warning(f"Redirect target is localhost but no request_token: {location}")
-            break
+            logger.info(f"[hop {_hop}] Redirect to app callback: {location}")
+            # No request_token in the location — fall through to HTML parse
 
-        # Follow any other redirect
-        if location:
-            logger.debug(f"Redirect hop {_hop}: {location[:80]}")
+        # Follow any other off-site redirect
+        elif location:
             current_url = location
             continue
 
-        # 200 response — parse the JS redirect in the finish page HTML
+        # ----- 200 response: parse the HTML body -----
         if last_resp.status_code == 200:
             body = last_resp.text
-            match = re.search(r'request_token=([A-Za-z0-9_-]+)', body)
+            logger.info(f"[hop {_hop}] HTML body (first 800 chars):\n{body[:800]}")
+
+            # Most common: window.location = "http://localhost?request_token=XYZ"
+            match = re.search(r'request_token[="\s:]+([A-Za-z0-9_-]{20,})', body)
             if match:
                 request_token = match.group(1)
+                logger.info(f"[hop {_hop}] request_token found in HTML body")
                 break
 
-            # Fallback: sess_id in the finish URL sometimes equals request_token
-            params = parse_qs(urlparse(last_resp.url).query)
-            sess_id = params.get("sess_id", [""])[0]
-            if sess_id:
-                logger.warning("Falling back to sess_id as request_token — verify this works.")
-                request_token = sess_id
-        break
+        # ----- Last resort: sess_id from the finish URL -----
+        params = parse_qs(urlparse(last_resp.url).query)
+        sess_id = params.get("sess_id", [""])[0]
+        if sess_id:
+            logger.warning(
+                f"[hop {_hop}] Could not find request_token in redirect or HTML. "
+                f"Trying sess_id as request_token: {sess_id[:8]}..."
+            )
+            request_token = sess_id
+
+        break  # Nothing more to try
 
     if not request_token:
         raise RuntimeError(
-            f"Could not extract request_token after following the redirect chain. "
+            f"Could not extract request_token after following the redirect chain.\n"
             f"Last URL: {last_resp.url if last_resp else current_url}\n"
-            "Check that ZERODHA_API_KEY redirect URL is set to http://localhost in "
-            "your Kite Connect app settings."
+            "Verify your Kite Connect app's redirect URL is http://localhost "
+            "in the Kite Connect Developer Console."
         )
+
     logger.info(f"Got request_token: {request_token[:8]}...")
 
     # Step 4 — Exchange for access_token
