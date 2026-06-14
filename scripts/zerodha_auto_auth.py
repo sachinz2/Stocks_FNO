@@ -6,6 +6,7 @@ Uses pyotp to generate TOTP — no manual intervention needed.
 import json
 import logging
 import os
+import re
 import sys
 import time
 
@@ -47,151 +48,124 @@ def generate_totp(secret: str) -> str:
 def zerodha_auto_login() -> str:
     """
     Fully automated Zerodha login. Returns access_token.
-    Requires ZERODHA_USER_ID, ZERODHA_PASSWORD, ZERODHA_TOTP_SECRET,
-    ZERODHA_API_KEY, ZERODHA_API_SECRET in environment.
+
+    Order matters: Connect OAuth session must be established BEFORE login.
+    If login happens first and we visit connect/login afterwards, Zerodha
+    skips the auth page but connect/finish returns 400 because the connect
+    session was never linked to the login. The correct order:
+      1. Visit connect/login (unauthenticated) → get sess_id
+      2. Login via /api/login in the same session (connect context cookie present)
+      3. TOTP via /api/twofa in the same session
+      4. Visit connect/finish → get 302 to localhost?request_token=...
+      5. Exchange request_token for access_token
     """
-    user_id = settings.ZERODHA_USER_ID
-    password = settings.ZERODHA_PASSWORD
-    totp_secret = settings.ZERODHA_TOTP_SECRET
-    api_key = settings.ZERODHA_API_KEY
-    api_secret = settings.ZERODHA_API_SECRET
-
-    if not all([user_id, password, api_key, api_secret]):
-        raise ValueError("Missing Zerodha credentials in .env")
-
-    # Determine 2FA method
-    if totp_secret:
-        twofa_value = generate_totp(totp_secret)
-        twofa_type = "totp"
-        logger.info("Using TOTP for 2FA")
-    else:
-        twofa_value = os.environ.get("ZERODHA_PIN", "")
-        twofa_type = "user_pin"
-        if not twofa_value:
-            raise ValueError("Set either ZERODHA_TOTP_SECRET or ZERODHA_PIN in .env")
-        logger.info("Using static PIN for 2FA")
-
-    session = requests.Session()
-    session.headers.update(HEADERS)
-
-    # Step 1 — Login with user_id + password
-    logger.info(f"Logging in to Zerodha as {user_id}...")
-    resp = session.post(LOGIN_URL, data={"user_id": user_id, "password": password})
-    resp.raise_for_status()
-    data = resp.json()
-
-    if data.get("status") != "success":
-        raise RuntimeError(f"Zerodha login failed: {data.get('message')}")
-
-    request_id = data["data"]["request_id"]
-    logger.info("Password accepted. Submitting 2FA...")
-
-    # Step 2 — Submit 2FA (TOTP or static PIN)
-    resp = session.post(TWOFA_URL, data={
-        "user_id": user_id,
-        "request_id": request_id,
-        "twofa_value": twofa_value,
-        "twofa_type": twofa_type,
-        "skip_session": "",
-    })
-    resp.raise_for_status()
-    data = resp.json()
-
-    if data.get("status") != "success":
-        raise RuntimeError(f"Zerodha TOTP failed: {data.get('message')}")
-
-    logger.info("TOTP accepted. Fetching request token...")
-
     import re
     from urllib.parse import parse_qs, urlparse
     from kiteconnect import KiteConnect
 
+    api_key = settings.ZERODHA_API_KEY
+    api_secret = settings.ZERODHA_API_SECRET
+    user_id = settings.ZERODHA_USER_ID
+    password = settings.ZERODHA_PASSWORD
+    totp_secret = settings.ZERODHA_TOTP_SECRET
+
+    if not all([user_id, password, api_key, api_secret]):
+        raise ValueError("Missing Zerodha credentials in .env")
+    if not totp_secret:
+        raise ValueError("ZERODHA_TOTP_SECRET is required for automated login")
+
     kite = KiteConnect(api_key=api_key)
 
-    # Use kite.zerodha.com so our session cookies (same domain) are sent.
-    connect_url = f"https://kite.zerodha.com/connect/login?api_key={api_key}&v=3"
+    # Fresh session — no prior cookies, so Zerodha shows the connect login page
+    session = requests.Session()
+    session.headers.update(HEADERS)
 
-    def _find_token(text: str):
-        m = re.search(r'request_token=([A-Za-z0-9_-]{20,})', text)
-        return m.group(1) if m else None
+    # ── Step 1: Establish the Connect OAuth session ──────────────────────────
+    # Visit connect/login unauthenticated. Zerodha sets a connect-context cookie
+    # and returns a sess_id in the URL. Login must happen inside this context.
+    print("[step1] Initiating Kite Connect OAuth session...", flush=True)
+    init_resp = session.get(
+        f"https://kite.trade/connect/login?api_key={api_key}&v=3",
+        allow_redirects=True,
+    )
+    connect_page_url = init_resp.url
+    print(f"[step1] Connect page: {connect_page_url}", flush=True)
+
+    page_params = parse_qs(urlparse(connect_page_url).query)
+    sess_id = page_params.get("sess_id", [""])[0]
+    if not sess_id:
+        # Already authenticated (shouldn't happen with fresh session, but handle it)
+        if "request_token=" in connect_page_url:
+            tok = page_params.get("request_token", [""])[0]
+            print(f"[step1] Surprise: already got request_token={tok[:8]}...", flush=True)
+            sd = kite.generate_session(tok, api_secret=api_secret)
+            return sd["access_token"]
+        raise RuntimeError(f"No sess_id in connect page URL: {connect_page_url}")
+    print(f"[step1] sess_id: {sess_id[:8]}...", flush=True)
+
+    # ── Step 2: Login inside the connect context ─────────────────────────────
+    print(f"[step2] Logging in as {user_id}...", flush=True)
+    resp = session.post(LOGIN_URL, data={"user_id": user_id, "password": password})
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("status") != "success":
+        raise RuntimeError(f"Zerodha login failed: {data.get('message')}")
+    request_id = data["data"]["request_id"]
+    logger.info("Password accepted. Submitting 2FA...")
+
+    # ── Step 3: TOTP inside the connect context ─────────────────────────────
+    totp_value = generate_totp(totp_secret)
+    print(f"[step3] Submitting TOTP...", flush=True)
+    resp = session.post(TWOFA_URL, data={
+        "user_id": user_id,
+        "request_id": request_id,
+        "twofa_value": totp_value,
+        "twofa_type": "totp",
+        "skip_session": "",
+    })
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("status") != "success":
+        raise RuntimeError(f"Zerodha TOTP failed: {data.get('message')}")
+    logger.info("TOTP accepted.")
+
+    # ── Step 4: Complete connect flow to get request_token ───────────────────
+    # The session now has BOTH the connect context (sess_id cookie from step 1)
+    # AND the authenticated user (from steps 2-3). connect/finish should now
+    # return a 302 to http://localhost?request_token=... instead of 400.
+    finish_url = f"https://kite.zerodha.com/connect/finish?api_key={api_key}&sess_id={sess_id}"
+    print(f"[step4] Visiting connect/finish with sess_id={sess_id[:8]}...", flush=True)
+
+    finish_resp = session.get(finish_url, allow_redirects=False)
+    location = finish_resp.headers.get("Location", "")
+    print(f"[step4] → {finish_resp.status_code} | Location: {location[:140]}", flush=True)
 
     request_token = None
-    last_url = connect_url
 
-    # ── Approach A: follow all redirects, catch ConnectionError for localhost ──
-    # If Zerodha sends a 302 to http://localhost?request_token=..., requests
-    # will raise ConnectionError (localhost unreachable on server). The URL —
-    # including request_token — is embedded in the exception message.
-    try:
-        resp = session.get(connect_url, allow_redirects=True)
-        last_url = resp.url
-        print(f"[auth] Approach A — Final URL: {last_url}", flush=True)
-        print(f"[auth] Status: {resp.status_code}", flush=True)
-
-        t = _find_token(last_url)
-        if t:
-            request_token = t
-            print(f"[auth] request_token found in final URL: {t[:8]}...", flush=True)
-        elif resp.status_code == 200:
-            body = resp.text
-            print(f"[auth] Page body (first 1000 chars):\n{body[:1000]}", flush=True)
-            t = _find_token(body)
-            if t:
-                request_token = t
-                print(f"[auth] request_token found in page body: {t[:8]}...", flush=True)
-
-    except requests.exceptions.ConnectionError as conn_err:
-        err_str = str(conn_err)
-        print(f"[auth] ConnectionError (expected when Zerodha redirects to localhost):\n{err_str[:500]}", flush=True)
-        t = _find_token(err_str)
-        if t:
-            request_token = t
-            print(f"[auth] request_token extracted from ConnectionError: {t[:8]}...", flush=True)
-
-    # ── Approach B: hop-by-hop with allow_redirects=False ──
-    if not request_token:
-        print("[auth] Approach A found no token. Trying hop-by-hop...", flush=True)
-        current_url = connect_url
-        last_resp = None
-        for hop in range(10):
-            last_resp = session.get(current_url, allow_redirects=False)
-            loc = last_resp.headers.get("Location", "")
-            print(
-                f"[hop {hop}] {current_url[:80]} → {last_resp.status_code} | "
-                f"Location: {loc[:100] or '(none)'}",
-                flush=True,
-            )
-
-            t = _find_token(loc)
-            if t:
-                request_token = t
-                print(f"[hop {hop}] request_token in Location header: {t[:8]}...", flush=True)
-                break
-
-            if loc and "localhost" not in loc and "127.0.0.1" not in loc:
-                current_url = loc
-                continue
-
-            if last_resp.status_code == 200:
-                body = last_resp.text
-                print(f"[hop {hop}] 200 body (first 800):\n{body[:800]}", flush=True)
-                t = _find_token(body)
-                if t:
-                    request_token = t
-                    print(f"[hop {hop}] request_token in body: {t[:8]}...", flush=True)
-                    break
-            break
+    if "request_token=" in location:
+        from urllib.parse import parse_qs, urlparse
+        request_token = parse_qs(urlparse(location).query).get("request_token", [""])[0]
+        print(f"[step4] request_token from Location header: {request_token[:8]}...", flush=True)
+    elif finish_resp.status_code == 200:
+        body = finish_resp.text
+        print(f"[step4] 200 body (first 800 chars):\n{body[:800]}", flush=True)
+        match = re.search(r'request_token=([A-Za-z0-9_-]{20,})', body)
+        if match:
+            request_token = match.group(1)
+            print(f"[step4] request_token from HTML body: {request_token[:8]}...", flush=True)
+    else:
+        print(f"[step4] {finish_resp.status_code} body:\n{finish_resp.text[:400]}", flush=True)
 
     if not request_token:
         raise RuntimeError(
-            f"Cannot extract request_token. Last URL: {last_url}\n"
-            "Open https://developers.kite.trade and confirm that your app's "
-            "Redirect URL is set to exactly: http://localhost"
+            f"connect/finish returned {finish_resp.status_code} — cannot get request_token.\n"
+            f"Location header: {location or '(none)'}\n"
+            "Verify redirect URL in Kite Connect app is set to http://localhost"
         )
 
     logger.info(f"Got request_token: {request_token[:8]}...")
 
-    # Step 4 — Exchange for access_token
+    # ── Step 5: Exchange request_token for access_token ──────────────────────
     session_data = kite.generate_session(request_token, api_secret=api_secret)
     access_token = session_data["access_token"]
     logger.info(f"Access token generated for {session_data.get('user_id')}")
