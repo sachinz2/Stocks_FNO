@@ -52,7 +52,8 @@ class Settings(BaseSettings):
     def get_database_url(self) -> str:
         if self.DATABASE_URL:
             return self.DATABASE_URL
-        return f"mysql+aiomysql://{self.DB_USER}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
+        from urllib.parse import quote_plus
+        return f"mysql+aiomysql://{self.DB_USER}:{quote_plus(self.DB_PASSWORD)}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
 
     def get_redis_url(self) -> str:
         if self.REDIS_PASSWORD:

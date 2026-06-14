@@ -18,9 +18,12 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 # Override sqlalchemy.url from environment so Docker service names work
-_db_url = (
-    os.environ.get("DATABASE_URL")
-    or f"mysql+aiomysql://{os.environ.get('DB_USER', 'falcon_user')}:{os.environ.get('DB_PASSWORD', 'password123')}@{os.environ.get('DB_HOST', 'mysql')}:{os.environ.get('DB_PORT', '3306')}/{os.environ.get('DB_NAME', 'falcon_db')}"
+from urllib.parse import quote_plus
+_db_url = os.environ.get("DATABASE_URL") or (
+    f"mysql+aiomysql://{os.environ.get('DB_USER', 'root')}:"
+    f"{quote_plus(os.environ.get('DB_PASSWORD', 'password123'))}@"
+    f"{os.environ.get('DB_HOST', 'mysql')}:{os.environ.get('DB_PORT', '3306')}/"
+    f"{os.environ.get('DB_NAME', 'falcon_db')}"
 )
 config.set_main_option("sqlalchemy.url", _db_url)
 
