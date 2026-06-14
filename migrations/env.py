@@ -1,26 +1,28 @@
 import asyncio
-from logging.config import fileConfig
-
-from sqlalchemy import pool
-from sqlalchemy.ext.asyncio import async_engine_from_config
-from alembic import context
-
-# Import your Base and all models so Alembic can read them
-from src.database.models import Base
 import os
 import sys
+from logging.config import fileConfig
+
+from alembic import context
+from sqlalchemy import pool
+from sqlalchemy.ext.asyncio import async_engine_from_config
 
 # Add the project root to sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-# this is the Alembic Config object, which provides
-# access to the values within the .ini file in use.
+from src.database.models import Base
+
 config = context.config
 
-# Interpret the config file for Python logging.
-# This line sets up loggers basically.
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
+
+# Override sqlalchemy.url from environment so Docker service names work
+_db_url = (
+    os.environ.get("DATABASE_URL")
+    or f"mysql+aiomysql://{os.environ.get('DB_USER', 'falcon_user')}:{os.environ.get('DB_PASSWORD', 'password123')}@{os.environ.get('DB_HOST', 'mysql')}:{os.environ.get('DB_PORT', '3306')}/{os.environ.get('DB_NAME', 'falcon_db')}"
+)
+config.set_main_option("sqlalchemy.url", _db_url)
 
 target_metadata = Base.metadata
 
