@@ -4,7 +4,8 @@ from src.api.dependencies import get_current_user
 from src.database.connection import get_db_session
 from src.database.models.position import Position
 from src.database.repositories.base import BaseRepository
-from src.core.logger import logger
+import logging
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/positions", tags=["Positions"])
 

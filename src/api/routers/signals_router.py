@@ -6,7 +6,8 @@ from src.database.connection import get_db_session
 from src.database.models.signal import Signal
 from src.database.models.stock import Stock
 from src.database.repositories.base import BaseRepository
-from src.core.logger import logger
+import logging
+logger = logging.getLogger(__name__)
 from datetime import datetime
 
 router = APIRouter(prefix="/signals", tags=["Signals"])

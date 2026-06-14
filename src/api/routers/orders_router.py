@@ -9,7 +9,8 @@ from src.database.repositories.base import BaseRepository
 from src.orders.order_manager import OrderManager
 from src.risk.risk_manager import RiskManager
 from src.paper_trading.paper_broker import PaperBroker
-from src.core.logger import logger
+import logging
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/orders", tags=["Orders"])
 
