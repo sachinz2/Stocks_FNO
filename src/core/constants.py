@@ -62,11 +62,15 @@ FNO_STRIKE_INTERVALS = {
     "TATASTEEL":    5,
 }
 
-# How many stocks to trade at a time (dynamic selection from the 40-stock pool)
+# How many stocks to trade at a time per strategy regime
 ACTIVE_TRADING_SYMBOLS = 5
 
-# Redis key for dynamically ranked top symbols
-REDIS_TOP_SYMBOLS_KEY = "nfo:top5"
+# Each strategy regime gets its own ranked symbol pool written by LTPPoller.
+# Engine reads the right key based on which strategy is generating the signal.
+REDIS_TOP_SYMBOLS_KEY = "nfo:top5"                        # EMA crossover: high ATR + strong trend
+REDIS_TOP_SYMBOLS_CREDIT_SPREAD = "nfo:top5:spread"       # Credit spread: low ATR + EMA directional
+REDIS_TOP_SYMBOLS_IRON_CONDOR = "nfo:top5:condor"         # Iron condor: low ATR + EMA flat
+
 REDIS_LOT_SIZE_PREFIX = "nfo:lot:"
 
 # Indicator defaults

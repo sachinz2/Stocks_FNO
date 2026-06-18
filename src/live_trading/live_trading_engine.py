@@ -4,7 +4,14 @@ from typing import Any, Dict, List, Optional
 
 from src.brokers.base import AbstractBroker
 from src.core.config import settings
-from src.core.constants import FNO_SYMBOLS, REDIS_LOT_SIZE_PREFIX, REDIS_TICK_PREFIX, REDIS_TOP_SYMBOLS_KEY
+from src.core.constants import (
+    FNO_SYMBOLS,
+    REDIS_LOT_SIZE_PREFIX,
+    REDIS_TICK_PREFIX,
+    REDIS_TOP_SYMBOLS_KEY,
+    REDIS_TOP_SYMBOLS_CREDIT_SPREAD,
+    REDIS_TOP_SYMBOLS_IRON_CONDOR,
+)
 from src.core.enums import SignalType, TradingMode
 from src.core.utils import (
     build_option_symbol,
@@ -54,6 +61,8 @@ class LiveTradingEngine:
         self._peak_premiums: Dict[str, float] = {}
         # Tracks active credit spreads: {underlying: {spread metadata dict}}
         self._active_spreads: Dict[str, Dict[str, Any]] = {}
+        # Tracks active iron condors: {underlying: {condor metadata dict}}
+        self._active_condors: Dict[str, Dict[str, Any]] = {}
 
         logger.info(f"LiveTradingEngine initialised — mode: {self.mode.value.upper()}")
 
@@ -102,15 +111,16 @@ class LiveTradingEngine:
         positions = await self._safe_get_positions()
         await self._refresh_risk_state(positions)
 
-        # Check spread exits before long-option exits (spreads have their own logic)
+        # Check spread / condor exits before long-option exits (own exit logic)
         await self._check_spread_exits(active_strategies)
+        await self._check_condor_exits(active_strategies)
 
         # FIX 1 + 3 + 4: Check all open option positions for exits every cycle
         await self._check_open_option_exits(positions, active_strategies)
 
-        # Generate new entry signals on top-ranked symbols
-        symbols = await self._get_active_symbols()
+        # Each strategy gets its own regime-matched symbol pool from Redis
         for strategy_id, strategy in active_strategies.items():
+            symbols = await self._get_active_symbols(strategy)
             for symbol in symbols:
                 try:
                     await self._process_signal(strategy, symbol)
@@ -151,8 +161,9 @@ class LiveTradingEngine:
         )
         self._today_order_count = 0
         self._peak_premiums.clear()
-        # Spreads closed at square-off; clear tracking state for next day
+        # Spreads/condors closed at square-off; clear tracking state for next day
         self._active_spreads.clear()
+        self._active_condors.clear()
 
     # ------------------------------------------------------------------
     # Exit management
@@ -176,11 +187,18 @@ class LiveTradingEngine:
         expiry = get_near_month_expiry()
         dte = (expiry - now_ist().replace(tzinfo=None)).days
 
-        # Contracts managed by _check_spread_exits — skip here to avoid double handling
+        # Contracts managed by spread/condor exit routines — skip here to avoid double handling
         spread_contracts: set = set()
         for spread in self._active_spreads.values():
             spread_contracts.add(spread.get("short_contract", ""))
             spread_contracts.add(spread.get("long_contract", ""))
+        for condor in self._active_condors.values():
+            spread_contracts.update([
+                condor.get("put_short_contract", ""),
+                condor.get("put_long_contract", ""),
+                condor.get("call_short_contract", ""),
+                condor.get("call_long_contract", ""),
+            ])
 
         for pos in positions:
             contract = pos.get("symbol", "")
@@ -266,6 +284,10 @@ class LiveTradingEngine:
 
         if signal_str in ("BULL_PUT_SPREAD", "BEAR_CALL_SPREAD"):
             await self._process_credit_spread(strategy, symbol, signal_str, market_data)
+            return
+
+        if signal_str == "IRON_CONDOR":
+            await self._process_iron_condor(strategy, symbol, market_data)
             return
 
         if signal_str not in ("BUY", "SELL"):
@@ -552,6 +574,241 @@ class LiveTradingEngine:
         for sym in to_remove:
             del self._active_spreads[sym]
 
+    async def _process_iron_condor(
+        self,
+        strategy,
+        symbol: str,
+        market_data: Dict[str, Any],
+    ) -> None:
+        """
+        Enter an iron condor on the given underlying.
+
+        Structure:
+          PUT  wing: SELL (ATM - short_offset×interval) PE
+                   + BUY  (ATM - short_offset×interval - hedge_offset×interval) PE
+          CALL wing: SELL (ATM + short_offset×interval) CE
+                   + BUY  (ATM + short_offset×interval + hedge_offset×interval) CE
+
+        Net credit = (short_put_premium + short_call_premium)
+                   - (long_put_premium  + long_call_premium)
+        """
+        if symbol in self._active_condors:
+            logger.info(f"[IronCondor] Already have active condor on {symbol}, skipping.")
+            return
+
+        underlying_price = float(market_data.get("close", 0))
+        if underlying_price <= 0:
+            return
+
+        from src.core.constants import FNO_STRIKE_INTERVALS
+        interval = FNO_STRIKE_INTERVALS.get(symbol, 50)
+        short_offset = getattr(strategy, "short_offset", 1) * interval
+        hedge_offset = getattr(strategy, "hedge_offset", 2) * interval
+
+        atm_strike = get_atm_strike(underlying_price, symbol)
+        expiry = get_near_month_expiry()
+        lot_size = await self._get_lot_size(symbol)
+        atr = float(market_data.get("atr14", underlying_price * 0.01))
+
+        # Strike calculation
+        put_short_strike = atm_strike - short_offset
+        put_long_strike = put_short_strike - hedge_offset
+        call_short_strike = atm_strike + short_offset
+        call_long_strike = call_short_strike + hedge_offset
+
+        # Premium estimates: OTM options decay with distance from ATM
+        # short legs (1 interval OTM) ≈ ATR×3, long legs (3 intervals OTM) ≈ ATR×1
+        put_short_premium = round(atr * 3, 2)
+        put_long_premium = round(atr * 1, 2)
+        call_short_premium = round(atr * 3, 2)
+        call_long_premium = round(atr * 1, 2)
+        net_credit = round(
+            (put_short_premium - put_long_premium) + (call_short_premium - call_long_premium), 2
+        )
+
+        put_short_contract = build_option_symbol(symbol, put_short_strike, "PE", expiry)
+        put_long_contract = build_option_symbol(symbol, put_long_strike, "PE", expiry)
+        call_short_contract = build_option_symbol(symbol, call_short_strike, "CE", expiry)
+        call_long_contract = build_option_symbol(symbol, call_long_strike, "CE", expiry)
+
+        dte = (expiry - now_ist().replace(tzinfo=None)).days
+        logger.info(
+            f"[IronCondor] {symbol} @ Rs{underlying_price:.2f} | "
+            f"Put wing: SELL {put_short_contract}@{put_short_premium} / BUY {put_long_contract}@{put_long_premium} | "
+            f"Call wing: SELL {call_short_contract}@{call_short_premium} / BUY {call_long_contract}@{call_long_premium} | "
+            f"Net credit Rs{net_credit:.2f}×{lot_size} | DTE {dte}"
+        )
+
+        # Place all 4 legs — if any fails, unwind the ones already placed
+        placed = []
+        legs = [
+            (put_short_contract,  "SELL", lot_size, put_short_premium),
+            (put_long_contract,   "BUY",  lot_size, put_long_premium),
+            (call_short_contract, "SELL", lot_size, call_short_premium),
+            (call_long_contract,  "BUY",  lot_size, call_long_premium),
+        ]
+        for contract, side, qty, price in legs:
+            order = await self.order_manager.place_order(contract, side, qty, price)
+            if not order or order.order_status != "OPEN":
+                logger.error(f"[IronCondor] Leg failed: {side} {contract}. Unwinding {len(placed)} legs.")
+                for (c, s, q, p) in placed:
+                    reverse = "BUY" if s == "SELL" else "SELL"
+                    await self.order_manager.place_order(c, reverse, q, p)
+                return
+            placed.append((contract, side, qty, price))
+
+        self._today_order_count += 4
+        self._active_condors[symbol] = {
+            "put_short_contract":  put_short_contract,
+            "put_long_contract":   put_long_contract,
+            "call_short_contract": call_short_contract,
+            "call_long_contract":  call_long_contract,
+            "put_short_strike":    put_short_strike,
+            "call_short_strike":   call_short_strike,
+            "put_short_premium":   put_short_premium,
+            "put_long_premium":    put_long_premium,
+            "call_short_premium":  call_short_premium,
+            "call_long_premium":   call_long_premium,
+            "net_credit":          net_credit,
+            "lot_size":            lot_size,
+        }
+
+        wing_spread = short_offset + hedge_offset
+        max_loss_per_wing = (wing_spread - (put_short_premium - put_long_premium)) * lot_size
+
+        await self._notify(
+            f"IRON CONDOR OPENED\n"
+            f"Strategy: {strategy.name}\n"
+            f"Underlying: {symbol} @ Rs{underlying_price:.2f} | DTE: {dte}\n"
+            f"PUT  wing: SELL {put_short_contract} @ Rs{put_short_premium:.2f} "
+            f"+ BUY {put_long_contract} @ Rs{put_long_premium:.2f}\n"
+            f"CALL wing: SELL {call_short_contract} @ Rs{call_short_premium:.2f} "
+            f"+ BUY {call_long_contract} @ Rs{call_long_premium:.2f}\n"
+            f"Net credit: Rs{net_credit:.2f}/share × {lot_size} = Rs{net_credit * lot_size:,.2f}\n"
+            f"Max profit: Rs{net_credit * lot_size:,.2f} | "
+            f"Max loss: ~Rs{max_loss_per_wing:,.2f}/wing"
+        )
+
+    async def _check_condor_exits(self, active_strategies: Dict[str, Any]) -> None:
+        """
+        Called every cycle. Evaluates exit conditions for all active iron condors.
+
+        Exit triggers (any one fires → close all 4 legs):
+          1. DTE < min_dte (default 7) — gamma risk near expiry
+          2. Underlying breaches put short strike or call short strike
+          3. Either short leg doubles in value (stop loss on that wing)
+          4. Both short legs decay to 25% of sold value (75% profit target)
+        """
+        if not self._active_condors:
+            return
+
+        expiry = get_near_month_expiry()
+        dte = (expiry - now_ist().replace(tzinfo=None)).days
+        to_remove: List[str] = []
+
+        ic_strategy = None
+        for s in active_strategies.values():
+            if s.__class__.__name__ == "IronCondorStrategy":
+                ic_strategy = s
+                break
+
+        for underlying, condor in self._active_condors.items():
+            market_data = await self._get_market_data(underlying)
+            if not market_data:
+                continue
+
+            current_price = float(market_data.get("close", 0))
+            atr = float(market_data.get("atr14", 0))
+
+            # Current premium estimates
+            current_put_short = round(atr * 3, 2) if atr > 0 else condor["put_short_premium"]
+            current_call_short = round(atr * 3, 2) if atr > 0 else condor["call_short_premium"]
+            current_put_long = round(atr * 1, 2) if atr > 0 else condor["put_long_premium"]
+            current_call_long = round(atr * 1, 2) if atr > 0 else condor["call_long_premium"]
+
+            exit_reason: Optional[str] = None
+            min_dte = getattr(ic_strategy, "min_dte", 7) if ic_strategy else 7
+            profit_close_pct = getattr(ic_strategy, "profit_close_pct", 0.25) if ic_strategy else 0.25
+            stop_loss_multiple = getattr(ic_strategy, "stop_loss_multiple", 2.0) if ic_strategy else 2.0
+
+            # Priority 1: DTE too close to expiry
+            if dte < min_dte:
+                exit_reason = f"DTE={dte} < {min_dte} — close before gamma risk"
+
+            # Priority 2: Strike breach (underlying moved through a short strike)
+            if exit_reason is None and current_price > 0:
+                if current_price < condor["put_short_strike"]:
+                    exit_reason = (
+                        f"Put strike breach: {underlying} @ Rs{current_price:.2f} "
+                        f"< short put Rs{condor['put_short_strike']}"
+                    )
+                elif current_price > condor["call_short_strike"]:
+                    exit_reason = (
+                        f"Call strike breach: {underlying} @ Rs{current_price:.2f} "
+                        f"> short call Rs{condor['call_short_strike']}"
+                    )
+
+            # Priority 3: Stop loss — either short leg doubled
+            if exit_reason is None:
+                if current_put_short >= condor["put_short_premium"] * stop_loss_multiple:
+                    exit_reason = (
+                        f"Put SL: sold Rs{condor['put_short_premium']:.2f}, "
+                        f"now Rs{current_put_short:.2f} ({stop_loss_multiple}x)"
+                    )
+                elif current_call_short >= condor["call_short_premium"] * stop_loss_multiple:
+                    exit_reason = (
+                        f"Call SL: sold Rs{condor['call_short_premium']:.2f}, "
+                        f"now Rs{current_call_short:.2f} ({stop_loss_multiple}x)"
+                    )
+
+            # Priority 4: Profit target — both short legs decayed to 25%
+            if exit_reason is None:
+                put_target_hit = current_put_short <= condor["put_short_premium"] * profit_close_pct
+                call_target_hit = current_call_short <= condor["call_short_premium"] * profit_close_pct
+                if put_target_hit and call_target_hit:
+                    exit_reason = "Both wings at 75% profit — closing condor"
+
+            if exit_reason is None:
+                continue
+
+            logger.info(f"[IronCondor] EXIT {underlying}: {exit_reason}")
+
+            lot_size = condor["lot_size"]
+
+            # Close all 4 legs: BUY back short legs, SELL long legs
+            await self.order_manager.place_order(
+                condor["put_short_contract"], "BUY", lot_size, current_put_short
+            )
+            await self.order_manager.place_order(
+                condor["put_long_contract"], "SELL", lot_size, current_put_long
+            )
+            await self.order_manager.place_order(
+                condor["call_short_contract"], "BUY", lot_size, current_call_short
+            )
+            await self.order_manager.place_order(
+                condor["call_long_contract"], "SELL", lot_size, current_call_long
+            )
+
+            net_pnl = (
+                (condor["put_short_premium"] - current_put_short)
+                + (condor["call_short_premium"] - current_call_short)
+                - (condor["put_long_premium"] - current_put_long)
+                - (condor["call_long_premium"] - current_call_long)
+            ) * lot_size
+            to_remove.append(underlying)
+
+            await self._notify(
+                f"IRON CONDOR CLOSED\n"
+                f"Underlying: {underlying}\n"
+                f"Reason: {exit_reason}\n"
+                f"Put  short: sold Rs{condor['put_short_premium']:.2f}, closed @ Rs{current_put_short:.2f}\n"
+                f"Call short: sold Rs{condor['call_short_premium']:.2f}, closed @ Rs{current_call_short:.2f}\n"
+                f"Est. Net PnL: Rs{net_pnl:,.2f}"
+            )
+
+        for sym in to_remove:
+            del self._active_condors[sym]
+
     async def _exit_all_options_for(self, underlying: str) -> None:
         """Exit all open option positions for the given underlying (EXIT signal)."""
         positions = await self._safe_get_positions()
@@ -594,6 +851,7 @@ class LiveTradingEngine:
             logger.warning(f"Auto square-off: {side} {abs(qty)} {contract}")
 
         self._active_spreads.clear()
+        self._active_condors.clear()
         if closed:
             await self._notify(f"AUTO SQUARE-OFF\nClosed {closed} option positions at 15:20 IST")
 
@@ -663,11 +921,26 @@ class LiveTradingEngine:
                 pass
         return get_lot_size(symbol)
 
-    async def _get_active_symbols(self) -> List[str]:
+    async def _get_active_symbols(self, strategy=None) -> List[str]:
+        """
+        Return the regime-appropriate symbol pool for the given strategy.
+        Each strategy gets its own ranked list from Redis (published by LTPPoller):
+          EMA Crossover  → nfo:top5          (high ATR + strong trend)
+          Credit Spread  → nfo:top5:spread   (low ATR + EMA directional)
+          Iron Condor    → nfo:top5:condor   (low ATR + EMA flat)
+        Falls back to the fallback symbols list if Redis is empty.
+        """
         redis = getattr(self, "_redis", None)
         if redis:
+            class_name = strategy.__class__.__name__ if strategy else ""
+            if class_name == "CreditSpreadStrategy":
+                key = REDIS_TOP_SYMBOLS_CREDIT_SPREAD
+            elif class_name == "IronCondorStrategy":
+                key = REDIS_TOP_SYMBOLS_IRON_CONDOR
+            else:
+                key = REDIS_TOP_SYMBOLS_KEY
             try:
-                raw = await redis.get(REDIS_TOP_SYMBOLS_KEY)
+                raw = await redis.get(key)
                 if raw:
                     return json.loads(raw)
             except Exception:

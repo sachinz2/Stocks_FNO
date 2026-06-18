@@ -99,6 +99,22 @@ async def lifespan(app: FastAPI):
         "min_dte": 7,                 # close spread at least 7 days before expiry
     })
 
+    # Strategy 3: Iron Condor — collect theta from both sides (low-vol + flat EMA regime)
+    # Fires when ATR% < 1.2% AND EMA is completely flat (spread < 0.1%) — stock going nowhere.
+    # Sells OTM PE + OTM CE simultaneously; wins as long as underlying stays in the range.
+    # Gets its own symbol pool from Redis (nfo:top5:condor) — most range-bound stocks.
+    StrategyRegistry.load_strategy("IRON_CONDOR", "iron_condor_v1", {
+        "fast_period": 20,
+        "slow_period": 50,
+        "low_vol_threshold": 1.2,    # same threshold as credit spread
+        "flat_threshold": 0.1,        # EMA spread must be below 0.1% of price
+        "short_offset": 1,            # short strikes are 1 interval away from ATM
+        "hedge_offset": 2,            # hedge legs are 2 more intervals from the short strikes
+        "profit_close_pct": 0.25,    # close when both short legs decay to 25% of sold price
+        "stop_loss_multiple": 2.0,   # stop loss when either short leg doubles
+        "min_dte": 7,                 # close at least 7 days before expiry
+    })
+
     engine = LiveTradingEngine(broker, risk_mgr, order_mgr, portfolio_mgr, notifier)
     engine.attach_redis(redis_client)
     engine.set_symbols(PHASE1_SYMBOLS)  # fallback if Redis top5 is absent
