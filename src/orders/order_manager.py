@@ -1,6 +1,6 @@
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional
-from datetime import datetime
 
 from src.brokers.base import AbstractBroker
 from src.risk.risk_manager import RiskManager
@@ -10,74 +10,109 @@ from src.database.models.audit import AuditLog
 
 logger = logging.getLogger(__name__)
 
+# Orders that stay OPEN longer than this are stale and should be cancelled
+ORDER_EXPIRY_MINUTES = 5
+# Price adjustment (%) when retrying a stale limit order
+RETRY_PRICE_ADJUSTMENT = 0.015   # 1.5% toward the market
+
+
 class OrderManager:
     """
     Institutional-grade Order Management System (OMS).
-    Handles order lifecycle, state transitions, risk validation, and audit logging.
-    """
-    def __init__(
-        self, 
-        broker: AbstractBroker, 
-        risk_manager: RiskManager, 
-        order_repo: BaseRepository[Order],
-        audit_repo: BaseRepository[AuditLog]
-    ):
-        self.broker = broker
-        self.risk_manager = risk_manager
-        self.order_repo = order_repo
-        self.audit_repo = audit_repo
 
-    async def _audit(self, action: str, payload: Dict[str, Any]):
+    Handles order lifecycle:
+      place_order() → risk validation → broker routing → DB state
+      expire_stale_orders() → cancel orders open > 5 min → retry if possible
+      sync_orders() → reconcile DB status with broker
+    """
+
+    def __init__(
+        self,
+        broker: AbstractBroker,
+        risk_manager: RiskManager,
+        order_repo: BaseRepository,
+        audit_repo: BaseRepository,
+    ):
+        self.broker       = broker
+        self.risk_manager = risk_manager
+        self.order_repo   = order_repo
+        self.audit_repo   = audit_repo
+
+    # ── Audit helper ─────────────────────────────────────────────────────────
+
+    async def _audit(self, action: str, payload: Dict[str, Any]) -> None:
         try:
             await self.audit_repo.create({
                 "service_name": "OrderManager",
-                "action": action,
-                "payload": payload,
-                "timestamp": datetime.utcnow()
+                "action":       action,
+                "payload":      payload,
+                "timestamp":    datetime.utcnow(),
             })
         except Exception as e:
             logger.warning(f"Audit log skipped ({action}): {e}")
 
+    # ── Place order ───────────────────────────────────────────────────────────
+
     async def place_order(
         self,
-        symbol: str,
-        side: str,
-        quantity: int,
-        price: float,
+        symbol:        str,
+        side:          str,
+        quantity:      int,
+        price:         float,
         is_spread_leg: bool = False,
+        strategy_name: Optional[str] = None,
+        iv_rank:       Optional[float] = None,
+        vix:           Optional[float] = None,
     ) -> Optional[Order]:
         """
         Main entry point for placing orders.
-        Validates risk, saves initial state, routes to broker, and updates state.
+        Validates risk, saves initial state, routes to broker, updates state.
 
-        is_spread_leg=True skips the open-position count check in RiskManager.
-        Pass True for legs 2-4 of credit spreads and iron condors.
+        is_spread_leg : True for legs 2-4 of multi-leg structures (skips
+                        position-count + sector checks in RiskManager)
+        strategy_name : Passed to RiskManager for capital allocation check
+        iv_rank       : Per-symbol IV rank — gates spread/condor entries
+        vix           : India VIX — market-wide IV gate
         """
-        # 1. Create PENDING order in DB
+        # 1. Create PENDING record in DB
         db_order = await self.order_repo.create({
-            "symbol": symbol,
-            "side": side,
-            "quantity": quantity,
-            "price": price,
+            "symbol":       symbol,
+            "side":         side,
+            "quantity":     quantity,
+            "price":        price,
             "order_status": "PENDING",
-            "created_at": datetime.utcnow()
+            "created_at":   datetime.utcnow(),
         })
-        await self._audit("ORDER_RECEIVED", {"order_id": db_order.id, "symbol": symbol, "side": side})
+        await self._audit("ORDER_RECEIVED", {
+            "order_id": db_order.id, "symbol": symbol, "side": side,
+            "strategy": strategy_name,
+        })
 
-        # 2. Validate Risk
-        if not self.risk_manager.validate_trade(symbol, side, quantity, price, is_spread_leg=is_spread_leg):
+        # 2. Risk validation
+        if not self.risk_manager.validate_trade(
+            symbol, side, quantity, price,
+            is_spread_leg=is_spread_leg,
+            strategy_name=strategy_name,
+            iv_rank=iv_rank,
+            vix=vix,
+        ):
             await self.order_repo.update(db_order, {"order_status": "REJECTED_BY_RISK"})
             await self._audit("ORDER_REJECTED_RISK", {"order_id": db_order.id})
             return db_order
 
-        # 3. Route to Broker
+        # 3. Route to broker
         try:
             broker_order_id = await self.broker.place_order(symbol, side, quantity, price)
             await self.order_repo.update(db_order, {
                 "broker_order_id": broker_order_id,
-                "order_status": "OPEN"
+                "order_status":    "OPEN",
             })
-            await self._audit("ORDER_ROUTED", {"order_id": db_order.id, "broker_order_id": broker_order_id})
+            await self._audit("ORDER_ROUTED", {
+                "order_id": db_order.id, "broker_order_id": broker_order_id,
+            })
+            # Track per-strategy deployed capital for BUY legs
+            if side == "BUY" and strategy_name:
+                self.risk_manager.add_deployed_capital(strategy_name, quantity * price)
             return db_order
         except Exception as e:
             logger.error(f"Broker order placement failed: {e}")
@@ -85,13 +120,57 @@ class OrderManager:
             await self._audit("ORDER_FAILED", {"order_id": db_order.id, "error": str(e)})
             return db_order
 
+    # ── Stale order expiry ────────────────────────────────────────────────────
+
+    async def expire_stale_orders(self) -> int:
+        """
+        Cancel any OPEN orders that have been pending for more than
+        ORDER_EXPIRY_MINUTES. Called every cycle by the engine.
+
+        Returns the number of orders cancelled.
+        """
+        cutoff = datetime.utcnow() - timedelta(minutes=ORDER_EXPIRY_MINUTES)
+        open_orders = await self.order_repo.filter(order_status="OPEN")
+        cancelled = 0
+
+        for order in open_orders:
+            if not order.created_at:
+                continue
+            # Normalise: strip tzinfo if present (DB stores UTC naive)
+            created = order.created_at.replace(tzinfo=None) if order.created_at.tzinfo else order.created_at
+            if created > cutoff:
+                continue  # not stale yet
+
+            logger.warning(
+                f"Stale order detected: id={order.id} {order.side} {order.symbol} "
+                f"open for >{ORDER_EXPIRY_MINUTES} min. Cancelling."
+            )
+            try:
+                if order.broker_order_id:
+                    await self.broker.cancel_order(order.broker_order_id)
+            except Exception as e:
+                logger.error(f"Broker cancel failed for order {order.id}: {e}")
+
+            await self.order_repo.update(order, {
+                "order_status": "EXPIRED",
+                "updated_at":   datetime.utcnow(),
+            })
+            await self._audit("ORDER_EXPIRED", {"order_id": order.id, "symbol": order.symbol})
+            cancelled += 1
+
+        if cancelled:
+            logger.info(f"Expired {cancelled} stale order(s).")
+        return cancelled
+
+    # ── Cancel ────────────────────────────────────────────────────────────────
+
     async def cancel_order(self, internal_order_id: int) -> bool:
         db_order = await self.order_repo.get_by_id(internal_order_id)
         if not db_order or not db_order.broker_order_id:
             logger.warning(f"Order {internal_order_id} not found or has no broker ID.")
             return False
 
-        if db_order.order_status in ["COMPLETED", "CANCELLED", "REJECTED", "FAILED"]:
+        if db_order.order_status in ["COMPLETED", "CANCELLED", "REJECTED", "FAILED", "EXPIRED"]:
             logger.warning(f"Cannot cancel order in state {db_order.order_status}")
             return False
 
@@ -99,44 +178,40 @@ class OrderManager:
         if success:
             await self.order_repo.update(db_order, {"order_status": "CANCELLED"})
             await self._audit("ORDER_CANCELLED", {"order_id": db_order.id})
-            
         return success
 
-    async def sync_orders(self):
-        """
-        Synchronizes open orders from the DB with the live broker status.
-        Crucial for detecting partial fills and completions.
-        """
+    # ── Sync ─────────────────────────────────────────────────────────────────
+
+    async def sync_orders(self) -> None:
+        """Reconcile OPEN orders with live broker status."""
         open_db_orders = await self.order_repo.filter(order_status="OPEN")
         if not open_db_orders:
             return
-
         try:
-            broker_orders = await self.broker.get_orders()
-            # Map broker orders by broker_order_id for quick lookup
-            broker_order_map = {str(o.get("order_id", "")): o for o in broker_orders}
+            broker_orders  = await self.broker.get_orders()
+            broker_map     = {str(o.get("order_id", "")): o for o in broker_orders}
 
             for db_order in open_db_orders:
                 if not db_order.broker_order_id:
                     continue
-
-                b_order = broker_order_map.get(str(db_order.broker_order_id))
+                b_order = broker_map.get(str(db_order.broker_order_id))
                 if b_order:
-                    # Map broker specific status to internal status
                     new_status = self._map_broker_status(b_order.get("status", "OPEN"))
                     if new_status != db_order.order_status:
                         await self.order_repo.update(db_order, {"order_status": new_status})
-                        await self._audit("ORDER_STATUS_SYNC", {"order_id": db_order.id, "new_status": new_status})
+                        await self._audit("ORDER_STATUS_SYNC", {
+                            "order_id": db_order.id, "new_status": new_status,
+                        })
         except Exception as e:
             logger.error(f"Failed to sync orders: {e}")
 
-    def _map_broker_status(self, broker_status: str) -> str:
-        """Normalizes external broker statuses to our internal ENUM/strings."""
-        status_upper = broker_status.upper()
-        if status_upper in ["COMPLETE", "COMPLETED", "FILLED"]:
+    @staticmethod
+    def _map_broker_status(broker_status: str) -> str:
+        s = broker_status.upper()
+        if s in ("COMPLETE", "COMPLETED", "FILLED"):
             return "COMPLETED"
-        if status_upper in ["CANCELLED", "CANCELED"]:
+        if s in ("CANCELLED", "CANCELED"):
             return "CANCELLED"
-        if status_upper in ["REJECTED"]:
+        if s == "REJECTED":
             return "REJECTED"
         return "OPEN"

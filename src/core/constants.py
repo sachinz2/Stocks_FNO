@@ -65,6 +65,60 @@ FNO_STRIKE_INTERVALS = {
 # How many stocks to trade at a time per strategy regime
 ACTIVE_TRADING_SYMBOLS = 5
 
+# Sector classification for concentration check (max 2 open structures per sector)
+FNO_SECTORS = {
+    "RELIANCE":    "Energy",
+    "TCS":         "IT",
+    "INFY":        "IT",
+    "HDFCBANK":    "Banking",
+    "ICICIBANK":   "Banking",
+    "SBIN":        "Banking",
+    "BAJFINANCE":  "NBFC",
+    "KOTAKBANK":   "Banking",
+    "AXISBANK":    "Banking",
+    "LT":          "Infrastructure",
+    "HINDUNILVR":  "FMCG",
+    "ITC":         "FMCG",
+    "WIPRO":       "IT",
+    "HCLTECH":     "IT",
+    "MARUTI":      "Auto",
+    "SUNPHARMA":   "Pharma",
+    "TATAMOTORS":  "Auto",
+    "BHARTIARTL":  "Telecom",
+    "ADANIPORTS":  "Infrastructure",
+    "ASIANPAINT":  "Chemicals",
+    "TITAN":       "Consumer",
+    "BAJAJ-AUTO":  "Auto",
+    "EICHERMOT":   "Auto",
+    "INDUSINDBK":  "Banking",
+    "DRREDDY":     "Pharma",
+    "CIPLA":       "Pharma",
+    "DIVISLAB":    "Pharma",
+    "JSWSTEEL":    "Metals",
+    "HINDALCO":    "Metals",
+    "GRASIM":      "Chemicals",
+    "TATACONSUM":  "FMCG",
+    "APOLLOHOSP":  "Healthcare",
+    "NESTLEIND":   "FMCG",
+    "TECHM":       "IT",
+    "BPCL":        "Energy",
+    "ONGC":        "Energy",
+    "NTPC":        "Power",
+    "POWERGRID":   "Power",
+    "ULTRACEMCO":  "Cement",
+    "TATASTEEL":   "Metals",
+}
+
+# Capital fraction allocated to each strategy (must sum to <= 1.0)
+STRATEGY_CAPITAL_ALLOCATION = {
+    "EMA_CROSSOVER": 0.40,   # ₹1,20,000 at ₹3L capital
+    "CREDIT_SPREAD": 0.40,   # ₹1,20,000
+    "IRON_CONDOR":   0.20,   # ₹60,000
+}
+
+# Max open structures per sector (prevents correlated blow-ups)
+MAX_SECTOR_POSITIONS = 2
+
 # Each strategy regime gets its own ranked symbol pool written by LTPPoller.
 # Engine reads the right key based on which strategy is generating the signal.
 REDIS_TOP_SYMBOLS_KEY = "nfo:top5"                        # EMA crossover: high ATR + strong trend

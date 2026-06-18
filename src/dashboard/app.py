@@ -41,7 +41,7 @@ st.sidebar.title("Falcon Quant")
 st.sidebar.markdown("---")
 page = st.sidebar.radio(
     "Navigate",
-    ["Home", "Positions", "Orders & Trades", "Strategies", "Risk & PnL", "System Health"],
+    ["Home", "Positions", "Orders & Trades", "Strategies", "Risk & PnL", "Analytics", "System Health"],
 )
 st.sidebar.markdown("---")
 
@@ -355,6 +355,86 @@ elif page == "Risk & PnL":
                 "Total PnL":    fmt_inr(unreal + real),
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+elif page == "Analytics":
+    st.title("Trade Analytics")
+
+    summary = fetch("analytics/summary") or {}
+    trades  = fetch("analytics/trades") or []
+    by_sym  = fetch("analytics/by-symbol") or []
+
+    if not trades:
+        st.info("No closed trades in the journal yet. Analytics populate once positions are closed.")
+    else:
+        # ── Overall banner ──────────────────────────────────────────────────
+        overall = summary.get("__overall__", {})
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Closed Trades", overall.get("trade_count", 0))
+        c2.metric("Win Rate",   f"{overall.get('win_rate', 0)*100:.1f}%")
+        c3.metric("Total PnL",  fmt_inr(overall.get("total_pnl", 0)))
+        c4.metric("Avg PnL / Trade", fmt_inr(overall.get("avg_pnl", 0)))
+
+        st.markdown("---")
+
+        # ── Per-strategy breakdown ──────────────────────────────────────────
+        st.subheader("Strategy Performance")
+        strat_rows = []
+        for strat, stats in summary.items():
+            if strat == "__overall__":
+                continue
+            strat_rows.append({
+                "Strategy":      strat,
+                "Trades":        stats.get("trade_count", 0),
+                "Win Rate":      f"{stats.get('win_rate', 0)*100:.1f}%",
+                "Avg PnL":       fmt_inr(stats.get("avg_pnl", 0)),
+                "Total PnL":     fmt_inr(stats.get("total_pnl", 0)),
+                "Best Trade":    fmt_inr(stats.get("max_win",  0)),
+                "Worst Trade":   fmt_inr(stats.get("max_loss", 0)),
+                "Avg Hold Days": stats.get("avg_hold_days", 0),
+            })
+        if strat_rows:
+            st.dataframe(pd.DataFrame(strat_rows), use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+
+        # ── By symbol ──────────────────────────────────────────────────────
+        col_l, col_r = st.columns(2)
+        with col_l:
+            st.subheader("Best Symbols")
+            if by_sym:
+                top = by_sym[:10]
+                df_sym = pd.DataFrame(top)
+                df_sym["total_pnl"] = df_sym["total_pnl"].apply(lambda v: fmt_inr(v))
+                df_sym["avg_pnl"]   = df_sym["avg_pnl"].apply(lambda v: fmt_inr(v))
+                df_sym["win_rate"]  = df_sym["win_rate"].apply(lambda v: f"{v*100:.1f}%")
+                df_sym.columns      = ["Symbol", "Trades", "Total PnL", "Avg PnL", "Win Rate"]
+                st.dataframe(df_sym, use_container_width=True, hide_index=True)
+
+        with col_r:
+            st.subheader("Worst Symbols")
+            if by_sym:
+                bot = list(reversed(by_sym))[:10]
+                df_bot = pd.DataFrame(bot)
+                df_bot["total_pnl"] = df_bot["total_pnl"].apply(lambda v: fmt_inr(v))
+                df_bot["avg_pnl"]   = df_bot["avg_pnl"].apply(lambda v: fmt_inr(v))
+                df_bot["win_rate"]  = df_bot["win_rate"].apply(lambda v: f"{v*100:.1f}%")
+                df_bot.columns      = ["Symbol", "Trades", "Total PnL", "Avg PnL", "Win Rate"]
+                st.dataframe(df_bot, use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+
+        # ── Trade log ──────────────────────────────────────────────────────
+        st.subheader("Closed Trade Log")
+        df_t = pd.DataFrame(trades)
+        show_cols = [c for c in [
+            "entry_time", "underlying", "strategy", "structure_type",
+            "entry_price", "exit_price", "pnl", "hold_days",
+            "iv_rank", "vix_at_entry", "exit_reason",
+        ] if c in df_t.columns]
+        df_t = df_t[show_cols]
+        df_t.columns = [c.replace("_", " ").title() for c in show_cols]
+        st.dataframe(df_t, use_container_width=True, hide_index=True)
 
 
 elif page == "System Health":
