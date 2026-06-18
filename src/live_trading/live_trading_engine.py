@@ -4,7 +4,15 @@ from typing import Any, Dict, List, Optional
 from src.brokers.base import AbstractBroker
 from src.core.config import settings
 from src.core.enums import SignalType, TradingMode
-from src.core.utils import is_market_open, is_square_off_time, now_ist
+from src.core.utils import (
+    build_option_symbol,
+    get_atm_strike,
+    get_lot_size,
+    get_near_month_expiry,
+    is_market_open,
+    is_square_off_time,
+    now_ist,
+)
 from src.orders.order_manager import OrderManager
 from src.portfolio.portfolio_manager import PortfolioManager
 from src.risk.risk_manager import RiskManager
@@ -150,19 +158,34 @@ class LiveTradingEngine:
         logger.info(f"Signal [{strategy.name}] {signal} {symbol}")
 
         if signal in (SignalType.BUY, SignalType.SELL):
-            price = float(market_data.get("close", 0))
-            quantity = self._calculate_quantity(price)
-            if quantity <= 0:
+            underlying_price = float(market_data.get("close", 0))
+            if underlying_price <= 0:
                 return
 
-            # signal may be a SignalType enum or a plain string from strategy.generate_signal()
-            side = signal.value if hasattr(signal, "value") else str(signal)
-            order = await self.order_manager.place_order(symbol, side, quantity, price)
+            # signal may be a SignalType enum or a plain string
+            signal_str = signal.value if hasattr(signal, "value") else str(signal)
+
+            # Map direction → option type (always BUY the option)
+            option_type = "CE" if signal_str == "BUY" else "PE"
+            strike = get_atm_strike(underlying_price, symbol)
+            expiry = get_near_month_expiry()
+            contract = build_option_symbol(symbol, strike, option_type, expiry)
+            lot_size = get_lot_size(symbol)
+
+            # Estimate ATM option premium for paper trading:
+            # Use ATR-based approximation: ATR × 4 ≈ near-month ATM premium
+            atr = float(market_data.get("atr14", underlying_price * 0.01))
+            option_price = round(atr * 4, 2)
+
+            order = await self.order_manager.place_order(contract, "BUY", lot_size, option_price)
             if order and order.order_status == "OPEN":
+                dte = (expiry - now_ist().replace(tzinfo=None)).days
                 await self._notify(
                     f"ORDER PLACED\n"
                     f"Strategy: {strategy.name}\n"
-                    f"{side} {quantity} {symbol} @ ₹{price:.2f}"
+                    f"BUY {lot_size} {contract} @ ₹{option_price:.2f}\n"
+                    f"Underlying: {symbol} @ ₹{underlying_price:.2f}\n"
+                    f"Strike: {strike} {option_type} | DTE: {dte}"
                 )
 
         elif signal == SignalType.EXIT:
@@ -235,12 +258,9 @@ class LiveTradingEngine:
         """Called at startup to wire the Redis client in."""
         self._redis = redis_client
 
-    def _calculate_quantity(self, price: float) -> int:
-        """1-lot sizing per PRD Phase 1: max exposure / price, minimum 1."""
-        if price <= 0:
-            return 0
-        max_value = settings.INITIAL_CAPITAL * settings.MAX_EXPOSURE_PCT
-        return max(1, int(max_value / price))
+    def _calculate_quantity(self, symbol: str, price: float = 0) -> int:
+        """Return the NSE lot size for this symbol. Always trade exactly 1 lot."""
+        return get_lot_size(symbol)
 
     # ------------------------------------------------------------------
     # Utility
