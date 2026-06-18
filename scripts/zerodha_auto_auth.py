@@ -192,13 +192,6 @@ def run_daily_auth():
         except Exception as e:
             logger.warning(f"Lot size refresh failed (non-fatal, using hardcoded fallback): {e}")
 
-        try:
-            import asyncio
-            from src.notifications.email_service import EmailNotifier
-            asyncio.run(EmailNotifier().send("Zerodha Login: SUCCESS\nReady for trading"))
-        except Exception:
-            pass
-
         return access_token
     except Exception as e:
         logger.error(f"Daily authentication FAILED: {e}")

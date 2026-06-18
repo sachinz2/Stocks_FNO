@@ -59,17 +59,10 @@ class LiveTradingEngine:
     async def start(self) -> None:
         self.is_running = True
         logger.info(f"Trading engine STARTED — {self.mode.value.upper()} mode")
-        await self._notify(
-            f"Falcon Trader STARTED\n"
-            f"Mode: {self.mode.value.upper()}\n"
-            f"Symbols: {len(self._symbols)}\n"
-            f"Capital: ₹{settings.INITIAL_CAPITAL:,.0f}"
-        )
 
     async def stop(self) -> None:
         self.is_running = False
         logger.info("Trading engine STOPPED")
-        await self._notify("Falcon Trader STOPPED")
 
     # ------------------------------------------------------------------
     # Scheduler callbacks
@@ -77,17 +70,9 @@ class LiveTradingEngine:
 
     async def on_market_open(self) -> None:
         logger.info("Market OPEN — 09:15 IST")
-        positions = await self._safe_get_positions()
-        await self._notify(
-            f"Market OPEN ✅\n"
-            f"Mode: {self.mode.value.upper()}\n"
-            f"Active strategies: {len(StrategyRegistry.get_active_strategies())}\n"
-            f"Open positions: {len(positions)}"
-        )
 
     async def on_market_close(self) -> None:
         logger.info("Market CLOSE — 15:30 IST")
-        await self._notify("Market CLOSED — 15:30 IST")
 
     async def run_signal_cycle(self) -> None:
         """Called every minute by the scheduler. Core trading loop."""
@@ -135,16 +120,25 @@ class LiveTradingEngine:
             logger.error(f"Position sync failed: {exc}")
 
     async def send_daily_report(self) -> None:
-        """Called at 15:45 IST by the scheduler."""
+        """Called at 15:45 IST. Sends EOD email only if trades were placed today."""
+        today_orders = getattr(self, "_today_order_count", 0)
+        if today_orders == 0:
+            logger.info("EOD: no trades today, skipping report email.")
+            return
+
         positions = await self._safe_get_positions()
-        total_pnl = sum(p.get("pnl", p.get("unrealised", 0)) for p in positions)
+        total_pnl = sum(
+            p.get("unrealized_pnl", 0) + p.get("realized_pnl", 0) for p in positions
+        )
         await self._notify(
-            f"EOD REPORT 📊\n"
+            f"EOD REPORT\n"
             f"Date: {now_ist().strftime('%d-%b-%Y')}\n"
             f"Mode: {self.mode.value.upper()}\n"
+            f"Orders today: {today_orders}\n"
             f"Open positions: {len(positions)}\n"
-            f"Total PnL: ₹{total_pnl:,.2f}"
+            f"Total PnL: Rs{total_pnl:,.2f}"
         )
+        self._today_order_count = 0  # reset for next day
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -183,12 +177,13 @@ class LiveTradingEngine:
 
             order = await self.order_manager.place_order(contract, "BUY", lot_size, option_price)
             if order and order.order_status == "OPEN":
+                self._today_order_count = getattr(self, "_today_order_count", 0) + 1
                 dte = (expiry - now_ist().replace(tzinfo=None)).days
                 await self._notify(
                     f"ORDER PLACED\n"
                     f"Strategy: {strategy.name}\n"
-                    f"BUY {lot_size} {contract} @ ₹{option_price:.2f}\n"
-                    f"Underlying: {symbol} @ ₹{underlying_price:.2f}\n"
+                    f"BUY {lot_size} {contract} @ Rs{option_price:.2f}\n"
+                    f"Underlying: {symbol} @ Rs{underlying_price:.2f}\n"
                     f"Strike: {strike} {option_type} | DTE: {dte}"
                 )
 
