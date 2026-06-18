@@ -33,9 +33,14 @@ class Settings(BaseSettings):
     ZERODHA_PASSWORD: str = ""
     ZERODHA_TOTP_SECRET: str = ""
 
-    # Telegram
+    # Telegram (kept for reference, no longer used)
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
+
+    # Email alerts (Gmail SMTP)
+    EMAIL_SENDER: str = ""
+    EMAIL_APP_PASSWORD: str = ""
+    EMAIL_RECIPIENT: str = ""
 
     # Trading
     INITIAL_CAPITAL: float = 300000.0
