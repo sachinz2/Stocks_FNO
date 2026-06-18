@@ -38,10 +38,20 @@ class OrderManager:
         except Exception as e:
             logger.warning(f"Audit log skipped ({action}): {e}")
 
-    async def place_order(self, symbol: str, side: str, quantity: int, price: float) -> Optional[Order]:
+    async def place_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: int,
+        price: float,
+        is_spread_leg: bool = False,
+    ) -> Optional[Order]:
         """
         Main entry point for placing orders.
         Validates risk, saves initial state, routes to broker, and updates state.
+
+        is_spread_leg=True skips the open-position count check in RiskManager.
+        Pass True for legs 2-4 of credit spreads and iron condors.
         """
         # 1. Create PENDING order in DB
         db_order = await self.order_repo.create({
@@ -55,7 +65,7 @@ class OrderManager:
         await self._audit("ORDER_RECEIVED", {"order_id": db_order.id, "symbol": symbol, "side": side})
 
         # 2. Validate Risk
-        if not self.risk_manager.validate_trade(symbol, side, quantity, price):
+        if not self.risk_manager.validate_trade(symbol, side, quantity, price, is_spread_leg=is_spread_leg):
             await self.order_repo.update(db_order, {"order_status": "REJECTED_BY_RISK"})
             await self._audit("ORDER_REJECTED_RISK", {"order_id": db_order.id})
             return db_order

@@ -22,11 +22,13 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Start trading engine and scheduler; tear down cleanly on shutdown."""
+    import asyncio
     import redis.asyncio as aioredis
     from apscheduler.triggers.interval import IntervalTrigger
 
     from src.core.config import settings
     from src.core.constants import FNO_SYMBOLS
+    from src.core.enums import TradingMode
     from src.core.scheduler import (
         get_scheduler,
         schedule_trading_jobs,
@@ -47,13 +49,13 @@ async def lifespan(app: FastAPI):
     from src.paper_trading.paper_broker import PaperBroker
     from src.portfolio.portfolio_manager import PortfolioManager
     from src.risk.risk_manager import RiskManager
-    import src.strategies  # noqa: F401 — importing triggers @StrategyRegistry.register() decorators
+    import src.strategies  # noqa: F401 — triggers @StrategyRegistry.register() decorators
     from src.strategies.base import StrategyRegistry
 
-    # Phase 1: top 5 liquid F&O symbols
+    # Phase 1: top 5 liquid F&O symbols (fallback if Redis top5 is absent)
     PHASE1_SYMBOLS = list(FNO_SYMBOLS[:5])
 
-    # ── Ensure all DB tables exist ────────────────────────────────────────────
+    # ── Ensure all DB tables exist ─────────────────────────────────────────────
     import src.database.models  # noqa: F401 — registers all ORM models with Base
     from src.database.base import Base
     from src.database.connection import engine as db_engine
@@ -62,65 +64,105 @@ async def lifespan(app: FastAPI):
     logger.info("Database tables verified / created.")
 
     redis_client = aioredis.from_url(settings.get_redis_url(), decode_responses=True)
-
-    broker = PaperBroker(initial_balance=settings.INITIAL_CAPITAL)
     risk_mgr = RiskManager(initial_capital=settings.INITIAL_CAPITAL)
 
-    # Pass the factory, not an instance — each DB op gets its own session
-    order_repo = BaseRepository(Order, AsyncSessionLocal)
-    audit_repo = BaseRepository(AuditLog, AsyncSessionLocal)
+    order_repo    = BaseRepository(Order,    AsyncSessionLocal)
+    audit_repo    = BaseRepository(AuditLog, AsyncSessionLocal)
     position_repo = BaseRepository(Position, AsyncSessionLocal)
-    stock_repo = BaseRepository(Stock, AsyncSessionLocal)
+    stock_repo    = BaseRepository(Stock,    AsyncSessionLocal)
 
-    order_mgr = OrderManager(broker, risk_mgr, order_repo, audit_repo)
+    # ── Broker: live vs paper ──────────────────────────────────────────────────
+    mode = TradingMode(settings.TRADING_MODE)
+    zerodha_ticker = None
+
+    if mode == TradingMode.LIVE:
+        from src.brokers.zerodha import ZerodhaBroker
+
+        raw_token = await redis_client.get("zerodha:access_token")
+        if not raw_token:
+            logger.critical(
+                "LIVE mode: Zerodha access token not found in Redis. "
+                "Run the auth script before starting the server. "
+                "Falling back to PaperBroker."
+            )
+            broker = PaperBroker(initial_balance=settings.INITIAL_CAPITAL)
+        else:
+            access_token = raw_token.strip()
+            broker = ZerodhaBroker.from_redis_token(
+                settings.ZERODHA_API_KEY, settings.ZERODHA_API_SECRET, access_token
+            )
+            logger.info("LIVE mode: ZerodhaBroker authenticated from Redis token.")
+
+            # Start the real-time WebSocket ticker (daemon thread, non-blocking)
+            try:
+                from src.market_data.zerodha_ticker import ZerodhaTicker
+                zerodha_ticker = ZerodhaTicker(
+                    api_key=settings.ZERODHA_API_KEY,
+                    access_token=access_token,
+                    redis_url=settings.get_redis_url(),
+                    symbols=set(FNO_SYMBOLS),
+                )
+                loop = asyncio.get_event_loop()
+                mapped = await loop.run_in_executor(
+                    None, zerodha_ticker.fetch_instrument_tokens
+                )
+                if mapped > 0:
+                    zerodha_ticker.start()
+                    logger.info(f"ZerodhaTicker: live stream started for {mapped} symbols.")
+                else:
+                    logger.warning("ZerodhaTicker: no tokens mapped — skipping WebSocket stream.")
+                    zerodha_ticker = None
+            except Exception as e:
+                logger.error(f"ZerodhaTicker init failed: {e}. Continuing without real-time LTP.")
+                zerodha_ticker = None
+    else:
+        logger.info("PAPER mode: using PaperBroker.")
+        broker = PaperBroker(initial_balance=settings.INITIAL_CAPITAL)
+
+    order_mgr     = OrderManager(broker, risk_mgr, order_repo, audit_repo)
     portfolio_mgr = PortfolioManager(broker, position_repo, stock_repo)
-    notifier = EmailNotifier()
+    notifier      = EmailNotifier()
 
-    # Strategy 1: EMA Crossover — buys CE/PE options on momentum (high-volatility regime)
+    # ── Strategies ─────────────────────────────────────────────────────────────
+
+    # Strategy 1: EMA Crossover — buys CE/PE options on momentum (high-vol regime)
     StrategyRegistry.load_strategy("EMA_CROSSOVER", "ema_crossover_v1", {
-        "fast_period": 20,
-        "slow_period": 50,
-        "stop_loss_pct": 0.50,       # exit if option premium drops 50% from entry
-        "target_pct": 1.0,            # exit if option premium doubles (2×)
-        "trailing_stop_pct": 0.25,    # exit if premium falls 25% below its peak
+        "fast_period":        20,
+        "slow_period":        50,
+        "stop_loss_pct":      0.50,   # exit if premium drops 50%
+        "target_pct":         1.0,    # exit if premium doubles
+        "trailing_stop_pct":  0.25,   # exit if premium falls 25% below peak
     })
 
-    # Strategy 2: Credit Spread — sells option spreads to collect theta (low-volatility regime)
-    # Complements EMA Crossover: fires when ATR% < 1.2% (market not making explosive moves).
-    # Bull Put Spread (EMA bullish): SELL ATM PE + BUY OTM PE — wins if underlying holds up.
-    # Bear Call Spread (EMA bearish): SELL ATM CE + BUY OTM CE — wins if underlying holds down.
+    # Strategy 2: Credit Spread — theta collection in low-vol, directional regime
     StrategyRegistry.load_strategy("CREDIT_SPREAD", "credit_spread_v1", {
-        "fast_period": 20,
-        "slow_period": 50,
-        "low_vol_threshold": 1.2,    # only enter spreads when ATR% < 1.2% (low vol)
-        "spread_width": 2,            # hedge leg is 2 strike intervals away from short leg
-        "profit_close_pct": 0.25,    # take profit when short leg decays to 25% of sold price
-        "stop_loss_multiple": 2.0,   # stop loss when short leg rises to 2× sold price
-        "min_dte": 7,                 # close spread at least 7 days before expiry
+        "fast_period":        20,
+        "slow_period":        50,
+        "low_vol_threshold":  1.2,    # only enter when ATR% < 1.2%
+        "spread_width":       2,      # hedge is 2 strike intervals from short
+        "profit_close_pct":   0.25,   # close when short leg decays to 25%
+        "stop_loss_multiple": 2.0,    # stop when short leg rises to 2×
+        "min_dte":            7,
     })
 
-    # Strategy 3: Iron Condor — collect theta from both sides (low-vol + flat EMA regime)
-    # Fires when ATR% < 1.2% AND EMA is completely flat (spread < 0.1%) — stock going nowhere.
-    # Sells OTM PE + OTM CE simultaneously; wins as long as underlying stays in the range.
-    # Gets its own symbol pool from Redis (nfo:top5:condor) — most range-bound stocks.
+    # Strategy 3: Iron Condor — theta collection in low-vol, flat-EMA regime
     StrategyRegistry.load_strategy("IRON_CONDOR", "iron_condor_v1", {
-        "fast_period": 20,
-        "slow_period": 50,
-        "low_vol_threshold": 1.2,    # same threshold as credit spread
-        "flat_threshold": 0.1,        # EMA spread must be below 0.1% of price
-        "short_offset": 1,            # short strikes are 1 interval away from ATM
-        "hedge_offset": 2,            # hedge legs are 2 more intervals from the short strikes
-        "profit_close_pct": 0.25,    # close when both short legs decay to 25% of sold price
-        "stop_loss_multiple": 2.0,   # stop loss when either short leg doubles
-        "min_dte": 7,                 # close at least 7 days before expiry
+        "fast_period":        20,
+        "slow_period":        50,
+        "low_vol_threshold":  1.2,
+        "flat_threshold":     0.1,    # EMA spread must be < 0.1% of price
+        "short_offset":       1,      # short strikes 1 interval from ATM
+        "hedge_offset":       2,      # hedge legs 2 more intervals out
+        "profit_close_pct":   0.25,
+        "stop_loss_multiple": 2.0,
+        "min_dte":            7,
     })
 
     engine = LiveTradingEngine(broker, risk_mgr, order_mgr, portfolio_mgr, notifier)
     engine.attach_redis(redis_client)
-    engine.set_symbols(PHASE1_SYMBOLS)  # fallback if Redis top5 is absent
+    engine.set_symbols(PHASE1_SYMBOLS)
     await engine.start()
 
-    # Poller covers all 40 symbols; it writes top-5 to Redis after each poll
     ltp_poller = LTPPoller(redis_client)
 
     scheduler = get_scheduler()
@@ -138,16 +180,24 @@ async def lifespan(app: FastAPI):
 
     app.state.trading_engine = engine
     app.state.redis = redis_client
+    app.state.zerodha_ticker = zerodha_ticker
 
-    logger.info("Falcon Trader: engine + scheduler started.")
+    logger.info(
+        f"Falcon Trader: engine + scheduler started. "
+        f"Mode={mode.value.upper()} | "
+        f"Capital=₹{settings.INITIAL_CAPITAL:,.0f} | "
+        f"RealTimeLTP={'yes' if zerodha_ticker else 'no (yfinance fallback)'}"
+    )
 
     yield
 
-    # ── Shutdown ──────────────────────────────────────────────────────────────
+    # ── Shutdown ───────────────────────────────────────────────────────────────
     await engine.stop()
     stop_scheduler()
+    if zerodha_ticker:
+        zerodha_ticker.stop()
     await redis_client.aclose()
-    logger.info("Falcon Trader: engine + scheduler stopped.")
+    logger.info("Falcon Trader: clean shutdown complete.")
 
 
 app = FastAPI(
@@ -171,8 +221,44 @@ app.add_middleware(
 
 
 @app.get("/api/v1/health")
-async def health_check():
-    return {"status": "UP", "database": "UP", "redis": "UP"}
+async def health_check(request: "Request" = None):
+    """Real health check — tests DB query and Redis ping."""
+    from fastapi import Request
+
+    db_status = "DOWN"
+    redis_status = "DOWN"
+    redis_ltp_source = "unknown"
+
+    # Test DB
+    try:
+        from src.database.connection import AsyncSessionLocal
+        from sqlalchemy import text
+        async with AsyncSessionLocal() as session:
+            await session.execute(text("SELECT 1"))
+        db_status = "UP"
+    except Exception as e:
+        db_status = f"DOWN: {e}"
+
+    # Test Redis + check LTP source for the first symbol
+    try:
+        if hasattr(app.state, "redis") and app.state.redis:
+            await app.state.redis.ping()
+            redis_status = "UP"
+            import json
+            raw = await app.state.redis.get("tick:RELIANCE")
+            if raw:
+                data = json.loads(raw)
+                redis_ltp_source = data.get("ltp_source", "unknown")
+    except Exception as e:
+        redis_status = f"DOWN: {e}"
+
+    overall = "UP" if db_status == "UP" and redis_status == "UP" else "DEGRADED"
+    return {
+        "status": overall,
+        "database": db_status,
+        "redis": redis_status,
+        "ltp_source": redis_ltp_source,
+    }
 
 
 app.include_router(stocks_router.router, prefix="/api/v1")

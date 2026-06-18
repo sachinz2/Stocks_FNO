@@ -15,6 +15,7 @@ from src.core.constants import (
 from src.core.enums import SignalType, TradingMode
 from src.core.utils import (
     build_option_symbol,
+    estimate_option_premium,
     get_atm_strike,
     get_lot_size,
     get_near_month_expiry,
@@ -29,8 +30,11 @@ from src.strategies.base import StrategyRegistry
 
 logger = logging.getLogger(__name__)
 
-# Sorted once at import time — longest symbol first so BAJFINANCE matches before BAJ
 _FNO_SYMBOLS_BY_LEN = sorted(FNO_SYMBOLS, key=len, reverse=True)
+
+# Redis keys for persisting spread/condor state across restarts
+_REDIS_ACTIVE_SPREADS = "engine:active_spreads"
+_REDIS_ACTIVE_CONDORS = "engine:active_condors"
 
 
 class LiveTradingEngine:
@@ -57,11 +61,12 @@ class LiveTradingEngine:
         self.is_running = False
         self._symbols: List[str] = []
         self._today_order_count: int = 0
-        # Tracks peak premium per contract for trailing stop: {contract: peak_premium}
+        # Max new entries per day (0 = unlimited). Prevents runaway on volatile days.
+        self._max_daily_orders: int = settings.MAX_DAILY_ORDERS if hasattr(settings, "MAX_DAILY_ORDERS") else 30
+        # Peak premium tracking for trailing stop: {contract: peak_premium}
         self._peak_premiums: Dict[str, float] = {}
-        # Tracks active credit spreads: {underlying: {spread metadata dict}}
+        # Active multi-leg structures (persisted to Redis for crash recovery)
         self._active_spreads: Dict[str, Dict[str, Any]] = {}
-        # Tracks active iron condors: {underlying: {condor metadata dict}}
         self._active_condors: Dict[str, Dict[str, Any]] = {}
 
         logger.info(f"LiveTradingEngine initialised — mode: {self.mode.value.upper()}")
@@ -72,14 +77,19 @@ class LiveTradingEngine:
 
     def set_symbols(self, symbols: List[str]) -> None:
         self._symbols = symbols
-        logger.info(f"Trading symbols set: {symbols}")
+        logger.info(f"Trading symbols set (fallback): {symbols}")
+
+    def attach_redis(self, redis_client: Any) -> None:
+        self._redis = redis_client
 
     async def start(self) -> None:
         self.is_running = True
+        await self._restore_state()
         logger.info(f"Trading engine STARTED — {self.mode.value.upper()} mode")
 
     async def stop(self) -> None:
         self.is_running = False
+        await self._persist_state()
         logger.info("Trading engine STOPPED")
 
     # ------------------------------------------------------------------
@@ -88,6 +98,26 @@ class LiveTradingEngine:
 
     async def on_market_open(self) -> None:
         logger.info("Market OPEN — 09:15 IST")
+        # Reset daily counters
+        self._today_order_count = 0
+        self.risk_manager.reset_daily_state()
+
+        # In live mode, verify the Zerodha token is still valid
+        if self.mode == TradingMode.LIVE:
+            redis = getattr(self, "_redis", None)
+            if redis:
+                token = await redis.get("zerodha:access_token")
+                if not token:
+                    logger.critical("LIVE MODE: Zerodha access token missing at market open!")
+                    self.risk_manager.activate_kill_switch("Zerodha token missing at market open")
+                    await self._notify(
+                        "CRITICAL: Zerodha access token not found in Redis at market open.\n"
+                        "Kill switch activated — no trades will fire.\n"
+                        "Re-run the auth script and manually deactivate the kill switch."
+                    )
+
+        await self._notify(f"Market OPEN — {self.mode.value.upper()} mode | "
+                           f"Capital: ₹{settings.INITIAL_CAPITAL:,.0f}")
 
     async def on_market_close(self) -> None:
         logger.info("Market CLOSE — 15:30 IST")
@@ -99,7 +129,6 @@ class LiveTradingEngine:
         if not is_market_open():
             return
 
-        # Auto square-off window: 15:20–15:30
         if is_square_off_time():
             await self._square_off_all()
             return
@@ -111,14 +140,12 @@ class LiveTradingEngine:
         positions = await self._safe_get_positions()
         await self._refresh_risk_state(positions)
 
-        # Check spread / condor exits before long-option exits (own exit logic)
+        # Exit checks — managed by their own routines
         await self._check_spread_exits(active_strategies)
         await self._check_condor_exits(active_strategies)
-
-        # FIX 1 + 3 + 4: Check all open option positions for exits every cycle
         await self._check_open_option_exits(positions, active_strategies)
 
-        # Each strategy gets its own regime-matched symbol pool from Redis
+        # Entry signals — each strategy reads from its own regime-specific symbol pool
         for strategy_id, strategy in active_strategies.items():
             symbols = await self._get_active_symbols(strategy)
             for symbol in symbols:
@@ -128,14 +155,12 @@ class LiveTradingEngine:
                     logger.error(f"Signal error [{strategy_id}:{symbol}]: {exc}")
 
     async def sync_orders(self) -> None:
-        """Called every 30 s by the scheduler."""
         try:
             await self.order_manager.sync_orders()
         except Exception as exc:
             logger.error(f"Order sync failed: {exc}")
 
     async def sync_positions(self) -> None:
-        """Called every minute by the scheduler."""
         try:
             await self.portfolio_manager.sync_positions()
         except Exception as exc:
@@ -145,25 +170,59 @@ class LiveTradingEngine:
         """Called at 15:45 IST. Sends EOD email only if trades were placed today."""
         if self._today_order_count == 0:
             logger.info("EOD: no trades today, skipping report email.")
-            return
+        else:
+            positions = await self._safe_get_positions()
+            total_pnl = sum(
+                p.get("unrealized_pnl", 0) + p.get("realized_pnl", 0) for p in positions
+            )
+            await self._notify(
+                f"EOD REPORT\n"
+                f"Date: {now_ist().strftime('%d-%b-%Y')}\n"
+                f"Mode: {self.mode.value.upper()}\n"
+                f"Orders today: {self._today_order_count}\n"
+                f"Open positions: {len(positions)}\n"
+                f"Total PnL: ₹{total_pnl:,.2f}"
+            )
 
-        positions = await self._safe_get_positions()
-        total_pnl = sum(
-            p.get("unrealized_pnl", 0) + p.get("realized_pnl", 0) for p in positions
-        )
-        await self._notify(
-            f"EOD REPORT\n"
-            f"Date: {now_ist().strftime('%d-%b-%Y')}\n"
-            f"Mode: {self.mode.value.upper()}\n"
-            f"Orders today: {self._today_order_count}\n"
-            f"Open positions: {len(positions)}\n"
-            f"Total PnL: Rs{total_pnl:,.2f}"
-        )
+        # Persist state then reset for next day
+        await self._persist_state()
         self._today_order_count = 0
         self._peak_premiums.clear()
-        # Spreads/condors closed at square-off; clear tracking state for next day
         self._active_spreads.clear()
         self._active_condors.clear()
+
+    # ------------------------------------------------------------------
+    # State persistence (crash recovery)
+    # ------------------------------------------------------------------
+
+    async def _persist_state(self) -> None:
+        """Save active spread/condor tracking dicts to Redis for crash recovery."""
+        redis = getattr(self, "_redis", None)
+        if not redis:
+            return
+        try:
+            await redis.set(_REDIS_ACTIVE_SPREADS, json.dumps(self._active_spreads))
+            await redis.set(_REDIS_ACTIVE_CONDORS, json.dumps(self._active_condors))
+        except Exception as e:
+            logger.error(f"Failed to persist engine state: {e}")
+
+    async def _restore_state(self) -> None:
+        """Load spread/condor state from Redis on startup (survives container restarts)."""
+        redis = getattr(self, "_redis", None)
+        if not redis:
+            return
+        try:
+            spreads_raw = await redis.get(_REDIS_ACTIVE_SPREADS)
+            if spreads_raw:
+                self._active_spreads = json.loads(spreads_raw)
+                logger.info(f"Restored {len(self._active_spreads)} active spread(s) from Redis")
+
+            condors_raw = await redis.get(_REDIS_ACTIVE_CONDORS)
+            if condors_raw:
+                self._active_condors = json.loads(condors_raw)
+                logger.info(f"Restored {len(self._active_condors)} active condor(s) from Redis")
+        except Exception as e:
+            logger.error(f"Failed to restore engine state from Redis: {e}")
 
     # ------------------------------------------------------------------
     # Exit management
@@ -175,29 +234,28 @@ class LiveTradingEngine:
         active_strategies: Dict[str, Any],
     ) -> None:
         """
-        FIX 1, 3, 4 — Runs every cycle for each open option position:
+        Runs every cycle for each open LONG option position.
 
-        Exit triggers (checked in priority order):
-          1. DTE < 4          — time decay protection (roll rule)
-          2. Strategy SL/TP   — manage_position() called with current premium estimate
-             a. Premium fell 50% from entry → stop loss
-             b. Premium rose 100% (2×) from entry → take profit
-             c. Premium fell 25% from its own peak → trailing stop
+        Exit triggers (priority order):
+          1. DTE < 4 — time decay protection
+          2. Strategy SL / take-profit / trailing stop via manage_position()
+
+        Spread and condor legs are skipped (their own exit routines handle them).
+        Updates market_price and unrealized_pnl in DB on every cycle.
         """
         expiry = get_near_month_expiry()
         dte = (expiry - now_ist().replace(tzinfo=None)).days
 
-        # Contracts managed by spread/condor exit routines — skip here to avoid double handling
-        spread_contracts: set = set()
+        # Build the set of contracts already managed by spread/condor routines
+        managed_contracts: set = set()
         for spread in self._active_spreads.values():
-            spread_contracts.add(spread.get("short_contract", ""))
-            spread_contracts.add(spread.get("long_contract", ""))
+            managed_contracts.update([
+                spread.get("short_contract", ""), spread.get("long_contract", "")
+            ])
         for condor in self._active_condors.values():
-            spread_contracts.update([
-                condor.get("put_short_contract", ""),
-                condor.get("put_long_contract", ""),
-                condor.get("call_short_contract", ""),
-                condor.get("call_long_contract", ""),
+            managed_contracts.update([
+                condor.get("put_short_contract", ""), condor.get("put_long_contract", ""),
+                condor.get("call_short_contract", ""), condor.get("call_long_contract", ""),
             ])
 
         for pos in positions:
@@ -207,22 +265,26 @@ class LiveTradingEngine:
 
             if qty == 0 or entry_premium <= 0:
                 continue
-
-            if contract in spread_contracts:
-                continue  # managed by _check_spread_exits instead
+            if contract in managed_contracts:
+                continue
+            if qty < 0:
+                continue  # short positions only from spreads/condors which are already skipped
 
             underlying = self._get_underlying_from_contract(contract)
             if not underlying:
-                continue  # not one of our option contracts
+                continue
 
             market_data = await self._get_market_data(underlying)
             if not market_data:
                 continue
 
             atr = float(market_data.get("atr14", 0))
-            current_premium = round(atr * 4, 2) if atr > 0 else entry_premium
+            current_premium = estimate_option_premium(atr, dte) if atr > 0 else entry_premium
 
-            # Update peak premium for trailing stop
+            # Update DB so dashboard shows live PnL
+            await self.portfolio_manager.update_position_market_price(contract, current_premium)
+
+            # Track peak for trailing stop
             peak = self._peak_premiums.get(contract, entry_premium)
             if current_premium > peak:
                 peak = current_premium
@@ -230,25 +292,19 @@ class LiveTradingEngine:
 
             exit_reason: Optional[str] = None
 
-            # Priority 1: time-decay exit
             if dte < 4:
                 exit_reason = f"DTE={dte} — entering illiquid expiry window"
 
-            # Priority 2: strategy-driven SL / TP / trailing stop
             if exit_reason is None:
-                pos_data = {
-                    "avg_price": entry_premium,
-                    "peak_premium": peak,
-                }
+                pos_data = {"avg_price": entry_premium, "peak_premium": peak}
                 for strategy in active_strategies.values():
                     result = strategy.manage_position(pos_data, current_premium)
                     if result == "EXIT":
                         pnl_pct = (current_premium - entry_premium) / entry_premium * 100
                         exit_reason = (
                             f"strategy={strategy.name} "
-                            f"entry=Rs{entry_premium:.2f} "
-                            f"current=Rs{current_premium:.2f} "
-                            f"({pnl_pct:+.1f}%)"
+                            f"entry=₹{entry_premium:.2f} "
+                            f"current=₹{current_premium:.2f} ({pnl_pct:+.1f}%)"
                         )
                         break
 
@@ -261,15 +317,14 @@ class LiveTradingEngine:
                     f"POSITION CLOSED\n"
                     f"Contract: {contract}\n"
                     f"Reason: {exit_reason}\n"
-                    f"Entry: Rs{entry_premium:.2f} | Exit: Rs{current_premium:.2f}\n"
-                    f"Est. PnL: Rs{pnl:,.2f}"
+                    f"Entry: ₹{entry_premium:.2f} | Exit: ₹{current_premium:.2f}\n"
+                    f"Est. PnL: ₹{pnl:,.2f}"
                 )
 
     async def _process_signal(self, strategy, symbol: str) -> None:
         """
-        FIX 2 — Handles reversal and duplicate-position guard before entering.
-        BUY signal → buy CE (close any open PE on this underlying first).
-        SELL signal → buy PE (close any open CE on this underlying first).
+        Core signal handler. Generates a signal from the strategy and routes it
+        to the appropriate entry method. Guards: daily order limit, duplicate positions.
         """
         market_data = await self._get_market_data(symbol)
         if not market_data:
@@ -280,8 +335,12 @@ class LiveTradingEngine:
             return
 
         signal_str = signal.value if hasattr(signal, "value") else str(signal)
+        if signal_str == "HOLD":
+            return
+
         logger.info(f"Signal [{strategy.name}] {signal_str} {symbol}")
 
+        # Route multi-leg strategies
         if signal_str in ("BULL_PUT_SPREAD", "BEAR_CALL_SPREAD"):
             await self._process_credit_spread(strategy, symbol, signal_str, market_data)
             return
@@ -291,8 +350,13 @@ class LiveTradingEngine:
             return
 
         if signal_str not in ("BUY", "SELL"):
-            if signal == SignalType.EXIT:
+            if signal_str == "EXIT":
                 await self._exit_all_options_for(symbol)
+            return
+
+        # Daily order cap (entries only)
+        if self._max_daily_orders > 0 and self._today_order_count >= self._max_daily_orders:
+            logger.warning(f"Daily order limit ({self._max_daily_orders}) reached — skipping entry.")
             return
 
         underlying_price = float(market_data.get("close", 0))
@@ -302,84 +366,66 @@ class LiveTradingEngine:
         option_type = "CE" if signal_str == "BUY" else "PE"
         opposite_type = "PE" if signal_str == "BUY" else "CE"
 
-        # FIX 2a: Exit opposite position (reversal)
         await self._close_option_positions(symbol, opposite_type, market_data)
 
-        # FIX 2b: Don't double-enter same direction
         if await self._has_open_option(symbol, option_type):
             logger.info(f"Already holding {option_type} on {symbol}, skipping entry.")
             return
 
         strike = get_atm_strike(underlying_price, symbol)
         expiry = get_near_month_expiry()
-        contract = build_option_symbol(symbol, strike, option_type, expiry)
+        dte = (expiry - now_ist().replace(tzinfo=None)).days
         lot_size = await self._get_lot_size(symbol)
-
         atr = float(market_data.get("atr14", underlying_price * 0.01))
-        option_price = round(atr * 4, 2)
+        option_price = estimate_option_premium(atr, dte)
 
+        contract = build_option_symbol(symbol, strike, option_type, expiry)
         order = await self.order_manager.place_order(contract, "BUY", lot_size, option_price)
         if order and order.order_status == "OPEN":
             self._today_order_count += 1
             self._peak_premiums[contract] = option_price
-            dte = (expiry - now_ist().replace(tzinfo=None)).days
             await self._notify(
                 f"ORDER PLACED\n"
                 f"Strategy: {strategy.name}\n"
-                f"BUY {lot_size} {contract} @ Rs{option_price:.2f}\n"
-                f"Underlying: {symbol} @ Rs{underlying_price:.2f}\n"
+                f"BUY {lot_size} {contract} @ ₹{option_price:.2f}\n"
+                f"Underlying: {symbol} @ ₹{underlying_price:.2f}\n"
                 f"Strike: {strike} {option_type} | DTE: {dte}"
             )
 
     async def _close_option_positions(
         self, underlying: str, option_type: str, market_data: Dict
     ) -> None:
-        """Close all open positions of a given type (CE/PE) for an underlying."""
+        """Close all open long positions of a given type (CE/PE) for an underlying."""
         positions = await self._safe_get_positions()
         atr = float(market_data.get("atr14", 0))
+        expiry = get_near_month_expiry()
+        dte = (expiry - now_ist().replace(tzinfo=None)).days
 
         for pos in positions:
             contract = pos.get("symbol", "")
             qty = pos.get("quantity", 0)
-            if qty == 0:
+            if qty <= 0:
                 continue
             if not (contract.startswith(underlying) and contract.endswith(option_type)):
                 continue
-
             entry_premium = float(pos.get("avg_price") or 0)
-            exit_price = round(atr * 4, 2) if atr > 0 else entry_premium
+            exit_price = estimate_option_premium(atr, dte) if atr > 0 else entry_premium
             await self.order_manager.place_order(contract, "SELL", abs(qty), exit_price)
             self._peak_premiums.pop(contract, None)
-            logger.info(f"REVERSAL EXIT: SELL {contract} @ Rs{exit_price:.2f}")
-            await self._notify(
-                f"REVERSAL EXIT\n"
-                f"Contract: {contract}\n"
-                f"Closed {option_type} before entering opposite side"
-            )
+            logger.info(f"REVERSAL EXIT: SELL {contract} @ ₹{exit_price:.2f}")
+            await self._notify(f"REVERSAL EXIT\nContract: {contract}\nClosed {option_type} before entering opposite side")
 
     async def _process_credit_spread(
-        self,
-        strategy,
-        symbol: str,
-        spread_type: str,
-        market_data: Dict[str, Any],
+        self, strategy, symbol: str, spread_type: str, market_data: Dict[str, Any]
     ) -> None:
         """
-        Enter a credit spread for the given underlying.
-
-        Bull Put Spread  (spread_type='BULL_PUT_SPREAD'):
-          SELL ATM PE  + BUY (ATM - 2×interval) PE
-          Profits when underlying stays above the short strike.
-
-        Bear Call Spread (spread_type='BEAR_CALL_SPREAD'):
-          SELL ATM CE  + BUY (ATM + 2×interval) CE
-          Profits when underlying stays below the short strike.
-
-        Both collect net credit = (short premium) - (long premium).
+        Enter a credit spread.
+        Bull Put Spread: SELL ATM PE + BUY (ATM - 2×interval) PE
+        Bear Call Spread: SELL ATM CE + BUY (ATM + 2×interval) CE
         """
-        # Only one spread per underlying at a time
         if symbol in self._active_spreads:
-            logger.info(f"[CreditSpread] Already have active spread on {symbol}, skipping.")
+            return
+        if self._max_daily_orders > 0 and self._today_order_count >= self._max_daily_orders:
             return
 
         underlying_price = float(market_data.get("close", 0))
@@ -392,56 +438,41 @@ class LiveTradingEngine:
 
         atm_strike = get_atm_strike(underlying_price, symbol)
         expiry = get_near_month_expiry()
+        dte = (expiry - now_ist().replace(tzinfo=None)).days
         lot_size = await self._get_lot_size(symbol)
         atr = float(market_data.get("atr14", underlying_price * 0.01))
 
-        # Premium estimates:  ATM ≈ ATR×4,  OTM ≈ ATR×2
-        short_premium = round(atr * 4, 2)
-        long_premium = round(atr * 2, 2)
+        short_premium = estimate_option_premium(atr, dte, otm_intervals=0)   # ATM
+        long_premium = estimate_option_premium(atr, dte, otm_intervals=2)    # 2 intervals OTM
 
         if spread_type == "BULL_PUT_SPREAD":
-            short_strike = atm_strike
-            long_strike = atm_strike - spread_width
-            option_type = "PE"
-        else:  # BEAR_CALL_SPREAD
-            short_strike = atm_strike
-            long_strike = atm_strike + spread_width
-            option_type = "CE"
+            short_strike, long_strike, opt = atm_strike, atm_strike - spread_width, "PE"
+        else:
+            short_strike, long_strike, opt = atm_strike, atm_strike + spread_width, "CE"
 
-        short_contract = build_option_symbol(symbol, short_strike, option_type, expiry)
-        long_contract = build_option_symbol(symbol, long_strike, option_type, expiry)
-
+        short_contract = build_option_symbol(symbol, short_strike, opt, expiry)
+        long_contract = build_option_symbol(symbol, long_strike, opt, expiry)
         net_credit = round(short_premium - long_premium, 2)
-        dte = (expiry - now_ist().replace(tzinfo=None)).days
 
         logger.info(
-            f"[CreditSpread] {spread_type} on {symbol} | "
-            f"SELL {short_contract} @ Rs{short_premium:.2f} + "
-            f"BUY {long_contract} @ Rs{long_premium:.2f} | "
-            f"Net credit: Rs{net_credit:.2f} × {lot_size} | DTE: {dte}"
+            f"[CreditSpread] {spread_type} {symbol} | "
+            f"SELL {short_contract}@₹{short_premium} BUY {long_contract}@₹{long_premium} | "
+            f"credit=₹{net_credit}×{lot_size} DTE={dte}"
         )
 
-        # Place short leg first (credit collected)
         short_order = await self.order_manager.place_order(
-            short_contract, "SELL", lot_size, short_premium
+            short_contract, "SELL", lot_size, short_premium, is_spread_leg=False
         )
         if not short_order or short_order.order_status != "OPEN":
-            logger.warning(f"[CreditSpread] Short leg order failed for {short_contract}")
+            logger.warning(f"[CreditSpread] Short leg failed: {short_contract}")
             return
 
-        # Place long leg (hedge, debit)
         long_order = await self.order_manager.place_order(
-            long_contract, "BUY", lot_size, long_premium
+            long_contract, "BUY", lot_size, long_premium, is_spread_leg=True
         )
         if not long_order or long_order.order_status != "OPEN":
-            # Short leg placed but long leg failed — close the short leg immediately
-            logger.error(
-                f"[CreditSpread] Long leg order failed for {long_contract}. "
-                f"Closing short leg {short_contract} to avoid naked short."
-            )
-            await self.order_manager.place_order(
-                short_contract, "BUY", lot_size, short_premium
-            )
+            logger.error(f"[CreditSpread] Long leg failed: {long_contract}. Unwinding short leg.")
+            await self.order_manager.place_order(short_contract, "BUY", lot_size, short_premium, is_spread_leg=True)
             return
 
         self._today_order_count += 2
@@ -451,35 +482,27 @@ class LiveTradingEngine:
             "long_contract": long_contract,
             "short_strike": short_strike,
             "long_strike": long_strike,
-            "option_type": option_type,
+            "option_type": opt,
             "short_premium": short_premium,
             "long_premium": long_premium,
             "net_credit": net_credit,
             "lot_size": lot_size,
         }
+        await self._persist_state()
 
         await self._notify(
             f"CREDIT SPREAD OPENED\n"
-            f"Strategy: {strategy.name}\n"
-            f"Type: {spread_type}\n"
-            f"Underlying: {symbol} @ Rs{underlying_price:.2f}\n"
-            f"SELL {short_contract} @ Rs{short_premium:.2f}\n"
-            f"BUY  {long_contract} @ Rs{long_premium:.2f}\n"
-            f"Net credit: Rs{net_credit:.2f}/share × {lot_size} = Rs{net_credit * lot_size:,.2f}\n"
-            f"Max profit: Rs{net_credit * lot_size:,.2f} | "
-            f"Max loss: Rs{(spread_width - net_credit) * lot_size:,.2f} | DTE: {dte}"
+            f"Strategy: {strategy.name} | Type: {spread_type}\n"
+            f"Underlying: {symbol} @ ₹{underlying_price:.2f} | DTE: {dte}\n"
+            f"SELL {short_contract} @ ₹{short_premium:.2f}\n"
+            f"BUY  {long_contract} @ ₹{long_premium:.2f}\n"
+            f"Net credit: ₹{net_credit:.2f}/share × {lot_size} = ₹{net_credit * lot_size:,.2f}\n"
+            f"Max profit: ₹{net_credit * lot_size:,.2f} | "
+            f"Max loss: ₹{(spread_width - net_credit) * lot_size:,.2f}"
         )
 
     async def _check_spread_exits(self, active_strategies: Dict[str, Any]) -> None:
-        """
-        Called every cycle before _check_open_option_exits.
-        Evaluates exit conditions for all active credit spreads:
-          1. DTE < min_dte (default 7) — close to avoid gamma risk near expiry
-          2. Strategy profit target — short leg decayed to 25% of sold price
-          3. Strategy stop loss — short leg rose to 2× sold price
-          4. Strike breach — underlying has crossed the short strike
-        When exiting: BUY back the short leg first, then SELL the long leg.
-        """
+        """Exit active credit spreads when DTE, strike breach, SL, or profit target hit."""
         if not self._active_spreads:
             return
 
@@ -487,12 +510,10 @@ class LiveTradingEngine:
         dte = (expiry - now_ist().replace(tzinfo=None)).days
         to_remove: List[str] = []
 
-        # Find credit spread strategy (for manage_position parameters)
-        cs_strategy = None
-        for s in active_strategies.values():
-            if s.__class__.__name__ == "CreditSpreadStrategy":
-                cs_strategy = s
-                break
+        cs_strategy = next(
+            (s for s in active_strategies.values() if s.__class__.__name__ == "CreditSpreadStrategy"),
+            None,
+        )
 
         for underlying, spread in self._active_spreads.items():
             market_data = await self._get_market_data(underlying)
@@ -501,99 +522,71 @@ class LiveTradingEngine:
 
             current_price = float(market_data.get("close", 0))
             atr = float(market_data.get("atr14", 0))
-            current_short_premium = round(atr * 4, 2) if atr > 0 else spread["short_premium"]
+            current_short_premium = estimate_option_premium(atr, dte) if atr > 0 else spread["short_premium"]
+            current_long_premium = estimate_option_premium(atr, dte, otm_intervals=2) if atr > 0 else spread["long_premium"]
 
             exit_reason: Optional[str] = None
             min_dte = getattr(cs_strategy, "min_dte", 7) if cs_strategy else 7
 
-            # Priority 1: DTE too close to expiry (gamma risk)
             if dte < min_dte:
                 exit_reason = f"DTE={dte} < {min_dte} — close before gamma risk"
 
-            # Priority 2: Strike breach (underlying has moved through the short strike)
             if exit_reason is None and current_price > 0:
                 short_strike = spread["short_strike"]
-                spread_type = spread["spread_type"]
-                if spread_type == "BULL_PUT_SPREAD" and current_price < short_strike:
-                    exit_reason = (
-                        f"Strike breach: {underlying} @ Rs{current_price:.2f} "
-                        f"< short put strike Rs{short_strike}"
-                    )
-                elif spread_type == "BEAR_CALL_SPREAD" and current_price > short_strike:
-                    exit_reason = (
-                        f"Strike breach: {underlying} @ Rs{current_price:.2f} "
-                        f"> short call strike Rs{short_strike}"
-                    )
+                if spread["spread_type"] == "BULL_PUT_SPREAD" and current_price < short_strike:
+                    exit_reason = f"Strike breach: {underlying} ₹{current_price:.2f} < put short ₹{short_strike}"
+                elif spread["spread_type"] == "BEAR_CALL_SPREAD" and current_price > short_strike:
+                    exit_reason = f"Strike breach: {underlying} ₹{current_price:.2f} > call short ₹{short_strike}"
 
-            # Priority 3: Strategy SL / profit target
             if exit_reason is None and cs_strategy:
                 result = cs_strategy.manage_position(
-                    {"short_premium": spread["short_premium"]},
-                    current_short_premium,
+                    {"short_premium": spread["short_premium"]}, current_short_premium
                 )
                 if result == "EXIT":
                     pnl_pct = (spread["short_premium"] - current_short_premium) / spread["short_premium"] * 100
                     exit_reason = (
                         f"strategy={cs_strategy.name} "
-                        f"short: sold Rs{spread['short_premium']:.2f} "
-                        f"now Rs{current_short_premium:.2f} ({pnl_pct:+.1f}%)"
+                        f"short sold ₹{spread['short_premium']:.2f} now ₹{current_short_premium:.2f} ({pnl_pct:+.1f}%)"
                     )
 
             if exit_reason is None:
                 continue
 
             logger.info(f"[CreditSpread] EXIT {underlying}: {exit_reason}")
-
             lot_size = spread["lot_size"]
-            short_contract = spread["short_contract"]
-            long_contract = spread["long_contract"]
-            short_premium = spread["short_premium"]
-            long_premium = spread["long_premium"]
+            await self.order_manager.place_order(spread["short_contract"], "BUY", lot_size, current_short_premium, is_spread_leg=True)
+            await self.order_manager.place_order(spread["long_contract"], "SELL", lot_size, current_long_premium, is_spread_leg=True)
 
-            # Close: BUY back short leg, SELL long leg
-            await self.order_manager.place_order(
-                short_contract, "BUY", lot_size, current_short_premium
-            )
-            long_exit_price = round(atr * 2, 2) if atr > 0 else long_premium
-            await self.order_manager.place_order(
-                long_contract, "SELL", lot_size, long_exit_price
-            )
-
-            net_pnl = (short_premium - current_short_premium - long_premium + long_exit_price) * lot_size
+            net_pnl = (
+                (spread["short_premium"] - current_short_premium)
+                - (spread["long_premium"] - current_long_premium)
+            ) * lot_size
             to_remove.append(underlying)
-
             await self._notify(
                 f"CREDIT SPREAD CLOSED\n"
-                f"Underlying: {underlying}\n"
-                f"Reason: {exit_reason}\n"
-                f"Short: {short_contract} sold @ Rs{short_premium:.2f}, bought back @ Rs{current_short_premium:.2f}\n"
-                f"Long:  {long_contract} bought @ Rs{long_premium:.2f}, sold @ Rs{long_exit_price:.2f}\n"
-                f"Est. Net PnL: Rs{net_pnl:,.2f}"
+                f"Underlying: {underlying}\nReason: {exit_reason}\n"
+                f"Short: sold ₹{spread['short_premium']:.2f}, closed ₹{current_short_premium:.2f}\n"
+                f"Long:  paid ₹{spread['long_premium']:.2f}, sold ₹{current_long_premium:.2f}\n"
+                f"Est. Net PnL: ₹{net_pnl:,.2f}"
             )
 
         for sym in to_remove:
             del self._active_spreads[sym]
+        if to_remove:
+            await self._persist_state()
 
     async def _process_iron_condor(
-        self,
-        strategy,
-        symbol: str,
-        market_data: Dict[str, Any],
+        self, strategy, symbol: str, market_data: Dict[str, Any]
     ) -> None:
         """
-        Enter an iron condor on the given underlying.
-
-        Structure:
-          PUT  wing: SELL (ATM - short_offset×interval) PE
-                   + BUY  (ATM - short_offset×interval - hedge_offset×interval) PE
-          CALL wing: SELL (ATM + short_offset×interval) CE
-                   + BUY  (ATM + short_offset×interval + hedge_offset×interval) CE
-
-        Net credit = (short_put_premium + short_call_premium)
-                   - (long_put_premium  + long_call_premium)
+        Enter an iron condor (4 legs).
+        PUT wing:  SELL (ATM-1×interval) PE + BUY (ATM-3×interval) PE
+        CALL wing: SELL (ATM+1×interval) CE + BUY (ATM+3×interval) CE
+        Unwinds all placed legs atomically if any leg order fails.
         """
         if symbol in self._active_condors:
-            logger.info(f"[IronCondor] Already have active condor on {symbol}, skipping.")
+            return
+        if self._max_daily_orders > 0 and self._today_order_count >= self._max_daily_orders:
             return
 
         underlying_price = float(market_data.get("close", 0))
@@ -605,100 +598,74 @@ class LiveTradingEngine:
         short_offset = getattr(strategy, "short_offset", 1) * interval
         hedge_offset = getattr(strategy, "hedge_offset", 2) * interval
 
-        atm_strike = get_atm_strike(underlying_price, symbol)
+        atm = get_atm_strike(underlying_price, symbol)
         expiry = get_near_month_expiry()
+        dte = (expiry - now_ist().replace(tzinfo=None)).days
         lot_size = await self._get_lot_size(symbol)
         atr = float(market_data.get("atr14", underlying_price * 0.01))
 
-        # Strike calculation
-        put_short_strike = atm_strike - short_offset
+        put_short_strike = atm - short_offset
         put_long_strike = put_short_strike - hedge_offset
-        call_short_strike = atm_strike + short_offset
+        call_short_strike = atm + short_offset
         call_long_strike = call_short_strike + hedge_offset
 
-        # Premium estimates: OTM options decay with distance from ATM
-        # short legs (1 interval OTM) ≈ ATR×3, long legs (3 intervals OTM) ≈ ATR×1
-        put_short_premium = round(atr * 3, 2)
-        put_long_premium = round(atr * 1, 2)
-        call_short_premium = round(atr * 3, 2)
-        call_long_premium = round(atr * 1, 2)
-        net_credit = round(
-            (put_short_premium - put_long_premium) + (call_short_premium - call_long_premium), 2
-        )
+        put_short_prem = estimate_option_premium(atr, dte, otm_intervals=1)
+        put_long_prem = estimate_option_premium(atr, dte, otm_intervals=3)
+        call_short_prem = estimate_option_premium(atr, dte, otm_intervals=1)
+        call_long_prem = estimate_option_premium(atr, dte, otm_intervals=3)
+        net_credit = round((put_short_prem - put_long_prem) + (call_short_prem - call_long_prem), 2)
 
-        put_short_contract = build_option_symbol(symbol, put_short_strike, "PE", expiry)
-        put_long_contract = build_option_symbol(symbol, put_long_strike, "PE", expiry)
-        call_short_contract = build_option_symbol(symbol, call_short_strike, "CE", expiry)
-        call_long_contract = build_option_symbol(symbol, call_long_strike, "CE", expiry)
+        psc = build_option_symbol(symbol, put_short_strike, "PE", expiry)
+        plc = build_option_symbol(symbol, put_long_strike, "PE", expiry)
+        csc = build_option_symbol(symbol, call_short_strike, "CE", expiry)
+        clc = build_option_symbol(symbol, call_long_strike, "CE", expiry)
 
-        dte = (expiry - now_ist().replace(tzinfo=None)).days
-        logger.info(
-            f"[IronCondor] {symbol} @ Rs{underlying_price:.2f} | "
-            f"Put wing: SELL {put_short_contract}@{put_short_premium} / BUY {put_long_contract}@{put_long_premium} | "
-            f"Call wing: SELL {call_short_contract}@{call_short_premium} / BUY {call_long_contract}@{call_long_premium} | "
-            f"Net credit Rs{net_credit:.2f}×{lot_size} | DTE {dte}"
-        )
-
-        # Place all 4 legs — if any fails, unwind the ones already placed
-        placed = []
         legs = [
-            (put_short_contract,  "SELL", lot_size, put_short_premium),
-            (put_long_contract,   "BUY",  lot_size, put_long_premium),
-            (call_short_contract, "SELL", lot_size, call_short_premium),
-            (call_long_contract,  "BUY",  lot_size, call_long_premium),
+            (psc, "SELL", put_short_prem, False),
+            (plc, "BUY",  put_long_prem,  True),
+            (csc, "SELL", call_short_prem, True),
+            (clc, "BUY",  call_long_prem,  True),
         ]
-        for contract, side, qty, price in legs:
-            order = await self.order_manager.place_order(contract, side, qty, price)
+        placed = []
+        for contract, side, price, is_leg in legs:
+            order = await self.order_manager.place_order(contract, side, lot_size, price, is_spread_leg=is_leg)
             if not order or order.order_status != "OPEN":
                 logger.error(f"[IronCondor] Leg failed: {side} {contract}. Unwinding {len(placed)} legs.")
-                for (c, s, q, p) in placed:
+                for (c, s, p, _) in placed:
                     reverse = "BUY" if s == "SELL" else "SELL"
-                    await self.order_manager.place_order(c, reverse, q, p)
+                    await self.order_manager.place_order(c, reverse, lot_size, p, is_spread_leg=True)
                 return
-            placed.append((contract, side, qty, price))
+            placed.append((contract, side, price, is_leg))
 
         self._today_order_count += 4
         self._active_condors[symbol] = {
-            "put_short_contract":  put_short_contract,
-            "put_long_contract":   put_long_contract,
-            "call_short_contract": call_short_contract,
-            "call_long_contract":  call_long_contract,
+            "put_short_contract":  psc,  "put_long_contract":   plc,
+            "call_short_contract": csc,  "call_long_contract":  clc,
             "put_short_strike":    put_short_strike,
             "call_short_strike":   call_short_strike,
-            "put_short_premium":   put_short_premium,
-            "put_long_premium":    put_long_premium,
-            "call_short_premium":  call_short_premium,
-            "call_long_premium":   call_long_premium,
+            "put_short_premium":   put_short_prem,
+            "put_long_premium":    put_long_prem,
+            "call_short_premium":  call_short_prem,
+            "call_long_premium":   call_long_prem,
             "net_credit":          net_credit,
             "lot_size":            lot_size,
         }
+        await self._persist_state()
 
         wing_spread = short_offset + hedge_offset
-        max_loss_per_wing = (wing_spread - (put_short_premium - put_long_premium)) * lot_size
-
+        max_loss_per_wing = (wing_spread - (put_short_prem - put_long_prem)) * lot_size
         await self._notify(
             f"IRON CONDOR OPENED\n"
             f"Strategy: {strategy.name}\n"
-            f"Underlying: {symbol} @ Rs{underlying_price:.2f} | DTE: {dte}\n"
-            f"PUT  wing: SELL {put_short_contract} @ Rs{put_short_premium:.2f} "
-            f"+ BUY {put_long_contract} @ Rs{put_long_premium:.2f}\n"
-            f"CALL wing: SELL {call_short_contract} @ Rs{call_short_premium:.2f} "
-            f"+ BUY {call_long_contract} @ Rs{call_long_premium:.2f}\n"
-            f"Net credit: Rs{net_credit:.2f}/share × {lot_size} = Rs{net_credit * lot_size:,.2f}\n"
-            f"Max profit: Rs{net_credit * lot_size:,.2f} | "
-            f"Max loss: ~Rs{max_loss_per_wing:,.2f}/wing"
+            f"Underlying: {symbol} @ ₹{underlying_price:.2f} | DTE: {dte}\n"
+            f"PUT  wing: SELL {psc} @ ₹{put_short_prem:.2f} + BUY {plc} @ ₹{put_long_prem:.2f}\n"
+            f"CALL wing: SELL {csc} @ ₹{call_short_prem:.2f} + BUY {clc} @ ₹{call_long_prem:.2f}\n"
+            f"Net credit: ₹{net_credit:.2f}/share × {lot_size} = ₹{net_credit * lot_size:,.2f}\n"
+            f"Max profit: ₹{net_credit * lot_size:,.2f} | Max loss/wing: ~₹{max_loss_per_wing:,.2f}"
         )
 
     async def _check_condor_exits(self, active_strategies: Dict[str, Any]) -> None:
-        """
-        Called every cycle. Evaluates exit conditions for all active iron condors.
-
-        Exit triggers (any one fires → close all 4 legs):
-          1. DTE < min_dte (default 7) — gamma risk near expiry
-          2. Underlying breaches put short strike or call short strike
-          3. Either short leg doubles in value (stop loss on that wing)
-          4. Both short legs decay to 25% of sold value (75% profit target)
-        """
+        """Exit active iron condors on DTE, strike breach, SL, or both wings at profit target."""
         if not self._active_condors:
             return
 
@@ -706,11 +673,10 @@ class LiveTradingEngine:
         dte = (expiry - now_ist().replace(tzinfo=None)).days
         to_remove: List[str] = []
 
-        ic_strategy = None
-        for s in active_strategies.values():
-            if s.__class__.__name__ == "IronCondorStrategy":
-                ic_strategy = s
-                break
+        ic_strategy = next(
+            (s for s in active_strategies.values() if s.__class__.__name__ == "IronCondorStrategy"),
+            None,
+        )
 
         for underlying, condor in self._active_condors.items():
             market_data = await self._get_market_data(underlying)
@@ -720,131 +686,109 @@ class LiveTradingEngine:
             current_price = float(market_data.get("close", 0))
             atr = float(market_data.get("atr14", 0))
 
-            # Current premium estimates
-            current_put_short = round(atr * 3, 2) if atr > 0 else condor["put_short_premium"]
-            current_call_short = round(atr * 3, 2) if atr > 0 else condor["call_short_premium"]
-            current_put_long = round(atr * 1, 2) if atr > 0 else condor["put_long_premium"]
-            current_call_long = round(atr * 1, 2) if atr > 0 else condor["call_long_premium"]
+            cur_put_short  = estimate_option_premium(atr, dte, otm_intervals=1) if atr > 0 else condor["put_short_premium"]
+            cur_put_long   = estimate_option_premium(atr, dte, otm_intervals=3) if atr > 0 else condor["put_long_premium"]
+            cur_call_short = estimate_option_premium(atr, dte, otm_intervals=1) if atr > 0 else condor["call_short_premium"]
+            cur_call_long  = estimate_option_premium(atr, dte, otm_intervals=3) if atr > 0 else condor["call_long_premium"]
+
+            min_dte = getattr(ic_strategy, "min_dte", 7) if ic_strategy else 7
+            profit_pct = getattr(ic_strategy, "profit_close_pct", 0.25) if ic_strategy else 0.25
+            sl_mult = getattr(ic_strategy, "stop_loss_multiple", 2.0) if ic_strategy else 2.0
 
             exit_reason: Optional[str] = None
-            min_dte = getattr(ic_strategy, "min_dte", 7) if ic_strategy else 7
-            profit_close_pct = getattr(ic_strategy, "profit_close_pct", 0.25) if ic_strategy else 0.25
-            stop_loss_multiple = getattr(ic_strategy, "stop_loss_multiple", 2.0) if ic_strategy else 2.0
 
-            # Priority 1: DTE too close to expiry
             if dte < min_dte:
                 exit_reason = f"DTE={dte} < {min_dte} — close before gamma risk"
 
-            # Priority 2: Strike breach (underlying moved through a short strike)
             if exit_reason is None and current_price > 0:
                 if current_price < condor["put_short_strike"]:
-                    exit_reason = (
-                        f"Put strike breach: {underlying} @ Rs{current_price:.2f} "
-                        f"< short put Rs{condor['put_short_strike']}"
-                    )
+                    exit_reason = f"Put breach: {underlying} ₹{current_price:.2f} < ₹{condor['put_short_strike']}"
                 elif current_price > condor["call_short_strike"]:
-                    exit_reason = (
-                        f"Call strike breach: {underlying} @ Rs{current_price:.2f} "
-                        f"> short call Rs{condor['call_short_strike']}"
-                    )
+                    exit_reason = f"Call breach: {underlying} ₹{current_price:.2f} > ₹{condor['call_short_strike']}"
 
-            # Priority 3: Stop loss — either short leg doubled
             if exit_reason is None:
-                if current_put_short >= condor["put_short_premium"] * stop_loss_multiple:
-                    exit_reason = (
-                        f"Put SL: sold Rs{condor['put_short_premium']:.2f}, "
-                        f"now Rs{current_put_short:.2f} ({stop_loss_multiple}x)"
-                    )
-                elif current_call_short >= condor["call_short_premium"] * stop_loss_multiple:
-                    exit_reason = (
-                        f"Call SL: sold Rs{condor['call_short_premium']:.2f}, "
-                        f"now Rs{current_call_short:.2f} ({stop_loss_multiple}x)"
-                    )
+                if cur_put_short >= condor["put_short_premium"] * sl_mult:
+                    exit_reason = f"Put SL: sold ₹{condor['put_short_premium']:.2f}, now ₹{cur_put_short:.2f}"
+                elif cur_call_short >= condor["call_short_premium"] * sl_mult:
+                    exit_reason = f"Call SL: sold ₹{condor['call_short_premium']:.2f}, now ₹{cur_call_short:.2f}"
 
-            # Priority 4: Profit target — both short legs decayed to 25%
             if exit_reason is None:
-                put_target_hit = current_put_short <= condor["put_short_premium"] * profit_close_pct
-                call_target_hit = current_call_short <= condor["call_short_premium"] * profit_close_pct
-                if put_target_hit and call_target_hit:
-                    exit_reason = "Both wings at 75% profit — closing condor"
+                put_ok = cur_put_short <= condor["put_short_premium"] * profit_pct
+                call_ok = cur_call_short <= condor["call_short_premium"] * profit_pct
+                if put_ok and call_ok:
+                    exit_reason = "Both wings at 75%+ profit — closing condor"
 
             if exit_reason is None:
                 continue
 
             logger.info(f"[IronCondor] EXIT {underlying}: {exit_reason}")
-
             lot_size = condor["lot_size"]
-
-            # Close all 4 legs: BUY back short legs, SELL long legs
-            await self.order_manager.place_order(
-                condor["put_short_contract"], "BUY", lot_size, current_put_short
-            )
-            await self.order_manager.place_order(
-                condor["put_long_contract"], "SELL", lot_size, current_put_long
-            )
-            await self.order_manager.place_order(
-                condor["call_short_contract"], "BUY", lot_size, current_call_short
-            )
-            await self.order_manager.place_order(
-                condor["call_long_contract"], "SELL", lot_size, current_call_long
-            )
+            await self.order_manager.place_order(condor["put_short_contract"],  "BUY",  lot_size, cur_put_short,  is_spread_leg=True)
+            await self.order_manager.place_order(condor["put_long_contract"],   "SELL", lot_size, cur_put_long,   is_spread_leg=True)
+            await self.order_manager.place_order(condor["call_short_contract"], "BUY",  lot_size, cur_call_short, is_spread_leg=True)
+            await self.order_manager.place_order(condor["call_long_contract"],  "SELL", lot_size, cur_call_long,  is_spread_leg=True)
 
             net_pnl = (
-                (condor["put_short_premium"] - current_put_short)
-                + (condor["call_short_premium"] - current_call_short)
-                - (condor["put_long_premium"] - current_put_long)
-                - (condor["call_long_premium"] - current_call_long)
+                (condor["put_short_premium"] - cur_put_short)
+                + (condor["call_short_premium"] - cur_call_short)
+                - (condor["put_long_premium"] - cur_put_long)
+                - (condor["call_long_premium"] - cur_call_long)
             ) * lot_size
             to_remove.append(underlying)
-
             await self._notify(
                 f"IRON CONDOR CLOSED\n"
-                f"Underlying: {underlying}\n"
-                f"Reason: {exit_reason}\n"
-                f"Put  short: sold Rs{condor['put_short_premium']:.2f}, closed @ Rs{current_put_short:.2f}\n"
-                f"Call short: sold Rs{condor['call_short_premium']:.2f}, closed @ Rs{current_call_short:.2f}\n"
-                f"Est. Net PnL: Rs{net_pnl:,.2f}"
+                f"Underlying: {underlying}\nReason: {exit_reason}\n"
+                f"Put short:  sold ₹{condor['put_short_premium']:.2f}, closed ₹{cur_put_short:.2f}\n"
+                f"Call short: sold ₹{condor['call_short_premium']:.2f}, closed ₹{cur_call_short:.2f}\n"
+                f"Est. Net PnL: ₹{net_pnl:,.2f}"
             )
 
         for sym in to_remove:
             del self._active_condors[sym]
+        if to_remove:
+            await self._persist_state()
 
     async def _exit_all_options_for(self, underlying: str) -> None:
-        """Exit all open option positions for the given underlying (EXIT signal)."""
+        """Exit all open long option positions for the given underlying (EXIT signal)."""
         positions = await self._safe_get_positions()
+        expiry = get_near_month_expiry()
+        dte = (expiry - now_ist().replace(tzinfo=None)).days
         for pos in positions:
             contract = pos.get("symbol", "")
             qty = pos.get("quantity", 0)
-            if qty == 0 or not contract.startswith(underlying):
+            if qty <= 0 or not contract.startswith(underlying):
                 continue
             entry_premium = float(pos.get("avg_price") or 0)
             market_data = await self._get_market_data(underlying)
             atr = float(market_data.get("atr14", 0)) if market_data else 0
-            exit_price = round(atr * 4, 2) if atr > 0 else entry_premium
+            exit_price = estimate_option_premium(atr, dte) if atr > 0 else entry_premium
             await self.order_manager.place_order(contract, "SELL", abs(qty), exit_price)
             self._peak_premiums.pop(contract, None)
-            logger.info(f"EXIT signal: SELL {contract} @ Rs{exit_price:.2f}")
+            logger.info(f"EXIT signal: SELL {contract} @ ₹{exit_price:.2f}")
 
     async def _square_off_all(self) -> None:
         """Auto square-off all open positions at 15:20 IST."""
         positions = await self._safe_get_positions()
+        expiry = get_near_month_expiry()
+        dte = (expiry - now_ist().replace(tzinfo=None)).days
         closed = 0
+
         for pos in positions:
             qty = pos.get("quantity", 0)
             if qty == 0:
                 continue
             contract = pos["symbol"]
-            # Long positions (qty > 0) → SELL to close; Short legs (qty < 0) → BUY to close
+            # Long positions → SELL; Short legs (qty<0) → BUY to close
             side = "SELL" if qty > 0 else "BUY"
             entry_premium = float(pos.get("avg_price") or 0)
             underlying = self._get_underlying_from_contract(contract)
-            exit_price = entry_premium  # fallback
+            exit_price = entry_premium
             if underlying:
                 market_data = await self._get_market_data(underlying)
                 if market_data:
                     atr = float(market_data.get("atr14", 0))
                     if atr > 0:
-                        exit_price = round(atr * 4, 2)
+                        exit_price = estimate_option_premium(atr, dte)
             await self.order_manager.place_order(contract, side, abs(qty), exit_price)
             self._peak_premiums.pop(contract, None)
             closed += 1
@@ -852,6 +796,8 @@ class LiveTradingEngine:
 
         self._active_spreads.clear()
         self._active_condors.clear()
+        await self._persist_state()
+
         if closed:
             await self._notify(f"AUTO SQUARE-OFF\nClosed {closed} option positions at 15:20 IST")
 
@@ -860,29 +806,19 @@ class LiveTradingEngine:
     # ------------------------------------------------------------------
 
     def _get_underlying_from_contract(self, contract: str) -> Optional[str]:
-        """
-        Extract the NSE underlying symbol from an option contract string.
-        e.g. 'HDFCBANK25JUL800CE' → 'HDFCBANK'
-             'BAJAJ-AUTO25JUL5000CE' → 'BAJAJ-AUTO'
-        Uses longest-match to avoid BAJFINANCE matching as BAJ.
-        """
         for sym in _FNO_SYMBOLS_BY_LEN:
             if contract.startswith(sym):
                 return sym
         return None
 
     async def _has_open_option(self, underlying: str, option_type: str) -> bool:
-        """True if there is already an open position in this underlying + CE/PE."""
         positions = await self._safe_get_positions()
-        for pos in positions:
-            contract = pos.get("symbol", "")
-            if (
-                pos.get("quantity", 0) != 0
-                and contract.startswith(underlying)
-                and contract.endswith(option_type)
-            ):
-                return True
-        return False
+        return any(
+            pos.get("quantity", 0) > 0
+            and pos.get("symbol", "").startswith(underlying)
+            and pos.get("symbol", "").endswith(option_type)
+            for pos in positions
+        )
 
     async def _refresh_risk_state(self, positions: List[Dict[str, Any]]) -> None:
         realized = sum(p.get("realized_pnl", 0) for p in positions)
@@ -907,9 +843,6 @@ class LiveTradingEngine:
             logger.error(f"Redis read failed [{symbol}]: {exc}")
             return None
 
-    def attach_redis(self, redis_client: Any) -> None:
-        self._redis = redis_client
-
     async def _get_lot_size(self, symbol: str) -> int:
         redis = getattr(self, "_redis", None)
         if redis:
@@ -922,14 +855,7 @@ class LiveTradingEngine:
         return get_lot_size(symbol)
 
     async def _get_active_symbols(self, strategy=None) -> List[str]:
-        """
-        Return the regime-appropriate symbol pool for the given strategy.
-        Each strategy gets its own ranked list from Redis (published by LTPPoller):
-          EMA Crossover  → nfo:top5          (high ATR + strong trend)
-          Credit Spread  → nfo:top5:spread   (low ATR + EMA directional)
-          Iron Condor    → nfo:top5:condor   (low ATR + EMA flat)
-        Falls back to the fallback symbols list if Redis is empty.
-        """
+        """Return the regime-appropriate symbol pool for the given strategy."""
         redis = getattr(self, "_redis", None)
         if redis:
             class_name = strategy.__class__.__name__ if strategy else ""
