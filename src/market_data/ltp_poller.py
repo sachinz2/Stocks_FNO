@@ -1,7 +1,7 @@
 """
-LTP Poller — fetches current prices from Zerodha REST API every minute.
-Uses yfinance for historical OHLC to compute indicators without WebSocket.
-Compatible with Zerodha Personal (free) API plan.
+LTP Poller — fetches prices and computes indicators using yfinance.
+No Zerodha market data permission required (Personal plan only covers orders).
+Runs every 60 s via APScheduler. Writes enriched tick to Redis for the engine.
 """
 import asyncio
 import json
@@ -12,19 +12,17 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from src.core.config import settings
 from src.core.constants import REDIS_TICK_PREFIX
 
 logger = logging.getLogger(__name__)
 
-REDIS_KEY_TOKEN = "zerodha:access_token"
-HISTORY_REFRESH_SECONDS = 1800  # reload yfinance every 30 min
+HISTORY_REFRESH_SECONDS = 300  # reload yfinance every 5 min
 
 
 class LTPPoller:
     """
-    Polls Zerodha LTP every minute and writes indicator-enriched ticks to Redis.
-    The trading engine reads from the same Redis keys (tick:<SYMBOL>).
+    Fetches 5-min OHLC from yfinance every 5 minutes, computes indicators,
+    and writes enriched tick data to Redis for the trading engine.
     """
 
     def __init__(self, redis_client, symbols: List[str]) -> None:
@@ -34,74 +32,44 @@ class LTPPoller:
         self._history_loaded_at: Dict[str, datetime] = {}
 
     async def poll(self) -> None:
-        """Called every 60 s by APScheduler. Fetches LTP and updates Redis."""
-        from kiteconnect import KiteConnect
+        """Called every 60 s by APScheduler."""
+        loop = asyncio.get_event_loop()
+        for symbol in self.symbols:
+            try:
+                df = await self._get_history(symbol, loop)
+                if df is None or len(df) < 20:
+                    logger.warning(f"Not enough history for {symbol}, skipping.")
+                    continue
 
-        token = await self._redis.get(REDIS_KEY_TOKEN)
-        if not token:
-            logger.warning("LTP poll skipped — no Zerodha access token in Redis.")
-            return
-
-        kite = KiteConnect(api_key=settings.ZERODHA_API_KEY)
-        kite.set_access_token(token)
-
-        instruments = [f"NSE:{s}" for s in self.symbols]
-        try:
-            ltp_data = kite.ltp(instruments)
-        except Exception as exc:
-            logger.error(f"kite.ltp() failed: {exc}")
-            return
-
-        for instrument, data in ltp_data.items():
-            symbol = instrument.split(":")[1]
-            ltp = float(data.get("last_price", 0))
-            if ltp <= 0:
-                continue
-
-            df = await self._get_history(symbol, ltp)
-            if df is not None and len(df) >= 20:
+                ltp = float(df["close"].iloc[-1])
                 tick = self._enrich(symbol, df, ltp)
-            else:
-                tick = {
-                    "symbol": symbol, "close": ltp,
-                    "ema20": None, "ema50": None, "atr14": None, "vwap": None,
-                    "timestamp": datetime.now().isoformat(),
-                }
+                await self._redis.set(f"{REDIS_TICK_PREFIX}{symbol}", json.dumps(tick))
+                logger.debug(f"Tick: {symbol} ltp={ltp:.2f} ema20={tick.get('ema20')}")
+            except Exception as exc:
+                logger.error(f"LTP poll failed for {symbol}: {exc}")
 
-            await self._redis.set(f"{REDIS_TICK_PREFIX}{symbol}", json.dumps(tick))
-            logger.debug(f"Tick: {symbol} ltp={ltp} ema20={tick.get('ema20')}")
-
-    async def _get_history(self, symbol: str, ltp: float) -> Optional[pd.DataFrame]:
-        """Return cached yfinance history with current LTP appended as the latest row."""
+    async def _get_history(self, symbol: str, loop) -> Optional[pd.DataFrame]:
+        """Return yfinance OHLC, refreshing cache every 5 minutes."""
         now = datetime.now()
         last = self._history_loaded_at.get(symbol)
         stale = last is None or (now - last).total_seconds() > HISTORY_REFRESH_SECONDS
 
         if stale:
-            loop = asyncio.get_event_loop()
             df = await loop.run_in_executor(None, self._fetch_yfinance, symbol)
             if df is not None and not df.empty:
                 self._history[symbol] = df
                 self._history_loaded_at[symbol] = now
 
-        df = self._history.get(symbol)
-        if df is None or df.empty:
-            return None
-
-        df = df.copy()
-        new_row = pd.DataFrame([{"open": ltp, "high": ltp, "low": ltp, "close": ltp, "volume": 1}])
-        df = pd.concat([df, new_row], ignore_index=True)
-        return df.tail(210)
+        return self._history.get(symbol)
 
     @staticmethod
     def _fetch_yfinance(symbol: str) -> Optional[pd.DataFrame]:
-        """Blocking — called from a thread executor."""
+        """Blocking — runs in thread executor. Fetches 10 days of 5-min candles."""
         try:
             import yfinance as yf
-            ticker = yf.Ticker(f"{symbol}.NS")
-            df = ticker.history(period="10d", interval="5m")
+            df = yf.Ticker(f"{symbol}.NS").history(period="10d", interval="5m")
             if df.empty:
-                logger.warning(f"yfinance returned empty data for {symbol}")
+                logger.warning(f"yfinance: no data for {symbol}")
                 return None
             df = df.rename(columns={
                 "Open": "open", "High": "high",
