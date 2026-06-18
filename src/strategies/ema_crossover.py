@@ -16,14 +16,19 @@ class EMACrossoverStrategy(StrategyBase):
     def initialize(self):
         self.fast_period = self.parameters.get("fast_period", 20)
         self.slow_period = self.parameters.get("slow_period", 50)
-        self.stop_loss_pct = self.parameters.get("stop_loss_pct", 0.02) # 2% default
-        self.trailing_stop_pct = self.parameters.get("trailing_stop_pct", 0.01) # 1% default
-        
+        # Options-specific exit thresholds (applied to option premium, not underlying price)
+        self.stop_loss_pct = self.parameters.get("stop_loss_pct", 0.50)      # exit if premium drops 50%
+        self.target_pct = self.parameters.get("target_pct", 1.0)              # exit if premium doubles (2×)
+        self.trailing_stop_pct = self.parameters.get("trailing_stop_pct", 0.25)  # exit if 25% below peak
+
         # State tracking for crossover detection
         self.prev_fast_ema: Optional[float] = None
         self.prev_slow_ema: Optional[float] = None
-        
-        logger.info(f"Initialized EMA Crossover Strategy '{self.name}' ({self.fast_period}/{self.slow_period})")
+
+        logger.info(
+            f"Initialized EMA Crossover '{self.name}' ({self.fast_period}/{self.slow_period}) | "
+            f"SL={self.stop_loss_pct:.0%} TP={self.target_pct:.0%} Trail={self.trailing_stop_pct:.0%}"
+        )
 
     def generate_signal(self, data: Dict[str, Any]) -> Optional[str]:
         """
@@ -57,42 +62,50 @@ class EMACrossoverStrategy(StrategyBase):
 
         return signal
 
-    def manage_position(self, current_position: Dict[str, Any], current_price: float) -> Optional[str]:
+    def manage_position(self, current_position: Dict[str, Any], current_premium: float) -> Optional[str]:
         """
-        Manages Trailing Stop Loss and Fixed Stop Loss.
-        Expects current_position to have 'avg_price', 'side', and optionally 'highest_price_reached' or 'lowest_price_reached'.
+        Options position management based on option premium movement.
+
+        current_position must contain:
+          - avg_price      : entry premium paid
+          - peak_premium   : highest premium seen since entry (tracked by engine)
+
+        Exit conditions (in priority order):
+          1. Hard stop loss  — premium fell >= stop_loss_pct (default 50%) from entry
+          2. Profit target   — premium rose >= target_pct (default 100%, i.e. 2×) from entry
+          3. Trailing stop   — premium fell >= trailing_stop_pct (default 25%) from its peak
         """
-        avg_price = current_position.get("avg_price")
-        side = current_position.get("side")
+        entry_premium = float(current_position.get("avg_price") or 0)
+        if entry_premium <= 0 or current_premium <= 0:
+            return "HOLD"
 
-        if not avg_price or not side:
-            return None
+        pnl_pct = (current_premium - entry_premium) / entry_premium
 
-        # Absolute stop loss check (e.g. 2% below entry)
-        if side == "BUY":
-            hard_sl = avg_price * (1 - self.stop_loss_pct)
-            if current_price <= hard_sl:
-                logger.info(f"[{self.name}] Hard Stop Loss Hit for BUY. Exiting at {current_price}")
-                return "EXIT"
-                
-            # Trailing stop check
-            highest_price = current_position.get("highest_price_reached", avg_price)
-            trail_sl = highest_price * (1 - self.trailing_stop_pct)
-            if current_price <= trail_sl:
-                logger.info(f"[{self.name}] Trailing Stop Hit for BUY. Exiting at {current_price}")
-                return "EXIT"
+        # 1. Hard stop loss
+        if pnl_pct <= -self.stop_loss_pct:
+            logger.info(
+                f"[{self.name}] Stop loss: entry=Rs{entry_premium:.2f} "
+                f"current=Rs{current_premium:.2f} ({pnl_pct:.1%})"
+            )
+            return "EXIT"
 
-        elif side == "SELL":
-            hard_sl = avg_price * (1 + self.stop_loss_pct)
-            if current_price >= hard_sl:
-                logger.info(f"[{self.name}] Hard Stop Loss Hit for SELL. Exiting at {current_price}")
-                return "EXIT"
-                
-            # Trailing stop check
-            lowest_price = current_position.get("lowest_price_reached", avg_price)
-            trail_sl = lowest_price * (1 + self.trailing_stop_pct)
-            if current_price >= trail_sl:
-                logger.info(f"[{self.name}] Trailing Stop Hit for SELL. Exiting at {current_price}")
+        # 2. Profit target
+        if pnl_pct >= self.target_pct:
+            logger.info(
+                f"[{self.name}] Target hit: entry=Rs{entry_premium:.2f} "
+                f"current=Rs{current_premium:.2f} ({pnl_pct:.1%})"
+            )
+            return "EXIT"
+
+        # 3. Trailing stop — only activates once we've been in profit
+        peak = float(current_position.get("peak_premium") or entry_premium)
+        if peak > entry_premium:
+            trail_drawdown = (peak - current_premium) / peak
+            if trail_drawdown >= self.trailing_stop_pct:
+                logger.info(
+                    f"[{self.name}] Trailing stop: peak=Rs{peak:.2f} "
+                    f"current=Rs{current_premium:.2f} (drawdown {trail_drawdown:.1%})"
+                )
                 return "EXIT"
 
         return "HOLD"

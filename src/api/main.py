@@ -80,8 +80,9 @@ async def lifespan(app: FastAPI):
     StrategyRegistry.load_strategy("EMA_CROSSOVER", "ema_crossover_v1", {
         "fast_period": 20,
         "slow_period": 50,
-        "stop_loss_pct": 0.02,
-        "trailing_stop_pct": 0.01,
+        "stop_loss_pct": 0.50,       # exit if option premium drops 50% from entry
+        "target_pct": 1.0,            # exit if option premium doubles (2×)
+        "trailing_stop_pct": 0.25,    # exit if premium falls 25% below its peak
     })
 
     engine = LiveTradingEngine(broker, risk_mgr, order_mgr, portfolio_mgr, notifier)
