@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from datetime import datetime
@@ -401,6 +402,7 @@ class LiveTradingEngine:
             return
 
         from src.core.constants import FNO_STRIKE_INTERVALS
+        from src.market_data.nse_oi import get_oi_data, pcr_allows_spread
         from src.market_data.option_chain import (
             atr_to_annualised_vol, find_delta_strike, get_entry_prices_for_spread,
         )
@@ -411,6 +413,16 @@ class LiveTradingEngine:
         atr      = float(market_data.get("atr14", underlying_price * 0.01))
         iv_rank  = await self._get_iv_rank(symbol, underlying_price, atr, dte)
         sigma    = atr_to_annualised_vol(atr, underlying_price)
+
+        # OI/PCR sentiment check — confirm spread direction with market positioning
+        redis = getattr(self, "_redis", None)
+        oi_data = await get_oi_data(symbol, redis) if redis else None
+        if oi_data and not pcr_allows_spread(oi_data.get("pcr"), spread_type):
+            logger.info(
+                f"[CreditSpread] {symbol} skipped — PCR={oi_data['pcr']:.2f} "
+                f"opposes {spread_type}"
+            )
+            return
 
         if spread_type == "BULL_PUT_SPREAD":
             opt          = "PE"
@@ -428,6 +440,19 @@ class LiveTradingEngine:
         short_contract = build_option_symbol(symbol, short_strike, opt, expiry)
         long_contract  = build_option_symbol(symbol, long_strike,  opt, expiry)
 
+        # Avoid selling at crowded OI strikes (high OI = frequently tested)
+        from src.market_data.nse_oi import is_strike_crowded
+        if is_strike_crowded(short_strike, oi_data, opt):
+            logger.info(
+                f"[CreditSpread] {symbol} short strike {short_strike} is crowded OI — "
+                f"moving 1 interval further OTM"
+            )
+            if opt == "PE":
+                short_strike -= interval
+            else:
+                short_strike += interval
+            short_contract = build_option_symbol(symbol, short_strike, opt, expiry)
+
         short_p, long_p = await get_entry_prices_for_spread(
             symbol, short_contract, long_contract,
             kite=self._kite, redis=getattr(self, "_redis", None),
@@ -435,10 +460,20 @@ class LiveTradingEngine:
         )
         net_credit = round(short_p - long_p, 2)
 
+        # Margin check — in live mode verify we have enough balance before placing
+        spread_width   = abs(short_strike - long_strike)
+        required_margin = spread_width * lot_size   # worst-case margin = max loss
+        if not await self._check_available_margin(required_margin):
+            logger.warning(
+                f"[CreditSpread] {symbol} skipped — insufficient margin "
+                f"(need ~Rs{required_margin:,.0f})"
+            )
+            return
+
         logger.info(
             f"[CreditSpread] {spread_type} {symbol} | SELL {short_contract}@Rs{short_p} "
             f"BUY {long_contract}@Rs{long_p} credit=Rs{net_credit}x{lot_size} "
-            f"DTE={dte} IV_rank={iv_rank}"
+            f"DTE={dte} IV_rank={iv_rank} PCR={oi_data['pcr'] if oi_data else 'N/A'}"
         )
 
         short_order = await self.order_manager.place_order(
@@ -618,6 +653,16 @@ class LiveTradingEngine:
         call_short_p = estimate_option_premium(atr, dte, otm_intervals=1)
         call_long_p  = estimate_option_premium(atr, dte, otm_intervals=3)
         net_credit   = round((put_short_p - put_long_p) + (call_short_p - call_long_p), 2)
+
+        # Margin check — condor requires margin for the wider of the two wings
+        wing_spread     = abs(put_short_strike - put_long_strike)
+        required_margin = wing_spread * lot_size
+        if not await self._check_available_margin(required_margin):
+            logger.warning(
+                f"[IronCondor] {symbol} skipped — insufficient margin "
+                f"(need ~Rs{required_margin:,.0f})"
+            )
+            return
 
         legs = [
             (psc, "SELL", put_short_p,  False),
@@ -869,6 +914,30 @@ class LiveTradingEngine:
             logger.error(f"TradeJournal close log failed: {e}")
 
     # ── IV / VIX helpers ──────────────────────────────────────────────────────
+
+    async def _check_available_margin(self, required: float) -> bool:
+        """
+        Verify broker has enough margin before placing a multi-leg structure.
+        In paper mode this always returns True.
+        In live mode it calls kite.margins() — fails-open on API error
+        (better to attempt the trade than to block it due to a transient error).
+        """
+        if self.mode != TradingMode.LIVE or not self._kite:
+            return True
+        try:
+            loop = asyncio.get_event_loop()
+            margins   = await loop.run_in_executor(None, self._kite.margins)
+            available = float(margins.get("equity", {}).get("net", 0))
+            if available < required:
+                logger.warning(
+                    f"Margin check: available Rs{available:,.0f} < "
+                    f"required Rs{required:,.0f}"
+                )
+                return False
+            return True
+        except Exception as e:
+            logger.error(f"Margin check API call failed: {e}. Allowing trade (fail-open).")
+            return True
 
     async def _get_cached_vix(self) -> Optional[float]:
         from src.market_data.option_chain import get_india_vix, fetch_and_cache_vix
