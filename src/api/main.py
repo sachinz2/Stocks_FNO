@@ -76,13 +76,27 @@ async def lifespan(app: FastAPI):
     portfolio_mgr = PortfolioManager(broker, position_repo, stock_repo)
     notifier = EmailNotifier()
 
-    # Load default strategies (EMA crossover active from day 1)
+    # Strategy 1: EMA Crossover — buys CE/PE options on momentum (high-volatility regime)
     StrategyRegistry.load_strategy("EMA_CROSSOVER", "ema_crossover_v1", {
         "fast_period": 20,
         "slow_period": 50,
         "stop_loss_pct": 0.50,       # exit if option premium drops 50% from entry
         "target_pct": 1.0,            # exit if option premium doubles (2×)
         "trailing_stop_pct": 0.25,    # exit if premium falls 25% below its peak
+    })
+
+    # Strategy 2: Credit Spread — sells option spreads to collect theta (low-volatility regime)
+    # Complements EMA Crossover: fires when ATR% < 1.2% (market not making explosive moves).
+    # Bull Put Spread (EMA bullish): SELL ATM PE + BUY OTM PE — wins if underlying holds up.
+    # Bear Call Spread (EMA bearish): SELL ATM CE + BUY OTM CE — wins if underlying holds down.
+    StrategyRegistry.load_strategy("CREDIT_SPREAD", "credit_spread_v1", {
+        "fast_period": 20,
+        "slow_period": 50,
+        "low_vol_threshold": 1.2,    # only enter spreads when ATR% < 1.2% (low vol)
+        "spread_width": 2,            # hedge leg is 2 strike intervals away from short leg
+        "profit_close_pct": 0.25,    # take profit when short leg decays to 25% of sold price
+        "stop_loss_multiple": 2.0,   # stop loss when short leg rises to 2× sold price
+        "min_dte": 7,                 # close spread at least 7 days before expiry
     })
 
     engine = LiveTradingEngine(broker, risk_mgr, order_mgr, portfolio_mgr, notifier)

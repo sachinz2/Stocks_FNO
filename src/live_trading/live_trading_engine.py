@@ -52,6 +52,8 @@ class LiveTradingEngine:
         self._today_order_count: int = 0
         # Tracks peak premium per contract for trailing stop: {contract: peak_premium}
         self._peak_premiums: Dict[str, float] = {}
+        # Tracks active credit spreads: {underlying: {spread metadata dict}}
+        self._active_spreads: Dict[str, Dict[str, Any]] = {}
 
         logger.info(f"LiveTradingEngine initialised — mode: {self.mode.value.upper()}")
 
@@ -100,6 +102,9 @@ class LiveTradingEngine:
         positions = await self._safe_get_positions()
         await self._refresh_risk_state(positions)
 
+        # Check spread exits before long-option exits (spreads have their own logic)
+        await self._check_spread_exits(active_strategies)
+
         # FIX 1 + 3 + 4: Check all open option positions for exits every cycle
         await self._check_open_option_exits(positions, active_strategies)
 
@@ -146,6 +151,8 @@ class LiveTradingEngine:
         )
         self._today_order_count = 0
         self._peak_premiums.clear()
+        # Spreads closed at square-off; clear tracking state for next day
+        self._active_spreads.clear()
 
     # ------------------------------------------------------------------
     # Exit management
@@ -169,6 +176,12 @@ class LiveTradingEngine:
         expiry = get_near_month_expiry()
         dte = (expiry - now_ist().replace(tzinfo=None)).days
 
+        # Contracts managed by _check_spread_exits — skip here to avoid double handling
+        spread_contracts: set = set()
+        for spread in self._active_spreads.values():
+            spread_contracts.add(spread.get("short_contract", ""))
+            spread_contracts.add(spread.get("long_contract", ""))
+
         for pos in positions:
             contract = pos.get("symbol", "")
             qty = pos.get("quantity", 0)
@@ -176,6 +189,9 @@ class LiveTradingEngine:
 
             if qty == 0 or entry_premium <= 0:
                 continue
+
+            if contract in spread_contracts:
+                continue  # managed by _check_spread_exits instead
 
             underlying = self._get_underlying_from_contract(contract)
             if not underlying:
@@ -248,6 +264,10 @@ class LiveTradingEngine:
         signal_str = signal.value if hasattr(signal, "value") else str(signal)
         logger.info(f"Signal [{strategy.name}] {signal_str} {symbol}")
 
+        if signal_str in ("BULL_PUT_SPREAD", "BEAR_CALL_SPREAD"):
+            await self._process_credit_spread(strategy, symbol, signal_str, market_data)
+            return
+
         if signal_str not in ("BUY", "SELL"):
             if signal == SignalType.EXIT:
                 await self._exit_all_options_for(symbol)
@@ -315,6 +335,223 @@ class LiveTradingEngine:
                 f"Closed {option_type} before entering opposite side"
             )
 
+    async def _process_credit_spread(
+        self,
+        strategy,
+        symbol: str,
+        spread_type: str,
+        market_data: Dict[str, Any],
+    ) -> None:
+        """
+        Enter a credit spread for the given underlying.
+
+        Bull Put Spread  (spread_type='BULL_PUT_SPREAD'):
+          SELL ATM PE  + BUY (ATM - 2×interval) PE
+          Profits when underlying stays above the short strike.
+
+        Bear Call Spread (spread_type='BEAR_CALL_SPREAD'):
+          SELL ATM CE  + BUY (ATM + 2×interval) CE
+          Profits when underlying stays below the short strike.
+
+        Both collect net credit = (short premium) - (long premium).
+        """
+        # Only one spread per underlying at a time
+        if symbol in self._active_spreads:
+            logger.info(f"[CreditSpread] Already have active spread on {symbol}, skipping.")
+            return
+
+        underlying_price = float(market_data.get("close", 0))
+        if underlying_price <= 0:
+            return
+
+        from src.core.constants import FNO_STRIKE_INTERVALS
+        interval = FNO_STRIKE_INTERVALS.get(symbol, 50)
+        spread_width = getattr(strategy, "spread_width", 2) * interval
+
+        atm_strike = get_atm_strike(underlying_price, symbol)
+        expiry = get_near_month_expiry()
+        lot_size = await self._get_lot_size(symbol)
+        atr = float(market_data.get("atr14", underlying_price * 0.01))
+
+        # Premium estimates:  ATM ≈ ATR×4,  OTM ≈ ATR×2
+        short_premium = round(atr * 4, 2)
+        long_premium = round(atr * 2, 2)
+
+        if spread_type == "BULL_PUT_SPREAD":
+            short_strike = atm_strike
+            long_strike = atm_strike - spread_width
+            option_type = "PE"
+        else:  # BEAR_CALL_SPREAD
+            short_strike = atm_strike
+            long_strike = atm_strike + spread_width
+            option_type = "CE"
+
+        short_contract = build_option_symbol(symbol, short_strike, option_type, expiry)
+        long_contract = build_option_symbol(symbol, long_strike, option_type, expiry)
+
+        net_credit = round(short_premium - long_premium, 2)
+        dte = (expiry - now_ist().replace(tzinfo=None)).days
+
+        logger.info(
+            f"[CreditSpread] {spread_type} on {symbol} | "
+            f"SELL {short_contract} @ Rs{short_premium:.2f} + "
+            f"BUY {long_contract} @ Rs{long_premium:.2f} | "
+            f"Net credit: Rs{net_credit:.2f} × {lot_size} | DTE: {dte}"
+        )
+
+        # Place short leg first (credit collected)
+        short_order = await self.order_manager.place_order(
+            short_contract, "SELL", lot_size, short_premium
+        )
+        if not short_order or short_order.order_status != "OPEN":
+            logger.warning(f"[CreditSpread] Short leg order failed for {short_contract}")
+            return
+
+        # Place long leg (hedge, debit)
+        long_order = await self.order_manager.place_order(
+            long_contract, "BUY", lot_size, long_premium
+        )
+        if not long_order or long_order.order_status != "OPEN":
+            # Short leg placed but long leg failed — close the short leg immediately
+            logger.error(
+                f"[CreditSpread] Long leg order failed for {long_contract}. "
+                f"Closing short leg {short_contract} to avoid naked short."
+            )
+            await self.order_manager.place_order(
+                short_contract, "BUY", lot_size, short_premium
+            )
+            return
+
+        self._today_order_count += 2
+        self._active_spreads[symbol] = {
+            "spread_type": spread_type,
+            "short_contract": short_contract,
+            "long_contract": long_contract,
+            "short_strike": short_strike,
+            "long_strike": long_strike,
+            "option_type": option_type,
+            "short_premium": short_premium,
+            "long_premium": long_premium,
+            "net_credit": net_credit,
+            "lot_size": lot_size,
+        }
+
+        await self._notify(
+            f"CREDIT SPREAD OPENED\n"
+            f"Strategy: {strategy.name}\n"
+            f"Type: {spread_type}\n"
+            f"Underlying: {symbol} @ Rs{underlying_price:.2f}\n"
+            f"SELL {short_contract} @ Rs{short_premium:.2f}\n"
+            f"BUY  {long_contract} @ Rs{long_premium:.2f}\n"
+            f"Net credit: Rs{net_credit:.2f}/share × {lot_size} = Rs{net_credit * lot_size:,.2f}\n"
+            f"Max profit: Rs{net_credit * lot_size:,.2f} | "
+            f"Max loss: Rs{(spread_width - net_credit) * lot_size:,.2f} | DTE: {dte}"
+        )
+
+    async def _check_spread_exits(self, active_strategies: Dict[str, Any]) -> None:
+        """
+        Called every cycle before _check_open_option_exits.
+        Evaluates exit conditions for all active credit spreads:
+          1. DTE < min_dte (default 7) — close to avoid gamma risk near expiry
+          2. Strategy profit target — short leg decayed to 25% of sold price
+          3. Strategy stop loss — short leg rose to 2× sold price
+          4. Strike breach — underlying has crossed the short strike
+        When exiting: BUY back the short leg first, then SELL the long leg.
+        """
+        if not self._active_spreads:
+            return
+
+        expiry = get_near_month_expiry()
+        dte = (expiry - now_ist().replace(tzinfo=None)).days
+        to_remove: List[str] = []
+
+        # Find credit spread strategy (for manage_position parameters)
+        cs_strategy = None
+        for s in active_strategies.values():
+            if s.__class__.__name__ == "CreditSpreadStrategy":
+                cs_strategy = s
+                break
+
+        for underlying, spread in self._active_spreads.items():
+            market_data = await self._get_market_data(underlying)
+            if not market_data:
+                continue
+
+            current_price = float(market_data.get("close", 0))
+            atr = float(market_data.get("atr14", 0))
+            current_short_premium = round(atr * 4, 2) if atr > 0 else spread["short_premium"]
+
+            exit_reason: Optional[str] = None
+            min_dte = getattr(cs_strategy, "min_dte", 7) if cs_strategy else 7
+
+            # Priority 1: DTE too close to expiry (gamma risk)
+            if dte < min_dte:
+                exit_reason = f"DTE={dte} < {min_dte} — close before gamma risk"
+
+            # Priority 2: Strike breach (underlying has moved through the short strike)
+            if exit_reason is None and current_price > 0:
+                short_strike = spread["short_strike"]
+                spread_type = spread["spread_type"]
+                if spread_type == "BULL_PUT_SPREAD" and current_price < short_strike:
+                    exit_reason = (
+                        f"Strike breach: {underlying} @ Rs{current_price:.2f} "
+                        f"< short put strike Rs{short_strike}"
+                    )
+                elif spread_type == "BEAR_CALL_SPREAD" and current_price > short_strike:
+                    exit_reason = (
+                        f"Strike breach: {underlying} @ Rs{current_price:.2f} "
+                        f"> short call strike Rs{short_strike}"
+                    )
+
+            # Priority 3: Strategy SL / profit target
+            if exit_reason is None and cs_strategy:
+                result = cs_strategy.manage_position(
+                    {"short_premium": spread["short_premium"]},
+                    current_short_premium,
+                )
+                if result == "EXIT":
+                    pnl_pct = (spread["short_premium"] - current_short_premium) / spread["short_premium"] * 100
+                    exit_reason = (
+                        f"strategy={cs_strategy.name} "
+                        f"short: sold Rs{spread['short_premium']:.2f} "
+                        f"now Rs{current_short_premium:.2f} ({pnl_pct:+.1f}%)"
+                    )
+
+            if exit_reason is None:
+                continue
+
+            logger.info(f"[CreditSpread] EXIT {underlying}: {exit_reason}")
+
+            lot_size = spread["lot_size"]
+            short_contract = spread["short_contract"]
+            long_contract = spread["long_contract"]
+            short_premium = spread["short_premium"]
+            long_premium = spread["long_premium"]
+
+            # Close: BUY back short leg, SELL long leg
+            await self.order_manager.place_order(
+                short_contract, "BUY", lot_size, current_short_premium
+            )
+            long_exit_price = round(atr * 2, 2) if atr > 0 else long_premium
+            await self.order_manager.place_order(
+                long_contract, "SELL", lot_size, long_exit_price
+            )
+
+            net_pnl = (short_premium - current_short_premium - long_premium + long_exit_price) * lot_size
+            to_remove.append(underlying)
+
+            await self._notify(
+                f"CREDIT SPREAD CLOSED\n"
+                f"Underlying: {underlying}\n"
+                f"Reason: {exit_reason}\n"
+                f"Short: {short_contract} sold @ Rs{short_premium:.2f}, bought back @ Rs{current_short_premium:.2f}\n"
+                f"Long:  {long_contract} bought @ Rs{long_premium:.2f}, sold @ Rs{long_exit_price:.2f}\n"
+                f"Est. Net PnL: Rs{net_pnl:,.2f}"
+            )
+
+        for sym in to_remove:
+            del self._active_spreads[sym]
+
     async def _exit_all_options_for(self, underlying: str) -> None:
         """Exit all open option positions for the given underlying (EXIT signal)."""
         positions = await self._safe_get_positions()
@@ -340,6 +577,8 @@ class LiveTradingEngine:
             if qty == 0:
                 continue
             contract = pos["symbol"]
+            # Long positions (qty > 0) → SELL to close; Short legs (qty < 0) → BUY to close
+            side = "SELL" if qty > 0 else "BUY"
             entry_premium = float(pos.get("avg_price") or 0)
             underlying = self._get_underlying_from_contract(contract)
             exit_price = entry_premium  # fallback
@@ -349,11 +588,12 @@ class LiveTradingEngine:
                     atr = float(market_data.get("atr14", 0))
                     if atr > 0:
                         exit_price = round(atr * 4, 2)
-            await self.order_manager.place_order(contract, "SELL", abs(qty), exit_price)
+            await self.order_manager.place_order(contract, side, abs(qty), exit_price)
             self._peak_premiums.pop(contract, None)
             closed += 1
-            logger.warning(f"Auto square-off: SELL {abs(qty)} {contract}")
+            logger.warning(f"Auto square-off: {side} {abs(qty)} {contract}")
 
+        self._active_spreads.clear()
         if closed:
             await self._notify(f"AUTO SQUARE-OFF\nClosed {closed} option positions at 15:20 IST")
 
