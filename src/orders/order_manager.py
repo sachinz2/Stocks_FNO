@@ -37,6 +37,10 @@ class OrderManager:
             })
         except Exception as e:
             logger.error(f"Failed to write audit log: {e}")
+            try:
+                await self.audit_repo.session.rollback()
+            except Exception:
+                pass
 
     async def place_order(self, symbol: str, side: str, quantity: int, price: float) -> Optional[Order]:
         """
