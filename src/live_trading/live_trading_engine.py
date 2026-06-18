@@ -162,7 +162,7 @@ class LiveTradingEngine:
                 await self._notify(
                     f"ORDER PLACED\n"
                     f"Strategy: {strategy.name}\n"
-                    f"{signal.value} {quantity} {symbol} @ ₹{price:.2f}"
+                    f"{side} {quantity} {symbol} @ ₹{price:.2f}"
                 )
 
         elif signal == SignalType.EXIT:
