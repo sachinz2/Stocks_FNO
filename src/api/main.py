@@ -45,7 +45,7 @@ async def lifespan(app: FastAPI):
     from src.database.repositories.base import BaseRepository
     from src.live_trading.live_trading_engine import LiveTradingEngine
     from src.market_data.ltp_poller import LTPPoller
-    from src.notifications.combo_notifier import ComboNotifier
+    from src.notifications.email_service import EmailNotifier
     from src.orders.order_manager import OrderManager
     from src.paper_trading.paper_broker import PaperBroker
     from src.portfolio.portfolio_manager import PortfolioManager
@@ -122,7 +122,7 @@ async def lifespan(app: FastAPI):
 
     order_mgr     = OrderManager(broker, risk_mgr, order_repo, audit_repo)
     portfolio_mgr = PortfolioManager(broker, position_repo, stock_repo)
-    notifier      = ComboNotifier()   # sends to both email + Telegram simultaneously
+    notifier      = EmailNotifier()
 
     # ── Strategies ─────────────────────────────────────────────────────────────
     StrategyRegistry.load_strategy("EMA_CROSSOVER", "ema_crossover_v1", {
