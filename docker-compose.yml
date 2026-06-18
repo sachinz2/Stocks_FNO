@@ -2,6 +2,7 @@ services:
   mysql:
     image: mysql:8.0
     container_name: falcon_mysql
+    restart: unless-stopped
     environment:
       MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:-password123}
       MYSQL_DATABASE: ${DB_NAME:-falcon_db}
@@ -21,6 +22,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: falcon_redis
+    restart: unless-stopped
     command: redis-server --requirepass ${REDIS_PASSWORD} --bind 127.0.0.1
     volumes:
       - redis_data:/data
@@ -36,6 +38,7 @@ services:
   api:
     build: .
     container_name: falcon_api
+    restart: unless-stopped
     depends_on:
       mysql:
         condition: service_healthy
@@ -60,6 +63,7 @@ services:
   dashboard:
     build: .
     container_name: falcon_dashboard
+    restart: unless-stopped
     depends_on:
       - api
     env_file:
@@ -83,6 +87,7 @@ services:
   nginx:
     image: nginx:alpine
     container_name: falcon_nginx
+    restart: unless-stopped
     ports:
       - "80:80"
       - "443:443"
