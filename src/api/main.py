@@ -62,15 +62,15 @@ async def lifespan(app: FastAPI):
     logger.info("Database tables verified / created.")
 
     redis_client = aioredis.from_url(settings.get_redis_url(), decode_responses=True)
-    db_session = AsyncSessionLocal()
 
     broker = PaperBroker(initial_balance=settings.INITIAL_CAPITAL)
     risk_mgr = RiskManager(initial_capital=settings.INITIAL_CAPITAL)
 
-    order_repo = BaseRepository(Order, db_session)
-    audit_repo = BaseRepository(AuditLog, db_session)
-    position_repo = BaseRepository(Position, db_session)
-    stock_repo = BaseRepository(Stock, db_session)
+    # Pass the factory, not an instance — each DB op gets its own session
+    order_repo = BaseRepository(Order, AsyncSessionLocal)
+    audit_repo = BaseRepository(AuditLog, AsyncSessionLocal)
+    position_repo = BaseRepository(Position, AsyncSessionLocal)
+    stock_repo = BaseRepository(Stock, AsyncSessionLocal)
 
     order_mgr = OrderManager(broker, risk_mgr, order_repo, audit_repo)
     portfolio_mgr = PortfolioManager(broker, position_repo, stock_repo)
@@ -115,7 +115,6 @@ async def lifespan(app: FastAPI):
     await engine.stop()
     stop_scheduler()
     await redis_client.aclose()
-    await db_session.close()
     logger.info("Falcon Trader: engine + scheduler stopped.")
 
 
