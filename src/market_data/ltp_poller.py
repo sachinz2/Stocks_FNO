@@ -1,7 +1,14 @@
 """
 LTP Poller — fetches prices and computes indicators using yfinance.
 No Zerodha market data permission required (Personal plan only covers orders).
-Runs every 60 s via APScheduler. Writes enriched tick to Redis for the engine.
+
+Runs every 60 s via APScheduler:
+  1. Polls all 40 F&O symbols via yfinance (5-min OHLC, 10-day window)
+  2. Computes EMA20, EMA50, ATR14, VWAP for each symbol
+  3. Writes enriched tick to Redis (tick:SYMBOL)
+  4. Scores all symbols by volatility + trend clarity
+  5. Writes top ACTIVE_TRADING_SYMBOLS ranked symbols to Redis (nfo:top5)
+     — trading engine reads this to decide which stocks to trade today
 """
 import asyncio
 import json
@@ -12,7 +19,12 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from src.core.constants import REDIS_TICK_PREFIX
+from src.core.constants import (
+    ACTIVE_TRADING_SYMBOLS,
+    FNO_SYMBOLS,
+    REDIS_TICK_PREFIX,
+    REDIS_TOP_SYMBOLS_KEY,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,32 +33,42 @@ HISTORY_REFRESH_SECONDS = 300  # reload yfinance every 5 min
 
 class LTPPoller:
     """
-    Fetches 5-min OHLC from yfinance every 5 minutes, computes indicators,
-    and writes enriched tick data to Redis for the trading engine.
+    Fetches 5-min OHLC from yfinance, computes indicators, writes to Redis.
+    Also ranks all symbols by suitability and publishes top N to Redis.
     """
 
-    def __init__(self, redis_client, symbols: List[str]) -> None:
+    def __init__(self, redis_client, symbols: List[str] = None) -> None:
         self._redis = redis_client
-        self.symbols = symbols
+        self.symbols = symbols or FNO_SYMBOLS  # default: all 40
         self._history: Dict[str, pd.DataFrame] = {}
         self._history_loaded_at: Dict[str, datetime] = {}
 
     async def poll(self) -> None:
         """Called every 60 s by APScheduler."""
         loop = asyncio.get_event_loop()
+        scores: Dict[str, float] = {}
+
         for symbol in self.symbols:
             try:
                 df = await self._get_history(symbol, loop)
-                if df is None or len(df) < 20:
-                    logger.warning(f"Not enough history for {symbol}, skipping.")
+                if df is None or len(df) < 50:
+                    logger.warning(f"Not enough history for {symbol} (need 50 bars), skipping.")
                     continue
 
                 ltp = float(df["close"].iloc[-1])
                 tick = self._enrich(symbol, df, ltp)
                 await self._redis.set(f"{REDIS_TICK_PREFIX}{symbol}", json.dumps(tick))
-                logger.debug(f"Tick: {symbol} ltp={ltp:.2f} ema20={tick.get('ema20')}")
+                scores[symbol] = self._score(tick)
+                logger.debug(f"Tick: {symbol} ltp={ltp:.2f} score={scores[symbol]:.4f}")
             except Exception as exc:
                 logger.error(f"LTP poll failed for {symbol}: {exc}")
+
+        # Rank symbols and publish top N
+        if scores:
+            ranked = sorted(scores, key=scores.__getitem__, reverse=True)
+            top = ranked[:ACTIVE_TRADING_SYMBOLS]
+            await self._redis.set(REDIS_TOP_SYMBOLS_KEY, json.dumps(top))
+            logger.info(f"Top {ACTIVE_TRADING_SYMBOLS} symbols: {top} (scores: {[round(scores[s],3) for s in top]})")
 
     async def _get_history(self, symbol: str, loop) -> Optional[pd.DataFrame]:
         """Return yfinance OHLC, refreshing cache every 5 minutes."""
@@ -112,3 +134,23 @@ class LTPPoller:
             "vwap": round(vwap, 4),
             "timestamp": datetime.now().isoformat(),
         }
+
+    @staticmethod
+    def _score(tick: dict) -> float:
+        """
+        Score a symbol for trading suitability. Higher = better.
+
+        Criteria:
+          - Volatility (60%): ATR14 as % of price — higher = more premium, bigger moves
+          - Trend clarity (40%): EMA20 vs EMA50 separation — wider = clearer directional signal
+        """
+        close = tick.get("close", 0)
+        if close <= 0:
+            return 0.0
+
+        atr_pct = (tick.get("atr14", 0) / close) * 100
+        ema20 = tick.get("ema20", close)
+        ema50 = tick.get("ema50", close)
+        ema_spread_pct = abs(ema20 - ema50) / close * 100
+
+        return round(atr_pct * 0.6 + ema_spread_pct * 0.4, 4)

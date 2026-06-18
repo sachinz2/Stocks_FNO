@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 from src.brokers.base import AbstractBroker
 from src.core.config import settings
 from src.core.enums import SignalType, TradingMode
+from src.core.constants import REDIS_LOT_SIZE_PREFIX, REDIS_TOP_SYMBOLS_KEY
 from src.core.utils import (
     build_option_symbol,
     get_atm_strike,
@@ -109,8 +110,11 @@ class LiveTradingEngine:
         positions = await self._safe_get_positions()
         await self._refresh_risk_state(positions)
 
+        # Use dynamically ranked symbols from Redis; fall back to configured list
+        symbols = await self._get_active_symbols()
+
         for strategy_id, strategy in active_strategies.items():
-            for symbol in self._symbols:
+            for symbol in symbols:
                 try:
                     await self._process_signal(strategy, symbol)
                 except Exception as exc:
@@ -170,7 +174,7 @@ class LiveTradingEngine:
             strike = get_atm_strike(underlying_price, symbol)
             expiry = get_near_month_expiry()
             contract = build_option_symbol(symbol, strike, option_type, expiry)
-            lot_size = get_lot_size(symbol)
+            lot_size = await self._get_lot_size(symbol)
 
             # Estimate ATM option premium for paper trading:
             # Use ATR-based approximation: ATR × 4 ≈ near-month ATM premium
@@ -258,9 +262,38 @@ class LiveTradingEngine:
         """Called at startup to wire the Redis client in."""
         self._redis = redis_client
 
-    def _calculate_quantity(self, symbol: str, price: float = 0) -> int:
-        """Return the NSE lot size for this symbol. Always trade exactly 1 lot."""
+    async def _get_lot_size(self, symbol: str) -> int:
+        """
+        Return NSE lot size for this symbol.
+        Primary: Redis (refreshed daily from kite.instruments after auth).
+        Fallback: hardcoded FNO_LOT_SIZES constant.
+        """
+        redis = getattr(self, "_redis", None)
+        if redis:
+            try:
+                val = await redis.get(f"{REDIS_LOT_SIZE_PREFIX}{symbol}")
+                if val:
+                    return int(val)
+            except Exception:
+                pass
         return get_lot_size(symbol)
+
+    async def _get_active_symbols(self) -> list:
+        """
+        Return today's ranked trading symbols from Redis.
+        LTP poller scores all 40 symbols every minute and writes top N here.
+        Falls back to the configured symbol list if Redis key is absent.
+        """
+        redis = getattr(self, "_redis", None)
+        if redis:
+            try:
+                raw = await redis.get(REDIS_TOP_SYMBOLS_KEY)
+                if raw:
+                    import json
+                    return json.loads(raw)
+            except Exception:
+                pass
+        return self._symbols
 
     # ------------------------------------------------------------------
     # Utility

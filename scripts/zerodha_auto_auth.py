@@ -147,6 +147,35 @@ def store_token(access_token: str):
         json.dump({"access_token": access_token}, f)
 
 
+def fetch_and_cache_lot_sizes(access_token: str) -> int:
+    """
+    Fetch all NFO instruments from Kite and cache lot sizes in Redis.
+    Called once daily after auth so the engine always has fresh lot sizes.
+    Returns number of symbols cached.
+    """
+    from kiteconnect import KiteConnect
+    from src.core.constants import FNO_SYMBOLS, REDIS_LOT_SIZE_PREFIX
+
+    kite = KiteConnect(api_key=settings.ZERODHA_API_KEY)
+    kite.set_access_token(access_token)
+
+    instruments = kite.instruments("NFO")
+    r = get_redis_client()
+    fno_set = set(FNO_SYMBOLS)
+    seen: set = set()
+
+    for inst in instruments:
+        name = inst.get("name", "")
+        if name in fno_set and name not in seen:
+            lot_size = inst.get("lot_size", 0)
+            if lot_size > 0:
+                r.set(f"{REDIS_LOT_SIZE_PREFIX}{name}", str(lot_size), ex=86400 * 7)
+                seen.add(name)
+
+    logger.info(f"Lot sizes cached for {len(seen)} F&O symbols")
+    return len(seen)
+
+
 def run_daily_auth():
     """Entry point called by the scheduler at 8:30 AM IST."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -155,19 +184,28 @@ def run_daily_auth():
         access_token = zerodha_auto_login()
         store_token(access_token)
         logger.info("Daily authentication SUCCESSFUL")
+
+        # Refresh lot sizes from live instrument data
+        try:
+            count = fetch_and_cache_lot_sizes(access_token)
+            logger.info(f"Instrument lot sizes refreshed: {count} symbols")
+        except Exception as e:
+            logger.warning(f"Lot size refresh failed (non-fatal, using hardcoded fallback): {e}")
+
         try:
             import asyncio
-            from src.notifications.telegram_service import TelegramNotifier
-            asyncio.run(TelegramNotifier().send("Zerodha Login: SUCCESS\nReady for trading"))
+            from src.notifications.email_service import EmailNotifier
+            asyncio.run(EmailNotifier().send("Zerodha Login: SUCCESS\nReady for trading"))
         except Exception:
             pass
+
         return access_token
     except Exception as e:
         logger.error(f"Daily authentication FAILED: {e}")
         try:
             import asyncio
-            from src.notifications.telegram_service import TelegramNotifier
-            asyncio.run(TelegramNotifier().alert("LOGIN FAILED", str(e)))
+            from src.notifications.email_service import EmailNotifier
+            asyncio.run(EmailNotifier().alert("LOGIN FAILED", str(e)))
         except Exception:
             pass
         raise

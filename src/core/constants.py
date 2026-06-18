@@ -6,62 +6,68 @@ MARKET_CLOSE_MINUTE = 30
 SQUARE_OFF_HOUR = 15
 SQUARE_OFF_MINUTE = 20  # Auto square-off 10 mins before close
 
-# NSE F&O Stocks — Phase 1 (top liquid options)
+# NSE F&O option-eligible stocks (40 most liquid)
+# Lot sizes and strike intervals are ALSO hardcoded here as fallback;
+# the primary source is Redis (refreshed daily from kite.instruments("NFO")).
 FNO_SYMBOLS = [
+    # Tier 1 — highest liquidity
     "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK",
-    "SBIN", "BAJFINANCE", "HINDUNILVR", "ITC", "KOTAKBANK",
-    "AXISBANK", "LT", "WIPRO", "HCLTECH", "MARUTI",
-    "SUNPHARMA", "ONGC", "NTPC", "POWERGRID", "ULTRACEMCO",
+    "SBIN", "BAJFINANCE", "KOTAKBANK", "AXISBANK", "LT",
+    # Tier 2 — high liquidity
+    "HINDUNILVR", "ITC", "WIPRO", "HCLTECH", "MARUTI",
+    "SUNPHARMA", "TATAMOTORS", "BHARTIARTL", "ADANIPORTS", "ASIANPAINT",
+    # Tier 3 — good liquidity
+    "TITAN", "BAJAJ-AUTO", "EICHERMOT", "INDUSINDBK", "DRREDDY",
+    "CIPLA", "DIVISLAB", "JSWSTEEL", "HINDALCO", "GRASIM",
+    # Tier 4 — moderate liquidity
+    "TATACONSUM", "APOLLOHOSP", "NESTLEIND", "TECHM", "BPCL",
+    "ONGC", "NTPC", "POWERGRID", "ULTRACEMCO", "TATASTEEL",
 ]
 
-# NSE lot sizes (shares per lot) — verify periodically at nseindia.com
-# Last verified: June 2026
+# Hardcoded lot sizes — fallback when Redis cache is empty.
+# Refreshed daily from kite.instruments("NFO") after auth.
+# Verify at nseindia.com/market-data/fo-equity-securities if issues arise.
 FNO_LOT_SIZES = {
-    "RELIANCE":    250,
-    "TCS":         150,
-    "INFY":        300,
-    "HDFCBANK":    550,
-    "ICICIBANK":   700,
-    "SBIN":       1500,
-    "BAJFINANCE":  125,
-    "HINDUNILVR":  300,
-    "ITC":        3200,
-    "KOTAKBANK":   400,
-    "AXISBANK":   1200,
-    "LT":          150,
-    "WIPRO":      1500,
-    "HCLTECH":     700,
-    "MARUTI":       25,
-    "SUNPHARMA":   700,
-    "ONGC":       1950,
-    "NTPC":       3750,
-    "POWERGRID":  4700,
-    "ULTRACEMCO":  100,
+    "RELIANCE":    250,   "TCS":         150,   "INFY":        300,
+    "HDFCBANK":    550,   "ICICIBANK":   700,   "SBIN":       1500,
+    "BAJFINANCE":  125,   "KOTAKBANK":   400,   "AXISBANK":   1200,
+    "LT":          150,   "HINDUNILVR":  300,   "ITC":        3200,
+    "WIPRO":      1500,   "HCLTECH":     700,   "MARUTI":       25,
+    "SUNPHARMA":   700,   "TATAMOTORS":  900,   "BHARTIARTL":  500,
+    "ADANIPORTS": 1250,   "ASIANPAINT":  200,   "TITAN":       375,
+    "BAJAJ-AUTO":   75,   "EICHERMOT":    50,   "INDUSINDBK":  500,
+    "DRREDDY":     125,   "CIPLA":       650,   "DIVISLAB":    200,
+    "JSWSTEEL":   1350,   "HINDALCO":   2150,   "GRASIM":      375,
+    "TATACONSUM":  900,   "APOLLOHOSP":  125,   "NESTLEIND":    40,
+    "TECHM":       600,   "BPCL":       1800,   "ONGC":       1950,
+    "NTPC":       3750,   "POWERGRID":  4700,   "ULTRACEMCO":  100,
+    "TATASTEEL":  5500,
 }
 
-# Strike price intervals per symbol (gap between consecutive strikes on NSE)
+# Gap between consecutive strikes on NSE for each symbol
 FNO_STRIKE_INTERVALS = {
-    "RELIANCE":    50,
-    "TCS":        100,
-    "INFY":        20,
-    "HDFCBANK":    20,
-    "ICICIBANK":   20,
-    "SBIN":        10,
-    "BAJFINANCE": 100,
-    "HINDUNILVR":  20,
-    "ITC":          5,
-    "KOTAKBANK":   20,
-    "AXISBANK":    10,
-    "LT":          50,
-    "WIPRO":        5,
-    "HCLTECH":     20,
-    "MARUTI":     100,
-    "SUNPHARMA":   20,
-    "ONGC":         5,
-    "NTPC":         5,
-    "POWERGRID":    5,
-    "ULTRACEMCO":  50,
+    "RELIANCE":    50,   "TCS":        100,   "INFY":        20,
+    "HDFCBANK":    20,   "ICICIBANK":   20,   "SBIN":        10,
+    "BAJFINANCE": 100,   "KOTAKBANK":   20,   "AXISBANK":    10,
+    "LT":          50,   "HINDUNILVR":  20,   "ITC":          5,
+    "WIPRO":        5,   "HCLTECH":     20,   "MARUTI":     100,
+    "SUNPHARMA":   20,   "TATAMOTORS":   5,   "BHARTIARTL":  10,
+    "ADANIPORTS":  10,   "ASIANPAINT":  50,   "TITAN":       25,
+    "BAJAJ-AUTO": 100,   "EICHERMOT":  100,   "INDUSINDBK":  10,
+    "DRREDDY":     50,   "CIPLA":       10,   "DIVISLAB":    50,
+    "JSWSTEEL":    10,   "HINDALCO":     5,   "GRASIM":      25,
+    "TATACONSUM":  10,   "APOLLOHOSP":  50,   "NESTLEIND":  100,
+    "TECHM":       10,   "BPCL":         5,   "ONGC":         5,
+    "NTPC":         5,   "POWERGRID":    5,   "ULTRACEMCO":  50,
+    "TATASTEEL":    5,
 }
+
+# How many stocks to trade at a time (dynamic selection from the 40-stock pool)
+ACTIVE_TRADING_SYMBOLS = 5
+
+# Redis key for dynamically ranked top symbols
+REDIS_TOP_SYMBOLS_KEY = "nfo:top5"
+REDIS_LOT_SIZE_PREFIX = "nfo:lot:"
 
 # Indicator defaults
 EMA_FAST = 20

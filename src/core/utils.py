@@ -36,12 +36,12 @@ def _last_thursday(year: int, month: int) -> datetime:
 def get_near_month_expiry() -> datetime:
     """
     Return the near-month NSE option expiry (last Thursday of the month).
-    Rolls to next month if fewer than 3 calendar days remain.
+    Rolls to next month if fewer than 4 calendar days remain — avoids
+    the illiquid final 4 days where spreads widen and theta decay accelerates.
     """
     today = datetime.now(IST).replace(tzinfo=None)
     expiry = _last_thursday(today.year, today.month)
-    if (expiry - today).days < 3:
-        # Roll to next month
+    if (expiry - today).days < 4:
         if today.month == 12:
             expiry = _last_thursday(today.year + 1, 1)
         else:

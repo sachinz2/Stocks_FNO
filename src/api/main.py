@@ -86,10 +86,11 @@ async def lifespan(app: FastAPI):
 
     engine = LiveTradingEngine(broker, risk_mgr, order_mgr, portfolio_mgr, notifier)
     engine.attach_redis(redis_client)
-    engine.set_symbols(PHASE1_SYMBOLS)
+    engine.set_symbols(PHASE1_SYMBOLS)  # fallback if Redis top5 is absent
     await engine.start()
 
-    ltp_poller = LTPPoller(redis_client, PHASE1_SYMBOLS)
+    # Poller covers all 40 symbols; it writes top-5 to Redis after each poll
+    ltp_poller = LTPPoller(redis_client)
 
     scheduler = get_scheduler()
     schedule_trading_jobs(engine)
