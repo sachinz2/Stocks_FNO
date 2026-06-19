@@ -113,18 +113,29 @@ def zerodha_auto_login() -> str:
     request_token = None
     current_url = connect_page_url   # kite.zerodha.com/connect/login?api_key=...&v=3
 
-    for _ in range(8):
+    for i in range(8):
         r = session.get(current_url, allow_redirects=False)
         loc = r.headers.get("Location", "")
+        logger.info(
+            f"Redirect [{i}]: status={r.status_code} "
+            f"url={current_url[:80]} "
+            f"location={loc[:100] if loc else 'none'}"
+        )
 
-        m = _token_re.search(loc) or _token_re.search(r.text)
+        m = _token_re.search(loc) or _token_re.search(r.url) or _token_re.search(r.text[:500])
         if m:
             request_token = m.group(1)
             break
 
         if loc:
+            # Handle relative redirect URLs
+            if loc.startswith("/"):
+                from urllib.parse import urlparse as _up
+                parsed = _up(current_url)
+                loc = f"{parsed.scheme}://{parsed.netloc}{loc}"
             current_url = loc
         else:
+            logger.info(f"Redirect [{i}]: no Location header. Body: {r.text[:300]}")
             break
 
     if not request_token:
