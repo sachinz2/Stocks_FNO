@@ -20,10 +20,11 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-_NSE_HOME   = "https://www.nseindia.com"
-_OC_URL     = "https://www.nseindia.com/api/option-chain-equities?symbol={symbol}"
-_CACHE_TTL  = 900   # 15 minutes
-_CACHE_KEY  = "nse_oi:{symbol}"
+_NSE_HOME      = "https://www.nseindia.com"
+_OC_URL        = "https://www.nseindia.com/api/option-chain-equities?symbol={symbol}"
+_CACHE_TTL     = 900   # 15 minutes
+_CACHE_KEY     = "nse_oi:{symbol}"
+_PREV_OI_KEY   = "nse_oi_prev:{symbol}"   # previous-cycle OI snapshot for delta
 
 _HEADERS = {
     "User-Agent": (
@@ -118,6 +119,10 @@ def _parse_option_chain(records: Dict) -> Dict:
         "total_call_oi":         total_call_oi,
         "total_put_oi":          total_put_oi,
         "expiry_date":           expiry,
+        # OI change fields — populated by get_oi_data() on subsequent calls
+        "call_oi_change":        0,
+        "put_oi_change":         0,
+        "oi_signal":             "NEUTRAL",   # see oi_price_signal()
     }
 
 
@@ -175,6 +180,35 @@ async def get_oi_data(symbol: str, redis) -> Optional[Dict]:
         return None
 
     parsed = _parse_option_chain(records)
+
+    # ── OI Change delta ───────────────────────────────────────────────────────
+    # Compare current OI with previous cycle to detect institutional positioning.
+    # Price↑ + OI↑ = fresh longs entering = STRONG BULLISH
+    # Price↑ + OI↓ = short covering only  = WEAK BULLISH (potential reversal)
+    # Price↓ + OI↑ = fresh shorts entering = STRONG BEARISH
+    # Price↓ + OI↓ = long exits only      = WEAK BEARISH
+    prev_key = _PREV_OI_KEY.format(symbol=symbol)
+    try:
+        prev_raw = await redis.get(prev_key)
+        if prev_raw:
+            prev = json.loads(prev_raw)
+            parsed["call_oi_change"] = (
+                parsed["total_call_oi"] - prev.get("total_call_oi", parsed["total_call_oi"])
+            )
+            parsed["put_oi_change"] = (
+                parsed["total_put_oi"] - prev.get("total_put_oi", parsed["total_put_oi"])
+            )
+            parsed["oi_signal"] = _oi_change_signal(
+                parsed["call_oi_change"], parsed["put_oi_change"]
+            )
+        # Store current as previous for next cycle
+        await redis.set(prev_key, json.dumps({
+            "total_call_oi": parsed["total_call_oi"],
+            "total_put_oi":  parsed["total_put_oi"],
+        }), ex=3600)   # expire after 1 hour (covers one trading session)
+    except Exception:
+        pass
+
     try:
         await redis.set(cache_key, json.dumps(parsed), ex=_CACHE_TTL)
     except Exception:
@@ -183,9 +217,52 @@ async def get_oi_data(symbol: str, redis) -> Optional[Dict]:
     logger.info(
         f"NSE OI [{symbol}]: PCR={parsed['pcr']:.2f} "
         f"MaxPain={parsed['max_pain']} "
+        f"OI_signal={parsed['oi_signal']} "
         f"Expiry={parsed['expiry_date']}"
     )
     return parsed
+
+
+def _oi_change_signal(call_oi_change: int, put_oi_change: int) -> str:
+    """
+    Classify the OI delta without price context (used during OI fetch).
+    Full price-aware signal: use oi_price_signal() after combining with LTP.
+    """
+    if put_oi_change > 0 and call_oi_change <= 0:
+        return "BULLISH_OI"   # puts added, calls not — market hedging puts
+    if call_oi_change > 0 and put_oi_change <= 0:
+        return "BEARISH_OI"   # calls added, puts not
+    return "NEUTRAL"
+
+
+def oi_price_signal(
+    call_oi_change: int,
+    put_oi_change:  int,
+    price_change_pct: float,   # current bar return vs prev bar
+) -> str:
+    """
+    Combined OI + price signal — the most useful OI interpretation.
+
+    Classic Price + OI analysis:
+      Price ↑ + Total OI ↑  → new longs entering   = STRONG_BULLISH
+      Price ↑ + Total OI ↓  → short covering        = WEAK_BULLISH (fading)
+      Price ↓ + Total OI ↑  → new shorts entering   = STRONG_BEARISH
+      Price ↓ + Total OI ↓  → long exits / unwinding = WEAK_BEARISH
+
+    We use combined OI (calls + puts) as a proxy for total market commitment.
+    """
+    total_oi_change = call_oi_change + put_oi_change
+    price_up = price_change_pct >= 0
+
+    if price_up and total_oi_change > 0:
+        return "STRONG_BULLISH"
+    if price_up and total_oi_change < 0:
+        return "WEAK_BULLISH"
+    if not price_up and total_oi_change > 0:
+        return "STRONG_BEARISH"
+    if not price_up and total_oi_change < 0:
+        return "WEAK_BEARISH"
+    return "NEUTRAL"
 
 
 def pcr_sentiment(pcr: Optional[float]) -> str:

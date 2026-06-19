@@ -58,9 +58,12 @@ async def lifespan(app: FastAPI):
     from src.risk.risk_manager import RiskManager
     from src.risk.strategy_monitor import StrategyMonitor
     from src.risk.portfolio_analyzer import PortfolioAnalyzer
+    from src.market_data.regime_detector import MarketRegimeDetector
+    from src.market_data.rs_ranker import RSRanker
     import src.strategies  # noqa: F401 — triggers @StrategyRegistry.register() decorators
     from src.strategies.base import StrategyRegistry
     from src.database.models.trade_journal import TradeJournal
+    from src.database.models.walk_forward import WalkForwardResult  # noqa: F401 — creates table
 
     PHASE1_SYMBOLS = list(FNO_SYMBOLS[:5])
 
@@ -168,11 +171,15 @@ async def lifespan(app: FastAPI):
     trade_journal_repo = BaseRepository(TradeJournal, AsyncSessionLocal)
     strategy_monitor   = StrategyMonitor(trade_journal_repo)
     portfolio_analyzer = PortfolioAnalyzer()
+    regime_detector    = MarketRegimeDetector(redis_client)
+    rs_ranker          = RSRanker(redis_client)
 
     engine = LiveTradingEngine(
         broker, risk_mgr, order_mgr, portfolio_mgr, notifier,
         strategy_monitor=strategy_monitor,
         portfolio_analyzer=portfolio_analyzer,
+        regime_detector=regime_detector,
+        rs_ranker=rs_ranker,
     )
     engine.attach_redis(redis_client)
     engine.set_symbols(PHASE1_SYMBOLS)
@@ -192,6 +199,16 @@ async def lifespan(app: FastAPI):
         name="LTP Poller (yfinance indicators)",
         replace_existing=True,
         misfire_grace_time=30,
+    )
+
+    # RS Ranking: runs every 5 minutes (downloads 30d daily history — heavier)
+    scheduler.add_job(
+        rs_ranker.rank,
+        IntervalTrigger(seconds=300),
+        id="rs_rank",
+        name="Relative Strength Ranker",
+        replace_existing=True,
+        misfire_grace_time=60,
     )
 
     # ── Zerodha REST LTP refresh (near-real-time, runs every 5 s) ─────────────

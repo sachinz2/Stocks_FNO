@@ -30,6 +30,8 @@ from src.portfolio.portfolio_manager import PortfolioManager
 from src.risk.risk_manager import RiskManager
 from src.risk.strategy_monitor import StrategyMonitor
 from src.risk.portfolio_analyzer import PortfolioAnalyzer
+from src.market_data.regime_detector import MarketRegimeDetector
+from src.market_data.rs_ranker import RSRanker
 from src.strategies.base import StrategyRegistry
 
 logger = logging.getLogger(__name__)
@@ -57,6 +59,8 @@ class LiveTradingEngine:
         notifier: Any = None,
         strategy_monitor: Optional[StrategyMonitor] = None,
         portfolio_analyzer: Optional[PortfolioAnalyzer] = None,
+        regime_detector: Optional[MarketRegimeDetector] = None,
+        rs_ranker: Optional[RSRanker] = None,
     ):
         self.broker             = broker
         self.risk_manager       = risk_manager
@@ -65,6 +69,8 @@ class LiveTradingEngine:
         self.notifier           = notifier
         self.strategy_monitor   = strategy_monitor
         self.portfolio_analyzer = portfolio_analyzer
+        self.regime_detector    = regime_detector
+        self.rs_ranker          = rs_ranker
         self.mode              = TradingMode(settings.TRADING_MODE)
         self.is_running        = False
         self._symbols: List[str] = []
@@ -160,6 +166,11 @@ class LiveTradingEngine:
         # Auto-kill check: pause strategies that show statistical deterioration
         if self.strategy_monitor:
             await self.strategy_monitor.evaluate_all()
+
+        # Regime detection + strategy switching (runs every cycle, lightweight)
+        if self.regime_detector:
+            await self.regime_detector.detect()
+            await self.regime_detector.enforce_regime_switching()
 
         # Log correlation / sector concentration warnings (non-blocking)
         if self.portfolio_analyzer and positions:
