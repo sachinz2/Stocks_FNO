@@ -31,6 +31,7 @@ class ZerodhaLTPPoller:
         self._redis  = redis_client
         self._instruments = [f"{_NSE_PREFIX}{s}" for s in symbols]
         self._symbol_map  = {f"{_NSE_PREFIX}{s}": s for s in symbols}
+        self._permission_ok = True   # set False on first "Insufficient permission"
 
     async def refresh_ltp(self) -> int:
         """
@@ -38,13 +39,25 @@ class ZerodhaLTPPoller:
         Returns number of symbols updated.
         Called by APScheduler every POLL_INTERVAL_SECONDS.
         """
+        if not self._permission_ok:
+            return 0
+
         try:
             loop  = asyncio.get_event_loop()
             quotes = await loop.run_in_executor(
                 None, self._kite.ltp, self._instruments
             )
         except Exception as e:
-            logger.warning(f"ZerodhaLTPPoller: kite.ltp() failed: {e}")
+            err = str(e)
+            if "Insufficient permission" in err or "permission" in err.lower():
+                self._permission_ok = False
+                logger.warning(
+                    "ZerodhaLTPPoller: kite.ltp() not permitted on this Zerodha plan. "
+                    "Falling back to yfinance only. "
+                    "To enable: contact Zerodha support to add 'Market quotes' to your plan."
+                )
+            else:
+                logger.warning(f"ZerodhaLTPPoller: kite.ltp() failed: {e}")
             return 0
 
         updated = 0

@@ -169,13 +169,14 @@ class LTPPoller:
         vwap = float((typical * vol_nonzero).sum() / cum_vol) if cum_vol > 0 else ltp
 
         return {
-            "symbol": symbol,
-            "close": ltp,
-            "ema20": round(ema20, 4),
-            "ema50": round(ema50, 4),
-            "atr14": round(atr14, 4),
-            "vwap": round(vwap, 4),
-            "timestamp": datetime.now().isoformat(),
+            "symbol":     symbol,
+            "close":      ltp,
+            "ema20":      round(ema20, 4),
+            "ema50":      round(ema50, 4),
+            "atr14":      round(atr14, 4),
+            "vwap":       round(vwap, 4),
+            "timestamp":  datetime.now().isoformat(),
+            "ltp_source": "yfinance",
         }
 
     @staticmethod
