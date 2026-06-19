@@ -4,7 +4,8 @@ FROM python:3.11-slim
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app
+    PYTHONPATH=/app \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 # Set work directory
 WORKDIR /app
@@ -22,7 +23,8 @@ RUN apt-get update && \
 COPY requirements.txt .
 RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt && \
-    playwright install chromium
+    playwright install chromium && \
+    chmod -R 755 /ms-playwright
 
 # Copy project
 COPY . /app/
