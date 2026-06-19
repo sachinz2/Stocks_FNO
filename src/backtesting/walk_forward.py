@@ -76,12 +76,16 @@ class WalkForwardTester:
         train_years: int = 2,
         test_years:  int = 1,
         initial_capital: float = 300_000.0,
+        kite=None,
+        instrument_tokens: Dict[str, int] = None,
     ):
-        self.strategy_name   = strategy_name
-        self.param_grid      = param_grid
-        self.train_years     = train_years
-        self.test_years      = test_years
-        self.initial_capital = initial_capital
+        self.strategy_name    = strategy_name
+        self.param_grid       = param_grid
+        self.train_years      = train_years
+        self.test_years       = test_years
+        self.initial_capital  = initial_capital
+        self._kite            = kite
+        self._tokens          = instrument_tokens or {}
 
     # ── Public ────────────────────────────────────────────────────────────────
 
@@ -242,24 +246,24 @@ class WalkForwardTester:
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _fetch_history(self, symbol: str, start_year: int, end_year: int) -> Optional[pd.DataFrame]:
-        import yfinance as yf
-        start = f"{start_year}-01-01"
-        end   = f"{end_year}-12-31"
-        for suffix in (".NS", ".BO"):
-            try:
-                df = yf.download(
-                    f"{symbol}{suffix}", start=start, end=end, interval="1d",
-                    auto_adjust=True, progress=False,
-                )
-                if not df.empty:
-                    df = df.rename(columns={
-                        "Open": "open", "High": "high",
-                        "Low": "low", "Close": "close", "Volume": "volume",
-                    })
-                    return df[["open", "high", "low", "close", "volume"]].dropna()
-            except Exception:
-                pass
-        return None
+        from datetime import datetime as dt
+        token = self._tokens.get(symbol)
+        if not self._kite or not token:
+            logger.warning(f"WalkForward: no kite/token for {symbol} — cannot fetch history.")
+            return None
+        from_date = dt(start_year, 1, 1)
+        to_date   = dt(end_year, 12, 31)
+        try:
+            records = self._kite.historical_data(
+                token, from_date, to_date, "day", continuous=False, oi=False
+            )
+            if not records:
+                return None
+            df = pd.DataFrame(records)
+            return df[["open", "high", "low", "close", "volume"]].dropna().reset_index(drop=True)
+        except Exception as e:
+            logger.warning(f"WalkForward: kite.historical_data failed for {symbol}: {e}")
+            return None
 
     @staticmethod
     def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:

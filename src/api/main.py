@@ -93,7 +93,8 @@ async def lifespan(app: FastAPI):
     kite_instance  = None
 
     # ── Always try Zerodha for market data if a token exists ──────────────────
-    raw_token = await redis_client.get("zerodha:access_token")
+    raw_token        = await redis_client.get("zerodha:access_token")
+    instrument_tokens: dict = {}   # symbol → Zerodha instrument_token int
     if raw_token and settings.ZERODHA_API_KEY and settings.ZERODHA_API_SECRET:
         from src.brokers.zerodha import ZerodhaBroker
         access_token  = raw_token.strip()
@@ -103,6 +104,21 @@ async def lifespan(app: FastAPI):
         kite_instance = _data_broker.kite
         logger.info("Zerodha kite session ready for market data (VIX, option quotes).")
 
+        # Fetch instrument tokens once — shared by ticker, LTPPoller, RSRanker
+        try:
+            loop = asyncio.get_event_loop()
+            nse_instruments = await loop.run_in_executor(
+                None, kite_instance.instruments, "NSE"
+            )
+            fno_set = set(FNO_SYMBOLS)
+            for inst in nse_instruments:
+                sym = inst.get("tradingsymbol", "")
+                if sym in fno_set:
+                    instrument_tokens[sym] = inst["instrument_token"]
+            logger.info(f"Instrument tokens loaded: {len(instrument_tokens)}/{len(fno_set)} F&O symbols.")
+        except Exception as e:
+            logger.warning(f"Instrument token fetch failed: {e}")
+
         try:
             from src.market_data.zerodha_ticker import ZerodhaTicker
             zerodha_ticker = ZerodhaTicker(
@@ -111,22 +127,21 @@ async def lifespan(app: FastAPI):
                 redis_url=settings.get_redis_url(),
                 symbols=set(FNO_SYMBOLS),
             )
-            loop   = asyncio.get_event_loop()
-            mapped = await loop.run_in_executor(
-                None, zerodha_ticker.fetch_instrument_tokens
-            )
-            if mapped > 0:
+            # Re-use already-fetched tokens to avoid a second instruments API call
+            zerodha_ticker._instrument_tokens = instrument_tokens.copy()
+            zerodha_ticker._token_symbol      = {v: k for k, v in instrument_tokens.items()}
+            if instrument_tokens:
                 zerodha_ticker.start()
-                logger.info(f"ZerodhaTicker: live stream started for {mapped} symbols.")
+                logger.info(f"ZerodhaTicker: live stream started for {len(instrument_tokens)} symbols.")
             else:
-                logger.warning("ZerodhaTicker: no tokens mapped — skipping WebSocket stream.")
+                logger.warning("ZerodhaTicker: no tokens — skipping WebSocket stream.")
                 zerodha_ticker = None
         except Exception as e:
             logger.error(f"ZerodhaTicker init failed: {e}. Continuing without real-time LTP.")
             zerodha_ticker = None
     else:
         logger.warning(
-            "No Zerodha access token in Redis — market data falls back to yfinance. "
+            "No Zerodha access token in Redis — LTP and indicator data unavailable. "
             "Run scripts/zerodha_auto_auth.py to fix this."
         )
 
@@ -172,7 +187,7 @@ async def lifespan(app: FastAPI):
     strategy_monitor   = StrategyMonitor(trade_journal_repo)
     portfolio_analyzer = PortfolioAnalyzer()
     regime_detector    = MarketRegimeDetector(redis_client)
-    rs_ranker          = RSRanker(redis_client)
+    rs_ranker          = RSRanker(redis_client, kite=kite_instance, instrument_tokens=instrument_tokens)
 
     engine = LiveTradingEngine(
         broker, risk_mgr, order_mgr, portfolio_mgr, notifier,
@@ -187,7 +202,7 @@ async def lifespan(app: FastAPI):
         engine.attach_kite(kite_instance)   # enables real VIX + option quotes
     await engine.start()
 
-    ltp_poller = LTPPoller(redis_client)
+    ltp_poller = LTPPoller(redis_client, kite=kite_instance, instrument_tokens=instrument_tokens)
 
     scheduler = get_scheduler()
     schedule_trading_jobs(engine)
@@ -196,7 +211,7 @@ async def lifespan(app: FastAPI):
         ltp_poller.poll,
         IntervalTrigger(seconds=60),
         id="ltp_poll",
-        name="LTP Poller (yfinance indicators)",
+        name="LTP Poller (Zerodha OHLC + indicators)",
         replace_existing=True,
         misfire_grace_time=30,
     )
@@ -230,9 +245,11 @@ async def lifespan(app: FastAPI):
         logger.info("ZerodhaLTPPoller: REST-based LTP refresh every 5 s (WebSocket fallback).")
     start_scheduler()
 
-    app.state.trading_engine = engine
-    app.state.redis          = redis_client
-    app.state.zerodha_ticker = zerodha_ticker
+    app.state.trading_engine   = engine
+    app.state.redis            = redis_client
+    app.state.zerodha_ticker   = zerodha_ticker
+    app.state.kite             = kite_instance
+    app.state.instrument_tokens = instrument_tokens
 
     logger.info(
         f"Falcon Trader STARTED | Mode={mode.value.upper()} | "
@@ -300,9 +317,9 @@ async def health_check():
 
     overall = "UP" if db_status == "UP" and redis_status == "UP" else "DEGRADED"
     source_label = {
-        "zerodha_realtime": "Zerodha WebSocket (real-time)",
-        "zerodha_rest":     "Zerodha REST poll (5 s)",
-        "yfinance":         "yfinance (60 s delay)",
+        "zerodha_realtime":   "Zerodha WebSocket (real-time)",
+        "zerodha_rest":       "Zerodha REST poll (5 s)",
+        "zerodha_historical": "Zerodha historical OHLC (60 s)",
     }.get(ltp_source, ltp_source)
     return {
         "status":     overall,

@@ -9,7 +9,7 @@ Four regimes:
 
 Detection logic:
   1. India VIX (from Redis, written by ZerodhaLTPPoller or estimated)
-  2. NIFTY50 ATR% (NIFTY.NS from yfinance, updated every 5 min via LTPPoller)
+  2. NIFTY50 ATR% (Zerodha historical OHLC, updated every 5 min via LTPPoller)
   3. NIFTY EMA spread% (same source)
 
 Regime is published to Redis key `market:regime` (JSON) every cycle and

@@ -48,9 +48,6 @@ pyotp
 # Headless browser for Zerodha Connect authorize step (React SPA — needs real browser)
 playwright
 
-# Market data (historical OHLC — no WebSocket needed on Personal plan)
-yfinance
-
 # ML
 xgboost
 lightgbm

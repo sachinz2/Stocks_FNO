@@ -56,10 +56,14 @@ class ParameterRobustnessAnalyzer:
         strategy_name: str,
         param_grid: Dict[str, List[Any]],
         initial_capital: float = 300_000.0,
+        kite=None,
+        instrument_tokens: Dict[str, int] = None,
     ):
         self.strategy_name   = strategy_name
         self.param_grid      = param_grid
         self.initial_capital = initial_capital
+        self._kite           = kite
+        self._tokens         = instrument_tokens or {}
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -155,25 +159,24 @@ class ParameterRobustnessAnalyzer:
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _fetch_history(self, symbol: str, years: int) -> Optional[pd.DataFrame]:
-        import yfinance as yf
-        from datetime import date, timedelta
-        end   = date.today().strftime("%Y-%m-%d")
-        start = (date.today() - timedelta(days=years * 365)).strftime("%Y-%m-%d")
-        for suffix in (".NS", ".BO"):
-            try:
-                df = yf.download(
-                    f"{symbol}{suffix}", start=start, end=end, interval="1d",
-                    auto_adjust=True, progress=False,
-                )
-                if not df.empty:
-                    df = df.rename(columns={
-                        "Open": "open", "High": "high",
-                        "Low": "low", "Close": "close", "Volume": "volume",
-                    })
-                    return df[["open", "high", "low", "close", "volume"]].dropna()
-            except Exception:
-                pass
-        return None
+        from datetime import datetime as dt, timedelta
+        token = self._tokens.get(symbol)
+        if not self._kite or not token:
+            logger.warning(f"Robustness: no kite/token for {symbol} — cannot fetch history.")
+            return None
+        to_date   = dt.now()
+        from_date = to_date - timedelta(days=years * 365)
+        try:
+            records = self._kite.historical_data(
+                token, from_date, to_date, "day", continuous=False, oi=False
+            )
+            if not records:
+                return None
+            df = pd.DataFrame(records)
+            return df[["open", "high", "low", "close", "volume"]].dropna().reset_index(drop=True)
+        except Exception as e:
+            logger.warning(f"Robustness: kite.historical_data failed for {symbol}: {e}")
+            return None
 
     @staticmethod
     def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:

@@ -392,11 +392,15 @@ async def run_walk_forward(
             "fast_period": list(range(fast_min, fast_max + 1)),
             "slow_period": list(range(slow_min, slow_max + 1, 2)),
         }
+        kite   = getattr(request.app.state, "kite", None)
+        tokens = getattr(request.app.state, "instrument_tokens", {})
         tester  = WalkForwardTester(
             strategy_name=strategy_name,
             param_grid=param_grid,
             train_years=train_years,
             test_years=test_years,
+            kite=kite,
+            instrument_tokens=tokens,
         )
         results = await tester.run(symbol=symbol, start_year=start_year, end_year=end_year)
         if not results:
@@ -476,9 +480,13 @@ async def run_robustness_check(
             "fast_period": list(range(fast_min, fast_max + 1)),
             "slow_period": list(range(slow_min, slow_max + 1, 2)),
         }
+        kite   = getattr(request.app.state, "kite", None)
+        tokens = getattr(request.app.state, "instrument_tokens", {})
         analyzer = ParameterRobustnessAnalyzer(
             strategy_name=strategy_name,
             param_grid=param_grid,
+            kite=kite,
+            instrument_tokens=tokens,
         )
         return await analyzer.analyze(symbol=symbol, years=years)
     except Exception as e:

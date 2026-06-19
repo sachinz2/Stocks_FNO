@@ -1,9 +1,8 @@
 """
-LTP Poller — fetches prices and computes indicators using yfinance.
-No Zerodha market data permission required (Personal plan only covers orders).
+LTP Poller — fetches 5-min OHLC from Zerodha and computes indicators.
 
 Runs every 60 s via APScheduler:
-  1. Polls all 40 F&O symbols via yfinance (5-min OHLC, 10-day window)
+  1. Polls all 40 F&O symbols via kite.historical_data() (5-min OHLC, 10-day window)
   2. Computes EMA20, EMA50, ATR14, VWAP for each symbol
   3. Writes enriched tick to Redis (tick:SYMBOL)
   4. Scores all 40 symbols THREE WAYS — one per strategy regime:
@@ -33,7 +32,7 @@ from src.core.constants import (
 
 logger = logging.getLogger(__name__)
 
-HISTORY_REFRESH_SECONDS = 300  # reload yfinance every 5 min
+HISTORY_REFRESH_SECONDS = 300  # reload OHLC history every 5 min
 
 # ATR% thresholds that must match strategy parameters
 _LOW_VOL_THRESHOLD = 1.2   # below = low volatility regime
@@ -42,14 +41,17 @@ _FLAT_EMA_THRESHOLD = 0.1  # EMA spread below = EMAs are flat (no direction)
 
 class LTPPoller:
     """
-    Fetches 5-min OHLC from yfinance, computes indicators, writes to Redis.
+    Fetches 5-min OHLC from Zerodha, computes indicators, writes to Redis.
     Scores all 40 symbols for three distinct trading regimes and publishes
     three separate top-N ranked lists so each strategy gets appropriate stocks.
     """
 
-    def __init__(self, redis_client, symbols: List[str] = None) -> None:
-        self._redis = redis_client
-        self.symbols = symbols or FNO_SYMBOLS  # default: all 40
+    def __init__(self, redis_client, symbols: List[str] = None,
+                 kite=None, instrument_tokens: Dict[str, int] = None) -> None:
+        self._redis   = redis_client
+        self._kite    = kite
+        self._tokens  = instrument_tokens or {}
+        self.symbols  = symbols or FNO_SYMBOLS  # default: all 40
         self._history: Dict[str, pd.DataFrame] = {}
         self._history_loaded_at: Dict[str, datetime] = {}
 
@@ -114,7 +116,7 @@ class LTPPoller:
             logger.info("Iron condor pool: no eligible symbols today (all have directional EMA or high ATR%)")
 
     async def _get_history(self, symbol: str, loop) -> Optional[pd.DataFrame]:
-        """Return yfinance OHLC, refreshing cache every 5 minutes.
+        """Return Zerodha 5-min OHLC, refreshing cache every 5 minutes.
         On fetch failure the timestamp is still updated so the symbol is not
         retried every 60 s — it waits the full HISTORY_REFRESH_SECONDS before retry."""
         now = datetime.now()
@@ -122,32 +124,34 @@ class LTPPoller:
         stale = last is None or (now - last).total_seconds() > HISTORY_REFRESH_SECONDS
 
         if stale:
-            df = await loop.run_in_executor(None, self._fetch_yfinance, symbol)
-            # Always stamp the time — prevents retrying a failing symbol every 60 s
+            if self._kite and symbol in self._tokens:
+                df = await loop.run_in_executor(None, self._fetch_kite_ohlc, symbol)
+            else:
+                logger.warning(f"LTPPoller: no kite/token for {symbol} — skipping OHLC fetch.")
+                df = None
             self._history_loaded_at[symbol] = now
             if df is not None and not df.empty:
                 self._history[symbol] = df
 
         return self._history.get(symbol)
 
-    @staticmethod
-    def _fetch_yfinance(symbol: str) -> Optional[pd.DataFrame]:
-        """Blocking — runs in thread executor. Fetches 10 days of 5-min candles.
-        Tries NSE (.NS) first, falls back to BSE (.BO) if NSE returns no data."""
-        import yfinance as yf
-        for suffix in (".NS", ".BO"):
-            try:
-                df = yf.Ticker(f"{symbol}{suffix}").history(period="10d", interval="5m")
-                if not df.empty:
-                    df = df.rename(columns={
-                        "Open": "open", "High": "high",
-                        "Low": "low", "Close": "close", "Volume": "volume",
-                    })
-                    return df[["open", "high", "low", "close", "volume"]].dropna().reset_index(drop=True)
-            except Exception:
-                pass
-        logger.warning(f"yfinance: no data for {symbol} (tried .NS and .BO)")
-        return None
+    def _fetch_kite_ohlc(self, symbol: str) -> Optional[pd.DataFrame]:
+        """Blocking — runs in thread executor. Fetches 10 days of 5-min candles via kite."""
+        from datetime import timedelta
+        token    = self._tokens[symbol]
+        to_date  = datetime.now()
+        from_date = to_date - timedelta(days=10)
+        try:
+            records = self._kite.historical_data(
+                token, from_date, to_date, "5minute", continuous=False, oi=False
+            )
+            if not records:
+                return None
+            df = pd.DataFrame(records)
+            return df[["open", "high", "low", "close", "volume"]].dropna().reset_index(drop=True)
+        except Exception as e:
+            logger.warning(f"kite.historical_data failed for {symbol}: {e}")
+            return None
 
     @staticmethod
     def _enrich(symbol: str, df: pd.DataFrame, ltp: float) -> dict:
@@ -180,7 +184,7 @@ class LTPPoller:
             "atr14":      round(atr14, 4),
             "vwap":       round(vwap, 4),
             "timestamp":  datetime.now().isoformat(),
-            "ltp_source": "yfinance",
+            "ltp_source": "zerodha_historical",
         }
 
     @staticmethod

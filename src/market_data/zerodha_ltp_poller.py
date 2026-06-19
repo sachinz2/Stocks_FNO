@@ -53,8 +53,7 @@ class ZerodhaLTPPoller:
                 self._permission_ok = False
                 logger.warning(
                     "ZerodhaLTPPoller: kite.ltp() not permitted on this Zerodha plan. "
-                    "Falling back to yfinance only. "
-                    "To enable: contact Zerodha support to add 'Market quotes' to your plan."
+                    "LTP REST polling disabled — check Zerodha plan permissions."
                 )
             else:
                 logger.warning(f"ZerodhaLTPPoller: kite.ltp() failed: {e}")

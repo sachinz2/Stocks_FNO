@@ -1,10 +1,8 @@
 """
 Zerodha WebSocket Ticker — real-time LTP for all 40 F&O underlying stocks.
 
-Replaces yfinance's 15-minute delayed LTP with Zerodha's live data stream.
-The LTPPoller still runs every 60 s to refresh EMA, ATR, VWAP from yfinance
-history. This ticker overwrites only the 'close' (LTP) field in Redis on
-every tick, keeping historical indicators fresh and LTP real-time.
+Overwrites only the 'close' (LTP) field in Redis on every tick, keeping
+the historical indicators (EMA, ATR, VWAP) computed by LTPPoller intact.
 
 Flow:
   1. fetch_instrument_tokens() — maps NSE symbols to Zerodha instrument_tokens
@@ -12,10 +10,6 @@ Flow:
   3. On connection: subscribe to all 40 tokens in MODE_LTP
   4. On each tick: read existing tick dict from Redis, update 'close', write back
   5. Automatic reconnection handled by KiteTicker (up to MAX_RECONNECT_ATTEMPTS)
-
-Graceful degradation: if the ticker fails to connect or loses connection,
-yfinance data (with 15-min delay) remains in Redis — signals still fire,
-just with older LTP until reconnection succeeds.
 """
 import json
 import logging
@@ -180,5 +174,5 @@ class ZerodhaTicker:
     def _on_noreconnect(self, ws) -> None:
         logger.critical(
             f"ZerodhaTicker: max reconnect attempts ({MAX_RECONNECT_ATTEMPTS}) reached. "
-            "Falling back to yfinance data — signals will have 15-min delay."
+            "WebSocket unavailable — ZerodhaLTPPoller REST fallback (5 s delay) remains active."
         )

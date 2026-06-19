@@ -45,8 +45,7 @@ def setup_logging(log_level: str = "INFO"):
     # Silence noisy third-party loggers
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
     logging.getLogger("apscheduler").setLevel(logging.WARNING)
-    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
-    logging.getLogger("peewee").setLevel(logging.WARNING)
+logging.getLogger("peewee").setLevel(logging.WARNING)
 
 
 def get_logger(name: str) -> logging.Logger:

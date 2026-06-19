@@ -39,21 +39,24 @@ logger = logging.getLogger(__name__)
 REDIS_RS_RANKS_KEY = "nfo:rs_ranks"
 REDIS_RS_TOP10_KEY = "nfo:rs_top10"
 NIFTY_SYMBOL       = "NIFTY50"
-NIFTY_YFINANCE     = "^NSEI"   # yfinance ticker for NIFTY50
+NIFTY_50_TOKEN     = 256265   # Zerodha NSE instrument token for NIFTY 50 index (stable)
 
 # How many days of history to download for RS calculation
-_RS_HISTORY_DAYS = "30d"
-_RS_HISTORY_TTL  = 300   # refresh yfinance every 5 minutes
+_RS_HISTORY_DAYS = 32   # days of daily candles
+_RS_HISTORY_TTL  = 300  # refresh every 5 minutes
 
 
 class RSRanker:
     """
     Computes and caches Relative Strength scores for all F&O symbols.
-    Stateless across restarts (all data re-derived from yfinance).
+    Uses Zerodha kite.historical_data() for daily OHLC.
     """
 
-    def __init__(self, redis_client, symbols: List[str] = None, top_n: int = 10):
+    def __init__(self, redis_client, symbols: List[str] = None, top_n: int = 10,
+                 kite=None, instrument_tokens: Dict[str, int] = None):
         self._redis   = redis_client
+        self._kite    = kite
+        self._tokens  = instrument_tokens or {}
         self.symbols  = symbols or FNO_SYMBOLS
         self.top_n    = top_n
         self._cache: Dict[str, pd.DataFrame] = {}    # symbol → daily OHLC
@@ -137,39 +140,41 @@ class RSRanker:
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _load_all_history(self) -> None:
-        """Blocking — runs in thread executor. Downloads 30d daily candles for all symbols + NIFTY."""
-        import yfinance as yf
+        """Blocking — runs in thread executor. Downloads daily candles for all symbols + NIFTY."""
+        from datetime import timedelta
+        if not self._kite:
+            logger.warning("RSRanker: no kite instance — cannot fetch history.")
+            return
 
-        # NIFTY50 benchmark
+        to_date   = datetime.now()
+        from_date = to_date - timedelta(days=_RS_HISTORY_DAYS)
+
+        # NIFTY50 benchmark (token 256265 is the NIFTY 50 index on Zerodha NSE)
         try:
-            nifty_df = yf.download(
-                NIFTY_YFINANCE, period=_RS_HISTORY_DAYS, interval="1d",
-                auto_adjust=True, progress=False, threads=False,
+            records = self._kite.historical_data(
+                NIFTY_50_TOKEN, from_date, to_date, "day", continuous=False, oi=False
             )
-            if not nifty_df.empty:
-                self._nifty = nifty_df[["Close"]].rename(columns={"Close": "close"}).dropna()
+            if records:
+                df = pd.DataFrame(records)[["close"]].dropna().reset_index(drop=True)
+                self._nifty = df
         except Exception as e:
             logger.warning(f"RSRanker: NIFTY download failed: {e}")
 
-        # All F&O symbols in one batch call (much faster than per-symbol)
-        tickers = [f"{s}.NS" for s in self.symbols]
-        try:
-            raw = yf.download(
-                tickers, period=_RS_HISTORY_DAYS, interval="1d",
-                auto_adjust=True, progress=False, threads=True, group_by="ticker",
-            )
-            for sym, ticker in zip(self.symbols, tickers):
-                try:
-                    if isinstance(raw.columns, pd.MultiIndex):
-                        df = raw[ticker][["Close"]].rename(columns={"Close": "close"}).dropna()
-                    else:
-                        df = raw[["Close"]].rename(columns={"Close": "close"}).dropna()
+        # All F&O symbols — one kite call each
+        for sym in self.symbols:
+            token = self._tokens.get(sym)
+            if not token:
+                continue
+            try:
+                records = self._kite.historical_data(
+                    token, from_date, to_date, "day", continuous=False, oi=False
+                )
+                if records:
+                    df = pd.DataFrame(records)[["close"]].dropna().reset_index(drop=True)
                     if not df.empty:
                         self._cache[sym] = df
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.warning(f"RSRanker: batch download error: {e}")
+            except Exception as e:
+                logger.debug(f"RSRanker: {sym} download failed: {e}")
 
     def _compute_rs(self, symbol: str) -> Optional[float]:
         """

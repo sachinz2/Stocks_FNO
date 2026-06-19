@@ -457,8 +457,10 @@ elif page == "System Health":
                 st.success(f"**{label}**: {value}")
             elif value in ("zerodha_realtime",):
                 st.success(f"**{label}**: {value} (real-time WebSocket)")
-            elif value in ("yfinance", "yfinance_fallback"):
-                st.warning(f"**{label}**: {value} (15-min delay — Zerodha ticker offline?)")
+            elif value == "zerodha_rest":
+                st.success(f"**{label}**: {value} (REST poll, 5 s delay)")
+            elif value == "zerodha_historical":
+                st.info(f"**{label}**: {value} (historical OHLC, 60 s delay)")
             elif isinstance(value, str) and value.startswith("DOWN"):
                 st.error(f"**{label}**: {value}")
             elif isinstance(value, (int, float)):
