@@ -147,6 +147,10 @@ class LiveTradingEngine:
         await self._check_condor_exits(active_strategies)
         await self._check_open_option_exits(positions, active_strategies)
 
+        # Refresh risk state after exits so sector/position checks see current positions
+        positions = await self._safe_get_positions()
+        await self._refresh_risk_state(positions)
+
         # Entry signals
         for strategy_id, strategy in active_strategies.items():
             symbols = await self._get_active_symbols(strategy)
