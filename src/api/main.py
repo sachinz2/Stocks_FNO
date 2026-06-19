@@ -72,52 +72,67 @@ async def lifespan(app: FastAPI):
     stock_repo    = BaseRepository(Stock,    AsyncSessionLocal)
 
     # ── Broker: live vs paper ──────────────────────────────────────────────────
+    # Data source (Zerodha WebSocket + kite) is independent of trade execution.
+    # Paper mode keeps PaperBroker for orders but can still use Zerodha for
+    # real-time LTP, VIX, option quotes, and IV rank — giving realistic paper
+    # trading on live market data without risking real money.
     mode           = TradingMode(settings.TRADING_MODE)
     zerodha_ticker = None
     kite_instance  = None
 
-    if mode == TradingMode.LIVE:
+    # ── Always try Zerodha for market data if a token exists ──────────────────
+    raw_token = await redis_client.get("zerodha:access_token")
+    if raw_token and settings.ZERODHA_API_KEY and settings.ZERODHA_API_SECRET:
         from src.brokers.zerodha import ZerodhaBroker
+        access_token  = raw_token.strip()
+        _data_broker  = ZerodhaBroker.from_redis_token(
+            settings.ZERODHA_API_KEY, settings.ZERODHA_API_SECRET, access_token
+        )
+        kite_instance = _data_broker.kite
+        logger.info("Zerodha kite session ready for market data (VIX, option quotes).")
 
-        raw_token = await redis_client.get("zerodha:access_token")
+        try:
+            from src.market_data.zerodha_ticker import ZerodhaTicker
+            zerodha_ticker = ZerodhaTicker(
+                api_key=settings.ZERODHA_API_KEY,
+                access_token=access_token,
+                redis_url=settings.get_redis_url(),
+                symbols=set(FNO_SYMBOLS),
+            )
+            loop   = asyncio.get_event_loop()
+            mapped = await loop.run_in_executor(
+                None, zerodha_ticker.fetch_instrument_tokens
+            )
+            if mapped > 0:
+                zerodha_ticker.start()
+                logger.info(f"ZerodhaTicker: live stream started for {mapped} symbols.")
+            else:
+                logger.warning("ZerodhaTicker: no tokens mapped — skipping WebSocket stream.")
+                zerodha_ticker = None
+        except Exception as e:
+            logger.error(f"ZerodhaTicker init failed: {e}. Continuing without real-time LTP.")
+            zerodha_ticker = None
+    else:
+        logger.warning(
+            "No Zerodha access token in Redis — market data falls back to yfinance. "
+            "Run scripts/zerodha_auto_auth.py to fix this."
+        )
+
+    # ── Order execution broker ─────────────────────────────────────────────────
+    if mode == TradingMode.LIVE:
         if not raw_token:
             logger.critical(
-                "LIVE mode: Zerodha access token not in Redis. "
-                "Run the auth script first. Falling back to PaperBroker."
+                "LIVE mode: Zerodha access token missing. Falling back to PaperBroker."
             )
             broker = PaperBroker(initial_balance=settings.INITIAL_CAPITAL)
         else:
-            access_token  = raw_token.strip()
-            broker        = ZerodhaBroker.from_redis_token(
+            from src.brokers.zerodha import ZerodhaBroker
+            broker = ZerodhaBroker.from_redis_token(
                 settings.ZERODHA_API_KEY, settings.ZERODHA_API_SECRET, access_token
             )
-            kite_instance = broker.kite   # expose for VIX + option quotes
-            logger.info("LIVE mode: ZerodhaBroker authenticated from Redis token.")
-
-            # Start WebSocket LTP ticker (daemon thread, non-blocking)
-            try:
-                from src.market_data.zerodha_ticker import ZerodhaTicker
-                zerodha_ticker = ZerodhaTicker(
-                    api_key=settings.ZERODHA_API_KEY,
-                    access_token=access_token,
-                    redis_url=settings.get_redis_url(),
-                    symbols=set(FNO_SYMBOLS),
-                )
-                loop   = asyncio.get_event_loop()
-                mapped = await loop.run_in_executor(
-                    None, zerodha_ticker.fetch_instrument_tokens
-                )
-                if mapped > 0:
-                    zerodha_ticker.start()
-                    logger.info(f"ZerodhaTicker: live stream started for {mapped} symbols.")
-                else:
-                    logger.warning("ZerodhaTicker: no tokens mapped — skipping WebSocket stream.")
-                    zerodha_ticker = None
-            except Exception as e:
-                logger.error(f"ZerodhaTicker init failed: {e}. Continuing without real-time LTP.")
-                zerodha_ticker = None
+            logger.info("LIVE mode: ZerodhaBroker active — real orders will be placed.")
     else:
-        logger.info("PAPER mode: using PaperBroker.")
+        logger.info("PAPER mode: PaperBroker active — no real orders will be placed.")
         broker = PaperBroker(initial_balance=settings.INITIAL_CAPITAL)
 
     order_mgr     = OrderManager(broker, risk_mgr, order_repo, audit_repo)
