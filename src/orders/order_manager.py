@@ -96,14 +96,17 @@ class OrderManager:
             iv_rank=iv_rank,
             vix=vix,
         ):
-            await self.order_repo.update(db_order, {"order_status": "REJECTED_BY_RISK"})
+            # Capture the returned merged object so order_status is reflected correctly
+            db_order = await self.order_repo.update(db_order, {"order_status": "REJECTED_BY_RISK"})
             await self._audit("ORDER_REJECTED_RISK", {"order_id": db_order.id})
             return db_order
 
         # 3. Route to broker
         try:
             broker_order_id = await self.broker.place_order(symbol, side, quantity, price)
-            await self.order_repo.update(db_order, {
+            # Must capture the return — BaseRepository.update() returns a new merged
+            # SQLAlchemy object; the original db_order is detached and NOT updated in place.
+            db_order = await self.order_repo.update(db_order, {
                 "broker_order_id": broker_order_id,
                 "order_status":    "OPEN",
             })
@@ -116,7 +119,7 @@ class OrderManager:
             return db_order
         except Exception as e:
             logger.error(f"Broker order placement failed: {e}")
-            await self.order_repo.update(db_order, {"order_status": "FAILED"})
+            db_order = await self.order_repo.update(db_order, {"order_status": "FAILED"})
             await self._audit("ORDER_FAILED", {"order_id": db_order.id, "error": str(e)})
             return db_order
 

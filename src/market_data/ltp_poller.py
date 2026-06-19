@@ -129,21 +129,22 @@ class LTPPoller:
 
     @staticmethod
     def _fetch_yfinance(symbol: str) -> Optional[pd.DataFrame]:
-        """Blocking — runs in thread executor. Fetches 10 days of 5-min candles."""
-        try:
-            import yfinance as yf
-            df = yf.Ticker(f"{symbol}.NS").history(period="10d", interval="5m")
-            if df.empty:
-                logger.warning(f"yfinance: no data for {symbol}")
-                return None
-            df = df.rename(columns={
-                "Open": "open", "High": "high",
-                "Low": "low", "Close": "close", "Volume": "volume",
-            })
-            return df[["open", "high", "low", "close", "volume"]].dropna().reset_index(drop=True)
-        except Exception as exc:
-            logger.error(f"yfinance fetch failed for {symbol}: {exc}")
-            return None
+        """Blocking — runs in thread executor. Fetches 10 days of 5-min candles.
+        Tries NSE (.NS) first, falls back to BSE (.BO) if NSE returns no data."""
+        import yfinance as yf
+        for suffix in (".NS", ".BO"):
+            try:
+                df = yf.Ticker(f"{symbol}{suffix}").history(period="10d", interval="5m")
+                if not df.empty:
+                    df = df.rename(columns={
+                        "Open": "open", "High": "high",
+                        "Low": "low", "Close": "close", "Volume": "volume",
+                    })
+                    return df[["open", "high", "low", "close", "volume"]].dropna().reset_index(drop=True)
+            except Exception:
+                pass
+        logger.warning(f"yfinance: no data for {symbol} (tried .NS and .BO)")
+        return None
 
     @staticmethod
     def _enrich(symbol: str, df: pd.DataFrame, ltp: float) -> dict:
