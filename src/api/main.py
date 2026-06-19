@@ -4,10 +4,12 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from src.core.logger import setup_logging
 from src.api.middleware.error_handler import global_exception_handler
 from src.api.routers import (
     analytics_router,
     backtest_router,
+    logs_router,
     market_data_router,
     orders_router,
     positions_router,
@@ -23,6 +25,10 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Start trading engine and scheduler; tear down cleanly on shutdown."""
+    # Must be called here (after uvicorn sets up its own handlers) so the
+    # RotatingFileHandler is appended rather than skipped by the guard.
+    setup_logging()
+
     import asyncio
     import redis.asyncio as aioredis
     from apscheduler.triggers.interval import IntervalTrigger
@@ -287,6 +293,7 @@ app.include_router(signals_router.router,      prefix="/api/v1")
 app.include_router(risk_router.router,         prefix="/api/v1")
 app.include_router(backtest_router.router,     prefix="/api/v1")
 app.include_router(strategy_router.router,     prefix="/api/v1")
+app.include_router(logs_router.router,         prefix="/api/v1")
 
 if __name__ == "__main__":
     import uvicorn

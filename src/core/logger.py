@@ -17,13 +17,17 @@ def setup_logging(log_level: str = "INFO"):
     root = logging.getLogger()
     root.setLevel(level)
 
+    # Console handler — only if nothing is set up yet (uvicorn manages its own)
     if not root.handlers:
-        # Console handler
         console = logging.StreamHandler(sys.stdout)
         console.setFormatter(formatter)
         root.addHandler(console)
 
-        # Rotating file handler — 10 MB per file, keep 7 days of files
+    # File handler — always add if not already present.
+    # Checked separately because uvicorn sets its own console handler first,
+    # which causes `if not root.handlers` to skip the file handler entirely.
+    has_file_handler = any(isinstance(h, RotatingFileHandler) for h in root.handlers)
+    if not has_file_handler:
         try:
             os.makedirs(LOG_DIR, exist_ok=True)
             file_handler = RotatingFileHandler(
@@ -34,6 +38,7 @@ def setup_logging(log_level: str = "INFO"):
             )
             file_handler.setFormatter(formatter)
             root.addHandler(file_handler)
+            root.info(f"File logging active → {os.path.join(LOG_DIR, 'falcon.log')}")
         except Exception as e:
             root.warning(f"Could not set up file logging at {LOG_DIR}: {e}")
 

@@ -1,6 +1,7 @@
 from src.api.routers import (
     analytics_router,
     backtest_router,
+    logs_router,
     market_data_router,
     orders_router,
     positions_router,
@@ -13,6 +14,7 @@ from src.api.routers import (
 __all__ = [
     "analytics_router",
     "backtest_router",
+    "logs_router",
     "market_data_router",
     "orders_router",
     "positions_router",
