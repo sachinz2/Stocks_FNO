@@ -9,16 +9,20 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # Set work directory
 WORKDIR /app
 
-# Install system dependencies (Updated for MySQL)
+# Install system dependencies (MySQL + Playwright Chromium deps)
 RUN apt-get update && \
-    apt-get install -y build-essential pkg-config default-libmysqlclient-dev gcc && \
+    apt-get install -y build-essential pkg-config default-libmysqlclient-dev gcc \
+        libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libxcomposite1 \
+        libxdamage1 libxfixes3 libxrandr2 libgbm1 libxkbcommon0 libpango-1.0-0 \
+        libcairo2 libasound2 libx11-xcb1 && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
 COPY requirements.txt .
 RUN pip install --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir -r requirements.txt && \
+    playwright install chromium
 
 # Copy project
 COPY . /app/

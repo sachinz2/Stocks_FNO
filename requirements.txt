@@ -45,6 +45,8 @@ tenacity
 # fails the WebSocket upgrade with Zerodha's server (403 Forbidden)
 kiteconnect==4.2.0
 pyotp
+# Headless browser for Zerodha Connect authorize step (React SPA — needs real browser)
+playwright
 
 # Market data (historical OHLC — no WebSocket needed on Personal plan)
 yfinance

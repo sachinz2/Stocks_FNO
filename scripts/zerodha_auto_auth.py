@@ -47,6 +47,107 @@ def get_redis_client():
     )
 
 
+def _playwright_authorize(authorize_url: str, cookies) -> str:
+    """
+    Use headless Chromium to click the Allow button on Zerodha's Connect
+    authorization page (a React SPA that can't be driven by requests alone).
+
+    Transfers the authenticated session cookies from the requests.Session so
+    Playwright starts already logged in.  Intercepts every navigation to catch
+    the redirect to the callback URL which carries request_token.
+    """
+    import re as _re
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+    _tok = _re.compile(r'request_token=([A-Za-z0-9_-]{20,})')
+    found_token = []
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        ctx = browser.new_context()
+
+        # Transfer session cookies so the browser is already authenticated
+        for c in cookies:
+            try:
+                ctx.add_cookies([{
+                    "name":   c.name,
+                    "value":  c.value,
+                    "domain": c.domain or "kite.zerodha.com",
+                    "path":   c.path or "/",
+                }])
+            except Exception:
+                pass
+
+        page = ctx.new_page()
+
+        # Intercept every request — callback URL arrives as a navigation event
+        def _on_request(req):
+            if "request_token=" in req.url:
+                m = _tok.search(req.url)
+                if m:
+                    found_token.append(m.group(1))
+
+        page.on("request", _on_request)
+
+        logger.info(f"Playwright: navigating to {authorize_url[:80]}")
+        page.goto(authorize_url, wait_until="networkidle", timeout=20_000)
+
+        if found_token:
+            browser.close()
+            return found_token[0]
+
+        # Find and click the Authorize / Allow button
+        clicked = False
+        for selector in [
+            "button[type='submit']",
+            "button:has-text('Allow')",
+            "button:has-text('Authorize')",
+            "button:has-text('Confirm')",
+            ".button-blue",
+            "input[type='submit']",
+        ]:
+            try:
+                page.click(selector, timeout=4_000)
+                logger.info(f"Playwright: clicked '{selector}'")
+                clicked = True
+                break
+            except PWTimeout:
+                continue
+
+        if not clicked:
+            logger.warning("Playwright: no known authorize button found — dumping page text")
+            logger.warning(page.inner_text("body")[:800])
+            browser.close()
+            raise RuntimeError("Playwright: could not find Authorize button on connect/authorize page.")
+
+        # Wait for the callback redirect (up to 10 s)
+        try:
+            page.wait_for_function(
+                "() => window.location.href.includes('request_token=')",
+                timeout=10_000,
+            )
+            m = _tok.search(page.url)
+            if m:
+                found_token.append(m.group(1))
+        except PWTimeout:
+            pass
+
+        if not found_token:
+            # Last resort — check any intercepted request
+            logger.warning(f"Playwright final URL: {page.url}")
+
+        browser.close()
+
+    if not found_token:
+        raise RuntimeError("Playwright: request_token not found after clicking Authorize.")
+
+    logger.info(f"Playwright: request_token obtained: {found_token[0][:8]}...")
+    return found_token[0]
+
+
 def zerodha_auto_login() -> str:
     """Automated Zerodha OAuth login. Returns access_token."""
     from urllib.parse import parse_qs, urlparse
@@ -113,35 +214,29 @@ def zerodha_auto_login() -> str:
     request_token = None
     current_url = connect_page_url   # kite.zerodha.com/connect/login?api_key=...&v=3
 
-    for i in range(10):
+    # Follow redirects until we hit connect/authorize (the React SPA confirm page)
+    # or find request_token directly.
+    for i in range(6):
         r = session.get(current_url, allow_redirects=False)
         loc = r.headers.get("Location", "")
-        logger.info(
-            f"Redirect [{i}]: status={r.status_code} "
-            f"url={current_url[:80]} "
-            f"location={loc[:100] if loc else 'none'}"
-        )
+        logger.info(f"Redirect [{i}]: status={r.status_code} url={current_url[:80]} loc={loc[:80] if loc else 'none'}")
 
-        m = _token_re.search(loc) or _token_re.search(r.url) or _token_re.search(r.text[:500])
+        m = _token_re.search(loc) or _token_re.search(r.url)
         if m:
             request_token = m.group(1)
             break
 
         if loc:
-            # Handle relative redirect URLs
             if loc.startswith("/"):
                 parsed = urlparse(current_url)
                 loc = f"{parsed.scheme}://{parsed.netloc}{loc}"
             current_url = loc
-
         elif r.status_code == 200 and "connect/authorize" in current_url:
-            # Connect plan authorization page — dump full HTML so we can find
-            # the correct form action / API endpoint to call.
-            logger.info("Authorization page HTML (first 3000 chars):")
-            logger.info(r.text[:3000])
+            # React SPA — use Playwright to click the Allow button
+            logger.info("Authorize page reached — launching headless browser to confirm.")
+            request_token = _playwright_authorize(current_url, session.cookies)
             break
         else:
-            logger.info(f"Redirect [{i}]: no Location header. Body: {r.text[:300]}")
             break
 
     if not request_token:
