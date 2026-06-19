@@ -494,6 +494,54 @@ async def run_robustness_check(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/pnl-summary")
+async def get_pnl_summary():
+    """
+    Combined PnL summary for the dashboard.
+
+    Today PnL  = closed trades exited today + open position unrealized PnL
+    Total PnL  = all closed trade PnL (all time) + open position unrealized PnL
+    """
+    try:
+        from datetime import date as _date
+        from src.database.models.position import Position
+        from src.database.repositories.base import BaseRepository
+
+        today_str = _date.today().isoformat()
+
+        # ── Closed trades ────────────────────────────────────────────────────
+        all_closed = await _get_closed_trades()
+
+        total_realized = round(sum(float(t.pnl or 0) for t in all_closed), 2)
+
+        today_closed = [
+            t for t in all_closed
+            if t.exit_time and t.exit_time.date().isoformat() == today_str
+        ]
+        today_realized = round(sum(float(t.pnl or 0) for t in today_closed), 2)
+
+        # ── Open positions (unrealized) ──────────────────────────────────────
+        pos_repo = BaseRepository(Position, AsyncSessionLocal)
+        positions = await pos_repo.get_all()
+        open_positions = [p for p in positions if p.deleted_at is None and p.quantity != 0]
+        total_unrealized = round(sum(float(p.unrealized_pnl or 0) for p in open_positions), 2)
+
+        return {
+            "today_realized":   today_realized,
+            "today_unrealized": total_unrealized,
+            "today_pnl":        round(today_realized + total_unrealized, 2),
+            "total_realized":   total_realized,
+            "total_unrealized": total_unrealized,
+            "total_pnl":        round(total_realized + total_unrealized, 2),
+            "closed_trades_today":  len(today_closed),
+            "closed_trades_total":  len(all_closed),
+            "open_positions":       len(open_positions),
+        }
+    except Exception as e:
+        logger.error(f"Analytics /pnl-summary error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
 @router.get("/walk-forward-results")
 async def get_walk_forward_results(
     strategy_name: Optional[str] = Query(None),

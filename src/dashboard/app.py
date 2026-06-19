@@ -80,11 +80,12 @@ def pnl_color(val: float) -> str:
 if page == "Home":
     st.title("Dashboard Overview")
 
-    positions = fetch("positions") or []
-    orders = fetch("orders") or []
-    health = fetch("health") or {}
+    positions  = fetch("positions") or []
+    orders     = fetch("orders") or []
+    health     = fetch("health") or {}
+    pnl_data   = fetch("analytics/pnl-summary") or {}
 
-    net_pnl = sum(p.get("unrealized_pnl", 0) + p.get("realized_pnl", 0) for p in positions)
+    net_pnl = pnl_data.get("total_pnl", 0)
     open_positions = len([p for p in positions if p.get("quantity", 0) != 0])
     capital_deployed = sum(abs(p.get("quantity", 0)) * p.get("avg_price", 0) for p in positions)
     capital_pct = (capital_deployed / INITIAL_CAPITAL) * 100 if capital_deployed else 0
@@ -292,21 +293,40 @@ elif page == "Strategies":
 elif page == "Risk & PnL":
     st.title("Risk Engine & PnL Report")
 
-    positions = fetch("positions") or []
-    orders    = fetch("orders") or []
+    positions  = fetch("positions") or []
+    orders     = fetch("orders") or []
+    pnl_data   = fetch("analytics/pnl-summary") or {}
 
-    total_unrealized = sum(p.get("unrealized_pnl", 0) for p in positions)
-    total_realized   = sum(p.get("realized_pnl", 0) for p in positions)
-    net_pnl = total_unrealized + total_realized
+    today_pnl       = pnl_data.get("today_pnl", 0)
+    today_realized  = pnl_data.get("today_realized", 0)
+    today_unrealized= pnl_data.get("today_unrealized", 0)
+    total_pnl       = pnl_data.get("total_pnl", 0)
+    total_realized  = pnl_data.get("total_realized", 0)
+    total_unrealized= pnl_data.get("total_unrealized", 0)
     capital = INITIAL_CAPITAL
     max_loss_limit = capital * MAX_DAILY_LOSS_PCT
 
-    st.subheader("PnL Summary")
+    # ── Today's PnL ─────────────────────────────────────────────────────────
+    st.subheader("Today's PnL")
+    c1, c2, c3 = st.columns(3)
+    today_pct = f"{(today_pnl / capital) * 100:.2f}%" if capital else "0%"
+    c1.metric("Today's Net PnL",   fmt_inr(today_pnl),       today_pct)
+    c2.metric("Today Realized",    fmt_inr(today_realized),
+              f"{pnl_data.get('closed_trades_today', 0)} closed trades")
+    c3.metric("Unrealized (Open)", fmt_inr(today_unrealized),
+              f"{pnl_data.get('open_positions', 0)} open positions")
+
+    st.markdown("---")
+
+    # ── All-time PnL ─────────────────────────────────────────────────────────
+    st.subheader("All-Time PnL")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Net PnL", fmt_inr(net_pnl), f"{(net_pnl / capital) * 100:.2f}%")
-    c2.metric("Unrealized", fmt_inr(total_unrealized))
-    c3.metric("Realized",   fmt_inr(total_realized))
-    c4.metric("Capital",    fmt_inr(capital))
+    total_pct = f"{(total_pnl / capital) * 100:.2f}%" if capital else "0%"
+    c1.metric("Total Net PnL",  fmt_inr(total_pnl),       total_pct)
+    c2.metric("Total Realized", fmt_inr(total_realized),
+              f"{pnl_data.get('closed_trades_total', 0)} closed trades")
+    c3.metric("Unrealized",     fmt_inr(total_unrealized))
+    c4.metric("Capital",        fmt_inr(capital))
 
     st.markdown("---")
     st.subheader("Risk Limits")
@@ -318,7 +338,7 @@ elif page == "Risk & PnL":
     pos_ratio = min(1.0, open_pos / MAX_OPEN_POSITIONS) if MAX_OPEN_POSITIONS > 0 else 0.0
     col1.progress(pos_ratio, text=f"Open Positions: {open_pos} / {MAX_OPEN_POSITIONS}")
 
-    loss_used = abs(min(net_pnl, 0))
+    loss_used = abs(min(today_pnl, 0))
     loss_ratio = min(1.0, loss_used / max_loss_limit) if max_loss_limit > 0 else 0.0
     col2.progress(
         loss_ratio,
