@@ -56,8 +56,11 @@ async def lifespan(app: FastAPI):
     from src.paper_trading.paper_broker import PaperBroker
     from src.portfolio.portfolio_manager import PortfolioManager
     from src.risk.risk_manager import RiskManager
+    from src.risk.strategy_monitor import StrategyMonitor
+    from src.risk.portfolio_analyzer import PortfolioAnalyzer
     import src.strategies  # noqa: F401 — triggers @StrategyRegistry.register() decorators
     from src.strategies.base import StrategyRegistry
+    from src.database.models.trade_journal import TradeJournal
 
     PHASE1_SYMBOLS = list(FNO_SYMBOLS[:5])
 
@@ -162,7 +165,15 @@ async def lifespan(app: FastAPI):
         "profit_close_pct": 0.25, "stop_loss_multiple": 2.0, "min_dte": 7,
     })
 
-    engine = LiveTradingEngine(broker, risk_mgr, order_mgr, portfolio_mgr, notifier)
+    trade_journal_repo = BaseRepository(TradeJournal, AsyncSessionLocal)
+    strategy_monitor   = StrategyMonitor(trade_journal_repo)
+    portfolio_analyzer = PortfolioAnalyzer()
+
+    engine = LiveTradingEngine(
+        broker, risk_mgr, order_mgr, portfolio_mgr, notifier,
+        strategy_monitor=strategy_monitor,
+        portfolio_analyzer=portfolio_analyzer,
+    )
     engine.attach_redis(redis_client)
     engine.set_symbols(PHASE1_SYMBOLS)
     if kite_instance:

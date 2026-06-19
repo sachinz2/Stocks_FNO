@@ -14,7 +14,9 @@ class Order(Base):
     symbol = Column(String(30), nullable=False)
     side = Column(String(10), nullable=False) # BUY, SELL
     quantity = Column(Integer, nullable=False)
-    price = Column(Numeric(18, 4))
+    price = Column(Numeric(18, 4))            # expected price (engine estimate)
+    fill_price = Column(Numeric(18, 4), nullable=True)  # actual fill after bid-ask slippage
+    slippage = Column(Numeric(18, 4), nullable=True)    # fill_price - price (per unit)
     order_status = Column(String(50)) # OPEN, COMPLETED, CANCELLED, REJECTED
     created_at = Column(TIMESTAMP, nullable=False, server_default=text('CURRENT_TIMESTAMP'))
     updated_at = Column(TIMESTAMP, nullable=False, server_default=text('CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP'))

@@ -5,7 +5,7 @@ No auth required (internal network, read-only).
 import logging
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from sqlalchemy import select, func, text
 
 from src.database.connection import AsyncSessionLocal
@@ -27,22 +27,28 @@ async def _get_closed_trades() -> List[TradeJournal]:
 
 def _trade_to_dict(t: TradeJournal) -> Dict[str, Any]:
     return {
-        "id":             t.id,
-        "strategy":       t.strategy_name,
-        "underlying":     t.underlying,
-        "structure_type": t.structure_type,
-        "entry_time":     t.entry_time.isoformat() if t.entry_time else None,
-        "exit_time":      t.exit_time.isoformat()  if t.exit_time  else None,
-        "entry_price":    float(t.entry_price or 0),
-        "exit_price":     float(t.exit_price  or 0),
-        "quantity":       t.quantity,
-        "pnl":            float(t.pnl or 0),
-        "hold_days":      t.hold_days,
-        "exit_reason":    t.exit_reason,
-        "regime_atr_pct": t.regime_atr_pct,
-        "iv_rank":        t.iv_rank,
-        "vix_at_entry":   t.vix_at_entry,
-        "slippage":       t.slippage,
+        "id":                 t.id,
+        "strategy":           t.strategy_name,
+        "underlying":         t.underlying,
+        "structure_type":     t.structure_type,
+        "entry_time":         t.entry_time.isoformat() if t.entry_time else None,
+        "exit_time":          t.exit_time.isoformat()  if t.exit_time  else None,
+        "entry_price":        float(t.entry_price or 0),
+        "exit_price":         float(t.exit_price  or 0),
+        "quantity":           t.quantity,
+        "pnl":                float(t.pnl or 0),
+        "hold_days":          t.hold_days,
+        "exit_reason":        t.exit_reason,
+        "regime_atr_pct":     t.regime_atr_pct,
+        "iv_rank":            t.iv_rank,
+        "vix_at_entry":       t.vix_at_entry,
+        "day_of_week":        t.day_of_week,
+        "hour_of_day":        t.hour_of_day,
+        "atr_at_exit":        t.atr_at_exit,
+        "vix_at_exit":        t.vix_at_exit,
+        "regime_label":       t.regime_label,
+        "total_slippage_pts": t.total_slippage_pts,
+        "slippage":           t.slippage,
     }
 
 
@@ -157,4 +163,163 @@ async def get_slippage_stats():
         }
     except Exception as e:
         logger.error(f"Analytics /slippage error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get("/strategy-performance")
+async def get_strategy_performance():
+    """
+    Deep rolling performance stats per strategy.
+
+    Returns for each strategy:
+      - Rolling profit factor (last 30 closed trades)
+      - Win rate / avg PnL / max drawdown
+      - PnL breakdown by day-of-week and hour-of-day (edge discovery)
+      - PnL breakdown by regime (TRENDING / RANGE_BOUND / VOLATILE)
+      - Average total slippage per trade
+      - is_active flag (paused or running)
+    """
+    try:
+        from src.strategies.base import StrategyRegistry
+        trades = await _get_closed_trades()
+        if not trades:
+            return {"message": "No closed trades yet.", "strategies": {}}
+
+        by_strategy: Dict[str, List[TradeJournal]] = {}
+        for t in trades:
+            by_strategy.setdefault(t.strategy_name, []).append(t)
+
+        active_map = {sid: inst.is_active for sid, inst in StrategyRegistry.get_active_strategies().items()}
+
+        result = {}
+        for strat, strat_trades in by_strategy.items():
+            pnls  = [float(t.pnl or 0) for t in strat_trades]
+            wins  = sum(1 for p in pnls if p > 0)
+            gross_wins   = sum(p for p in pnls if p > 0)
+            gross_losses = abs(sum(p for p in pnls if p < 0))
+            pf = round(gross_wins / gross_losses, 3) if gross_losses > 0 else None
+
+            # Rolling window PF (last 30)
+            recent_pnls = pnls[:30]
+            rw_wins   = sum(p for p in recent_pnls if p > 0)
+            rw_losses = abs(sum(p for p in recent_pnls if p < 0))
+            rolling_pf = round(rw_wins / rw_losses, 3) if rw_losses > 0 else None
+
+            # Max drawdown
+            cumulative, peak, max_dd = 0.0, 0.0, 0.0
+            for p in reversed(pnls):
+                cumulative += p
+                if cumulative > peak:
+                    peak = cumulative
+                dd = peak - cumulative
+                if dd > max_dd:
+                    max_dd = dd
+
+            # Day-of-week breakdown (0=Mon … 4=Fri)
+            by_dow: Dict[int, List[float]] = {}
+            for t in strat_trades:
+                if t.day_of_week is not None:
+                    by_dow.setdefault(t.day_of_week, []).append(float(t.pnl or 0))
+            dow_stats = {
+                str(dow): {
+                    "count": len(ps),
+                    "avg_pnl": round(sum(ps) / len(ps), 2),
+                    "win_rate": round(sum(1 for p in ps if p > 0) / len(ps), 3),
+                }
+                for dow, ps in sorted(by_dow.items())
+            }
+
+            # Hour-of-day breakdown
+            by_hour: Dict[int, List[float]] = {}
+            for t in strat_trades:
+                if t.hour_of_day is not None:
+                    by_hour.setdefault(t.hour_of_day, []).append(float(t.pnl or 0))
+            hour_stats = {
+                str(hr): {
+                    "count": len(ps),
+                    "avg_pnl": round(sum(ps) / len(ps), 2),
+                    "win_rate": round(sum(1 for p in ps if p > 0) / len(ps), 3),
+                }
+                for hr, ps in sorted(by_hour.items())
+            }
+
+            # Regime breakdown
+            by_regime: Dict[str, List[float]] = {}
+            for t in strat_trades:
+                lbl = t.regime_label or "UNKNOWN"
+                by_regime.setdefault(lbl, []).append(float(t.pnl or 0))
+            regime_stats = {
+                lbl: {
+                    "count": len(ps),
+                    "avg_pnl": round(sum(ps) / len(ps), 2),
+                    "win_rate": round(sum(1 for p in ps if p > 0) / len(ps), 3),
+                }
+                for lbl, ps in sorted(by_regime.items())
+            }
+
+            # Avg slippage
+            slips = [t.total_slippage_pts for t in strat_trades if t.total_slippage_pts is not None]
+            avg_slip = round(sum(slips) / len(slips), 4) if slips else None
+
+            result[strat] = {
+                "is_active":         active_map.get(strat, None),
+                "trade_count":       len(strat_trades),
+                "win_rate":          round(wins / len(strat_trades), 3),
+                "avg_pnl":           round(sum(pnls) / len(pnls), 2) if pnls else 0,
+                "total_pnl":         round(sum(pnls), 2),
+                "max_win":           round(max(pnls), 2) if pnls else 0,
+                "max_loss":          round(min(pnls), 2) if pnls else 0,
+                "max_drawdown":      round(max_dd, 2),
+                "profit_factor":     pf,
+                "rolling_pf_30":     rolling_pf,
+                "avg_slippage_pts":  avg_slip,
+                "by_day_of_week":    dow_stats,
+                "by_hour_of_day":    hour_stats,
+                "by_regime":         regime_stats,
+            }
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Analytics /strategy-performance error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get("/strategy-health")
+async def get_strategy_health(request: Request):
+    """
+    Live health snapshot from StrategyMonitor.
+
+    Shows rolling PF, rolling drawdown, expected drawdown thresholds,
+    and whether each strategy has been auto-paused and why.
+    """
+    try:
+        engine = getattr(request.app.state, "trading_engine", None)
+        if not engine or not engine.strategy_monitor:
+            return {"message": "StrategyMonitor not initialised."}
+        return await engine.strategy_monitor.get_report()
+    except Exception as e:
+        logger.error(f"Analytics /strategy-health error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get("/portfolio-exposure")
+async def get_portfolio_exposure(request: Request):
+    """
+    Live portfolio correlation and sector concentration analysis.
+
+    Returns:
+      - sector_exposure: notional and count per sector
+      - beta_exposure: per-symbol beta and weighted portfolio beta
+      - correlation_flags: pairs of open positions with r > 0.85
+      - concentration_alerts: sectors over the MAX_SECTOR_POSITIONS / notional limit
+    """
+    try:
+        engine = getattr(request.app.state, "trading_engine", None)
+        if not engine or not engine.portfolio_analyzer:
+            return {"message": "PortfolioAnalyzer not initialised."}
+        positions = await engine.broker.get_positions()
+        return engine.portfolio_analyzer.get_report(positions)
+    except Exception as e:
+        logger.error(f"Analytics /portfolio-exposure error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")

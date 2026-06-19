@@ -45,32 +45,73 @@ class PaperBroker(AbstractBroker):
         stamp = turnover * 0.00003 if side == "BUY" else 0.0
         return round(brokerage + stt + exchange + gst + sebi + stamp, 2)
 
+    @staticmethod
+    def _bid_ask_half_spread(price: float) -> float:
+        """
+        Estimate half the bid-ask spread for an NSE F&O option.
+        Options are quoted at the mid; we assume fills happen at:
+          BUY  → ask = mid + half_spread  (we pay more)
+          SELL → bid = mid - half_spread  (we receive less)
+
+        Thresholds are calibrated to typical NSE F&O microstructure:
+          ≤ ₹0.30  → illiquid deep-OTM hedge legs; spread can be ≥ 40% of mid
+          ≤ ₹0.75  → cheap near-expiry / far-OTM legs; 20% half-spread
+          ≤ ₹2.00  → standard hedge legs; 10% half-spread
+          ≤ ₹5.00  → short legs close to ATM; 6% half-spread
+          > ₹5.00  → liquid ITM / high-premium legs; 3% half-spread
+        """
+        if price <= 0.30:
+            return price * 0.40
+        if price <= 0.75:
+            return price * 0.20
+        if price <= 2.00:
+            return price * 0.10
+        if price <= 5.00:
+            return price * 0.06
+        return price * 0.03
+
     async def place_order(self, symbol: str, side: str, quantity: int, price: float) -> str:
-        """Simulates instant execution at the requested price, deducting realistic fees."""
-        order_id = str(uuid.uuid4())
+        """
+        Simulates instant execution with realistic bid-ask slippage and fees.
+
+        Expected price (engine estimate) → fill price (bid or ask):
+          BUY  fills at the ask: price + half_spread  (worse for buyer)
+          SELL fills at the bid: price - half_spread  (worse for seller)
+        """
+        order_id  = str(uuid.uuid4())
         timestamp = datetime.utcnow()
-        cost = quantity * price
-        fees = self._transaction_fees(side, quantity, price)
+
+        # Apply bid-ask slippage
+        half_spread  = self._bid_ask_half_spread(price)
+        fill_price   = price + half_spread if side == "BUY" else price - half_spread
+        fill_price   = round(max(fill_price, 0.05), 2)   # floor at NSE min tick
+        slippage_ppu = round(fill_price - price, 4)      # per-unit (negative for SELL)
+
+        cost = quantity * fill_price
+        fees = self._transaction_fees(side, quantity, fill_price)
 
         if side == "BUY" and self.balance < cost + fees:
             logger.warning(
-                f"PaperBroker: Insufficient funds to BUY {quantity} {symbol} @ {price}. "
-                f"Balance: ₹{self.balance:.2f}, Required: ₹{cost + fees:.2f} (incl. fees ₹{fees:.2f})"
+                f"PaperBroker: Insufficient funds to BUY {quantity} {symbol} "
+                f"@ fill ₹{fill_price:.2f} (expected ₹{price:.2f}). "
+                f"Balance: ₹{self.balance:.2f}, Required: ₹{cost + fees:.2f}"
             )
             raise ValueError("Insufficient virtual funds.")
 
         order = {
-            "order_id": order_id,
-            "symbol": symbol,
-            "side": side,
-            "quantity": quantity,
-            "price": price,
-            "fees": fees,
-            "status": "COMPLETED",
-            "timestamp": timestamp,
+            "order_id":     order_id,
+            "symbol":       symbol,
+            "side":         side,
+            "quantity":     quantity,
+            "price":        price,          # engine's expected price
+            "fill_price":   fill_price,     # actual execution price (incl. slippage)
+            "slippage":     slippage_ppu,   # fill_price - price per unit
+            "fees":         fees,
+            "status":       "COMPLETED",
+            "timestamp":    timestamp,
         }
         self._orders[order_id] = order
-        self._update_position(symbol, side, quantity, price)
+        self._update_position(symbol, side, quantity, fill_price)
 
         if side == "BUY":
             self.balance -= cost + fees
@@ -78,8 +119,11 @@ class PaperBroker(AbstractBroker):
             self.balance += cost - fees
 
         self.total_fees_paid += fees
+        slip_pct = abs(slippage_ppu / price * 100) if price > 0 else 0
         logger.info(
-            f"PaperBroker: {side} {quantity} {symbol} @ ₹{price:.2f} | "
+            f"PaperBroker: {side} {quantity} {symbol} "
+            f"@ expected ₹{price:.2f} → fill ₹{fill_price:.2f} "
+            f"(slip {slippage_ppu:+.3f}, {slip_pct:.1f}%) | "
             f"Fees: ₹{fees:.2f} | Balance: ₹{self.balance:.2f}"
         )
         return order_id

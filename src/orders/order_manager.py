@@ -186,7 +186,7 @@ class OrderManager:
     # ── Sync ─────────────────────────────────────────────────────────────────
 
     async def sync_orders(self) -> None:
-        """Reconcile OPEN orders with live broker status."""
+        """Reconcile OPEN orders with live broker status, including fill_price and slippage."""
         open_db_orders = await self.order_repo.filter(order_status="OPEN")
         if not open_db_orders:
             return
@@ -198,10 +198,26 @@ class OrderManager:
                 if not db_order.broker_order_id:
                     continue
                 b_order = broker_map.get(str(db_order.broker_order_id))
-                if b_order:
-                    new_status = self._map_broker_status(b_order.get("status", "OPEN"))
-                    if new_status != db_order.order_status:
-                        await self.order_repo.update(db_order, {"order_status": new_status})
+                if not b_order:
+                    continue
+
+                new_status = self._map_broker_status(b_order.get("status", "OPEN"))
+                updates: dict = {}
+                if new_status != db_order.order_status:
+                    updates["order_status"] = new_status
+
+                # Persist fill_price and slippage when the broker provides them.
+                # PaperBroker includes these; ZerodhaBroker can expose average_price.
+                b_fill = b_order.get("fill_price") or b_order.get("average_price")
+                if b_fill and db_order.fill_price is None:
+                    b_fill = float(b_fill)
+                    updates["fill_price"] = b_fill
+                    if db_order.price:
+                        updates["slippage"] = round(b_fill - float(db_order.price), 4)
+
+                if updates:
+                    await self.order_repo.update(db_order, updates)
+                    if "order_status" in updates:
                         await self._audit("ORDER_STATUS_SYNC", {
                             "order_id": db_order.id, "new_status": new_status,
                         })

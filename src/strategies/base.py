@@ -71,3 +71,25 @@ class StrategyRegistry:
     @classmethod
     def get_active_strategies(cls) -> Dict[str, StrategyBase]:
         return cls._active_instances
+
+    @classmethod
+    def pause_strategy(cls, instance_id: str) -> bool:
+        """Disable a running strategy (blocks new entries; exits still run)."""
+        instance = cls._active_instances.get(instance_id)
+        if not instance:
+            logger.warning(f"pause_strategy: {instance_id} not found")
+            return False
+        instance.is_active = False
+        logger.warning(f"Strategy PAUSED by monitor: {instance_id}")
+        return True
+
+    @classmethod
+    def resume_strategy(cls, instance_id: str) -> bool:
+        """Re-enable a previously paused strategy."""
+        instance = cls._active_instances.get(instance_id)
+        if not instance:
+            logger.warning(f"resume_strategy: {instance_id} not found")
+            return False
+        instance.is_active = True
+        logger.info(f"Strategy RESUMED: {instance_id}")
+        return True

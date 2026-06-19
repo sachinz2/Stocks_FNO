@@ -28,6 +28,8 @@ from src.core.utils import (
 from src.orders.order_manager import OrderManager
 from src.portfolio.portfolio_manager import PortfolioManager
 from src.risk.risk_manager import RiskManager
+from src.risk.strategy_monitor import StrategyMonitor
+from src.risk.portfolio_analyzer import PortfolioAnalyzer
 from src.strategies.base import StrategyRegistry
 
 logger = logging.getLogger(__name__)
@@ -53,12 +55,16 @@ class LiveTradingEngine:
         order_manager: OrderManager,
         portfolio_manager: PortfolioManager,
         notifier: Any = None,
+        strategy_monitor: Optional[StrategyMonitor] = None,
+        portfolio_analyzer: Optional[PortfolioAnalyzer] = None,
     ):
-        self.broker            = broker
-        self.risk_manager      = risk_manager
-        self.order_manager     = order_manager
-        self.portfolio_manager = portfolio_manager
-        self.notifier          = notifier
+        self.broker             = broker
+        self.risk_manager       = risk_manager
+        self.order_manager      = order_manager
+        self.portfolio_manager  = portfolio_manager
+        self.notifier           = notifier
+        self.strategy_monitor   = strategy_monitor
+        self.portfolio_analyzer = portfolio_analyzer
         self.mode              = TradingMode(settings.TRADING_MODE)
         self.is_running        = False
         self._symbols: List[str] = []
@@ -151,7 +157,19 @@ class LiveTradingEngine:
         positions = await self._safe_get_positions()
         await self._refresh_risk_state(positions)
 
-        # Entry signals
+        # Auto-kill check: pause strategies that show statistical deterioration
+        if self.strategy_monitor:
+            await self.strategy_monitor.evaluate_all()
+
+        # Log correlation / sector concentration warnings (non-blocking)
+        if self.portfolio_analyzer and positions:
+            report = self.portfolio_analyzer.get_report(positions)
+            for flag in report.get("correlation_flags", []):
+                logger.warning(f"PortfolioAnalyzer: {flag}")
+            for alert in report.get("concentration_alerts", []):
+                logger.warning(f"PortfolioAnalyzer: {alert}")
+
+        # Entry signals — only for strategies that are still is_active
         for strategy_id, strategy in active_strategies.items():
             symbols = await self._get_active_symbols(strategy)
             for symbol in symbols:
@@ -907,19 +925,22 @@ class LiveTradingEngine:
                 float(market_data.get("atr14", 0))
                 / max(float(market_data.get("close", 1)), 1) * 100
             )
-            ema_sp = float(market_data.get("ema_spread_pct", 0))
+            ema_sp   = float(market_data.get("ema_spread_pct", 0))
+            entry_ts = now_ist().replace(tzinfo=None)
             row = await repo.create({
                 "strategy_name":  strategy,
                 "underlying":     underlying,
                 "structure_type": structure_type,
                 "contracts":      json.dumps(contracts),
-                "entry_time":     now_ist().replace(tzinfo=None),
+                "entry_time":     entry_ts,
                 "entry_price":    entry_price,
                 "quantity":       quantity,
                 "regime_atr_pct": round(atr_pct, 4),
                 "ema_spread_pct": round(ema_sp, 4),
                 "iv_rank":        iv_rank,
                 "vix_at_entry":   vix,
+                "day_of_week":    entry_ts.weekday(),   # 0=Mon … 4=Fri
+                "hour_of_day":    entry_ts.hour,        # IST hour
             })
             return row.id
         except Exception as e:
@@ -932,6 +953,8 @@ class LiveTradingEngine:
         exit_price: float,
         pnl: float,
         exit_reason: str,
+        market_data: Optional[Dict] = None,
+        total_slippage_pts: Optional[float] = None,
     ) -> None:
         if not journal_id:
             return
@@ -945,13 +968,36 @@ class LiveTradingEngine:
                 return
             exit_t    = now_ist().replace(tzinfo=None)
             hold_days = (exit_t - row.entry_time.replace(tzinfo=None)).days if row.entry_time else 0
-            await repo.update(row, {
-                "exit_time":   exit_t,
-                "exit_price":  exit_price,
-                "pnl":         round(pnl, 2),
-                "exit_reason": exit_reason[:200],
-                "hold_days":   hold_days,
-            })
+
+            md = market_data or {}
+            atr_exit = md.get("atr14") or md.get("atr_at_exit")
+            vix_exit = md.get("vix") or md.get("vix_at_exit")
+
+            # Derive regime label from ATR%: same heuristic as LTPPoller
+            regime: Optional[str] = None
+            atr_pct = md.get("atr_pct")
+            if atr_pct is not None:
+                atr_pct = float(atr_pct)
+                if atr_pct >= 2.5:
+                    regime = "VOLATILE"
+                elif atr_pct >= 1.2:
+                    regime = "TRENDING"
+                else:
+                    regime = "RANGE_BOUND"
+
+            updates = {
+                "exit_time":          exit_t,
+                "exit_price":         exit_price,
+                "pnl":                round(pnl, 2),
+                "exit_reason":        exit_reason[:200],
+                "hold_days":          hold_days,
+                "atr_at_exit":        float(atr_exit) if atr_exit is not None else None,
+                "vix_at_exit":        float(vix_exit) if vix_exit is not None else None,
+                "regime_label":       regime,
+                "total_slippage_pts": round(total_slippage_pts, 4) if total_slippage_pts is not None else None,
+                "slippage":           round(total_slippage_pts, 4) if total_slippage_pts is not None else None,
+            }
+            await repo.update(row, updates)
         except Exception as e:
             logger.error(f"TradeJournal close log failed: {e}")
 
