@@ -65,45 +65,23 @@ def zerodha_auto_login() -> str:
     session = requests.Session()
     session.headers.update(HEADERS)
 
-    # Step 1: Establish Connect OAuth session.
-    # kite.trade/connect/login → 302 → kite.zerodha.com/connect/login?...&sess_id=xxx
-    # sess_id lives in the FIRST redirect Location header, not the final URL.
-    # Use allow_redirects=False to capture it before it gets followed away.
+    # Step 1: Visit connect login to establish session cookie.
+    # Zerodha now tracks the OAuth session via cookie, not sess_id in the URL.
+    # We just need to hit the page so the server sets the session cookie on our
+    # requests.Session object before we POST credentials.
+    connect_page_url = f"https://kite.zerodha.com/connect/login?api_key={api_key}&v=3"
     init_resp = session.get(
         f"https://kite.trade/connect/login?api_key={api_key}&v=3",
-        allow_redirects=False,
+        allow_redirects=True,
     )
-    connect_page_url = init_resp.headers.get("Location", "")
-
-    # If no redirect at all, fall back to scanning history (shouldn't normally happen)
-    if not connect_page_url:
-        # Try following and scanning history
-        init_resp2 = session.get(
-            f"https://kite.trade/connect/login?api_key={api_key}&v=3",
-            allow_redirects=True,
-        )
-        for r in init_resp2.history:
-            loc = r.headers.get("Location", "")
-            if "sess_id" in loc:
-                connect_page_url = loc
-                break
-        if not connect_page_url:
-            connect_page_url = init_resp2.url
-
-    page_params = parse_qs(urlparse(connect_page_url).query)
-    sess_id = page_params.get("sess_id", [""])[0]
 
     # Edge case: already authenticated from a previous run
-    if not sess_id:
-        if "request_token=" in connect_page_url:
-            tok = page_params.get("request_token", [""])[0]
+    if "request_token=" in init_resp.url:
+        params = parse_qs(urlparse(init_resp.url).query)
+        tok = params.get("request_token", [""])[0]
+        if tok:
             sd = kite.generate_session(tok, api_secret=api_secret)
             return sd["access_token"]
-        raise RuntimeError(
-            f"No sess_id found. Connect page URL: {connect_page_url}\n"
-            f"Check: (1) API key is correct, (2) app is Connect plan, "
-            f"(3) redirect URL in Zerodha console is set."
-        )
 
     logger.info("Connect session established.")
 
@@ -129,11 +107,11 @@ def zerodha_auto_login() -> str:
         raise RuntimeError(f"TOTP failed: {resp.json().get('message')}")
     logger.info("TOTP accepted.")
 
-    # Step 4: Follow redirect chain to get request_token
-    # connect/login → 302 → connect/finish → 302 → localhost?request_token=...
+    # Step 4: Re-visit the connect login URL — now that we're authenticated via
+    # cookie, Zerodha will redirect us through connect/finish → callback?request_token=...
     _token_re = re.compile(r'request_token=([A-Za-z0-9_-]{20,})')
     request_token = None
-    current_url = connect_page_url
+    current_url = connect_page_url   # kite.zerodha.com/connect/login?api_key=...&v=3
 
     for _ in range(8):
         r = session.get(current_url, allow_redirects=False)
