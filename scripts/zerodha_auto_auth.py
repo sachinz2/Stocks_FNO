@@ -113,7 +113,7 @@ def zerodha_auto_login() -> str:
     request_token = None
     current_url = connect_page_url   # kite.zerodha.com/connect/login?api_key=...&v=3
 
-    for i in range(8):
+    for i in range(10):
         r = session.get(current_url, allow_redirects=False)
         loc = r.headers.get("Location", "")
         logger.info(
@@ -130,10 +130,33 @@ def zerodha_auto_login() -> str:
         if loc:
             # Handle relative redirect URLs
             if loc.startswith("/"):
-                from urllib.parse import urlparse as _up
-                parsed = _up(current_url)
+                parsed = urlparse(current_url)
                 loc = f"{parsed.scheme}://{parsed.netloc}{loc}"
             current_url = loc
+
+        elif r.status_code == 200 and "connect/authorize" in current_url:
+            # Connect plan authorization page — user must explicitly approve.
+            # POST to the same URL to confirm; response should redirect to callback
+            # with request_token.
+            logger.info("Authorization confirmation page detected — POSTing to approve.")
+            r2 = session.post(current_url, allow_redirects=False)
+            loc2 = r2.headers.get("Location", "")
+            logger.info(
+                f"Authorize POST: status={r2.status_code} "
+                f"location={loc2[:100] if loc2 else 'none'}"
+            )
+            m2 = _token_re.search(loc2) or _token_re.search(r2.text[:500])
+            if m2:
+                request_token = m2.group(1)
+                break
+            if loc2:
+                if loc2.startswith("/"):
+                    parsed = urlparse(current_url)
+                    loc2 = f"{parsed.scheme}://{parsed.netloc}{loc2}"
+                current_url = loc2
+            else:
+                logger.info(f"Authorize POST body: {r2.text[:400]}")
+                break
         else:
             logger.info(f"Redirect [{i}]: no Location header. Body: {r.text[:300]}")
             break
