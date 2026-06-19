@@ -65,12 +65,31 @@ def zerodha_auto_login() -> str:
     session = requests.Session()
     session.headers.update(HEADERS)
 
-    # Step 1: Establish Connect OAuth session (must be before login)
+    # Step 1: Establish Connect OAuth session.
+    # kite.trade/connect/login → 302 → kite.zerodha.com/connect/login?...&sess_id=xxx
+    # sess_id lives in the FIRST redirect Location header, not the final URL.
+    # Use allow_redirects=False to capture it before it gets followed away.
     init_resp = session.get(
         f"https://kite.trade/connect/login?api_key={api_key}&v=3",
-        allow_redirects=True,
+        allow_redirects=False,
     )
-    connect_page_url = init_resp.url
+    connect_page_url = init_resp.headers.get("Location", "")
+
+    # If no redirect at all, fall back to scanning history (shouldn't normally happen)
+    if not connect_page_url:
+        # Try following and scanning history
+        init_resp2 = session.get(
+            f"https://kite.trade/connect/login?api_key={api_key}&v=3",
+            allow_redirects=True,
+        )
+        for r in init_resp2.history:
+            loc = r.headers.get("Location", "")
+            if "sess_id" in loc:
+                connect_page_url = loc
+                break
+        if not connect_page_url:
+            connect_page_url = init_resp2.url
+
     page_params = parse_qs(urlparse(connect_page_url).query)
     sess_id = page_params.get("sess_id", [""])[0]
 
@@ -80,7 +99,11 @@ def zerodha_auto_login() -> str:
             tok = page_params.get("request_token", [""])[0]
             sd = kite.generate_session(tok, api_secret=api_secret)
             return sd["access_token"]
-        raise RuntimeError(f"No sess_id in connect page URL: {connect_page_url}")
+        raise RuntimeError(
+            f"No sess_id found. Connect page URL: {connect_page_url}\n"
+            f"Check: (1) API key is correct, (2) app is Connect plan, "
+            f"(3) redirect URL in Zerodha console is set."
+        )
 
     logger.info("Connect session established.")
 
