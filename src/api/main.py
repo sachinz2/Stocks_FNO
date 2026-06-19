@@ -172,10 +172,26 @@ async def lifespan(app: FastAPI):
         ltp_poller.poll,
         IntervalTrigger(seconds=60),
         id="ltp_poll",
-        name="LTP Poller",
+        name="LTP Poller (yfinance indicators)",
         replace_existing=True,
         misfire_grace_time=30,
     )
+
+    # ── Zerodha REST LTP refresh (near-real-time, runs every 5 s) ─────────────
+    # Used when kite_instance is available but WebSocket ticker is unavailable.
+    # One kite.ltp() call fetches all 40 symbols — no WebSocket needed.
+    if kite_instance and not zerodha_ticker:
+        from src.market_data.zerodha_ltp_poller import ZerodhaLTPPoller
+        zerodha_ltp_poller = ZerodhaLTPPoller(kite_instance, redis_client, list(FNO_SYMBOLS))
+        scheduler.add_job(
+            zerodha_ltp_poller.refresh_ltp,
+            IntervalTrigger(seconds=5),
+            id="zerodha_ltp_rest",
+            name="Zerodha LTP REST poller",
+            replace_existing=True,
+            misfire_grace_time=3,
+        )
+        logger.info("ZerodhaLTPPoller: REST-based LTP refresh every 5 s (WebSocket fallback).")
     start_scheduler()
 
     app.state.trading_engine = engine
@@ -247,11 +263,16 @@ async def health_check():
         redis_status = f"DOWN: {e}"
 
     overall = "UP" if db_status == "UP" and redis_status == "UP" else "DEGRADED"
+    source_label = {
+        "zerodha_realtime": "Zerodha WebSocket (real-time)",
+        "zerodha_rest":     "Zerodha REST poll (5 s)",
+        "yfinance":         "yfinance (60 s delay)",
+    }.get(ltp_source, ltp_source)
     return {
         "status":     overall,
         "database":   db_status,
         "redis":      redis_status,
-        "ltp_source": ltp_source,
+        "ltp_source": source_label,
     }
 
 
