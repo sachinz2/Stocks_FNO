@@ -41,7 +41,7 @@ class PaperBroker(AbstractBroker):
         stt = turnover * 0.001 if side == "SELL" else 0.0
         exchange = turnover * 0.00053
         gst = (brokerage + exchange) * 0.18
-        sebi = turnover * 0.00000001 * 10_000_000  # ₹10 per crore
+        sebi = turnover * 0.000001  # ₹10 per crore = ₹10 / 1,00,00,000
         stamp = turnover * 0.00003 if side == "BUY" else 0.0
         return round(brokerage + stt + exchange + gst + sebi + stamp, 2)
 

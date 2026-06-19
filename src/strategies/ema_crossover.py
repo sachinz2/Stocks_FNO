@@ -16,18 +16,23 @@ class EMACrossoverStrategy(StrategyBase):
     def initialize(self):
         self.fast_period = self.parameters.get("fast_period", 20)
         self.slow_period = self.parameters.get("slow_period", 50)
-        # Options-specific exit thresholds (applied to option premium, not underlying price)
-        self.stop_loss_pct = self.parameters.get("stop_loss_pct", 0.50)      # exit if premium drops 50%
-        self.target_pct = self.parameters.get("target_pct", 1.0)              # exit if premium doubles (2×)
-        self.trailing_stop_pct = self.parameters.get("trailing_stop_pct", 0.25)  # exit if 25% below peak
+        self.stop_loss_pct = self.parameters.get("stop_loss_pct", 0.50)
+        self.target_pct = self.parameters.get("target_pct", 1.0)
+        self.trailing_stop_pct = self.parameters.get("trailing_stop_pct", 0.25)
 
-        # State tracking for crossover detection
+        # Signal confirmation: crossover must persist for this many consecutive cycles
+        # before a BUY/SELL fires. Prevents rapid BUY↔SELL alternation when EMAs are close.
+        self.signal_confirm_bars: int = self.parameters.get("signal_confirm_bars", 2)
+
         self.prev_fast_ema: Optional[float] = None
         self.prev_slow_ema: Optional[float] = None
+        self._pending_signal: Optional[str] = None
+        self._pending_count: int = 0
 
         logger.info(
             f"Initialized EMA Crossover '{self.name}' ({self.fast_period}/{self.slow_period}) | "
-            f"SL={self.stop_loss_pct:.0%} TP={self.target_pct:.0%} Trail={self.trailing_stop_pct:.0%}"
+            f"SL={self.stop_loss_pct:.0%} TP={self.target_pct:.0%} Trail={self.trailing_stop_pct:.0%} "
+            f"ConfirmBars={self.signal_confirm_bars}"
         )
 
     def generate_signal(self, data: Dict[str, Any]) -> Optional[str]:
@@ -45,18 +50,40 @@ class EMACrossoverStrategy(StrategyBase):
 
         signal = "HOLD"
 
-        # Check for crossover if we have previous state
         if self.prev_fast_ema is not None and self.prev_slow_ema is not None:
-            # Bullish Cross: Fast was below Slow, now Fast is above Slow
             if self.prev_fast_ema <= self.prev_slow_ema and fast_ema > slow_ema:
-                logger.info(f"[{self.name}] BUY Signal Generated. Bullish Crossover detected.")
-                signal = "BUY"
-            # Bearish Cross: Fast was above Slow, now Fast is below Slow
+                raw = "BUY"
             elif self.prev_fast_ema >= self.prev_slow_ema and fast_ema < slow_ema:
-                logger.info(f"[{self.name}] SELL Signal Generated. Bearish Crossover detected.")
-                signal = "SELL"
+                raw = "SELL"
+            else:
+                raw = None
 
-        # Update state for next tick
+            if raw is not None:
+                if raw == self._pending_signal:
+                    self._pending_count += 1
+                else:
+                    # New crossover direction — reset confirmation counter
+                    self._pending_signal = raw
+                    self._pending_count = 1
+
+                if self._pending_count >= self.signal_confirm_bars:
+                    logger.info(
+                        f"[{self.name}] {raw} Signal confirmed after "
+                        f"{self._pending_count} bars — {raw}ing."
+                    )
+                    signal = raw
+                    self._pending_signal = None
+                    self._pending_count = 0
+                else:
+                    logger.debug(
+                        f"[{self.name}] {raw} crossover pending "
+                        f"({self._pending_count}/{self.signal_confirm_bars} bars)"
+                    )
+            else:
+                # No crossover this bar — clear any pending signal
+                self._pending_signal = None
+                self._pending_count = 0
+
         self.prev_fast_ema = fast_ema
         self.prev_slow_ema = slow_ema
 

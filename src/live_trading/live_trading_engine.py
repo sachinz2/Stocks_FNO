@@ -409,6 +409,13 @@ class LiveTradingEngine:
         interval = FNO_STRIKE_INTERVALS.get(symbol, 50)
         expiry   = get_near_month_expiry()
         dte      = (expiry - now_ist().replace(tzinfo=None)).days
+        min_dte  = getattr(strategy, "min_dte", 7)
+        if dte < min_dte:
+            logger.info(
+                f"[CreditSpread] {symbol} skipped — DTE={dte} < min_dte={min_dte}, too close to expiry"
+            )
+            return
+
         lot_size = await self._get_lot_size(symbol)
         atr      = float(market_data.get("atr14", underlying_price * 0.01))
         iv_rank  = await self._get_iv_rank(symbol, underlying_price, atr, dte)
@@ -639,6 +646,13 @@ class LiveTradingEngine:
         interval = FNO_STRIKE_INTERVALS.get(symbol, 50)
         expiry   = get_near_month_expiry()
         dte      = (expiry - now_ist().replace(tzinfo=None)).days
+        min_dte  = getattr(strategy, "min_dte", 7)
+        if dte < min_dte:
+            logger.info(
+                f"[IronCondor] {symbol} skipped — DTE={dte} < min_dte={min_dte}, too close to expiry"
+            )
+            return
+
         lot_size = await self._get_lot_size(symbol)
         atr      = float(market_data.get("atr14", underlying_price * 0.01))
         iv_rank  = await self._get_iv_rank(symbol, underlying_price, atr, dte)

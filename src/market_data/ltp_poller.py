@@ -114,16 +114,19 @@ class LTPPoller:
             logger.info("Iron condor pool: no eligible symbols today (all have directional EMA or high ATR%)")
 
     async def _get_history(self, symbol: str, loop) -> Optional[pd.DataFrame]:
-        """Return yfinance OHLC, refreshing cache every 5 minutes."""
+        """Return yfinance OHLC, refreshing cache every 5 minutes.
+        On fetch failure the timestamp is still updated so the symbol is not
+        retried every 60 s — it waits the full HISTORY_REFRESH_SECONDS before retry."""
         now = datetime.now()
         last = self._history_loaded_at.get(symbol)
         stale = last is None or (now - last).total_seconds() > HISTORY_REFRESH_SECONDS
 
         if stale:
             df = await loop.run_in_executor(None, self._fetch_yfinance, symbol)
+            # Always stamp the time — prevents retrying a failing symbol every 60 s
+            self._history_loaded_at[symbol] = now
             if df is not None and not df.empty:
                 self._history[symbol] = df
-                self._history_loaded_at[symbol] = now
 
         return self._history.get(symbol)
 
