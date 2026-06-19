@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     # Dashboard
     DASHBOARD_PASSWORD: str = "falcon123"
 
+    # Logs API
+    LOGS_API_TOKEN: str = ""   # set in .env — empty = logs endpoint disabled
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "case_sensitive": True}
 
     def get_database_url(self) -> str:

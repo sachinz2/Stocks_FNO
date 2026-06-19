@@ -1,14 +1,19 @@
 """
-Log management endpoints.
+Log management endpoints — protected by a secret token.
 
-GET  /api/v1/logs/              — list available log files with sizes
-GET  /api/v1/logs/tail?n=200   — last N lines of the active log (default 200)
-GET  /api/v1/logs/download/{filename} — download a log file
+Pass the token as a query parameter:
+  GET  /api/v1/logs/?token=<LOGS_API_TOKEN>
+  GET  /api/v1/logs/tail?n=200&token=<LOGS_API_TOKEN>
+  GET  /api/v1/logs/download/falcon.log?token=<LOGS_API_TOKEN>
+
+Set LOGS_API_TOKEN in .env on the server. If the env var is empty or
+unset the endpoints return 403 so the server is safe by default.
 """
 import os
+import secrets
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse, PlainTextResponse
 
 LOG_DIR = Path(os.environ.get("LOG_DIR", "/app/logs"))
@@ -16,9 +21,18 @@ LOG_DIR = Path(os.environ.get("LOG_DIR", "/app/logs"))
 router = APIRouter(prefix="/logs", tags=["logs"])
 
 
+def _check_token(token: str) -> None:
+    expected = os.environ.get("LOGS_API_TOKEN", "")
+    if not expected:
+        raise HTTPException(status_code=403, detail="Logs API is disabled. Set LOGS_API_TOKEN in .env to enable.")
+    if not secrets.compare_digest(token, expected):
+        raise HTTPException(status_code=403, detail="Invalid token.")
+
+
 @router.get("/")
-async def list_logs():
+async def list_logs(token: str = Query(..., description="LOGS_API_TOKEN from .env")):
     """List all log files with their sizes."""
+    _check_token(token)
     if not LOG_DIR.exists():
         return {"log_dir": str(LOG_DIR), "files": []}
 
@@ -35,8 +49,12 @@ async def list_logs():
 
 
 @router.get("/tail", response_class=PlainTextResponse)
-async def tail_log(n: int = 200):
+async def tail_log(
+    token: str = Query(..., description="LOGS_API_TOKEN from .env"),
+    n: int = Query(200, description="Number of lines to return"),
+):
     """Return the last N lines of falcon.log."""
+    _check_token(token)
     log_file = LOG_DIR / "falcon.log"
     if not log_file.exists():
         raise HTTPException(status_code=404, detail="Log file not found. Has the API written any logs yet?")
@@ -48,16 +66,21 @@ async def tail_log(n: int = 200):
 
 
 @router.get("/download/{filename}")
-async def download_log(filename: str):
+async def download_log(
+    filename: str,
+    token: str = Query(..., description="LOGS_API_TOKEN from .env"),
+):
     """Download a specific log file."""
+    _check_token(token)
+
     # Prevent path traversal
     safe_name = Path(filename).name
     if safe_name != filename or not safe_name.startswith("falcon"):
-        raise HTTPException(status_code=400, detail="Invalid filename")
+        raise HTTPException(status_code=400, detail="Invalid filename.")
 
     log_file = LOG_DIR / safe_name
     if not log_file.exists():
-        raise HTTPException(status_code=404, detail=f"{filename} not found")
+        raise HTTPException(status_code=404, detail=f"{filename} not found.")
 
     return FileResponse(
         path=str(log_file),
