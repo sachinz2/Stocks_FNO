@@ -24,8 +24,8 @@ from typing import Dict, Optional, Set
 
 logger = logging.getLogger(__name__)
 
-MAX_RECONNECT_ATTEMPTS = 50
-RECONNECT_DELAY_SECONDS = 5
+MAX_RECONNECT_ATTEMPTS = 5   # 403 is an auth error; stop fast rather than spamming
+RECONNECT_DELAY_SECONDS = 10
 
 
 class ZerodhaTicker:
@@ -165,6 +165,14 @@ class ZerodhaTicker:
 
     def _on_error(self, ws, code, reason) -> None:
         logger.error(f"ZerodhaTicker: error (code={code}): {reason}")
+        if code == 1006 and "403" in str(reason):
+            logger.critical(
+                "ZerodhaTicker: 403 Forbidden — WebSocket auth rejected by Zerodha. "
+                "Check: (1) app streaming permissions on kite.trade, "
+                "(2) re-run zerodha_auto_auth.py to refresh the access token."
+            )
+            if self._ticker:
+                self._ticker.close()   # stop reconnecting — 403 won't fix itself
 
     def _on_reconnect(self, ws, attempts_count) -> None:
         logger.info(f"ZerodhaTicker: reconnecting (attempt {attempts_count})...")
