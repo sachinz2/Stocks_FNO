@@ -178,9 +178,11 @@ async def lifespan(app: FastAPI):
     )
 
     # ── Zerodha REST LTP refresh (near-real-time, runs every 5 s) ─────────────
-    # Used when kite_instance is available but WebSocket ticker is unavailable.
-    # One kite.ltp() call fetches all 40 symbols — no WebSocket needed.
-    if kite_instance and not zerodha_ticker:
+    # Always run when kite_instance is available — provides a reliable 5-second
+    # LTP update via REST as a complement to (or fallback for) WebSocket.
+    # zerodha_ticker may be set but fail in its background thread (403), so we
+    # cannot use `not zerodha_ticker` as the condition here.
+    if kite_instance:
         from src.market_data.zerodha_ltp_poller import ZerodhaLTPPoller
         zerodha_ltp_poller = ZerodhaLTPPoller(kite_instance, redis_client, list(FNO_SYMBOLS))
         scheduler.add_job(
