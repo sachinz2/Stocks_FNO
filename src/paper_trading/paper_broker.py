@@ -11,24 +11,51 @@ class PaperBroker(AbstractBroker):
     """
     Virtual Broker for Paper Trading.
     Simulates order execution, maintains virtual balance and positions.
+    Deducts realistic Zerodha F&O fees on every order so paper P&L
+    reflects actual take-home rather than gross premium.
     """
 
     def __init__(self, initial_balance: float = 300000.0):
         self.balance = initial_balance
+        self.total_fees_paid = 0.0
         self._orders: Dict[str, Dict[str, Any]] = {}
         self._positions: Dict[str, Dict[str, Any]] = {}
         logger.info(f"Initialized PaperBroker with virtual balance: ₹{self.balance}")
 
+    @staticmethod
+    def _transaction_fees(side: str, quantity: int, price: float) -> float:
+        """
+        Estimate Zerodha F&O fees per order (options).
+        Brokerage dominates at ₹20 flat — the rest are small for low-premium trades.
+
+        Zerodha F&O fee structure:
+          Brokerage        : ₹20 flat per order (or 0.03% turnover, whichever lower)
+          STT              : 0.1% of premium turnover on SELL side only
+          Exchange charges : 0.053% of premium turnover (NSE)
+          GST              : 18% on (brokerage + exchange charges)
+          SEBI charges     : ₹10 per crore of turnover
+          Stamp duty       : 0.003% of turnover on BUY side only
+        """
+        turnover = quantity * price
+        brokerage = min(20.0, turnover * 0.0003)
+        stt = turnover * 0.001 if side == "SELL" else 0.0
+        exchange = turnover * 0.00053
+        gst = (brokerage + exchange) * 0.18
+        sebi = turnover * 0.00000001 * 10_000_000  # ₹10 per crore
+        stamp = turnover * 0.00003 if side == "BUY" else 0.0
+        return round(brokerage + stt + exchange + gst + sebi + stamp, 2)
+
     async def place_order(self, symbol: str, side: str, quantity: int, price: float) -> str:
-        """Simulates instant execution at the requested price."""
+        """Simulates instant execution at the requested price, deducting realistic fees."""
         order_id = str(uuid.uuid4())
         timestamp = datetime.utcnow()
         cost = quantity * price
+        fees = self._transaction_fees(side, quantity, price)
 
-        if side == "BUY" and self.balance < cost:
+        if side == "BUY" and self.balance < cost + fees:
             logger.warning(
                 f"PaperBroker: Insufficient funds to BUY {quantity} {symbol} @ {price}. "
-                f"Balance: ₹{self.balance:.2f}, Required: ₹{cost:.2f}"
+                f"Balance: ₹{self.balance:.2f}, Required: ₹{cost + fees:.2f} (incl. fees ₹{fees:.2f})"
             )
             raise ValueError("Insufficient virtual funds.")
 
@@ -38,6 +65,7 @@ class PaperBroker(AbstractBroker):
             "side": side,
             "quantity": quantity,
             "price": price,
+            "fees": fees,
             "status": "COMPLETED",
             "timestamp": timestamp,
         }
@@ -45,13 +73,14 @@ class PaperBroker(AbstractBroker):
         self._update_position(symbol, side, quantity, price)
 
         if side == "BUY":
-            self.balance -= cost
+            self.balance -= cost + fees
         else:
-            self.balance += cost
+            self.balance += cost - fees
 
+        self.total_fees_paid += fees
         logger.info(
             f"PaperBroker: {side} {quantity} {symbol} @ ₹{price:.2f} | "
-            f"Balance: ₹{self.balance:.2f}"
+            f"Fees: ₹{fees:.2f} | Balance: ₹{self.balance:.2f}"
         )
         return order_id
 

@@ -459,6 +459,18 @@ class LiveTradingEngine:
             atr=atr, dte=dte,
         )
         net_credit = round(short_p - long_p, 2)
+        total_credit = net_credit * lot_size
+
+        # Fee viability check — 2 entry + 2 exit orders × ₹20 brokerage = ₹80 minimum fees.
+        # Require at least ₹350 net credit so fees (₹80–120 round trip) don't eat the trade.
+        MIN_SPREAD_NET_CREDIT = 350.0
+        if total_credit < MIN_SPREAD_NET_CREDIT:
+            logger.info(
+                f"[CreditSpread] {symbol} skipped — net credit ₹{total_credit:.0f} "
+                f"too low (min ₹{MIN_SPREAD_NET_CREDIT:.0f} after fees). "
+                f"SELL@{short_p} BUY@{long_p} x {lot_size} lots."
+            )
+            return
 
         # Margin check — in live mode verify we have enough balance before placing
         spread_width   = abs(short_strike - long_strike)
@@ -472,7 +484,7 @@ class LiveTradingEngine:
 
         logger.info(
             f"[CreditSpread] {spread_type} {symbol} | SELL {short_contract}@Rs{short_p} "
-            f"BUY {long_contract}@Rs{long_p} credit=Rs{net_credit}x{lot_size} "
+            f"BUY {long_contract}@Rs{long_p} credit=Rs{net_credit}x{lot_size}=Rs{total_credit:.0f} "
             f"DTE={dte} IV_rank={iv_rank} PCR={oi_data['pcr'] if oi_data else 'N/A'}"
         )
 
@@ -653,6 +665,18 @@ class LiveTradingEngine:
         call_short_p = estimate_option_premium(atr, dte, otm_intervals=1)
         call_long_p  = estimate_option_premium(atr, dte, otm_intervals=3)
         net_credit   = round((put_short_p - put_long_p) + (call_short_p - call_long_p), 2)
+        total_credit = net_credit * lot_size
+
+        # Fee viability check — 4 entry + 4 exit orders × ₹20 brokerage = ₹160 minimum fees.
+        # Require at least ₹600 net credit so fees (₹160–250 round trip) don't eat the trade.
+        MIN_CONDOR_NET_CREDIT = 600.0
+        if total_credit < MIN_CONDOR_NET_CREDIT:
+            logger.info(
+                f"[IronCondor] {symbol} skipped — net credit ₹{total_credit:.0f} "
+                f"too low (min ₹{MIN_CONDOR_NET_CREDIT:.0f} after fees). "
+                f"PS@{put_short_p} PL@{put_long_p} CS@{call_short_p} CL@{call_long_p} x {lot_size} lots."
+            )
+            return
 
         # Margin check — condor requires margin for the wider of the two wings
         wing_spread     = abs(put_short_strike - put_long_strike)
