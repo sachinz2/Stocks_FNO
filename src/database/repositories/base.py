@@ -53,11 +53,18 @@ class BaseRepository(Generic[ModelType]):
             result = await session.execute(select(self.model))
             return result.scalars().all()
 
-    async def filter(self, **kwargs) -> List[ModelType]:
+    async def filter(self, limit: Optional[int] = None, order_by: Optional[str] = None, **kwargs) -> List[ModelType]:
         async with self._factory() as session:
-            result = await session.execute(
-                select(self.model).filter_by(**kwargs)
-            )
+            stmt = select(self.model).filter_by(**kwargs)
+            if order_by:
+                col_name, _, direction = order_by.partition(" ")
+                col = getattr(self.model, col_name, None)
+                if col is not None:
+                    from sqlalchemy import desc, asc
+                    stmt = stmt.order_by(desc(col) if direction.upper() == "DESC" else asc(col))
+            if limit is not None:
+                stmt = stmt.limit(limit)
+            result = await session.execute(stmt)
             return result.scalars().all()
 
     async def paginate(self, skip: int = 0, limit: int = 100) -> List[ModelType]:

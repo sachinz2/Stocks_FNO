@@ -20,6 +20,9 @@ POLL_INTERVAL_SECONDS = 5
 _NSE_PREFIX = "NSE:"
 
 
+REDIS_TOKEN_KEY = "zerodha:access_token"
+
+
 class ZerodhaLTPPoller:
     """
     Near-real-time LTP refresh using kite.ltp() REST API.
@@ -32,6 +35,24 @@ class ZerodhaLTPPoller:
         self._instruments = [f"{_NSE_PREFIX}{s}" for s in symbols]
         self._symbol_map  = {f"{_NSE_PREFIX}{s}": s for s in symbols}
         self._permission_ok = True   # set False on first "Insufficient permission"
+        self._last_known_token: Optional[str] = None
+
+    async def _try_refresh_token(self) -> bool:
+        """
+        On auth failure, check Redis for a newer token (written by the 8:30 scheduler job).
+        If a different token is found, update the shared kite instance so all callers benefit.
+        Returns True if the token was refreshed.
+        """
+        try:
+            token = await self._redis.get(REDIS_TOKEN_KEY)
+            if token and token != self._last_known_token:
+                self._kite.set_access_token(token)
+                self._last_known_token = token
+                logger.info("ZerodhaLTPPoller: access token refreshed from Redis — resuming.")
+                return True
+        except Exception as e:
+            logger.debug(f"ZerodhaLTPPoller: token refresh check failed: {e}")
+        return False
 
     async def refresh_ltp(self) -> int:
         """
@@ -55,6 +76,11 @@ class ZerodhaLTPPoller:
                     "ZerodhaLTPPoller: kite.ltp() not permitted on this Zerodha plan. "
                     "LTP REST polling disabled — check Zerodha plan permissions."
                 )
+            elif "api_key" in err.lower() or "access_token" in err.lower():
+                # Token expired — silently try Redis; log only if no fresh token yet
+                refreshed = await self._try_refresh_token()
+                if not refreshed:
+                    logger.warning(f"ZerodhaLTPPoller: kite.ltp() failed: {e}")
             else:
                 logger.warning(f"ZerodhaLTPPoller: kite.ltp() failed: {e}")
             return 0
