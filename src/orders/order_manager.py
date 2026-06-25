@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional
@@ -14,6 +15,8 @@ logger = logging.getLogger(__name__)
 ORDER_EXPIRY_MINUTES = 5
 # Price adjustment (%) when retrying a stale limit order
 RETRY_PRICE_ADJUSTMENT = 0.015   # 1.5% toward the market
+# Maximum seconds to wait for any single broker API call
+BROKER_TIMEOUT_SEC = 15
 
 
 class OrderManager:
@@ -105,7 +108,10 @@ class OrderManager:
 
         # 3. Route to broker
         try:
-            broker_order_id = await self.broker.place_order(symbol, side, quantity, price)
+            broker_order_id = await asyncio.wait_for(
+                self.broker.place_order(symbol, side, quantity, price),
+                timeout=BROKER_TIMEOUT_SEC,
+            )
             # Must capture the return — BaseRepository.update() returns a new merged
             # SQLAlchemy object; the original db_order is detached and NOT updated in place.
             db_order = await self.order_repo.update(db_order, {
@@ -118,6 +124,11 @@ class OrderManager:
             # Track per-strategy deployed capital for BUY legs
             if side == "BUY" and strategy_name:
                 self.risk_manager.add_deployed_capital(strategy_name, quantity * price)
+            return db_order
+        except asyncio.TimeoutError:
+            logger.error(f"Broker order timed out after {BROKER_TIMEOUT_SEC}s: {side} {quantity} {symbol}")
+            db_order = await self.order_repo.update(db_order, {"order_status": "FAILED"})
+            await self._audit("ORDER_TIMEOUT", {"order_id": db_order.id, "symbol": symbol})
             return db_order
         except Exception as e:
             logger.error(f"Broker order placement failed: {e}")
@@ -152,8 +163,11 @@ class OrderManager:
             )
             try:
                 if order.broker_order_id:
-                    await self.broker.cancel_order(order.broker_order_id)
-            except Exception as e:
+                    await asyncio.wait_for(
+                        self.broker.cancel_order(order.broker_order_id),
+                        timeout=BROKER_TIMEOUT_SEC,
+                    )
+            except (asyncio.TimeoutError, Exception) as e:
                 logger.error(f"Broker cancel failed for order {order.id}: {e}")
 
             await self.order_repo.update(order, {
@@ -193,7 +207,9 @@ class OrderManager:
         if not open_db_orders:
             return
         try:
-            broker_orders  = await self.broker.get_orders()
+            broker_orders  = await asyncio.wait_for(
+                self.broker.get_orders(), timeout=BROKER_TIMEOUT_SEC
+            )
             broker_map     = {str(o.get("order_id", "")): o for o in broker_orders}
 
             for db_order in open_db_orders:

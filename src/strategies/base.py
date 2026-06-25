@@ -31,6 +31,11 @@ class StrategyBase(ABC):
         """Cleanup resources on shutdown."""
         pass
 
+    def on_pause(self) -> None:
+        """Called whenever this strategy is paused (regime change or auto-kill).
+        Override to clear any transient state that should not survive a pause."""
+        pass
+
 class StrategyRegistry:
     """Registry for dynamic strategy loading and management."""
     _strategies: Dict[str, type] = {}
@@ -82,6 +87,7 @@ class StrategyRegistry:
             return False
         instance.is_active = False
         instance.paused_reason = reason
+        instance.on_pause()
         logger.warning(f"Strategy PAUSED: {instance_id} — {reason or 'manual'}")
         return True
 

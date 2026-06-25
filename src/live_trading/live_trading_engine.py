@@ -332,6 +332,57 @@ class LiveTradingEngine:
         except Exception as e:
             logger.error(f"Failed to restore engine state: {e}")
 
+        # After Redis restore, cross-check broker positions for orphans
+        await self._reconcile_broker_positions()
+
+    async def _reconcile_broker_positions(self) -> None:
+        """
+        Compare broker's actual positions against engine's in-memory state.
+        Logs CRITICAL warnings for any option contracts held by the broker that
+        the engine is not tracking — these will NOT be auto-exited.
+        Called once at startup after _restore_state().
+        """
+        try:
+            broker_positions = await self.broker.get_positions()
+        except Exception as e:
+            logger.warning(f"Reconcile: could not fetch broker positions: {e}")
+            return
+
+        if not broker_positions:
+            return
+
+        # Collect every contract the engine is currently tracking
+        tracked: set = set()
+        for s in self._active_spreads.values():
+            tracked.update([s.get("short_contract"), s.get("long_contract")])
+        for c in self._active_condors.values():
+            tracked.update([
+                c.get("put_short_contract"), c.get("put_long_contract"),
+                c.get("call_short_contract"), c.get("call_long_contract"),
+            ])
+        for contract in self._single_leg_journals:
+            tracked.add(contract)
+        tracked.discard(None)
+
+        orphans = [
+            p for p in broker_positions
+            if p.get("symbol") not in tracked and p.get("quantity", 0) != 0
+        ]
+        if not orphans:
+            logger.info("Reconcile: all broker positions are accounted for in engine state.")
+            return
+
+        logger.critical(
+            f"RECONCILE WARNING: {len(orphans)} broker position(s) are NOT tracked "
+            "by the engine — likely from a crash or flushed Redis. "
+            "These positions will NOT trigger auto-exit. Close them manually."
+        )
+        for p in orphans:
+            logger.critical(
+                f"  ORPHANED: {p.get('symbol')} qty={p.get('quantity')} "
+                f"avg_price={p.get('avg_price', '?')}"
+            )
+
     # ── Market price refresh ──────────────────────────────────────────────────
 
     async def _refresh_all_position_market_prices(
@@ -1296,7 +1347,9 @@ class LiveTradingEngine:
             if not row:
                 return
             exit_t    = now_ist().replace(tzinfo=None)
-            hold_days = (exit_t - row.entry_time.replace(tzinfo=None)).days if row.entry_time else 0
+            hold_days = (
+                exit_t.date() - row.entry_time.replace(tzinfo=None).date()
+            ).days if row.entry_time else 0
 
             md = market_data or {}
             atr_exit = md.get("atr14") or md.get("atr_at_exit")
@@ -1334,27 +1387,51 @@ class LiveTradingEngine:
 
     async def _check_available_margin(self, required: float) -> bool:
         """
-        Verify broker has enough margin before placing a multi-leg structure.
-        In paper mode this always returns True.
-        In live mode it calls kite.margins() — fails-open on API error
-        (better to attempt the trade than to block it due to a transient error).
+        Verify enough margin exists before placing a multi-leg structure.
+
+        Paper mode: simulates margin by computing total locked margin across all
+        active spreads/condors (max-loss per structure = spread_width × lot_size)
+        and subtracting from initial_capital. Prevents paper account from opening
+        unlimited structures beyond what real margin would allow.
+
+        Live mode: queries kite.margins() — fails-open on API error so a transient
+        Zerodha glitch never blocks a legitimate exit.
         """
-        if self.mode != TradingMode.LIVE or not self._kite:
-            return True
-        try:
-            loop = asyncio.get_event_loop()
-            margins   = await loop.run_in_executor(None, self._kite.margins)
-            available = float(margins.get("equity", {}).get("net", 0))
-            if available < required:
-                logger.warning(
-                    f"Margin check: available Rs{available:,.0f} < "
-                    f"required Rs{required:,.0f}"
-                )
-                return False
-            return True
-        except Exception as e:
-            logger.error(f"Margin check API call failed: {e}. Allowing trade (fail-open).")
-            return True
+        if self.mode == TradingMode.LIVE and self._kite:
+            try:
+                loop = asyncio.get_event_loop()
+                margins   = await loop.run_in_executor(None, self._kite.margins)
+                available = float(margins.get("equity", {}).get("net", 0))
+                if available < required:
+                    logger.warning(
+                        f"Margin check: available Rs{available:,.0f} < "
+                        f"required Rs{required:,.0f}"
+                    )
+                    return False
+                return True
+            except Exception as e:
+                logger.error(f"Margin check API call failed: {e}. Allowing trade (fail-open).")
+                return True
+
+        # ── Paper mode: simulate margin from active structures ────────────────
+        capital = float(getattr(settings, "initial_capital", 300_000))
+        locked = 0.0
+        for s in self._active_spreads.values():
+            wing = abs(s.get("short_strike", 0) - s.get("long_strike", 0))
+            locked += wing * s.get("lot_size", 1)
+        for c in self._active_condors.values():
+            put_wing  = abs(c.get("put_short_strike",  0) - c.get("put_long_strike",  0))
+            call_wing = abs(c.get("call_short_strike", 0) - c.get("call_long_strike", 0))
+            locked += max(put_wing, call_wing) * c.get("lot_size", 1)
+
+        available = capital - locked
+        if available < required:
+            logger.warning(
+                f"Paper margin check: capital Rs{capital:,.0f} - locked Rs{locked:,.0f} = "
+                f"available Rs{available:,.0f} < required Rs{required:,.0f}"
+            )
+            return False
+        return True
 
     async def _get_cached_vix(self) -> Optional[float]:
         from src.market_data.option_chain import get_india_vix, fetch_and_cache_vix

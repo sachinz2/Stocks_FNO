@@ -149,5 +149,16 @@ class EMACrossoverStrategy(StrategyBase):
 
         return "HOLD"
 
+    def on_pause(self) -> None:
+        """Clear the confirmation buffer so a stale crossover can't fire on resume."""
+        if self._pending_signal:
+            logger.info(
+                f"[{self.name}] on_pause: clearing pending {self._pending_signal} signal "
+                f"({self._pending_count} bars accumulated)."
+            )
+        self._pending_signal = None
+        self._pending_count  = 0
+        self._pending_bar_key = None
+
     def shutdown(self):
         logger.info(f"Shutting down EMA Crossover Strategy '{self.name}'")
