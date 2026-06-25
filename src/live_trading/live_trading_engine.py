@@ -621,6 +621,19 @@ class LiveTradingEngine:
             )
             return
 
+        # Risk/reward check: net credit must be ≥ 20% of wing width.
+        # A ₹50 spread collecting only ₹5 has a 1:9 risk/reward — not viable.
+        # Minimum 20% means: at worst a ₹50 wing collects ₹10, giving 1:4 risk/reward.
+        spread_width_pts = abs(short_strike - long_strike)
+        MIN_CREDIT_PCT_OF_WING = 0.20
+        if net_credit < spread_width_pts * MIN_CREDIT_PCT_OF_WING:
+            logger.info(
+                f"[CreditSpread] {symbol} skipped — net credit ₹{net_credit:.2f} < "
+                f"20% of wing width ({spread_width_pts} pts × 20% = ₹{spread_width_pts * MIN_CREDIT_PCT_OF_WING:.2f}). "
+                f"R/R too poor."
+            )
+            return
+
         # Margin check — in live mode verify we have enough balance before placing
         spread_width   = abs(short_strike - long_strike)
         required_margin = spread_width * lot_size   # worst-case margin = max loss
@@ -831,6 +844,26 @@ class LiveTradingEngine:
                 f"[IronCondor] {symbol} skipped — net credit ₹{total_credit:.0f} "
                 f"too low (min ₹{MIN_CONDOR_NET_CREDIT:.0f} after fees). "
                 f"PS@{put_short_p} PL@{put_long_p} CS@{call_short_p} CL@{call_long_p} x {lot_size} lots."
+            )
+            return
+
+        # Risk/reward check: each wing's net credit must be ≥ 20% of that wing's width.
+        # A 50-point wing collecting only 4 points per share gives 1:11.5 risk/reward — not viable.
+        put_wing_width  = abs(put_short_strike  - put_long_strike)
+        call_wing_width = abs(call_short_strike - call_long_strike)
+        put_wing_credit  = put_short_p  - put_long_p
+        call_wing_credit = call_short_p - call_long_p
+        MIN_WING_CREDIT_PCT = 0.20
+        if put_wing_credit < put_wing_width * MIN_WING_CREDIT_PCT:
+            logger.info(
+                f"[IronCondor] {symbol} skipped — put wing credit ₹{put_wing_credit:.2f} < "
+                f"20% of wing ({put_wing_width} pts × 20% = ₹{put_wing_width * MIN_WING_CREDIT_PCT:.2f})."
+            )
+            return
+        if call_wing_credit < call_wing_width * MIN_WING_CREDIT_PCT:
+            logger.info(
+                f"[IronCondor] {symbol} skipped — call wing credit ₹{call_wing_credit:.2f} < "
+                f"20% of wing ({call_wing_width} pts × 20% = ₹{call_wing_width * MIN_WING_CREDIT_PCT:.2f})."
             )
             return
 
@@ -1202,13 +1235,37 @@ class LiveTradingEngine:
             logger.error(f"Failed to fetch positions: {exc}")
             return []
 
+    # Market data is considered stale if older than this many seconds.
+    # Prevents entries when the LTP poller has fallen behind (e.g., Zerodha API lag).
+    _MARKET_DATA_MAX_AGE_SECONDS = 90
+
     async def _get_market_data(self, symbol: str) -> Optional[Dict[str, Any]]:
         redis = getattr(self, "_redis", None)
         if not redis:
             return None
         try:
             raw = await redis.get(f"{REDIS_TICK_PREFIX}{symbol}")
-            return json.loads(raw) if raw else None
+            if not raw:
+                return None
+            data = json.loads(raw)
+            # Stale data circuit breaker: reject data older than 90 seconds
+            ts_str = data.get("timestamp")
+            if ts_str:
+                try:
+                    from datetime import datetime as _dt, timezone as _tz
+                    ts = _dt.fromisoformat(ts_str)
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=_tz.utc)
+                    age = (_dt.now(_tz.utc) - ts).total_seconds()
+                    if age > self._MARKET_DATA_MAX_AGE_SECONDS:
+                        logger.warning(
+                            f"Stale market data for {symbol}: {age:.0f}s old "
+                            f"(limit {self._MARKET_DATA_MAX_AGE_SECONDS}s) — skipping."
+                        )
+                        return None
+                except Exception:
+                    pass  # malformed timestamp — allow data through
+            return data
         except Exception as exc:
             logger.error(f"Redis read [{symbol}]: {exc}")
             return None
