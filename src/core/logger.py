@@ -1,7 +1,7 @@
 import logging
 import os
 import sys
-from logging.handlers import RotatingFileHandler
+from logging.handlers import TimedRotatingFileHandler
 
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 
@@ -26,16 +26,19 @@ def setup_logging(log_level: str = "INFO"):
     # File handler — always add if not already present.
     # Checked separately because uvicorn sets its own console handler first,
     # which causes `if not root.handlers` to skip the file handler entirely.
-    has_file_handler = any(isinstance(h, RotatingFileHandler) for h in root.handlers)
+    has_file_handler = any(isinstance(h, TimedRotatingFileHandler) for h in root.handlers)
     if not has_file_handler:
         try:
             os.makedirs(LOG_DIR, exist_ok=True)
-            file_handler = RotatingFileHandler(
+            file_handler = TimedRotatingFileHandler(
                 filename=os.path.join(LOG_DIR, "falcon.log"),
-                maxBytes=10 * 1024 * 1024,   # 10 MB
-                backupCount=7,
+                when="midnight",
+                interval=1,
+                backupCount=30,       # keep 30 days of logs
                 encoding="utf-8",
+                utc=False,            # rotate at local midnight (IST on the server)
             )
+            file_handler.suffix = "%Y-%m-%d"   # falcon.log.2026-06-24
             file_handler.setFormatter(formatter)
             root.addHandler(file_handler)
             root.info(f"File logging active → {os.path.join(LOG_DIR, 'falcon.log')}")
@@ -45,7 +48,7 @@ def setup_logging(log_level: str = "INFO"):
     # Silence noisy third-party loggers
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
     logging.getLogger("apscheduler").setLevel(logging.WARNING)
-logging.getLogger("peewee").setLevel(logging.WARNING)
+    logging.getLogger("peewee").setLevel(logging.WARNING)
 
 
 def get_logger(name: str) -> logging.Logger:
