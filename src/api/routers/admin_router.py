@@ -26,6 +26,7 @@ _TRADING_TABLES = [
 _ENGINE_REDIS_KEYS = [
     "engine:active_spreads",
     "engine:active_condors",
+    "engine:single_leg_journals",
     "falcon:active_spreads",
     "falcon:active_condors",
 ]
@@ -61,6 +62,7 @@ async def reset_all_data(request: Request):
         if engine:
             engine._active_spreads.clear()
             engine._active_condors.clear()
+            engine._single_leg_journals.clear()
             engine._peak_premiums.clear()
             engine._today_order_count = 0
             engine.risk_manager.reset_daily_state()

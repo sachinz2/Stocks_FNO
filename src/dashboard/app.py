@@ -166,12 +166,32 @@ elif page == "Positions":
         # Try to identify multi-leg groups from position contracts
         # A contract is a spread/condor leg if there is another contract with the same underlying
         # and opposite qty sign (short + long pair)
+        # Build known underlying list from a fixed set so extraction is reliable.
+        # A contract like RELIANCE25JUN2850CE → underlying = RELIANCE.
+        _KNOWN_UNDERLYINGS = [
+            "HDFCBANK", "ICICIBANK", "RELIANCE", "INFY", "TCS",
+            "AXISBANK", "KOTAKBANK", "SBIN", "BAJFINANCE", "MARUTI",
+            "WIPRO", "LTIM", "HCLTECH", "SUNPHARMA", "TATAMOTORS",
+            "TATACONSUM", "HINDUNILVR", "ASIANPAINT", "NESTLEIND",
+            "TITAN", "ULTRACEMCO", "POWERGRID", "NTPC", "ONGC",
+            "ADANIENT", "ADANIPORTS", "BAJAJ-AUTO", "BAJAJFINSV",
+            "BPCL", "BRITANNIA", "CIPLA", "COALINDIA", "DIVISLAB",
+            "DRREDDY", "EICHERMOT", "GRASIM", "HEROMOTOCO", "HINDALCO",
+            "INDUSINDBK", "ITC", "JSWSTEEL", "LT", "M&M", "SBILIFE",
+            "SHRIRAMFIN", "TATASTEEL", "TECHM", "UPL",
+        ]
+        _UND_BY_LEN = sorted(_KNOWN_UNDERLYINGS, key=len, reverse=True)
+
+        def _extract_underlying(contract: str) -> str:
+            for u in _UND_BY_LEN:
+                if contract.startswith(u):
+                    return u
+            return contract[:10]
+
         by_underlying: dict = {}
         for p in positions:
             sym = p.get("symbol", "")
-            qty = p.get("quantity", 0)
-            # Extract underlying: strip trailing digits and option type
-            underlying = sym.rstrip("CEPE").rstrip("0123456789").rstrip("ABCDEFGHIJKLMNOPQRSTUVWXYZ")[:10]
+            underlying = _extract_underlying(sym)
             by_underlying.setdefault(underlying, []).append(p)
 
         # Identify grouped multi-leg structures

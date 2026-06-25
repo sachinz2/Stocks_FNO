@@ -38,8 +38,9 @@ logger = logging.getLogger(__name__)
 
 _FNO_SYMBOLS_BY_LEN = sorted(FNO_SYMBOLS, key=len, reverse=True)
 
-_REDIS_ACTIVE_SPREADS = "engine:active_spreads"
-_REDIS_ACTIVE_CONDORS = "engine:active_condors"
+_REDIS_ACTIVE_SPREADS  = "engine:active_spreads"
+_REDIS_ACTIVE_CONDORS  = "engine:active_condors"
+_REDIS_SINGLE_LEG_JRNL = "engine:single_leg_journals"
 
 
 class LiveTradingEngine:
@@ -77,8 +78,11 @@ class LiveTradingEngine:
         self._today_order_count: int = 0
         self._max_daily_orders: int  = getattr(settings, "MAX_DAILY_ORDERS", 30)
         self._peak_premiums:   Dict[str, float] = {}
-        self._active_spreads:  Dict[str, Dict[str, Any]] = {}
-        self._active_condors:  Dict[str, Dict[str, Any]] = {}
+        self._active_spreads:       Dict[str, Dict[str, Any]] = {}
+        self._active_condors:       Dict[str, Dict[str, Any]] = {}
+        # Maps option contract → {journal_id, underlying, strategy_name}
+        # so _check_open_option_exits can write the exit to trade_journal.
+        self._single_leg_journals:  Dict[str, Dict[str, Any]] = {}
         self._kite = None   # attached in live mode for real quotes + VIX
 
         logger.info(f"LiveTradingEngine initialised — mode: {self.mode.value.upper()}")
@@ -225,17 +229,45 @@ class LiveTradingEngine:
         if self._today_order_count == 0:
             logger.info("EOD: no trades today, skipping report.")
         else:
+            # Read today's realized PnL from trade_journal (the authoritative source).
+            # positions.realized_pnl is not reliably populated in paper mode.
+            try:
+                from datetime import date as _date
+                from src.database.connection import AsyncSessionLocal
+                from src.database.models.trade_journal import TradeJournal
+                from src.database.repositories.base import BaseRepository
+                from sqlalchemy import select as _select
+                today_str = _date.today().isoformat()
+                async with AsyncSessionLocal() as session:
+                    result = await session.execute(
+                        _select(TradeJournal).where(
+                            TradeJournal.exit_time.isnot(None)
+                        )
+                    )
+                    closed_today = [
+                        t for t in result.scalars().all()
+                        if t.exit_time and t.exit_time.date().isoformat() == today_str
+                    ]
+                today_realized = sum(float(t.pnl or 0) for t in closed_today)
+                closed_count   = len(closed_today)
+            except Exception as e:
+                logger.error(f"EOD: failed to read trade_journal: {e}")
+                today_realized = 0.0
+                closed_count   = 0
+
             positions = await self._safe_get_positions()
-            total_pnl = sum(
-                p.get("unrealized_pnl", 0) + p.get("realized_pnl", 0) for p in positions
-            )
+            open_unrealized = sum(p.get("unrealized_pnl", 0) for p in positions)
+
             await self._notify(
                 f"EOD REPORT\n"
                 f"Date: {now_ist().strftime('%d-%b-%Y')}\n"
                 f"Mode: {self.mode.value.upper()}\n"
-                f"Orders today: {self._today_order_count}\n"
-                f"Open positions: {len(positions)}\n"
-                f"Total PnL: Rs{total_pnl:,.2f}"
+                f"Orders placed today: {self._today_order_count}\n"
+                f"Closed trades today: {closed_count}\n"
+                f"Realized PnL today:  Rs{today_realized:,.2f}\n"
+                f"Open positions:      {len(positions)}\n"
+                f"Unrealized PnL:      Rs{open_unrealized:,.2f}\n"
+                f"Net PnL today:       Rs{today_realized + open_unrealized:,.2f}"
             )
 
         await self._persist_state()
@@ -251,8 +283,9 @@ class LiveTradingEngine:
         if not redis:
             return
         try:
-            await redis.set(_REDIS_ACTIVE_SPREADS, json.dumps(self._active_spreads))
-            await redis.set(_REDIS_ACTIVE_CONDORS, json.dumps(self._active_condors))
+            await redis.set(_REDIS_ACTIVE_SPREADS,  json.dumps(self._active_spreads))
+            await redis.set(_REDIS_ACTIVE_CONDORS,  json.dumps(self._active_condors))
+            await redis.set(_REDIS_SINGLE_LEG_JRNL, json.dumps(self._single_leg_journals))
         except Exception as e:
             logger.error(f"Failed to persist engine state: {e}")
 
@@ -269,6 +302,10 @@ class LiveTradingEngine:
             if condors_raw:
                 self._active_condors = json.loads(condors_raw)
                 logger.info(f"Restored {len(self._active_condors)} active condor(s)")
+            jrnl_raw = await redis.get(_REDIS_SINGLE_LEG_JRNL)
+            if jrnl_raw:
+                self._single_leg_journals = json.loads(jrnl_raw)
+                logger.info(f"Restored {len(self._single_leg_journals)} single-leg journal pointer(s)")
         except Exception as e:
             logger.error(f"Failed to restore engine state: {e}")
 
@@ -425,6 +462,20 @@ class LiveTradingEngine:
                 if db_order and db_order.order_status not in ("REJECTED_BY_RISK", "FAILED"):
                     self._peak_premiums.pop(contract, None)
                     pnl = (current_p - entry_p) * abs(qty)
+
+                    # Write exit to trade_journal so PnL appears in analytics + dashboard
+                    info = self._single_leg_journals.pop(contract, None)
+                    if info:
+                        md = await self._get_market_data(info["underlying"])
+                        await self._log_trade_close(
+                            journal_id=info["journal_id"],
+                            exit_price=current_p,
+                            pnl=pnl,
+                            exit_reason=exit_reason,
+                            market_data=md,
+                        )
+                        await self._persist_state()
+
                     await self._notify(
                         f"POSITION CLOSED\nContract: {contract}\n"
                         f"Reason: {exit_reason}\n"
@@ -494,12 +545,19 @@ class LiveTradingEngine:
         if order and order.order_status == "OPEN":
             self._today_order_count += 1
             self._peak_premiums[contract] = option_p
-            await self._log_trade_open(
+            journal_id = await self._log_trade_open(
                 strategy=strategy.name, underlying=symbol,
                 structure_type="SINGLE_LEG", contracts=[contract],
                 entry_price=option_p, quantity=lot_size,
                 market_data=market_data, iv_rank=iv_rank, vix=vix,
             )
+            if journal_id:
+                self._single_leg_journals[contract] = {
+                    "journal_id":    journal_id,
+                    "underlying":    symbol,
+                    "strategy_name": strategy.name,
+                }
+                await self._persist_state()
             await self._notify(
                 f"ORDER PLACED\nStrategy: {strategy.name}\n"
                 f"BUY {lot_size} {contract} @ Rs{option_p:.2f}\n"
@@ -765,6 +823,7 @@ class LiveTradingEngine:
                 journal_id=spread.get("journal_id"),
                 exit_price=round(cur_short - cur_long, 2),
                 pnl=net_pnl, exit_reason=exit_reason,
+                market_data=market_data,
             )
             to_close.append(underlying)
             await self._notify(
@@ -996,6 +1055,7 @@ class LiveTradingEngine:
                 journal_id=c.get("journal_id"),
                 exit_price=round(cur_ps + cur_cs - cur_pl - cur_cl, 2),
                 pnl=net_pnl, exit_reason=exit_reason,
+                market_data=market_data,
             )
             to_close.append(underlying)
             await self._notify(

@@ -176,15 +176,20 @@ class LTPPoller:
         cum_vol = vol_nonzero.sum()
         vwap = float((typical * vol_nonzero).sum() / cum_vol) if cum_vol > 0 else ltp
 
+        atr_pct       = round((atr14 / ltp * 100) if ltp > 0 else 0, 4)
+        ema_spread_pct = round((abs(ema20 - ema50) / ema50 * 100) if ema50 > 0 else 0, 4)
+
         return {
-            "symbol":     symbol,
-            "close":      ltp,
-            "ema20":      round(ema20, 4),
-            "ema50":      round(ema50, 4),
-            "atr14":      round(atr14, 4),
-            "vwap":       round(vwap, 4),
-            "timestamp":  datetime.now().isoformat(),
-            "ltp_source": "zerodha_historical",
+            "symbol":        symbol,
+            "close":         ltp,
+            "ema20":         round(ema20, 4),
+            "ema50":         round(ema50, 4),
+            "atr14":         round(atr14, 4),
+            "atr_pct":       atr_pct,
+            "ema_spread_pct": ema_spread_pct,
+            "vwap":          round(vwap, 4),
+            "timestamp":     datetime.now().isoformat(),
+            "ltp_source":    "zerodha_historical",
         }
 
     @staticmethod
