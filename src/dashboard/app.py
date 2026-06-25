@@ -41,7 +41,7 @@ st.sidebar.title("Falcon Quant")
 st.sidebar.markdown("---")
 page = st.sidebar.radio(
     "Navigate",
-    ["Home", "Positions", "Orders & Trades", "Strategies", "Risk & PnL", "Analytics", "System Health"],
+    ["Home", "Positions", "Orders & Trades", "Strategies", "Risk & PnL", "Analytics", "System Health", "Admin"],
 )
 st.sidebar.markdown("---")
 
@@ -60,6 +60,17 @@ def fetch(endpoint: str):
         st.warning(f"API returned {r.status_code} for /{endpoint}")
     except Exception as e:
         st.warning(f"API not reachable ({endpoint}): {e}")
+    return None
+
+
+def post(endpoint: str, timeout: int = 10):
+    try:
+        r = requests.post(f"{API_BASE_URL}/{endpoint}", timeout=timeout)
+        if r.status_code == 200:
+            return r.json()
+        st.error(f"API returned {r.status_code}: {r.text}")
+    except Exception as e:
+        st.error(f"API not reachable ({endpoint}): {e}")
     return None
 
 
@@ -490,6 +501,73 @@ elif page == "System Health":
 
     st.markdown("---")
     st.caption(f"Last checked: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+
+elif page == "Admin":
+    st.title("Admin Controls")
+    st.warning("These controls affect live trading state. Use with care.")
+
+    # ── Email Alerts ─────────────────────────────────────────────────────────
+    st.subheader("Email Alerts")
+    alert_status = fetch("admin/email-alerts") or {}
+    is_paused    = alert_status.get("paused", False)
+    configured   = alert_status.get("configured", False)
+
+    if not configured:
+        st.error("Email is not configured — check EMAIL_SENDER / EMAIL_APP_PASSWORD / EMAIL_RECIPIENT in .env")
+    else:
+        if is_paused:
+            st.error("Email alerts are currently PAUSED")
+            if st.button("Resume Email Alerts", type="primary"):
+                result = post("admin/email-alerts/resume")
+                if result:
+                    st.success("Email alerts resumed.")
+                    st.rerun()
+        else:
+            st.success("Email alerts are ACTIVE")
+            if st.button("Pause Email Alerts"):
+                result = post("admin/email-alerts/pause")
+                if result:
+                    st.warning("Email alerts paused.")
+                    st.rerun()
+
+    st.markdown("---")
+
+    # ── Reset All Data ───────────────────────────────────────────────────────
+    st.subheader("Reset Platform Data")
+    st.markdown("""
+**What this deletes:**
+- All orders, positions, trades, trade journal entries
+- All audit logs, signals, walk-forward results
+- Engine in-memory state (active spreads, condors, peak premiums)
+- PaperBroker virtual balance reset to ₹3,00,000
+
+**What is kept:**
+- Stocks, instruments, historical OHLC data
+- Zerodha access token and lot sizes
+- Strategy configuration
+""")
+
+    if "confirm_reset" not in st.session_state:
+        st.session_state["confirm_reset"] = False
+
+    if not st.session_state["confirm_reset"]:
+        if st.button("Reset All Trading Data", type="secondary"):
+            st.session_state["confirm_reset"] = True
+            st.rerun()
+    else:
+        st.error("Are you sure? This will permanently delete ALL trading history and cannot be undone.")
+        col1, col2 = st.columns(2)
+        if col1.button("YES — Delete Everything", type="primary"):
+            result = post("admin/reset", timeout=30)
+            if result:
+                st.session_state["confirm_reset"] = False
+                st.success(f"Reset complete. {result.get('message', '')}")
+                st.balloons()
+                st.rerun()
+        if col2.button("Cancel"):
+            st.session_state["confirm_reset"] = False
+            st.rerun()
 
 
 # ── Auto-refresh ───────────────────────────────────────────────────────────────

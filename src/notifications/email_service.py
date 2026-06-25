@@ -27,6 +27,7 @@ class EmailNotifier:
         self.password = settings.EMAIL_APP_PASSWORD
         self.recipient = settings.EMAIL_RECIPIENT
         self.enabled = bool(self.sender and self.password and self.recipient)
+        self.paused  = False  # toggled via POST /admin/email-alerts/pause|resume
 
         if not self.enabled:
             logger.warning("Email alerts disabled — set EMAIL_SENDER, EMAIL_APP_PASSWORD, EMAIL_RECIPIENT in .env")
@@ -44,7 +45,9 @@ class EmailNotifier:
         return True
 
     async def send(self, message: str) -> bool:
-        if not self.enabled:
+        if not self.enabled or self.paused:
+            if self.paused:
+                logger.debug(f"Email suppressed (paused): {message[:60]}")
             return False
         # Use first line as subject, rest as body
         lines = message.strip().splitlines()

@@ -18,6 +18,7 @@ from src.api.routers import (
     stocks_router,
     strategy_router,
 )
+from src.api.routers.admin_router import router as admin_router
 
 logger = logging.getLogger(__name__)
 
@@ -245,11 +246,16 @@ async def lifespan(app: FastAPI):
         logger.info("ZerodhaLTPPoller: REST-based LTP refresh every 5 s (WebSocket fallback).")
     start_scheduler()
 
-    app.state.trading_engine   = engine
-    app.state.redis            = redis_client
-    app.state.zerodha_ticker   = zerodha_ticker
-    app.state.kite             = kite_instance
+    app.state.trading_engine    = engine
+    app.state.redis             = redis_client
+    app.state.zerodha_ticker    = zerodha_ticker
+    app.state.kite              = kite_instance
     app.state.instrument_tokens = instrument_tokens
+
+    # Restore email-pause state across restarts
+    if await redis_client.get("alerts:email_paused"):
+        engine.notifier.paused = True
+        logger.warning("Email alerts are PAUSED (persisted from previous session)")
 
     logger.info(
         f"Falcon Trader STARTED | Mode={mode.value.upper()} | "
@@ -339,6 +345,7 @@ app.include_router(risk_router.router,         prefix="/api/v1")
 app.include_router(backtest_router.router,     prefix="/api/v1")
 app.include_router(strategy_router.router,     prefix="/api/v1")
 app.include_router(logs_router.router,         prefix="/api/v1")
+app.include_router(admin_router,               prefix="/api/v1")
 
 if __name__ == "__main__":
     import uvicorn
