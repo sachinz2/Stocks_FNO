@@ -272,6 +272,19 @@ def find_delta_strike(
             best_diff = diff
             best_strike = K
 
+    # Enforce minimum 1-interval OTM distance — the short leg must never be
+    # at or inside the current price (that would be an immediate breach).
+    if option_type == "PE":
+        # Put short strike must be strictly below the underlying
+        ceiling = int(round(underlying_price / strike_interval) * strike_interval) - strike_interval
+        if best_strike > ceiling:
+            best_strike = ceiling
+    else:
+        # Call short strike must be strictly above the underlying
+        floor_ = int(round(underlying_price / strike_interval) * strike_interval) + strike_interval
+        if best_strike < floor_:
+            best_strike = floor_
+
     return int(best_strike)
 
 

@@ -96,27 +96,45 @@ def build_option_symbol(symbol: str, strike: int, option_type: str, expiry: date
     return f"{symbol}{yy}{mon}{strike}{option_type}"
 
 
-def estimate_option_premium(atr: float, dte: int, otm_intervals: int = 0) -> float:
+def estimate_option_premium(
+    atr: float,
+    dte: int,
+    otm_intervals: int = 0,
+    underlying_price: float = 0.0,
+    strike: float = 0.0,
+    option_type: str = "PE",
+) -> float:
     """
-    Estimate option premium for paper trading — DTE-aware and moneyness-aware.
+    Estimate option premium for paper trading.
 
-    Model:
-      ATM premium at 20 DTE  ≈  ATR × 4
-      Scales with sqrt(DTE / 20)  — theta decays roughly proportional to sqrt(time)
-      Each interval away from ATM discounts by 25%  (OTM options lose value quickly)
+    When underlying_price and strike are supplied, uses Black-Scholes for
+    accurate pricing — this correctly includes intrinsic value for ITM
+    options, which is critical for realistic exit PnL after a breach.
 
-    Examples at ATR=10, DTE=20:
-      ATM  (0 intervals): 10 × 4 × 1.00 = Rs 40.00
-      1 OTM:              10 × 4 × 0.75 = Rs 30.00
-      2 OTM:              10 × 4 × 0.56 = Rs 22.50
-      3 OTM:              10 × 4 × 0.42 = Rs 16.88
+    Falls back to the ATR-based heuristic when strike/price are unavailable
+    (e.g. when computing entry credits before strikes are chosen).
 
-    At DTE=7 (with ATR=10, ATM):
-      10 × 4 × sqrt(7/20) = Rs 23.66  (realistic near-expiry decay)
+    ATR-based fallback model:
+      ATM premium at 20 DTE  ≈  ATR × 4  × sqrt(DTE/20)
+      Each interval OTM discounts by 25%
     """
+    dte = max(dte, 1)
+
+    if underlying_price > 0 and strike > 0:
+        from src.market_data.option_chain import bs_price
+        T = dte / 365.0
+        if atr > 0 and underlying_price > 0:
+            daily_vol = atr / underlying_price
+            sigma = daily_vol * math.sqrt(252)
+            sigma = max(0.05, min(sigma, 2.0))
+        else:
+            sigma = 0.30
+        price = bs_price(underlying_price, strike, T, sigma, option_type)
+        return max(round(price, 2), 0.05)
+
+    # ATR-based fallback
     if atr <= 0:
         return 0.01
-    dte = max(dte, 1)
     dte_factor = math.sqrt(dte / 20.0)
     atm_premium = atr * 4.0 * dte_factor
     otm_discount = 0.75 ** max(otm_intervals, 0)

@@ -637,6 +637,21 @@ class LiveTradingEngine:
         iv_rank  = await self._get_iv_rank(symbol, underlying_price, atr, dte)
         sigma    = atr_to_annualised_vol(atr, underlying_price)
 
+        # VIX + IV Rank gates — only sell premium when it is worth selling
+        from src.market_data.option_chain import vix_allows_selling, iv_rank_allows_selling
+        if not vix_allows_selling(vix):
+            logger.info(
+                f"[CreditSpread] {symbol} skipped — VIX={vix:.1f} too low "
+                f"(need ≥14.0 for rich premium). Not worth selling spreads."
+            )
+            return
+        if not iv_rank_allows_selling(iv_rank):
+            logger.info(
+                f"[CreditSpread] {symbol} skipped — IV Rank={iv_rank:.2f} too low "
+                f"(need ≥0.30). Premium too cheap."
+            )
+            return
+
         # OI/PCR sentiment check — confirm spread direction with market positioning
         redis = getattr(self, "_redis", None)
         oi_data = await get_oi_data(symbol, redis) if redis else None
@@ -737,6 +752,8 @@ class LiveTradingEngine:
         )
         if not short_order or short_order.order_status != "OPEN":
             logger.warning(f"[CreditSpread] Short leg rejected: {short_contract}")
+            if short_order and short_order.order_status == "REJECTED_BY_RISK":
+                self._exited_today.add(symbol)  # stop retrying every minute
             return
 
         long_order = await self.order_manager.place_order(
@@ -804,8 +821,15 @@ class LiveTradingEngine:
 
             current_price = float(market_data.get("close", 0))
             atr = float(market_data.get("atr14", 0))
-            cur_short = estimate_option_premium(atr, dte) if atr > 0 else spread["short_premium"]
-            cur_long  = estimate_option_premium(atr, dte, otm_intervals=2) if atr > 0 else spread["long_premium"]
+            opt = spread["option_type"]
+            cur_short = estimate_option_premium(
+                atr, dte,
+                underlying_price=current_price, strike=spread["short_strike"], option_type=opt,
+            ) if current_price > 0 else spread["short_premium"]
+            cur_long = estimate_option_premium(
+                atr, dte,
+                underlying_price=current_price, strike=spread["long_strike"], option_type=opt,
+            ) if current_price > 0 else spread["long_premium"]
 
             min_dte     = getattr(cs_strategy, "min_dte", 7) if cs_strategy else 7
             exit_reason: Optional[str] = None
@@ -898,6 +922,21 @@ class LiveTradingEngine:
         iv_rank  = await self._get_iv_rank(symbol, underlying_price, atr, dte)
         sigma    = atr_to_annualised_vol(atr, underlying_price)
 
+        # VIX + IV Rank gates — only sell premium when it is worth selling
+        from src.market_data.option_chain import vix_allows_selling, iv_rank_allows_selling
+        if not vix_allows_selling(vix):
+            logger.info(
+                f"[IronCondor] {symbol} skipped — VIX={vix:.1f} too low "
+                f"(need ≥14.0 for rich premium). Not worth selling condors."
+            )
+            return
+        if not iv_rank_allows_selling(iv_rank):
+            logger.info(
+                f"[IronCondor] {symbol} skipped — IV Rank={iv_rank:.2f} too low "
+                f"(need ≥0.30). Premium too cheap."
+            )
+            return
+
         # Delta-based: short ~0.20, hedge ~0.10 on each wing
         put_short_strike  = find_delta_strike(underlying_price, -0.20, "PE", dte, sigma, interval)
         put_long_strike   = find_delta_strike(underlying_price, -0.10, "PE", dte, sigma, interval)
@@ -984,6 +1023,8 @@ class LiveTradingEngine:
             order = await self.order_manager.place_order(contract, side, lot_size, price, **kwargs)
             if not order or order.order_status != "OPEN":
                 logger.error(f"[IronCondor] Leg failed: {side} {contract}. Unwinding {len(placed)} leg(s).")
+                if order and order.order_status == "REJECTED_BY_RISK":
+                    self._exited_today.add(symbol)  # stop retrying every minute
                 for (c, s, p, _) in placed:
                     rev = "BUY" if s == "SELL" else "SELL"
                     await self.order_manager.place_order(c, rev, lot_size, p, is_spread_leg=True)
@@ -1001,8 +1042,8 @@ class LiveTradingEngine:
         self._active_condors[symbol] = {
             "put_short_contract":  psc,  "put_long_contract":   plc,
             "call_short_contract": csc,  "call_long_contract":  clc,
-            "put_short_strike":    put_short_strike,
-            "call_short_strike":   call_short_strike,
+            "put_short_strike":    put_short_strike,  "put_long_strike":   put_long_strike,
+            "call_short_strike":   call_short_strike, "call_long_strike":  call_long_strike,
             "put_short_premium":   put_short_p,  "put_long_premium":  put_long_p,
             "call_short_premium":  call_short_p, "call_long_premium": call_long_p,
             "net_credit":          net_credit,   "lot_size":          lot_size,
@@ -1041,10 +1082,16 @@ class LiveTradingEngine:
 
             current_price = float(market_data.get("close", 0))
             atr = float(market_data.get("atr14", 0))
-            cur_ps = estimate_option_premium(atr, dte, otm_intervals=1) if atr > 0 else c["put_short_premium"]
-            cur_pl = estimate_option_premium(atr, dte, otm_intervals=3) if atr > 0 else c["put_long_premium"]
-            cur_cs = estimate_option_premium(atr, dte, otm_intervals=1) if atr > 0 else c["call_short_premium"]
-            cur_cl = estimate_option_premium(atr, dte, otm_intervals=3) if atr > 0 else c["call_long_premium"]
+            if current_price > 0:
+                cur_ps = estimate_option_premium(atr, dte, underlying_price=current_price, strike=c["put_short_strike"],  option_type="PE")
+                cur_pl = estimate_option_premium(atr, dte, underlying_price=current_price, strike=c["put_long_strike"],   option_type="PE")
+                cur_cs = estimate_option_premium(atr, dte, underlying_price=current_price, strike=c["call_short_strike"], option_type="CE")
+                cur_cl = estimate_option_premium(atr, dte, underlying_price=current_price, strike=c["call_long_strike"],  option_type="CE")
+            else:
+                cur_ps = c["put_short_premium"]
+                cur_pl = c["put_long_premium"]
+                cur_cs = c["call_short_premium"]
+                cur_cl = c["call_long_premium"]
 
             min_dte    = getattr(ic_strategy, "min_dte",            7)   if ic_strategy else 7
             profit_pct = getattr(ic_strategy, "profit_close_pct",  0.25) if ic_strategy else 0.25
