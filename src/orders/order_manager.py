@@ -60,6 +60,7 @@ class OrderManager:
         quantity:      int,
         price:         float,
         is_spread_leg: bool = False,
+        is_exit_order: bool = False,
         strategy_name: Optional[str] = None,
         iv_rank:       Optional[float] = None,
         vix:           Optional[float] = None,
@@ -68,8 +69,8 @@ class OrderManager:
         Main entry point for placing orders.
         Validates risk, saves initial state, routes to broker, updates state.
 
-        is_spread_leg : True for legs 2-4 of multi-leg structures (skips
-                        position-count + sector checks in RiskManager)
+        is_spread_leg : True for legs 2-4 of multi-leg structures (skips entry-only checks)
+        is_exit_order : True when closing an existing position (skips entry-only risk checks)
         strategy_name : Passed to RiskManager for capital allocation check
         iv_rank       : Per-symbol IV rank — gates spread/condor entries
         vix           : India VIX — market-wide IV gate
@@ -92,6 +93,7 @@ class OrderManager:
         if not self.risk_manager.validate_trade(
             symbol, side, quantity, price,
             is_spread_leg=is_spread_leg,
+            is_exit_order=is_exit_order,
             strategy_name=strategy_name,
             iv_rank=iv_rank,
             vix=vix,

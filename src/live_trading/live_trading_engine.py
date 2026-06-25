@@ -315,15 +315,20 @@ class LiveTradingEngine:
 
             if exit_reason:
                 logger.info(f"EXIT [{contract}]: {exit_reason}")
-                await self.order_manager.place_order(contract, "SELL", abs(qty), current_p)
-                self._peak_premiums.pop(contract, None)
-                pnl = (current_p - entry_p) * abs(qty)
-                await self._notify(
-                    f"POSITION CLOSED\nContract: {contract}\n"
-                    f"Reason: {exit_reason}\n"
-                    f"Entry: Rs{entry_p:.2f} -> Exit: Rs{current_p:.2f}\n"
-                    f"Est. PnL: Rs{pnl:,.2f}"
+                db_order = await self.order_manager.place_order(
+                    contract, "SELL", abs(qty), current_p, is_exit_order=True
                 )
+                if db_order and db_order.order_status not in ("REJECTED_BY_RISK", "FAILED"):
+                    self._peak_premiums.pop(contract, None)
+                    pnl = (current_p - entry_p) * abs(qty)
+                    await self._notify(
+                        f"POSITION CLOSED\nContract: {contract}\n"
+                        f"Reason: {exit_reason}\n"
+                        f"Entry: Rs{entry_p:.2f} -> Exit: Rs{current_p:.2f}\n"
+                        f"Est. PnL: Rs{pnl:,.2f}"
+                    )
+                else:
+                    logger.error(f"EXIT FAILED [{contract}]: order rejected or failed — will retry next cycle")
 
     async def _process_signal(
         self, strategy, symbol: str, vix: Optional[float] = None
@@ -413,7 +418,7 @@ class LiveTradingEngine:
                 continue
             entry_p = float(pos.get("avg_price") or 0)
             exit_p  = estimate_option_premium(atr, dte) if atr > 0 else entry_p
-            await self.order_manager.place_order(contract, "SELL", abs(qty), exit_p)
+            await self.order_manager.place_order(contract, "SELL", abs(qty), exit_p, is_exit_order=True)
             self._peak_premiums.pop(contract, None)
             logger.info(f"REVERSAL EXIT: SELL {contract} @ Rs{exit_p:.2f}")
 
@@ -880,7 +885,7 @@ class LiveTradingEngine:
             md = await self._get_market_data(underlying)
             atr = float(md.get("atr14", 0)) if md else 0
             exit_p = estimate_option_premium(atr, dte) if atr > 0 else entry_p
-            await self.order_manager.place_order(pos["symbol"], "SELL", abs(pos["quantity"]), exit_p)
+            await self.order_manager.place_order(pos["symbol"], "SELL", abs(pos["quantity"]), exit_p, is_exit_order=True)
             self._peak_premiums.pop(pos["symbol"], None)
 
     async def _square_off_all(self) -> None:
@@ -903,7 +908,7 @@ class LiveTradingEngine:
                     atr = float(md.get("atr14", 0))
                     if atr > 0:
                         exit_p = estimate_option_premium(atr, dte)
-            await self.order_manager.place_order(contract, side, abs(qty), exit_p)
+            await self.order_manager.place_order(contract, side, abs(qty), exit_p, is_exit_order=True)
             self._peak_premiums.pop(contract, None)
             closed += 1
 

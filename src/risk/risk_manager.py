@@ -97,6 +97,7 @@ class RiskManager:
         quantity: int,
         price: float,
         is_spread_leg: bool = False,
+        is_exit_order: bool = False,
         strategy_name: Optional[str] = None,
         iv_rank: Optional[float] = None,
         vix: Optional[float] = None,
@@ -111,6 +112,8 @@ class RiskManager:
         quantity      : Lot size
         price         : Expected fill price
         is_spread_leg : True for legs 2-4 of spreads/condors — skips count + sector checks
+        is_exit_order : True when closing an existing position — skips entry-only checks
+                        (sector concentration, capital allocation, position count, BUY exposure)
         strategy_name : Used for per-strategy capital allocation check
         iv_rank       : Per-symbol IV rank [0,1] — gates spread/condor entries
         vix           : India VIX — secondary IV gate
@@ -132,27 +135,27 @@ class RiskManager:
             self.activate_kill_switch("Max Daily Loss Reached")
             return False
 
+        # Exit orders only need the two safety checks above (kill switch + daily loss).
+        # Skipping entry-only gates: IV rank, sector concentration, capital allocation,
+        # position count, BUY exposure — these would incorrectly block position closures.
+        if is_exit_order or is_spread_leg:
+            logger.info(f"Risk OK (exit/spread leg): {side} {quantity} {symbol} @ {price}")
+            return True
+
         # ── 3. IV Rank gate (only for premium-selling strategies) ─────────────
-        if not is_spread_leg and strategy_name in ("CREDIT_SPREAD", "IRON_CONDOR"):
-            # IV rank check (per-symbol, from Redis history)
+        if strategy_name in ("CREDIT_SPREAD", "IRON_CONDOR"):
             if iv_rank is not None and iv_rank < 0.30:
                 logger.warning(
                     f"Risk: IV rank {iv_rank:.2f} < 0.30 for {symbol} "
                     f"[{strategy_name}] — options too cheap, skipping."
                 )
                 return False
-            # VIX check (market-wide proxy)
             if vix is not None and vix < 14.0:
                 logger.warning(
                     f"Risk: India VIX {vix:.1f} < 14 — options too cheap market-wide, "
                     f"skipping [{strategy_name}]."
                 )
                 return False
-
-        # Remaining checks — skip for non-first legs of multi-leg structures
-        if is_spread_leg:
-            logger.info(f"Risk OK (spread leg): {side} {quantity} {symbol} @ {price}")
-            return True
 
         underlying = self._get_underlying(symbol)
 
