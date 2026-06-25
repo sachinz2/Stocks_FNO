@@ -9,6 +9,7 @@ class StrategyBase(ABC):
         self.name = name
         self.parameters = parameters or {}
         self.is_active = False
+        self.paused_reason: Optional[str] = None
 
     @abstractmethod
     def initialize(self):
@@ -73,14 +74,15 @@ class StrategyRegistry:
         return cls._active_instances
 
     @classmethod
-    def pause_strategy(cls, instance_id: str) -> bool:
+    def pause_strategy(cls, instance_id: str, reason: Optional[str] = None) -> bool:
         """Disable a running strategy (blocks new entries; exits still run)."""
         instance = cls._active_instances.get(instance_id)
         if not instance:
             logger.warning(f"pause_strategy: {instance_id} not found")
             return False
         instance.is_active = False
-        logger.warning(f"Strategy PAUSED by monitor: {instance_id}")
+        instance.paused_reason = reason
+        logger.warning(f"Strategy PAUSED: {instance_id} — {reason or 'manual'}")
         return True
 
     @classmethod
@@ -91,5 +93,6 @@ class StrategyRegistry:
             logger.warning(f"resume_strategy: {instance_id} not found")
             return False
         instance.is_active = True
+        instance.paused_reason = None
         logger.info(f"Strategy RESUMED: {instance_id}")
         return True

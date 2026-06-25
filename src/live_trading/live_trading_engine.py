@@ -490,6 +490,8 @@ class LiveTradingEngine:
     async def _process_signal(
         self, strategy, symbol: str, vix: Optional[float] = None
     ) -> None:
+        if not strategy.is_active:
+            return
         market_data = await self._get_market_data(symbol)
         if not market_data:
             return

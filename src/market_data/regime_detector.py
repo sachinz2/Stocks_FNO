@@ -106,7 +106,7 @@ class MarketRegimeDetector:
         for sid, instance in active.items():
             should_be_active = sid in should_run
             if instance.is_active and not should_be_active:
-                StrategyRegistry.pause_strategy(sid)
+                StrategyRegistry.pause_strategy(sid, reason=f"Regime is {regime} — strategy not active in this regime")
                 logger.warning(
                     f"RegimeSwitching: PAUSED {sid} — "
                     f"regime={regime} not in its allowed set"

@@ -306,19 +306,49 @@ elif page == "Orders & Trades":
 elif page == "Strategies":
     st.title("Strategy Management")
 
-    strategies = fetch("strategies") or []
+    strategies   = fetch("strategies") or []
+    health_data  = fetch("analytics/strategy-health") or {}
+    perf_data    = fetch("analytics/strategy-performance") or {}
+    regime_data  = fetch("analytics/market-regime") or {}
+
+    current_regime = regime_data.get("regime", "—")
+    regime_ts      = regime_data.get("timestamp", "")[:16].replace("T", " ")
+    st.caption(f"Current Regime: **{current_regime}** (as of {regime_ts} IST)")
+    st.markdown("---")
 
     if not strategies:
-        st.info("No strategies registered.")
+        st.info("No strategies registered. The engine may not be running.")
     else:
         for s in strategies:
-            col1, col2 = st.columns([3, 1])
-            name = s.get("name", "Unknown")
-            active = s.get("active", False)
-            col1.markdown(f"**{name}** — {'Active' if active else 'Inactive'}")
-            col2.write("🟢 Running" if active else "⚫ Stopped")
-        st.markdown("---")
-        st.caption("Activate / deactivate strategies via the FastAPI docs at `/docs`.")
+            sid    = s.get("id") or s.get("name", "unknown")
+            is_active     = s.get("is_active", False)
+            paused_reason = s.get("paused_reason") or ""
+            perf   = perf_data.get(sid, {})
+            health = health_data.get(sid, {})
+
+            with st.container():
+                c1, c2, c3, c4, c5 = st.columns([3, 1, 1, 1, 1])
+                status_icon = "🟢 Running" if is_active else "🔴 Paused"
+                c1.markdown(f"**{sid}**")
+                c2.write(status_icon)
+                c3.metric("Trades", perf.get("trade_count", 0))
+                c4.metric("Win Rate", f"{perf.get('win_rate', 0)*100:.0f}%" if perf else "—")
+                c5.metric("Total PnL", fmt_inr(perf.get("total_pnl", 0)) if perf else "—")
+
+                if not is_active and paused_reason:
+                    st.caption(f"Paused: {paused_reason}")
+
+                act_col, deact_col, _ = st.columns([1, 1, 5])
+                if act_col.button("Activate", key=f"act_{sid}", disabled=is_active):
+                    r = requests.post(f"{API_BASE_URL}/strategies/activate", json={"strategy_id": sid})
+                    st.success("Activated." if r.ok else r.text)
+                    st.rerun()
+                if deact_col.button("Pause", key=f"deact_{sid}", disabled=not is_active):
+                    r = requests.post(f"{API_BASE}/strategies/deactivate", json={"strategy_id": sid})
+                    st.success("Paused." if r.ok else r.text)
+                    st.rerun()
+
+            st.markdown("---")
 
 
 elif page == "Risk & PnL":
