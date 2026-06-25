@@ -152,7 +152,7 @@ class RiskManager:
             return True
 
         # ── 3. IV Rank gate (only for premium-selling strategies) ─────────────
-        if strategy_name in ("CREDIT_SPREAD", "IRON_CONDOR"):
+        if strategy_name in ("CREDIT_SPREAD", "IRON_CONDOR", "credit_spread_v1", "iron_condor_v1"):
             if iv_rank is not None and iv_rank < 0.30:
                 logger.warning(
                     f"Risk: IV rank {iv_rank:.2f} < 0.30 for {symbol} "

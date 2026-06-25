@@ -41,6 +41,8 @@ _FNO_SYMBOLS_BY_LEN = sorted(FNO_SYMBOLS, key=len, reverse=True)
 _REDIS_ACTIVE_SPREADS  = "engine:active_spreads"
 _REDIS_ACTIVE_CONDORS  = "engine:active_condors"
 _REDIS_SINGLE_LEG_JRNL = "engine:single_leg_journals"
+_REDIS_EXITED_TODAY    = "engine:exited_today"
+_REDIS_ORDER_COUNT     = "engine:order_count"
 
 
 class LiveTradingEngine:
@@ -285,9 +287,12 @@ class LiveTradingEngine:
         if not redis:
             return
         try:
+            today = now_ist().date().isoformat()
             await redis.set(_REDIS_ACTIVE_SPREADS,  json.dumps(self._active_spreads))
             await redis.set(_REDIS_ACTIVE_CONDORS,  json.dumps(self._active_condors))
             await redis.set(_REDIS_SINGLE_LEG_JRNL, json.dumps(self._single_leg_journals))
+            await redis.set(_REDIS_EXITED_TODAY, json.dumps({"date": today, "symbols": list(self._exited_today)}))
+            await redis.set(_REDIS_ORDER_COUNT,  json.dumps({"date": today, "count": self._today_order_count}))
         except Exception as e:
             logger.error(f"Failed to persist engine state: {e}")
 
@@ -296,6 +301,8 @@ class LiveTradingEngine:
         if not redis:
             return
         try:
+            today = now_ist().date().isoformat()
+
             spreads_raw = await redis.get(_REDIS_ACTIVE_SPREADS)
             if spreads_raw:
                 self._active_spreads = json.loads(spreads_raw)
@@ -308,6 +315,20 @@ class LiveTradingEngine:
             if jrnl_raw:
                 self._single_leg_journals = json.loads(jrnl_raw)
                 logger.info(f"Restored {len(self._single_leg_journals)} single-leg journal pointer(s)")
+
+            # Restore today-only state — discard if it's from a previous day
+            exited_raw = await redis.get(_REDIS_EXITED_TODAY)
+            if exited_raw:
+                exited_data = json.loads(exited_raw)
+                if exited_data.get("date") == today:
+                    self._exited_today = set(exited_data.get("symbols", []))
+                    logger.info(f"Restored _exited_today: {self._exited_today}")
+            count_raw = await redis.get(_REDIS_ORDER_COUNT)
+            if count_raw:
+                count_data = json.loads(count_raw)
+                if count_data.get("date") == today:
+                    self._today_order_count = count_data.get("count", 0)
+                    logger.info(f"Restored today's order count: {self._today_order_count}")
         except Exception as e:
             logger.error(f"Failed to restore engine state: {e}")
 
@@ -787,6 +808,7 @@ class LiveTradingEngine:
             "short_premium":  short_p,        "long_premium":   long_p,
             "net_credit":     net_credit,     "lot_size":       lot_size,
             "journal_id":     journal_id,
+            "strategy_name":  strategy.name,
         }
         await self._persist_state()
 
@@ -866,6 +888,11 @@ class LiveTradingEngine:
                 (spread["short_premium"] - cur_short)
                 - (spread["long_premium"]  - cur_long)
             ) * lot
+
+            self.risk_manager.release_deployed_capital(
+                spread.get("strategy_name", "credit_spread_v1"),
+                spread["long_premium"] * lot,
+            )
 
             await self._log_trade_close(
                 journal_id=spread.get("journal_id"),
@@ -1050,6 +1077,7 @@ class LiveTradingEngine:
             "call_short_premium":  call_short_p, "call_long_premium": call_long_p,
             "net_credit":          net_credit,   "lot_size":          lot_size,
             "journal_id":          journal_id,
+            "strategy_name":       strategy.name,
         }
         await self._persist_state()
 
@@ -1132,6 +1160,11 @@ class LiveTradingEngine:
                 - (c["put_long_premium"]   - cur_pl)
                 - (c["call_long_premium"]  - cur_cl)
             ) * lot
+
+            self.risk_manager.release_deployed_capital(
+                c.get("strategy_name", "iron_condor_v1"),
+                (c["put_long_premium"] + c["call_long_premium"]) * lot,
+            )
 
             await self._log_trade_close(
                 journal_id=c.get("journal_id"),
