@@ -80,6 +80,7 @@ class LiveTradingEngine:
         self._peak_premiums:   Dict[str, float] = {}
         self._active_spreads:       Dict[str, Dict[str, Any]] = {}
         self._active_condors:       Dict[str, Dict[str, Any]] = {}
+        self._exited_today:         set = set()   # symbols that had a breach/exit today — no re-entry same day
         # Maps option contract → {journal_id, underlying, strategy_name}
         # so _check_open_option_exits can write the exit to trade_journal.
         self._single_leg_journals:  Dict[str, Dict[str, Any]] = {}
@@ -275,6 +276,7 @@ class LiveTradingEngine:
         self._peak_premiums.clear()
         self._active_spreads.clear()
         self._active_condors.clear()
+        self._exited_today.clear()
 
     # ── State persistence ─────────────────────────────────────────────────────
 
@@ -605,6 +607,9 @@ class LiveTradingEngine:
     ) -> None:
         if symbol in self._active_spreads:
             return
+        if symbol in self._exited_today:
+            logger.debug(f"[CreditSpread] {symbol} skipped — already exited today, no re-entry.")
+            return
         if self._max_daily_orders > 0 and self._today_order_count >= self._max_daily_orders:
             return
 
@@ -648,12 +653,18 @@ class LiveTradingEngine:
             long_strike  = find_delta_strike(underlying_price, -0.10, "PE", dte, sigma, interval)
             if long_strike >= short_strike:
                 long_strike = short_strike - 2 * interval
+            if underlying_price <= short_strike:
+                logger.info(f"[CreditSpread] {symbol} skipped — price Rs{underlying_price:.2f} already at/below short put Rs{short_strike}")
+                return
         else:
             opt          = "CE"
             short_strike = find_delta_strike(underlying_price,  0.20, "CE", dte, sigma, interval)
             long_strike  = find_delta_strike(underlying_price,  0.10, "CE", dte, sigma, interval)
             if long_strike <= short_strike:
                 long_strike = short_strike + 2 * interval
+            if underlying_price >= short_strike:
+                logger.info(f"[CreditSpread] {symbol} skipped — price Rs{underlying_price:.2f} already at/above short call Rs{short_strike}")
+                return
 
         short_contract = build_option_symbol(symbol, short_strike, opt, expiry)
         long_contract  = build_option_symbol(symbol, long_strike,  opt, expiry)
@@ -847,6 +858,7 @@ class LiveTradingEngine:
 
         for sym in to_close:
             del self._active_spreads[sym]
+            self._exited_today.add(sym)
         if to_close:
             await self._persist_state()
 
@@ -858,6 +870,9 @@ class LiveTradingEngine:
         vix: Optional[float] = None,
     ) -> None:
         if symbol in self._active_condors:
+            return
+        if symbol in self._exited_today:
+            logger.debug(f"[IronCondor] {symbol} skipped — already exited today, no re-entry.")
             return
         if self._max_daily_orders > 0 and self._today_order_count >= self._max_daily_orders:
             return
@@ -893,6 +908,13 @@ class LiveTradingEngine:
             put_long_strike  = put_short_strike  - 2 * interval
         if call_long_strike <= call_short_strike:
             call_long_strike = call_short_strike + 2 * interval
+
+        if underlying_price <= put_short_strike or underlying_price >= call_short_strike:
+            logger.info(
+                f"[IronCondor] {symbol} skipped — price Rs{underlying_price:.2f} is outside "
+                f"short strikes [{put_short_strike}–{call_short_strike}], would breach immediately."
+            )
+            return
 
         psc = build_option_symbol(symbol, put_short_strike,  "PE", expiry)
         plc = build_option_symbol(symbol, put_long_strike,   "PE", expiry)
@@ -1079,6 +1101,7 @@ class LiveTradingEngine:
 
         for sym in to_close:
             del self._active_condors[sym]
+            self._exited_today.add(sym)
         if to_close:
             await self._persist_state()
 
