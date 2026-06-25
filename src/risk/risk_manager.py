@@ -119,9 +119,18 @@ class RiskManager:
         vix           : India VIX — secondary IV gate
         """
 
+        # ── 0. Exit orders bypass ALL checks ─────────────────────────────────────
+        # An open position must always be closeable — kill switch, daily loss limit,
+        # and every entry-only check are irrelevant when closing a position.
+        # Trapping an open loss behind a kill switch is far more dangerous than
+        # allowing the exit order through.
+        if is_exit_order:
+            logger.info(f"Risk OK (exit — all checks bypassed): {side} {quantity} {symbol} @ {price}")
+            return True
+
         # ── 1. Kill switch / circuit breaker ──────────────────────────────────
         if self.rules["kill_switch_active"] or self.rules["circuit_breaker_active"]:
-            logger.error("Risk: kill switch / circuit breaker active — trade blocked.")
+            logger.error("Risk: kill switch / circuit breaker active — entry blocked.")
             return False
 
         # ── 2. Daily loss limit ───────────────────────────────────────────────
@@ -135,11 +144,11 @@ class RiskManager:
             self.activate_kill_switch("Max Daily Loss Reached")
             return False
 
-        # Exit orders only need the two safety checks above (kill switch + daily loss).
-        # Skipping entry-only gates: IV rank, sector concentration, capital allocation,
-        # position count, BUY exposure — these would incorrectly block position closures.
-        if is_exit_order or is_spread_leg:
-            logger.info(f"Risk OK (exit/spread leg): {side} {quantity} {symbol} @ {price}")
+        # Spread legs bypass entry-only checks (but kill switch above still applies).
+        # By the time leg 2-4 is placed, leg 1 has already executed — blocking the
+        # hedge would leave a naked short, which is more dangerous than proceeding.
+        if is_spread_leg:
+            logger.info(f"Risk OK (spread leg): {side} {quantity} {symbol} @ {price}")
             return True
 
         # ── 3. IV Rank gate (only for premium-selling strategies) ─────────────

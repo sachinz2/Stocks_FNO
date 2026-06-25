@@ -61,7 +61,7 @@ The engine reads from a three-tier data pipeline. Each tier is a fallback for th
 
 This means:
 - EMA20 = 20-bar EMA on 5-minute candles (covers ~100 minutes of intraday data)
-- EMA50 = 50-bar EMA on 5-minute candles (covers ~250 minutes = ~2.5 days of intraday data)
+- EMA50 = 50-bar EMA on 5-minute candles (covers ~250 minutes = ~4.17 hours of market time, roughly 2/3 of a trading day)
 - ATR14 = 14-bar ATR on 5-minute candles (covers ~70 minutes)
 
 Signals **can and do change intraday** as new 5-minute bars form. A crossover that occurs at 11:30 AM is distinct from the opening state.
@@ -220,12 +220,14 @@ A crossover is detected by comparing current EMA values to the **previous cycle'
 
 **Step 2 — Confirmation filter:**
 
-The crossover must persist for **2 consecutive cycles** (2 minutes) before a trade fires. If the crossover reverses before 2 confirmations, the pending count resets. This prevents false signals when EMAs are nearly equal and oscillating.
+The crossover must persist for **2 distinct 5-minute bars** before a trade fires. The engine tracks an `ohlc_bar_key` (the timestamp of the last completed 5-min candle). The pending count only increments when the bar key changes — engine cycles within the same 5-minute candle are ignored. If the crossover reverses before 2 bar confirmations, the pending count resets.
 
 ```
-Cycle 1: EMA20 crosses above EMA50 → pending BUY (1/2)
-Cycle 2: EMA20 still above EMA50   → CONFIRMED → BUY order placed
+Bar 1 closes: EMA20 crosses above EMA50 → pending BUY (1/2)
+Bar 2 closes: EMA20 still above EMA50   → CONFIRMED → BUY order placed
 ```
+
+This ensures true 2-candle confirmation, not 2 engine-cycle confirmation within the same bar.
 
 **Step 3 — Duplicate prevention:**
 
@@ -250,7 +252,7 @@ No entries before 9:30 AM regardless of signals.
 ```
 RELIANCE @ ₹2,850  |  ATR14 (5-min) = ₹45  →  ATR% = 1.58%
 EMA20 (5-min) = 2,855  crossed above  EMA50 (5-min) = 2,840
-Confirmed over 2 cycles
+Confirmed over 2 completed 5-min bars
 
 → BUY  RELIANCE25JUN2850CE  @ ₹62  (1 lot × 250 shares)
   Total outlay:  ₹15,500
@@ -546,9 +548,9 @@ Net PnL = [(put_short_sold − put_short_close)
 |----------|-----------|
 | Redis tick missing for a symbol | `_get_market_data` returns None → symbol skipped this cycle |
 | Redis tick older than 90 seconds | Same as missing — symbol skipped |
-| Redis completely unavailable | No market data → no entries, no exits (positions remain open) |
+| Redis completely unavailable | No market data → no entries; intraday stop-loss/trailing-stop exits also disabled until Redis recovers. 3:15 PM square-off still fires (engine holds the expiry timestamp in memory), using entry price as fallback exit price in paper mode. |
 | Zerodha broker unavailable (paper mode) | Orders rejected at PaperBroker level, logged as FAILED |
-| Kill switch activated | All orders rejected until manually deactivated |
+| Kill switch activated | New entries blocked; exit orders are **always allowed through** regardless of kill switch state |
 
 ---
 
@@ -716,7 +718,9 @@ All alerts have `[Falcon Trader]` prefix in the subject line.
 | `stop_loss_pct` | 0.50 | Exit if premium falls 50% from entry |
 | `target_pct` | 1.00 | Exit if premium rises 100% from entry |
 | `trailing_stop_pct` | 0.25 | Exit if premium falls 25% from peak |
-| `signal_confirm_bars` | 2 | Crossover must persist for 2 cycles |
+| `signal_confirm_bars` | 2 | Crossover must persist on 2 distinct 5-min bars |
+| `min_dte` | 10 | Minimum days-to-expiry before entry |
+| `max_dte` | 25 | Maximum days-to-expiry before entry |
 
 ### Credit Spread (`credit_spread_v1`)
 

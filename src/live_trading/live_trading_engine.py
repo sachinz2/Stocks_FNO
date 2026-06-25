@@ -530,6 +530,17 @@ class LiveTradingEngine:
 
         expiry   = get_near_month_expiry()
         dte      = (expiry - now_ist().replace(tzinfo=None)).days
+
+        # DTE range filter — keeps us in the liquid, balanced-theta window
+        min_dte = getattr(strategy, "min_dte", 0)
+        max_dte = getattr(strategy, "max_dte", 999)
+        if not (min_dte <= dte <= max_dte):
+            logger.info(
+                f"[{strategy.name}] DTE={dte} outside [{min_dte},{max_dte}] "
+                f"— skipping entry for {symbol}"
+            )
+            return
+
         lot_size = await self._get_lot_size(symbol)
         atr      = float(market_data.get("atr14", underlying_price * 0.01))
         iv_rank  = await self._get_iv_rank(symbol, underlying_price, atr, dte)

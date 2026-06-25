@@ -148,7 +148,9 @@ class LTPPoller:
             if not records:
                 return None
             df = pd.DataFrame(records)
-            return df[["open", "high", "low", "close", "volume"]].dropna().reset_index(drop=True)
+            # Keep "date" so _enrich can produce ohlc_bar_key for true-bar confirmation
+            cols = [c for c in ["date", "open", "high", "low", "close", "volume"] if c in df.columns]
+            return df[cols].dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
         except Exception as e:
             logger.warning(f"kite.historical_data failed for {symbol}: {e}")
             return None
@@ -179,6 +181,14 @@ class LTPPoller:
         atr_pct       = round((atr14 / ltp * 100) if ltp > 0 else 0, 4)
         ema_spread_pct = round((abs(ema20 - ema50) / ema50 * 100) if ema50 > 0 else 0, 4)
 
+        # ohlc_bar_key — changes once per 5-min bar; strategies use this for true-bar
+        # confirmation so that `signal_confirm_bars=2` means 2 distinct candles, not
+        # 2 engine cycles that may both fall inside the same unfinished bar.
+        ohlc_bar_key: Optional[str] = None
+        if "date" in df.columns:
+            last_date = df["date"].iloc[-1]
+            ohlc_bar_key = str(last_date)
+
         return {
             "symbol":        symbol,
             "close":         ltp,
@@ -188,6 +198,7 @@ class LTPPoller:
             "atr_pct":       atr_pct,
             "ema_spread_pct": ema_spread_pct,
             "vwap":          round(vwap, 4),
+            "ohlc_bar_key":  ohlc_bar_key,
             "timestamp":     datetime.now().isoformat(),
             "ltp_source":    "zerodha_historical",
         }

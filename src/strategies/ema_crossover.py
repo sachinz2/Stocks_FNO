@@ -23,11 +23,14 @@ class EMACrossoverStrategy(StrategyBase):
         # Signal confirmation: crossover must persist for this many consecutive cycles
         # before a BUY/SELL fires. Prevents rapid BUY↔SELL alternation when EMAs are close.
         self.signal_confirm_bars: int = self.parameters.get("signal_confirm_bars", 2)
+        self.min_dte: int = self.parameters.get("min_dte", 10)
+        self.max_dte: int = self.parameters.get("max_dte", 25)
 
         self.prev_fast_ema: Optional[float] = None
         self.prev_slow_ema: Optional[float] = None
         self._pending_signal: Optional[str] = None
         self._pending_count: int = 0
+        self._pending_bar_key: Optional[str] = None  # tracks last 5-min bar seen
 
         logger.info(
             f"Initialized EMA Crossover '{self.name}' ({self.fast_period}/{self.slow_period}) | "
@@ -40,9 +43,12 @@ class EMACrossoverStrategy(StrategyBase):
         Expects data dict containing:
         - ema20 (or dynamic fast_period key)
         - ema50 (or dynamic slow_period key)
+        - ohlc_bar_key (optional): changes once per 5-min bar; used so that
+          signal_confirm_bars counts distinct completed candles, not engine cycles.
         """
         fast_ema = data.get(f"ema{self.fast_period}")
         slow_ema = data.get(f"ema{self.slow_period}")
+        bar_key  = data.get("ohlc_bar_key")  # None in test/backtest contexts
 
         if fast_ema is None or slow_ema is None:
             logger.warning(f"Strategy {self.name}: Missing EMA data.")
@@ -59,30 +65,36 @@ class EMACrossoverStrategy(StrategyBase):
                 raw = None
 
             if raw is not None:
-                if raw == self._pending_signal:
-                    self._pending_count += 1
-                else:
-                    # New crossover direction — reset confirmation counter
+                if raw != self._pending_signal:
+                    # New crossover direction — start fresh
                     self._pending_signal = raw
                     self._pending_count = 1
+                    self._pending_bar_key = bar_key
+                elif bar_key is None or bar_key != self._pending_bar_key:
+                    # Same direction AND we're on a new 5-min bar (or bar_key unavailable)
+                    self._pending_count += 1
+                    self._pending_bar_key = bar_key
+                # else: same bar as last cycle — don't double-count
 
                 if self._pending_count >= self.signal_confirm_bars:
                     logger.info(
-                        f"[{self.name}] {raw} Signal confirmed after "
-                        f"{self._pending_count} bars — {raw}ing."
+                        f"[{self.name}] {raw} confirmed after "
+                        f"{self._pending_count} bars — firing."
                     )
                     signal = raw
                     self._pending_signal = None
                     self._pending_count = 0
+                    self._pending_bar_key = None
                 else:
                     logger.debug(
                         f"[{self.name}] {raw} crossover pending "
                         f"({self._pending_count}/{self.signal_confirm_bars} bars)"
                     )
             else:
-                # No crossover this bar — clear any pending signal
+                # No crossover this bar — clear pending
                 self._pending_signal = None
                 self._pending_count = 0
+                self._pending_bar_key = None
 
         self.prev_fast_ema = fast_ema
         self.prev_slow_ema = slow_ema
