@@ -60,7 +60,8 @@ class ZerodhaLTPPoller:
         Returns number of symbols updated.
         Called by APScheduler every POLL_INTERVAL_SECONDS.
         """
-        if not self._permission_ok:
+        from src.core.utils import is_market_open
+        if not self._permission_ok or not is_market_open():
             return 0
 
         try:

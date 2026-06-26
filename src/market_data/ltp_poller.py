@@ -54,10 +54,15 @@ class LTPPoller:
         self.symbols  = symbols or FNO_SYMBOLS  # default: all 40
         self._history: Dict[str, pd.DataFrame] = {}
         self._history_loaded_at: Dict[str, datetime] = {}
-        self._no_token_warned: set = set()  # suppress repeat warnings per symbol
+        self._no_token_warned: set = set()    # suppress repeat "no token" warnings per symbol
+        self._no_history_warned: set = set()  # suppress repeat "not enough history" warnings
 
     async def poll(self) -> None:
         """Called every 60 s by APScheduler."""
+        from src.core.utils import is_market_open
+        if not is_market_open():
+            return
+
         loop = asyncio.get_event_loop()
 
         ema_scores: Dict[str, float] = {}
@@ -68,7 +73,9 @@ class LTPPoller:
             try:
                 df = await self._get_history(symbol, loop)
                 if df is None or len(df) < 50:
-                    logger.warning(f"Not enough history for {symbol} (need 50 bars), skipping.")
+                    if symbol not in self._no_history_warned:
+                        logger.warning(f"Not enough history for {symbol} (need 50 bars), skipping (won't repeat).")
+                        self._no_history_warned.add(symbol)
                     continue
 
                 ltp = float(df["close"].iloc[-1])
