@@ -44,18 +44,24 @@ STRATEGY_SPREAD    = "credit_spread_v1"
 STRATEGY_CONDOR    = "iron_condor_v1"
 
 # Regime → which strategies should be ACTIVE
+#
+# Credit spreads are DIRECTIONAL — the engine picks BULL_PUT in an uptrend and
+# BEAR_CALL in a downtrend, so the short strike is always placed *away* from the
+# price move.  This makes credit spreads safer in TRENDING markets than condors.
+# Iron condors are NEUTRAL — they need flat price action, so they are excluded
+# from TRENDING and VOLATILE where one wing reliably gets blown out.
 REGIME_STRATEGY_MAP: Dict[str, list] = {
-    "TRENDING":    [STRATEGY_EMA],                        # momentum only
-    "RANGE_BOUND": [STRATEGY_CONDOR],                     # range plays only
-    "VOLATILE":    [STRATEGY_SPREAD],                     # IV-crush plays
-    "LOW_VOL":     [STRATEGY_SPREAD, STRATEGY_CONDOR],   # quiet = premium seller heaven
+    "TRENDING":    [STRATEGY_EMA, STRATEGY_SPREAD],       # spread aligned with trend = low breach risk
+    "RANGE_BOUND": [STRATEGY_CONDOR, STRATEGY_SPREAD],   # both premium sellers thrive in flat market
+    "VOLATILE":    [STRATEGY_SPREAD],                     # high IV = rich premium; condor wings blow
+    "LOW_VOL":     [STRATEGY_SPREAD, STRATEGY_CONDOR],   # quiet market = premium seller heaven
 }
 
 # Regimes where each strategy is explicitly forbidden
 STRATEGY_DISABLE_IN: Dict[str, list] = {
     STRATEGY_EMA:    ["RANGE_BOUND", "LOW_VOL"],   # EMA whipsaws in flat markets
     STRATEGY_CONDOR: ["TRENDING", "VOLATILE"],      # condors blow up in big moves
-    STRATEGY_SPREAD: ["TRENDING"],                  # momentum kills credit spread timing
+    STRATEGY_SPREAD: [],                            # credit spreads allowed in all regimes
 }
 
 
@@ -207,13 +213,15 @@ class MarketRegimeDetector:
                 VOLATILE        VIX < 12?
                               /          \\
                            YES            NO
-                          LOW_VOL     ATR% > 1.5%?
+                          LOW_VOL     ATR% >= 1.5%?
                                      /             \\
                                   YES               NO
-                               TRENDING         EMA_flat?
-                                               /         \\
-                                            YES            NO
-                                        RANGE_BOUND    TRENDING
+                               TRENDING         EMA_spread <= 0.15%?
+                                               /                    \\
+                                            YES                      NO
+                                        RANGE_BOUND             RANGE_BOUND (default)
+                                    (explicit flat)           (moderate/borderline —
+                                                               treat conservatively)
         """
         if vix > VIX_HIGH_THRESHOLD:
             return "VOLATILE"
@@ -221,6 +229,10 @@ class MarketRegimeDetector:
             return "LOW_VOL"
         if atr_pct >= ATR_TREND_THRESHOLD:
             return "TRENDING"
-        if ema_spread_pct < EMA_FLAT_THRESHOLD:
+        # ATR is moderate — EMAs are flat or borderline flat.
+        # Default to RANGE_BOUND (not TRENDING) so iron condors and credit
+        # spreads are available in quiet markets where they perform best.
+        # Changed < to <= so EMA_spread exactly at threshold rounds to flat.
+        if ema_spread_pct <= EMA_FLAT_THRESHOLD:
             return "RANGE_BOUND"
-        return "TRENDING"
+        return "RANGE_BOUND"
