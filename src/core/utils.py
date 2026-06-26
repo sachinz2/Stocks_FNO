@@ -1,9 +1,12 @@
 import calendar
+import logging
 import math
 from datetime import date, datetime, timedelta
 import pytz
 
 from src.core.constants import FNO_LOT_SIZES, FNO_STRIKE_INTERVALS
+
+logger = logging.getLogger(__name__)
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -12,9 +15,10 @@ _MONTH_ABBR = {
     7: "JUL", 8: "AUG", 9: "SEP", 10: "OCT", 11: "NOV", 12: "DEC",
 }
 
-# NSE trading holidays. Verify against nseindia.com/market-data/market-holidays each year.
-# Missing a holiday is non-fatal (no data returns → no signals fire), but adds log noise.
-_NSE_HOLIDAYS: frozenset = frozenset({
+# Hardcoded fallback — used only when exchange_calendars is not installed.
+# exchange_calendars (pip install exchange-calendars) is the preferred source
+# and is updated automatically whenever you run pip install --upgrade.
+_NSE_HOLIDAYS_FALLBACK: frozenset = frozenset({
     # 2025
     date(2025, 1, 26),   # Republic Day
     date(2025, 2, 26),   # Mahashivratri
@@ -30,7 +34,7 @@ _NSE_HOLIDAYS: frozenset = frozenset({
     date(2025, 10, 22),  # Diwali Balipratipada
     date(2025, 11, 5),   # Guru Nanak Jayanti
     date(2025, 12, 25),  # Christmas
-    # 2026 — verify full list at nseindia.com/market-data/market-holidays each Dec
+    # 2026
     date(2026, 1, 26),   # Republic Day
     date(2026, 2, 26),   # Maha Shivaratri
     date(2026, 3, 20),   # Holi
@@ -38,7 +42,7 @@ _NSE_HOLIDAYS: frozenset = frozenset({
     date(2026, 4, 2),    # Good Friday
     date(2026, 4, 14),   # Dr. Ambedkar Jayanti
     date(2026, 5, 1),    # Maharashtra Day
-    date(2026, 6, 7),    # Eid ul-Adha / Bakri Eid (approx — moon-sighting dependent)
+    date(2026, 6, 7),    # Eid ul-Adha / Bakri Eid (approx)
     date(2026, 6, 26),   # Muharram (Ashura)
     date(2026, 8, 15),   # Independence Day
     date(2026, 8, 27),   # Janmashtami
@@ -49,6 +53,43 @@ _NSE_HOLIDAYS: frozenset = frozenset({
     date(2026, 11, 25),  # Guru Nanak Jayanti (approx)
     date(2026, 12, 25),  # Christmas
 })
+
+
+def _init_nse_holiday_checker():
+    """
+    Tries to load NSE trading calendar from exchange_calendars (dynamic, auto-updated).
+    Falls back to the hardcoded _NSE_HOLIDAYS_FALLBACK set if the package is absent.
+
+    Returns a callable:  is_nse_holiday(d: date) -> bool
+    """
+    try:
+        import exchange_calendars as ecals
+        import pandas as pd
+
+        cal = ecals.get_calendar("XNSE")
+        logger.info("NSE holiday calendar loaded from exchange_calendars (dynamic)")
+
+        def _check(d: date) -> bool:
+            try:
+                return not cal.is_session(pd.Timestamp(d))
+            except Exception:
+                return d in _NSE_HOLIDAYS_FALLBACK
+
+        return _check
+
+    except ImportError:
+        logger.warning(
+            "exchange_calendars not installed — run: pip install exchange-calendars  "
+            "Using hardcoded NSE holiday list as fallback."
+        )
+    except Exception as e:
+        logger.warning(f"exchange_calendars init failed ({e}) — using hardcoded NSE holiday list")
+
+    return lambda d: d in _NSE_HOLIDAYS_FALLBACK
+
+
+# Initialised once at import time — zero overhead per is_market_open() call.
+_is_nse_holiday = _init_nse_holiday_checker()
 
 
 def get_lot_size(symbol: str) -> int:
@@ -154,7 +195,7 @@ def is_market_open() -> bool:
     now = now_ist()
     if now.weekday() >= 5:
         return False
-    if now.date() in _NSE_HOLIDAYS:
+    if _is_nse_holiday(now.date()):
         return False
     market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
     market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)

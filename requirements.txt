@@ -38,6 +38,11 @@ PyJWT
 pandas
 numpy
 
+# Dynamic NSE holiday calendar — replaces hardcoded date list in src/core/utils.py.
+# Bundles accurate exchange calendars for 50+ markets; XNSE covers all NSE holidays.
+# Run `pip install --upgrade exchange-calendars` once a year to pull the latest data.
+exchange-calendars
+
 # Retry logic
 tenacity
 
