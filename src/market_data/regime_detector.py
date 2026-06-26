@@ -36,7 +36,7 @@ EMA_FLAT_THRESHOLD   = 0.15   # EMA spread% below = range-bound / flat
 
 REDIS_REGIME_KEY  = "market:regime"
 REDIS_NIFTY_TICK  = "tick:NIFTY50"
-REDIS_VIX_KEY     = "market:vix"
+REDIS_VIX_KEY     = "market:india_vix"  # matches option_chain.fetch_and_cache_vix()
 
 # Strategy IDs that must exactly match what StrategyRegistry uses
 STRATEGY_EMA       = "ema_crossover_v1"

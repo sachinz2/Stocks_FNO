@@ -54,6 +54,7 @@ class LTPPoller:
         self.symbols  = symbols or FNO_SYMBOLS  # default: all 40
         self._history: Dict[str, pd.DataFrame] = {}
         self._history_loaded_at: Dict[str, datetime] = {}
+        self._no_token_warned: set = set()  # suppress repeat warnings per symbol
 
     async def poll(self) -> None:
         """Called every 60 s by APScheduler."""
@@ -127,7 +128,9 @@ class LTPPoller:
             if self._kite and symbol in self._tokens:
                 df = await loop.run_in_executor(None, self._fetch_kite_ohlc, symbol)
             else:
-                logger.warning(f"LTPPoller: no kite/token for {symbol} — skipping OHLC fetch.")
+                if symbol not in self._no_token_warned:
+                    logger.warning(f"LTPPoller: no kite/token for {symbol} — skipping OHLC fetch (won't repeat).")
+                    self._no_token_warned.add(symbol)
                 df = None
             self._history_loaded_at[symbol] = now
             if df is not None and not df.empty:
