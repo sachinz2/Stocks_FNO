@@ -30,18 +30,23 @@ _NSE_HOLIDAYS: frozenset = frozenset({
     date(2025, 10, 22),  # Diwali Balipratipada
     date(2025, 11, 5),   # Guru Nanak Jayanti
     date(2025, 12, 25),  # Christmas
-    # 2026
+    # 2026 — verify full list at nseindia.com/market-data/market-holidays each Dec
     date(2026, 1, 26),   # Republic Day
-    date(2026, 2, 26),   # Maha Shivaratri (approx)
-    date(2026, 3, 20),   # Holi (approx)
-    date(2026, 3, 30),   # Id-Ul-Fitr (approx — moon-sighting dependent)
+    date(2026, 2, 26),   # Maha Shivaratri
+    date(2026, 3, 20),   # Holi
+    date(2026, 3, 30),   # Id-Ul-Fitr / Ramzan Eid (moon-sighting dependent)
     date(2026, 4, 2),    # Good Friday
     date(2026, 4, 14),   # Dr. Ambedkar Jayanti
     date(2026, 5, 1),    # Maharashtra Day
+    date(2026, 6, 7),    # Eid ul-Adha / Bakri Eid (approx — moon-sighting dependent)
+    date(2026, 6, 26),   # Muharram (Ashura)
     date(2026, 8, 15),   # Independence Day
+    date(2026, 8, 27),   # Janmashtami
     date(2026, 10, 2),   # Gandhi Jayanti
+    date(2026, 10, 20),  # Dussehra / Vijaya Dashami (approx)
     date(2026, 11, 14),  # Diwali Laxmi Pujan (approx)
     date(2026, 11, 15),  # Diwali Balipratipada (approx)
+    date(2026, 11, 25),  # Guru Nanak Jayanti (approx)
     date(2026, 12, 25),  # Christmas
 })
 
