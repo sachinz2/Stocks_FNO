@@ -897,14 +897,29 @@ class LiveTradingEngine:
             current_price = float(market_data.get("close", 0))
             atr = float(market_data.get("atr14", 0))
             opt = spread["option_type"]
-            cur_short = estimate_option_premium(
-                atr, dte,
-                underlying_price=current_price, strike=spread["short_strike"], option_type=opt,
-            ) if current_price > 0 else spread["short_premium"]
-            cur_long = estimate_option_premium(
-                atr, dte,
-                underlying_price=current_price, strike=spread["long_strike"], option_type=opt,
-            ) if current_price > 0 else spread["long_premium"]
+
+            # Try real Kite LTP first (same source as entry pricing via get_entry_prices_for_spread).
+            # BS fallback uses 5-min ATR which underestimates annualised vol by ~8×, causing
+            # exits to show near-zero option prices and triggering fake "max profit" exits.
+            from src.market_data.option_chain import get_option_quote
+            kite  = getattr(self, "_kite",  None)
+            redis = getattr(self, "_redis", None)
+            short_ltp = await get_option_quote(spread["short_contract"], kite, redis)
+            long_ltp  = await get_option_quote(spread["long_contract"],  kite, redis)
+
+            if short_ltp and short_ltp > 0:
+                cur_short = short_ltp
+            elif current_price > 0:
+                cur_short = estimate_option_premium(atr, dte, underlying_price=current_price, strike=spread["short_strike"], option_type=opt)
+            else:
+                cur_short = spread["short_premium"]
+
+            if long_ltp and long_ltp > 0:
+                cur_long = long_ltp
+            elif current_price > 0:
+                cur_long = estimate_option_premium(atr, dte, underlying_price=current_price, strike=spread["long_strike"], option_type=opt)
+            else:
+                cur_long = spread["long_premium"]
 
             min_dte     = getattr(cs_strategy, "min_dte", 7) if cs_strategy else 7
             exit_reason: Optional[str] = None
@@ -1163,16 +1178,28 @@ class LiveTradingEngine:
 
             current_price = float(market_data.get("close", 0))
             atr = float(market_data.get("atr14", 0))
-            if current_price > 0:
-                cur_ps = estimate_option_premium(atr, dte, underlying_price=current_price, strike=c["put_short_strike"],  option_type="PE")
-                cur_pl = estimate_option_premium(atr, dte, underlying_price=current_price, strike=c["put_long_strike"],   option_type="PE")
-                cur_cs = estimate_option_premium(atr, dte, underlying_price=current_price, strike=c["call_short_strike"], option_type="CE")
-                cur_cl = estimate_option_premium(atr, dte, underlying_price=current_price, strike=c["call_long_strike"],  option_type="CE")
-            else:
-                cur_ps = c["put_short_premium"]
-                cur_pl = c["put_long_premium"]
-                cur_cs = c["call_short_premium"]
-                cur_cl = c["call_long_premium"]
+
+            # Try real Kite LTPs first — same fix as _check_spread_exits.
+            from src.market_data.option_chain import get_option_quote
+            kite  = getattr(self, "_kite",  None)
+            redis = getattr(self, "_redis", None)
+
+            def _leg_price(ltp, bs_fallback_kwargs, entry_p):
+                if ltp and ltp > 0:
+                    return ltp
+                if current_price > 0:
+                    return estimate_option_premium(atr, dte, **bs_fallback_kwargs)
+                return entry_p
+
+            ps_ltp = await get_option_quote(c["put_short_contract"],  kite, redis)
+            pl_ltp = await get_option_quote(c["put_long_contract"],   kite, redis)
+            cs_ltp = await get_option_quote(c["call_short_contract"], kite, redis)
+            cl_ltp = await get_option_quote(c["call_long_contract"],  kite, redis)
+
+            cur_ps = _leg_price(ps_ltp, {"underlying_price": current_price, "strike": c["put_short_strike"],  "option_type": "PE"}, c["put_short_premium"])
+            cur_pl = _leg_price(pl_ltp, {"underlying_price": current_price, "strike": c["put_long_strike"],   "option_type": "PE"}, c["put_long_premium"])
+            cur_cs = _leg_price(cs_ltp, {"underlying_price": current_price, "strike": c["call_short_strike"], "option_type": "CE"}, c["call_short_premium"])
+            cur_cl = _leg_price(cl_ltp, {"underlying_price": current_price, "strike": c["call_long_strike"],  "option_type": "CE"}, c["call_long_premium"])
 
             min_dte    = getattr(ic_strategy, "min_dte",            7)   if ic_strategy else 7
             profit_pct = getattr(ic_strategy, "profit_close_pct",  0.25) if ic_strategy else 0.25
