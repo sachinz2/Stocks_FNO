@@ -526,7 +526,6 @@ elif page == "System Health":
     if not health:
         st.error("Cannot reach the API.")
     else:
-        col1, col2 = st.columns(2)
         checks = {
             "API":        health.get("status", "UNKNOWN"),
             "Database":   health.get("database", "UNKNOWN"),
@@ -550,7 +549,54 @@ elif page == "System Health":
                 st.info(f"**{label}**: {value}")
 
     st.markdown("---")
-    st.caption(f"Last checked: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # ── Live Log Tail ─────────────────────────────────────────────────────────
+    st.subheader("Live Log (last 20 lines)")
+
+    log_col, btn_col = st.columns([5, 1])
+    with btn_col:
+        if st.button("Refresh", key="refresh_logs"):
+            st.rerun()
+
+    log_data = fetch("logs/recent?n=20") or {}
+    log_lines = log_data.get("lines", [])
+    log_note  = log_data.get("note", "")
+
+    if log_note:
+        st.info(log_note)
+    elif not log_lines:
+        st.info("No log entries yet.")
+    else:
+        _COLOR = {
+            "CRITICAL": "#FF0000",
+            "ERROR":    "#FF4B4B",
+            "WARNING":  "#FFA500",
+            "DEBUG":    "#888888",
+            "INFO":     "#DDDDDD",
+        }
+        html_rows = []
+        for entry in log_lines:
+            raw   = entry.get("text", "")
+            level = entry.get("level", "INFO")
+            # Escape HTML special chars
+            safe  = raw.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            color = _COLOR.get(level, "#DDDDDD")
+            html_rows.append(f'<span style="color:{color}">{safe}</span>')
+
+        log_html = (
+            '<pre style="'
+            "background:#0e1117;padding:12px;border-radius:6px;"
+            "overflow-x:auto;font-size:11px;line-height:1.6;"
+            'white-space:pre-wrap;word-break:break-all">'
+            + "<br>".join(html_rows)
+            + "</pre>"
+        )
+        st.markdown(log_html, unsafe_allow_html=True)
+
+    st.caption(
+        f"Fetched at {datetime.now().strftime('%H:%M:%S')} IST  ·  "
+        "ERROR = red  ·  WARNING = orange  ·  DEBUG = gray"
+    )
 
 
 elif page == "Admin":

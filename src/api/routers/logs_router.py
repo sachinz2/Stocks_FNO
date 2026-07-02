@@ -48,6 +48,42 @@ async def list_logs(token: str = Query(..., description="LOGS_API_TOKEN from .en
     return {"log_dir": str(LOG_DIR), "files": files}
 
 
+@router.get("/recent")
+async def recent_logs(n: int = Query(20, ge=5, le=100)):
+    """
+    Return the last N log lines as structured JSON.
+    No token required — intended for the internal dashboard only.
+    Each entry includes the raw text and a parsed severity level.
+    """
+    log_file = LOG_DIR / "falcon.log"
+    if not log_file.exists():
+        return {"lines": [], "count": 0, "log_file": "falcon.log",
+                "note": "Log file not found yet — has the API written any logs?"}
+
+    with open(log_file, "r", encoding="utf-8", errors="replace") as fh:
+        lines = fh.readlines()
+
+    parsed = []
+    for line in lines[-n:]:
+        text = line.rstrip()
+        if not text:
+            continue
+        upper = text.upper()
+        if " CRITICAL " in upper or upper.startswith("CRITICAL"):
+            level = "CRITICAL"
+        elif " ERROR " in upper or upper.startswith("ERROR"):
+            level = "ERROR"
+        elif " WARNING " in upper or " WARN " in upper or upper.startswith("WARNING"):
+            level = "WARNING"
+        elif " DEBUG " in upper or upper.startswith("DEBUG"):
+            level = "DEBUG"
+        else:
+            level = "INFO"
+        parsed.append({"text": text, "level": level})
+
+    return {"lines": parsed, "count": len(parsed), "log_file": "falcon.log"}
+
+
 @router.get("/tail", response_class=PlainTextResponse)
 async def tail_log(
     token: str = Query(..., description="LOGS_API_TOKEN from .env"),
