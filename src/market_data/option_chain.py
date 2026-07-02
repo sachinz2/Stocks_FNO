@@ -275,11 +275,11 @@ def find_delta_strike(
     T = max(dte, 1) / 365.0
     atm = round(underlying_price / strike_interval) * strike_interval
 
-    # Build candidate strikes: 20 OTM to ATM
+    # Build candidate strikes: 30 OTM to ATM
     if option_type == "CE":
-        candidates = [atm + i * strike_interval for i in range(-2, 21)]
+        candidates = [atm + i * strike_interval for i in range(-2, 31)]
     else:
-        candidates = [atm - i * strike_interval for i in range(-2, 21)]
+        candidates = [atm - i * strike_interval for i in range(-2, 31)]
 
     best_strike = atm
     best_diff = float("inf")
