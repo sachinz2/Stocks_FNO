@@ -52,6 +52,18 @@ def schedule_trading_jobs(engine) -> None:
         misfire_grace_time=30,
     )
 
+    # F: Fast exit-check job — every 10 seconds (spread/condor SL + profit only, no new entries).
+    # Reduces SL overshoot from up to 60s lag to ≤10s. Uses _exit_cycle_lock so it never
+    # runs concurrently with the 1-minute signal cycle.
+    scheduler.add_job(
+        engine._run_exit_checks_only,
+        IntervalTrigger(seconds=10),
+        id="fast_exit_check",
+        name="Fast Exit Check (10s)",
+        replace_existing=True,
+        misfire_grace_time=5,
+    )
+
     # Order sync — every 30 seconds
     scheduler.add_job(
         engine.sync_orders,
@@ -78,6 +90,18 @@ def schedule_trading_jobs(engine) -> None:
         CronTrigger(hour=9, minute=15, day_of_week="mon-fri", timezone="Asia/Kolkata"),
         id=JOB_MARKET_OPEN,
         name="Market Open",
+        replace_existing=True,
+    )
+
+    # A: Gap check — 09:16:30 IST, Mon–Fri.
+    # Checks overnight positions for gap breaches 90 seconds after market open,
+    # before the first 60-second signal cycle fires. Catches gap-down/gap-up moves
+    # that would otherwise not be detected until 09:17.
+    scheduler.add_job(
+        engine._check_gap_opens,
+        CronTrigger(hour=9, minute=16, second=30, day_of_week="mon-fri", timezone="Asia/Kolkata"),
+        id="gap_check",
+        name="Gap Check (09:16:30 IST)",
         replace_existing=True,
     )
 

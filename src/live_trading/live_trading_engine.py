@@ -7,7 +7,9 @@ from typing import Any, Dict, List, Optional
 from src.brokers.base import AbstractBroker
 from src.core.config import settings
 from src.core.constants import (
+    FNO_SECTORS,
     FNO_SYMBOLS,
+    MAX_SECTOR_POSITIONS,
     REDIS_LOT_SIZE_PREFIX,
     REDIS_TICK_PREFIX,
     REDIS_TOP_SYMBOLS_KEY,
@@ -88,6 +90,10 @@ class LiveTradingEngine:
         self._single_leg_journals:  Dict[str, Dict[str, Any]] = {}
         self._kite = None        # attached in live mode for real quotes + VIX
         self._ltp_poller = None  # ZerodhaLTPPoller — registers active option contracts
+        # Prevents concurrent exit checks from 1-min signal cycle + 10-s exit-only job (F)
+        self._exit_cycle_lock: asyncio.Lock = asyncio.Lock()
+        # Symbols flagged during _restore_state() for immediate close (C)
+        self._close_on_first_cycle: set = set()
 
         logger.info(f"LiveTradingEngine initialised — mode: {self.mode.value.upper()}")
 
@@ -176,9 +182,10 @@ class LiveTradingEngine:
         # Cancel orders that have been pending > 5 minutes
         await self.order_manager.expire_stale_orders()
 
-        # Exit checks
-        await self._check_spread_exits(active_strategies)
-        await self._check_condor_exits(active_strategies)
+        # Exit checks — lock prevents interleaving with the 10-second exit-only job (F)
+        async with self._exit_cycle_lock:
+            await self._check_spread_exits(active_strategies)
+            await self._check_condor_exits(active_strategies)
         await self._check_open_option_exits(positions, active_strategies)
 
         # Refresh risk state after exits so sector/position checks see current positions
@@ -345,24 +352,56 @@ class LiveTradingEngine:
                 self._active_condors = json.loads(condors_raw)
                 logger.info(f"Restored {len(self._active_condors)} active condor(s)")
 
-            # Discard stale spreads/condors from a previous expiry cycle
+            # Discard stale spreads/condors from a previous expiry cycle.
+            # IMPORTANT: when DTE < 7 (min_dte), get_near_month_expiry() rolls to the
+            # next month. Active positions from the CURRENT expiry will then appear
+            # "stale" because their stored expiry_date != new current_expiry. Instead
+            # of discarding them (which would leave orphaned Zerodha positions), we
+            # flag them for immediate close in the next exit cycle (_close_on_first_cycle).
             current_expiry = get_near_month_expiry().isoformat()
-            stale_spreads = [sym for sym, s in self._active_spreads.items()
-                             if s.get("expiry_date") and s["expiry_date"] != current_expiry]
-            for sym in stale_spreads:
-                logger.warning(
-                    f"Discarding stale spread for {sym} "
-                    f"(expiry {self._active_spreads[sym].get('expiry_date')} != {current_expiry})"
-                )
+            today_str      = now_ist().replace(tzinfo=None).date().isoformat()
+
+            truly_stale_spreads: List[str] = []
+            for sym, s in self._active_spreads.items():
+                stored = s.get("expiry_date", "")
+                if not stored:
+                    truly_stale_spreads.append(sym)
+                elif stored < today_str:
+                    # Expiry already passed — position should have been closed already
+                    logger.error(
+                        f"Spread {sym}: stored expiry {stored} is IN THE PAST — "
+                        "was not closed properly. Discarding from tracking."
+                    )
+                    truly_stale_spreads.append(sym)
+                elif stored != current_expiry:
+                    # DTE rolled near-month expiry forward; this position is near expiry.
+                    # Keep it in tracking and force-close in the next exit cycle.
+                    logger.warning(
+                        f"Spread {sym}: expiry {stored} != current near-month {current_expiry} "
+                        "— DTE roll detected. Flagging for immediate close."
+                    )
+                    self._close_on_first_cycle.add(sym)
+            for sym in truly_stale_spreads:
                 del self._active_spreads[sym]
 
-            stale_condors = [sym for sym, c in self._active_condors.items()
-                             if c.get("expiry_date") and c["expiry_date"] != current_expiry]
-            for sym in stale_condors:
-                logger.warning(
-                    f"Discarding stale condor for {sym} "
-                    f"(expiry {self._active_condors[sym].get('expiry_date')} != {current_expiry})"
-                )
+            truly_stale_condors: List[str] = []
+            for sym, c in self._active_condors.items():
+                stored = c.get("expiry_date", "")
+                if not stored:
+                    truly_stale_condors.append(sym)
+                elif stored < today_str:
+                    logger.error(
+                        f"Condor {sym}: stored expiry {stored} is IN THE PAST — "
+                        "was not closed properly. Discarding from tracking."
+                    )
+                    truly_stale_condors.append(sym)
+                elif stored != current_expiry:
+                    logger.warning(
+                        f"Condor {sym}: expiry {stored} != current near-month {current_expiry} "
+                        "— DTE roll detected. Flagging for immediate close."
+                    )
+                    self._close_on_first_cycle.add(sym)
+            for sym in truly_stale_condors:
                 del self._active_condors[sym]
             jrnl_raw = await redis.get(_REDIS_SINGLE_LEG_JRNL)
             if jrnl_raw:
@@ -431,15 +470,159 @@ class LiveTradingEngine:
             return
 
         logger.critical(
-            f"RECONCILE WARNING: {len(orphans)} broker position(s) are NOT tracked "
-            "by the engine — likely from a crash or flushed Redis. "
-            "These positions will NOT trigger auto-exit. Close them manually."
+            f"RECONCILE: {len(orphans)} orphaned position(s) found — engine lost tracking "
+            "(likely Redis flush or crash). Auto-closing to prevent unmonitored exposure."
         )
+        from src.market_data.option_chain import get_option_quote
+        kite  = getattr(self, "_kite",  None)
+        redis = getattr(self, "_redis", None)
+        expiry = get_near_month_expiry()
+        dte    = (expiry - now_ist().replace(tzinfo=None)).days
+        closed_orphans = 0
         for p in orphans:
+            contract = p.get("symbol", "")
+            qty      = p.get("quantity", 0)
+            avg_p    = float(p.get("avg_price") or 0)
+            side     = "BUY" if qty < 0 else "SELL"   # reverse to close
+
+            # Attempt live price first, fall back to avg entry price
+            exit_p = await get_option_quote(contract, kite, redis) or avg_p
             logger.critical(
-                f"  ORPHANED: {p.get('symbol')} qty={p.get('quantity')} "
-                f"avg_price={p.get('avg_price', '?')}"
+                f"  ORPHAN CLOSE: {side} {abs(qty)} {contract} @ ₹{exit_p:.2f}"
             )
+            try:
+                await self.order_manager.place_order(
+                    contract, side, abs(qty), exit_p, is_exit_order=True
+                )
+                closed_orphans += 1
+            except Exception as e:
+                logger.error(f"  ORPHAN CLOSE FAILED for {contract}: {e}")
+
+        await self._notify(
+            f"ORPHAN POSITION ALERT\n"
+            f"Found {len(orphans)} untracked position(s) on startup (Redis likely flushed).\n"
+            f"Auto-closed {closed_orphans}/{len(orphans)} position(s).\n"
+            + "\n".join(
+                f"  {p.get('symbol')} qty={p.get('quantity')} avg=₹{p.get('avg_price','?')}"
+                for p in orphans
+            )
+        )
+
+    # ── Gap check + fast exit job + GTT backstop ─────────────────────────────
+
+    async def _check_gap_opens(self) -> None:
+        """
+        A: Called at 09:16:30 IST — catches overnight gap breaches before the
+        first 60-second signal cycle fires (~09:17).
+
+        A stock can gap 5–8% overnight on news/results. Without this check the
+        first exit cycle would only fire at 09:17, by which point the loss from
+        holding a breached short strike is already locked in.
+
+        The existing breach detection in _check_spread_exits / _check_condor_exits
+        handles the actual exit logic — we just call it 90 seconds early.
+        """
+        if not self._active_spreads and not self._active_condors:
+            return
+        logger.info(
+            f"[GapCheck] Scanning {len(self._active_spreads)} spread(s) and "
+            f"{len(self._active_condors)} condor(s) for overnight gap breaches..."
+        )
+        async with self._exit_cycle_lock:
+            active_strategies = StrategyRegistry.get_active_strategies()
+            await self._check_spread_exits(active_strategies)
+            await self._check_condor_exits(active_strategies)
+
+    async def _run_exit_checks_only(self) -> None:
+        """
+        F: 10-second exit-monitoring job.
+
+        Runs _check_spread_exits and _check_condor_exits every 10 seconds so
+        that stop-losses and profit targets are caught within 10 seconds of
+        the trigger price being reached, not up to 60 seconds.
+
+        Skips silently if the main signal cycle (or gap check) already holds the
+        lock — the 1-minute cycle is the primary and should not be blocked.
+        """
+        if not self.is_running or not is_market_open():
+            return
+        if is_square_off_time():
+            return
+        if not self._active_spreads and not self._active_condors:
+            return
+        if self._exit_cycle_lock.locked():
+            return  # main cycle is running — skip this tick
+        async with self._exit_cycle_lock:
+            active_strategies = StrategyRegistry.get_active_strategies()
+            await self._check_spread_exits(active_strategies)
+            await self._check_condor_exits(active_strategies)
+
+    async def _place_gtt_backstop(
+        self,
+        contract: str,
+        lot_size: int,
+        entry_price: float,
+        trigger_mult: float = 2.5,
+    ) -> Optional[int]:
+        """
+        I: Place a Zerodha GTT buy-back order on a short leg.
+
+        Fires automatically at the exchange if the option price rises to
+        trigger_mult × entry_price. Acts as a server-independent emergency stop
+        — protects the position even if the server crashes entirely.
+
+        Only active in LIVE mode (paper broker has no GTT support).
+        Returns the GTT trigger_id or None.
+        """
+        if self.mode != TradingMode.LIVE:
+            return None
+        kite = getattr(self, "_kite", None)
+        if not kite:
+            return None
+        trigger_price = round(entry_price * trigger_mult, 2)
+        try:
+            loop   = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: kite.place_gtt(
+                    trigger_type="single",
+                    tradingsymbol=contract,
+                    exchange="NFO",
+                    trigger_values=[trigger_price],
+                    last_price=entry_price,
+                    orders=[{
+                        "transaction_type": "BUY",
+                        "quantity":         lot_size,
+                        "order_type":       "MARKET",
+                        "product":          "NRML",
+                        "price":            0,
+                    }],
+                ),
+            )
+            gtt_id = result.get("trigger_id")
+            logger.info(
+                f"[GTT] Backstop on {contract}: trigger ₹{trigger_price:.2f} "
+                f"({trigger_mult}× entry ₹{entry_price:.2f}) → GTT #{gtt_id}"
+            )
+            return gtt_id
+        except Exception as e:
+            logger.warning(f"[GTT] Failed to place backstop on {contract}: {e}")
+            return None
+
+    async def _cancel_gtt(self, gtt_id: Optional[int], contract: str = "") -> None:
+        """I: Cancel a GTT backstop after normal exit. No-op if gtt_id is None."""
+        if not gtt_id or self.mode != TradingMode.LIVE:
+            return
+        kite = getattr(self, "_kite", None)
+        if not kite:
+            return
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, lambda: kite.delete_gtt(gtt_id))
+            logger.info(f"[GTT] Cancelled backstop #{gtt_id} ({contract})")
+        except Exception as e:
+            # GTT may have already fired (SL hit at exchange level) — not an error
+            logger.debug(f"[GTT] Could not cancel #{gtt_id} ({contract}): {e}")
 
     # ── Market price refresh ──────────────────────────────────────────────────
 
@@ -804,6 +987,33 @@ class LiveTradingEngine:
             logger.debug(f"[CreditSpread] {symbol} skipped — past entry cutoff 14:30 IST.")
             return
 
+        # D: SL frequency circuit breaker — block re-entry after 2+ adverse exits in 5 days.
+        # Prevents repeatedly entering a stock that's in a sustained adverse trend.
+        _redis_cb = getattr(self, "_redis", None)
+        if _redis_cb:
+            _sl_freq = await _redis_cb.get(f"sl_freq:{symbol}")
+            if _sl_freq and int(_sl_freq) >= 2:
+                logger.info(
+                    f"[CreditSpread] {symbol} blocked — {_sl_freq} adverse SL exit(s) "
+                    "in last 5 days (circuit breaker). Will unblock automatically."
+                )
+                return
+
+        # H: Sector concentration check — max 2 open structures per sector.
+        # Prevents correlated sector blow-ups (e.g. all pharma positions hit simultaneously).
+        _sym_sector = FNO_SECTORS.get(symbol)
+        if _sym_sector:
+            _sector_count = sum(
+                1 for s in list(self._active_spreads) + list(self._active_condors)
+                if FNO_SECTORS.get(s) == _sym_sector
+            )
+            if _sector_count >= MAX_SECTOR_POSITIONS:
+                logger.info(
+                    f"[CreditSpread] {symbol} ({_sym_sector}) skipped — "
+                    f"{_sector_count}/{MAX_SECTOR_POSITIONS} positions already open in sector."
+                )
+                return
+
         lot_size = await self._get_lot_size(symbol)
         atr      = float(market_data.get("atr14", underlying_price * 0.01))
         iv_rank  = await self._get_iv_rank(symbol, underlying_price, atr, dte)
@@ -970,9 +1180,19 @@ class LiveTradingEngine:
             "journal_id":     journal_id,
             "strategy_name":  strategy.name,
             "expiry_date":    expiry.isoformat(),
+            "entry_date":     now_ist().replace(tzinfo=None).date().isoformat(),
+            "entry_vix":      vix or 0.0,    # E: stored for VIX spike threshold adjustment
+            "gtt_id":         None,           # I: filled below after GTT placement
         }
         if self._ltp_poller:
             self._ltp_poller.register_option_contracts([short_contract, long_contract])
+
+        # I: place exchange-level GTT backstop on the short leg (live mode only).
+        # If server crashes entirely, this fires at Zerodha when price hits 2.5× entry.
+        _gtt_id = await self._place_gtt_backstop(short_contract, lot_size, short_p)
+        if _gtt_id:
+            self._active_spreads[symbol]["gtt_id"] = _gtt_id
+
         await self._persist_state()
 
         await self._notify(
@@ -1036,14 +1256,39 @@ class LiveTradingEngine:
             min_dte     = getattr(cs_strategy, "min_dte", 7) if cs_strategy else 7
             exit_reason: Optional[str] = None
 
-            if dte < min_dte:
+            # C: near-expiry restore — force close immediately on first cycle after restart
+            if underlying in self._close_on_first_cycle:
+                exit_reason = f"Near-expiry forced close (restored expiry={spread.get('expiry_date')})"
+            elif dte < min_dte:
                 exit_reason = f"DTE={dte} < {min_dte}"
+
             if exit_reason is None and current_price > 0:
                 ss = spread["short_strike"]
                 if spread["spread_type"] == "BULL_PUT_SPREAD" and current_price < ss:
                     exit_reason = f"Put breach: {underlying} Rs{current_price:.2f} < short Rs{ss}"
                 elif spread["spread_type"] == "BEAR_CALL_SPREAD" and current_price > ss:
                     exit_reason = f"Call breach: {underlying} Rs{current_price:.2f} > short Rs{ss}"
+
+            # E: VIX spike → tighten thresholds before normal manage_position check.
+            # If VIX has risen 50%+ from entry, IV expansion works against short options —
+            # take 60% profit early and use 1.5× SL instead of waiting for full 2× SL.
+            if exit_reason is None:
+                _entry_vix = spread.get("entry_vix", 0.0)
+                if _entry_vix > 0:
+                    _cur_vix = await self._get_cached_vix()
+                    if _cur_vix and _cur_vix >= _entry_vix * 1.5:
+                        if cur_short >= spread["short_premium"] * 1.5:
+                            exit_reason = (
+                                f"VIX spike SL (entry {_entry_vix:.1f}→now {_cur_vix:.1f}): "
+                                f"short ₹{cur_short:.2f} ≥ 1.5× — exiting early"
+                            )
+                        elif cur_short <= spread["short_premium"] * 0.40:
+                            pnl_pct = (spread["short_premium"] - cur_short) / spread["short_premium"] * 100
+                            exit_reason = (
+                                f"VIX spike profit (entry {_entry_vix:.1f}→now {_cur_vix:.1f}): "
+                                f"60% captured ({pnl_pct:.1f}%) — exiting early"
+                            )
+
             if exit_reason is None and cs_strategy:
                 result = cs_strategy.manage_position(
                     {"short_premium": spread["short_premium"]}, cur_short
@@ -1101,6 +1346,28 @@ class LiveTradingEngine:
                 f"Net PnL: Rs{net_pnl:,.2f}"
             )
 
+            # D: increment SL frequency counter for adverse exits (circuit breaker)
+            _is_adverse = any(
+                kw in exit_reason for kw in ("breach", "Breach", "SL:", " SL ", "spike SL")
+            )
+            if _is_adverse:
+                _r = getattr(self, "_redis", None)
+                if _r:
+                    _sl_key   = f"sl_freq:{underlying}"
+                    _sl_count = int(await _r.incr(_sl_key))
+                    if _sl_count == 1:
+                        await _r.expire(_sl_key, 5 * 86400)
+                    logger.info(
+                        f"[CircuitBreaker] {underlying}: adverse exit #{_sl_count} "
+                        f"in 5-day window"
+                    )
+
+            # I: cancel GTT backstop now that position is closed normally
+            await self._cancel_gtt(spread.get("gtt_id"), spread.get("short_contract", ""))
+
+            # C: remove from near-expiry set
+            self._close_on_first_cycle.discard(underlying)
+
         for sym in to_close:
             del self._active_spreads[sym]
             self._exited_today.add(sym)
@@ -1155,6 +1422,31 @@ class LiveTradingEngine:
         if (now.replace(tzinfo=None).hour, now.replace(tzinfo=None).minute) >= (_ENTRY_CUTOFF_HOUR, _ENTRY_CUTOFF_MIN):
             logger.debug(f"[IronCondor] {symbol} skipped — past entry cutoff 14:30 IST.")
             return
+
+        # D: SL frequency circuit breaker
+        _redis_cb_ic = getattr(self, "_redis", None)
+        if _redis_cb_ic:
+            _sl_freq_ic = await _redis_cb_ic.get(f"sl_freq:{symbol}")
+            if _sl_freq_ic and int(_sl_freq_ic) >= 2:
+                logger.info(
+                    f"[IronCondor] {symbol} blocked — {_sl_freq_ic} adverse SL exit(s) "
+                    "in last 5 days (circuit breaker). Will unblock automatically."
+                )
+                return
+
+        # H: Sector concentration check
+        _sym_sector_ic = FNO_SECTORS.get(symbol)
+        if _sym_sector_ic:
+            _sector_count_ic = sum(
+                1 for s in list(self._active_spreads) + list(self._active_condors)
+                if FNO_SECTORS.get(s) == _sym_sector_ic
+            )
+            if _sector_count_ic >= MAX_SECTOR_POSITIONS:
+                logger.info(
+                    f"[IronCondor] {symbol} ({_sym_sector_ic}) skipped — "
+                    f"{_sector_count_ic}/{MAX_SECTOR_POSITIONS} positions already open in sector."
+                )
+                return
 
         lot_size = await self._get_lot_size(symbol)
         atr      = float(market_data.get("atr14", underlying_price * 0.01))
@@ -1333,9 +1625,22 @@ class LiveTradingEngine:
             "journal_id":          journal_id,
             "strategy_name":       strategy.name,
             "expiry_date":         expiry.isoformat(),
+            "entry_date":          now_ist().replace(tzinfo=None).date().isoformat(),
+            "entry_vix":           vix or 0.0,  # E: stored for VIX spike threshold adjustment
+            "put_short_gtt_id":    None,         # I: filled below
+            "call_short_gtt_id":   None,         # I: filled below
         }
         if self._ltp_poller:
             self._ltp_poller.register_option_contracts([psc, plc, csc, clc])
+
+        # I: GTT backstops on both short legs (live mode only)
+        _put_gtt  = await self._place_gtt_backstop(psc, lot_size, put_short_p)
+        _call_gtt = await self._place_gtt_backstop(csc, lot_size, call_short_p)
+        if _put_gtt:
+            self._active_condors[symbol]["put_short_gtt_id"]  = _put_gtt
+        if _call_gtt:
+            self._active_condors[symbol]["call_short_gtt_id"] = _call_gtt
+
         await self._persist_state()
 
         await self._notify(
@@ -1395,10 +1700,29 @@ class LiveTradingEngine:
             min_dte    = getattr(ic_strategy, "min_dte",            7)   if ic_strategy else 7
             profit_pct = getattr(ic_strategy, "profit_close_pct",  0.25) if ic_strategy else 0.25
             sl_mult    = getattr(ic_strategy, "stop_loss_multiple", 2.0)  if ic_strategy else 2.0
+
+            # E: VIX spike — tighten condor thresholds dynamically.
+            # If VIX has risen 50%+ from entry, IV expansion inflates option prices
+            # and the range-bound thesis is weakening. Exit earlier.
+            _entry_vix_c = c.get("entry_vix", 0.0)
+            if _entry_vix_c > 0:
+                _cur_vix_c = await self._get_cached_vix()
+                if _cur_vix_c and _cur_vix_c >= _entry_vix_c * 1.5:
+                    profit_pct = max(profit_pct, 0.40)   # take 60% profit early
+                    sl_mult    = min(sl_mult,    1.5)     # tighter SL during IV expansion
+                    logger.debug(
+                        f"[IronCondor] {underlying}: VIX {_entry_vix_c:.1f}→{_cur_vix_c:.1f} "
+                        f"(+{(_cur_vix_c/_entry_vix_c - 1)*100:.0f}%) — thresholds tightened"
+                    )
+
             exit_reason: Optional[str] = None
 
-            if dte < min_dte:
+            # C: near-expiry restore — force close on first cycle after restart
+            if underlying in self._close_on_first_cycle:
+                exit_reason = f"Near-expiry forced close (restored expiry={c.get('expiry_date')})"
+            elif dte < min_dte:
                 exit_reason = f"DTE={dte} < {min_dte}"
+
             if exit_reason is None and current_price > 0:
                 if current_price < c["put_short_strike"]:
                     exit_reason = f"Put breach: Rs{current_price:.2f} < Rs{c['put_short_strike']}"
@@ -1412,7 +1736,29 @@ class LiveTradingEngine:
             if exit_reason is None:
                 if (cur_ps <= c["put_short_premium"] * profit_pct
                         and cur_cs <= c["call_short_premium"] * profit_pct):
-                    exit_reason = "Both wings at 75%+ profit — closing condor"
+                    profit_label = "75%+" if profit_pct <= 0.25 else "60%+ (VIX spike early exit)"
+                    exit_reason = f"Both wings at {profit_label} profit — closing condor"
+
+            # G: Regime shift post-entry — iron condors need RANGE_BOUND/LOW_VOL.
+            # If regime has shifted to TRENDING or VOLATILE after entry, the neutrality
+            # thesis is broken. Exit after holding at least 1 day (avoids same-day noise).
+            if exit_reason is None:
+                _r = getattr(self, "_redis", None)
+                if _r:
+                    try:
+                        _regime_raw = await _r.get("market:regime")
+                        if _regime_raw:
+                            _regime = json.loads(_regime_raw).get("regime", "")
+                            if _regime in ("TRENDING", "VOLATILE"):
+                                _entry_date = c.get("entry_date", "")
+                                _today_str  = now_ist().replace(tzinfo=None).date().isoformat()
+                                if _entry_date and _entry_date < _today_str:
+                                    exit_reason = (
+                                        f"Regime shift: {_regime} post-entry — "
+                                        "condor range assumption broken, exiting"
+                                    )
+                    except Exception:
+                        pass
 
             if exit_reason is None:
                 continue
@@ -1465,6 +1811,29 @@ class LiveTradingEngine:
                 f"Call short: Rs{c['call_short_premium']:.2f} -> Rs{cur_cs:.2f}\n"
                 f"Net PnL: Rs{net_pnl:,.2f}"
             )
+
+            # D: increment SL frequency counter for adverse exits (circuit breaker)
+            _is_adverse_c = any(
+                kw in exit_reason for kw in ("breach", "Breach", "SL:", " SL ", "spike SL")
+            )
+            if _is_adverse_c:
+                _r_c = getattr(self, "_redis", None)
+                if _r_c:
+                    _sl_key_c   = f"sl_freq:{underlying}"
+                    _sl_count_c = int(await _r_c.incr(_sl_key_c))
+                    if _sl_count_c == 1:
+                        await _r_c.expire(_sl_key_c, 5 * 86400)
+                    logger.info(
+                        f"[CircuitBreaker] {underlying}: adverse exit #{_sl_count_c} "
+                        f"in 5-day window"
+                    )
+
+            # I: cancel GTT backstops on both short legs
+            await self._cancel_gtt(c.get("put_short_gtt_id"),  c.get("put_short_contract", ""))
+            await self._cancel_gtt(c.get("call_short_gtt_id"), c.get("call_short_contract", ""))
+
+            # C: remove from near-expiry set
+            self._close_on_first_cycle.discard(underlying)
 
         for sym in to_close:
             del self._active_condors[sym]
