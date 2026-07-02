@@ -115,12 +115,13 @@ def _last_thursday(year: int, month: int) -> datetime:
 def get_near_month_expiry() -> datetime:
     """
     Return the near-month NSE option expiry (last Thursday of the month).
-    Rolls to next month if fewer than 4 calendar days remain — avoids
-    the illiquid final 4 days where spreads widen and theta decay accelerates.
+    Rolls to next month if fewer than 7 calendar days remain — aligns with
+    the entry min_dte=7 check so we never enter a position that immediately
+    fails the DTE floor on the next cycle.
     """
     today = datetime.now(IST).replace(tzinfo=None)
     expiry = _last_thursday(today.year, today.month)
-    if (expiry - today).days < 4:
+    if (expiry - today).days < 7:
         if today.month == 12:
             expiry = _last_thursday(today.year + 1, 1)
         else:
@@ -199,7 +200,7 @@ def is_market_open() -> bool:
         return False
     market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
     market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    return market_open <= now <= market_close
+    return market_open <= now < market_close
 
 
 def is_square_off_time() -> bool:

@@ -241,22 +241,21 @@ class LiveTradingEngine:
             # Read today's realized PnL from trade_journal (the authoritative source).
             # positions.realized_pnl is not reliably populated in paper mode.
             try:
-                from datetime import date as _date
+                from datetime import date as _date, datetime as _datetime
                 from src.database.connection import AsyncSessionLocal
                 from src.database.models.trade_journal import TradeJournal
                 from src.database.repositories.base import BaseRepository
                 from sqlalchemy import select as _select
-                today_str = _date.today().isoformat()
+                today = _date.today()
+                today_start = _datetime(today.year, today.month, today.day, 0, 0, 0)
                 async with AsyncSessionLocal() as session:
                     result = await session.execute(
                         _select(TradeJournal).where(
-                            TradeJournal.exit_time.isnot(None)
+                            TradeJournal.exit_time.isnot(None),
+                            TradeJournal.exit_time >= today_start,
                         )
                     )
-                    closed_today = [
-                        t for t in result.scalars().all()
-                        if t.exit_time and t.exit_time.date().isoformat() == today_str
-                    ]
+                    closed_today = result.scalars().all()
                 today_realized = sum(float(t.pnl or 0) for t in closed_today)
                 closed_count   = len(closed_today)
             except Exception as e:
@@ -317,10 +316,35 @@ class LiveTradingEngine:
             if condors_raw:
                 self._active_condors = json.loads(condors_raw)
                 logger.info(f"Restored {len(self._active_condors)} active condor(s)")
+
+            # Discard stale spreads/condors from a previous expiry cycle
+            current_expiry = get_near_month_expiry().isoformat()
+            stale_spreads = [sym for sym, s in self._active_spreads.items()
+                             if s.get("expiry_date") and s["expiry_date"] != current_expiry]
+            for sym in stale_spreads:
+                logger.warning(
+                    f"Discarding stale spread for {sym} "
+                    f"(expiry {self._active_spreads[sym].get('expiry_date')} != {current_expiry})"
+                )
+                del self._active_spreads[sym]
+
+            stale_condors = [sym for sym, c in self._active_condors.items()
+                             if c.get("expiry_date") and c["expiry_date"] != current_expiry]
+            for sym in stale_condors:
+                logger.warning(
+                    f"Discarding stale condor for {sym} "
+                    f"(expiry {self._active_condors[sym].get('expiry_date')} != {current_expiry})"
+                )
+                del self._active_condors[sym]
             jrnl_raw = await redis.get(_REDIS_SINGLE_LEG_JRNL)
             if jrnl_raw:
                 self._single_leg_journals = json.loads(jrnl_raw)
-                logger.info(f"Restored {len(self._single_leg_journals)} single-leg journal pointer(s)")
+                today = now_ist().date().isoformat()
+                self._single_leg_journals = {
+                    k: v for k, v in self._single_leg_journals.items()
+                    if v.get("date", today) == today
+                }
+                logger.info(f"Restored {len(self._single_leg_journals)} single-leg journal(s) for today")
 
             # Restore today-only state — discard if it's from a previous day
             exited_raw = await redis.get(_REDIS_EXITED_TODAY)
@@ -431,8 +455,8 @@ class LiveTradingEngine:
         # Build OTM-intervals map from active spread/condor metadata (most accurate)
         contract_otm: Dict[str, int] = {}
         for s in self._active_spreads.values():
-            contract_otm[s.get("short_contract", "")] = 0   # short is near-ATM
-            contract_otm[s.get("long_contract", "")]  = 2   # long is 2 OTM
+            contract_otm[s.get("short_contract", "")] = 1   # short is ~1 interval OTM (~0.20 delta)
+            contract_otm[s.get("long_contract", "")]  = 3   # long is ~3 intervals OTM (~0.10 delta)
         for c in self._active_condors.values():
             contract_otm[c.get("put_short_contract",  "")] = 1
             contract_otm[c.get("put_long_contract",   "")] = 2
@@ -508,8 +532,15 @@ class LiveTradingEngine:
             if not market_data:
                 continue
 
-            atr       = float(market_data.get("atr14", 0))
-            current_p = estimate_option_premium(atr, dte) if atr > 0 else entry_p
+            atr = float(market_data.get("atr14", 0))
+            from src.market_data.option_chain import get_option_quote
+            _live_p = await get_option_quote(contract, getattr(self, "_kite", None), getattr(self, "_redis", None))
+            if _live_p and _live_p > 0:
+                current_p = _live_p
+            elif atr > 0:
+                current_p = estimate_option_premium(atr, dte)
+            else:
+                current_p = entry_p
             await self.portfolio_manager.update_position_market_price(contract, current_p)
 
             peak = self._peak_premiums.get(contract, entry_p)
@@ -649,6 +680,7 @@ class LiveTradingEngine:
                     "journal_id":    journal_id,
                     "underlying":    symbol,
                     "strategy_name": strategy.name,
+                    "date":          now_ist().date().isoformat(),
                 }
                 await self._persist_state()
             await self._notify(
@@ -662,20 +694,34 @@ class LiveTradingEngine:
     async def _close_option_positions(
         self, underlying: str, option_type: str, market_data: Dict
     ) -> None:
+        from src.market_data.option_chain import get_option_quote
         positions = await self._safe_get_positions()
         expiry = get_near_month_expiry()
         dte    = (expiry - now_ist().replace(tzinfo=None)).days
         atr    = float(market_data.get("atr14", 0))
+        opposite_type = option_type  # the type being closed (PE or CE)
         for pos in positions:
             contract = pos.get("symbol", "")
             qty      = pos.get("quantity", 0)
             if qty <= 0 or not (contract.startswith(underlying) and contract.endswith(option_type)):
                 continue
             entry_p = float(pos.get("avg_price") or 0)
-            exit_p  = estimate_option_premium(atr, dte) if atr > 0 else entry_p
+            _live_p = await get_option_quote(contract, getattr(self, "_kite", None), getattr(self, "_redis", None))
+            exit_p = _live_p if (_live_p and _live_p > 0) else (estimate_option_premium(atr, dte) if atr > 0 else entry_p)
             await self.order_manager.place_order(contract, "SELL", abs(qty), exit_p, is_exit_order=True)
             self._peak_premiums.pop(contract, None)
             logger.info(f"REVERSAL EXIT: SELL {contract} @ Rs{exit_p:.2f}")
+            jrnl = self._single_leg_journals.pop(contract, None)
+            if jrnl:
+                pnl = (exit_p - entry_p) * abs(qty)
+                await self._log_trade_close(
+                    journal_id=jrnl.get("journal_id"),
+                    exit_price=exit_p,
+                    pnl=pnl,
+                    exit_reason=f"Reversal exit ({opposite_type} signal)",
+                    market_data=market_data,
+                )
+                await self._persist_state()
 
     async def _process_credit_spread(
         self,
@@ -722,7 +768,7 @@ class LiveTradingEngine:
         if not vix_allows_selling(vix):
             logger.info(
                 f"[CreditSpread] {symbol} skipped — VIX={vix:.1f} too low "
-                f"(need ≥14.0 for rich premium). Not worth selling spreads."
+                f"(need ≥12.0 for rich premium). Not worth selling spreads."
             )
             return
         if not iv_rank_allows_selling(iv_rank):
@@ -776,6 +822,14 @@ class LiveTradingEngine:
             else:
                 short_strike += interval
             short_contract = build_option_symbol(symbol, short_strike, opt, expiry)
+            # Re-validate spread geometry after OI bump
+            if spread_type == "BULL_PUT_SPREAD":
+                if long_strike >= short_strike:
+                    long_strike = short_strike - 2 * interval
+            else:  # BEAR_CALL_SPREAD
+                if long_strike <= short_strike:
+                    long_strike = short_strike + 2 * interval
+            long_contract = build_option_symbol(symbol, long_strike, opt, expiry)
 
         short_p, long_p = await get_entry_prices_for_spread(
             symbol, short_contract, long_contract,
@@ -842,9 +896,12 @@ class LiveTradingEngine:
         )
         if not long_order or long_order.order_status != "OPEN":
             logger.error(f"[CreditSpread] Long leg failed: {long_contract}. Unwinding short.")
+            from src.market_data.option_chain import get_option_quote as _gq
+            _unwind_p = await _gq(short_contract, getattr(self, "_kite", None), getattr(self, "_redis", None)) or short_p
             await self.order_manager.place_order(
-                short_contract, "BUY", lot_size, short_p, is_spread_leg=True
+                short_contract, "BUY", lot_size, _unwind_p, is_spread_leg=True
             )
+            self._exited_today.add(symbol)
             return
 
         self._today_order_count += 2
@@ -866,6 +923,7 @@ class LiveTradingEngine:
             "net_credit":     net_credit,     "lot_size":       lot_size,
             "journal_id":     journal_id,
             "strategy_name":  strategy.name,
+            "expiry_date":    expiry.isoformat(),
         }
         if self._ltp_poller:
             self._ltp_poller.register_option_contracts([short_contract, long_contract])
@@ -955,8 +1013,18 @@ class LiveTradingEngine:
                 continue
 
             lot = spread["lot_size"]
-            await self.order_manager.place_order(spread["short_contract"], "BUY",  lot, cur_short, is_spread_leg=True)
-            await self.order_manager.place_order(spread["long_contract"],  "SELL", lot, cur_long,  is_spread_leg=True)
+            exit_short = await self.order_manager.place_order(spread["short_contract"], "BUY",  lot, cur_short, is_spread_leg=True)
+            exit_long  = await self.order_manager.place_order(spread["long_contract"],  "SELL", lot, cur_long,  is_spread_leg=True)
+
+            _bad = {"REJECTED", "REJECTED_BY_RISK", "CANCELLED"}
+            if exit_short is None or exit_long is None or \
+               getattr(exit_short, "order_status", "") in _bad or \
+               getattr(exit_long,  "order_status", "") in _bad:
+                logger.warning(
+                    f"[CreditSpread] Exit orders for {underlying} partially rejected — "
+                    f"keeping position in tracking to retry next cycle."
+                )
+                continue
 
             net_pnl = (
                 (spread["short_premium"] - cur_short)
@@ -1034,13 +1102,25 @@ class LiveTradingEngine:
         if not vix_allows_selling(vix):
             logger.info(
                 f"[IronCondor] {symbol} skipped — VIX={vix:.1f} too low "
-                f"(need ≥14.0 for rich premium). Not worth selling condors."
+                f"(need ≥12.0 for rich premium). Not worth selling condors."
             )
             return
         if not iv_rank_allows_selling(iv_rank):
             logger.info(
                 f"[IronCondor] {symbol} skipped — IV Rank={iv_rank:.2f} too low "
                 f"(need ≥0.30). Premium too cheap."
+            )
+            return
+
+        # OI/PCR neutrality check — iron condors need a non-directional market
+        from src.market_data.nse_oi import get_oi_data, is_strike_crowded
+        redis = getattr(self, "_redis", None)
+        oi_data = await get_oi_data(symbol, redis) if redis else None
+        pcr = market_data.get("pcr") or (oi_data.get("pcr") if oi_data else None)
+        if pcr is not None and (pcr < 0.7 or pcr > 1.4):
+            logger.info(
+                f"[IronCondor] {symbol} skipped — PCR={pcr:.2f} is extreme "
+                f"(need 0.7–1.4 for neutral condor). Market too directional."
             )
             return
 
@@ -1054,6 +1134,24 @@ class LiveTradingEngine:
             put_long_strike  = put_short_strike  - 2 * interval
         if call_long_strike <= call_short_strike:
             call_long_strike = call_short_strike + 2 * interval
+
+        # Crowded-strike avoidance for both short legs
+        if is_strike_crowded(put_short_strike, oi_data, "PE"):
+            logger.info(
+                f"[IronCondor] {symbol} put short strike {put_short_strike} is crowded OI — "
+                f"moving 1 interval further OTM"
+            )
+            put_short_strike -= interval
+            if put_long_strike >= put_short_strike:
+                put_long_strike = put_short_strike - 2 * interval
+        if is_strike_crowded(call_short_strike, oi_data, "CE"):
+            logger.info(
+                f"[IronCondor] {symbol} call short strike {call_short_strike} is crowded OI — "
+                f"moving 1 interval further OTM"
+            )
+            call_short_strike += interval
+            if call_long_strike <= call_short_strike:
+                call_long_strike = call_short_strike + 2 * interval
 
         if underlying_price <= put_short_strike or underlying_price >= call_short_strike:
             logger.info(
@@ -1116,7 +1214,7 @@ class LiveTradingEngine:
             return
 
         # Margin check — condor requires margin for the wider of the two wings
-        wing_spread     = abs(put_short_strike - put_long_strike)
+        wing_spread     = max(abs(put_short_strike - put_long_strike), abs(call_short_strike - call_long_strike))
         required_margin = wing_spread * lot_size
         if not await self._check_available_margin(required_margin):
             logger.warning(
@@ -1140,11 +1238,15 @@ class LiveTradingEngine:
             order = await self.order_manager.place_order(contract, side, lot_size, price, **kwargs)
             if not order or order.order_status != "OPEN":
                 logger.error(f"[IronCondor] Leg failed: {side} {contract}. Unwinding {len(placed)} leg(s).")
-                if order and order.order_status == "REJECTED_BY_RISK":
+                if order and order.order_status in ("REJECTED", "REJECTED_BY_RISK", "CANCELLED"):
                     self._exited_today.add(symbol)  # stop retrying every minute
+                else:
+                    self._exited_today.add(symbol)
+                from src.market_data.option_chain import get_option_quote as _gq
                 for (c, s, p, _) in placed:
                     rev = "BUY" if s == "SELL" else "SELL"
-                    await self.order_manager.place_order(c, rev, lot_size, p, is_spread_leg=True)
+                    _unwind_p = await _gq(c, getattr(self, "_kite", None), getattr(self, "_redis", None)) or p
+                    await self.order_manager.place_order(c, rev, lot_size, _unwind_p, is_spread_leg=True)
                 return
             placed.append((contract, side, price, is_leg))
 
@@ -1166,6 +1268,7 @@ class LiveTradingEngine:
             "net_credit":          net_credit,   "lot_size":          lot_size,
             "journal_id":          journal_id,
             "strategy_name":       strategy.name,
+            "expiry_date":         expiry.isoformat(),
         }
         if self._ltp_poller:
             self._ltp_poller.register_option_contracts([psc, plc, csc, clc])
@@ -1251,10 +1354,21 @@ class LiveTradingEngine:
                 continue
 
             lot = c["lot_size"]
-            await self.order_manager.place_order(c["put_short_contract"],  "BUY",  lot, cur_ps, is_spread_leg=True)
-            await self.order_manager.place_order(c["put_long_contract"],   "SELL", lot, cur_pl, is_spread_leg=True)
-            await self.order_manager.place_order(c["call_short_contract"], "BUY",  lot, cur_cs, is_spread_leg=True)
-            await self.order_manager.place_order(c["call_long_contract"],  "SELL", lot, cur_cl, is_spread_leg=True)
+            exit_ps = await self.order_manager.place_order(c["put_short_contract"],  "BUY",  lot, cur_ps, is_spread_leg=True)
+            exit_pl = await self.order_manager.place_order(c["put_long_contract"],   "SELL", lot, cur_pl, is_spread_leg=True)
+            exit_cs = await self.order_manager.place_order(c["call_short_contract"], "BUY",  lot, cur_cs, is_spread_leg=True)
+            exit_cl = await self.order_manager.place_order(c["call_long_contract"],  "SELL", lot, cur_cl, is_spread_leg=True)
+
+            _bad = {"REJECTED", "REJECTED_BY_RISK", "CANCELLED"}
+            if any(
+                o is None or getattr(o, "order_status", "") in _bad
+                for o in (exit_ps, exit_pl, exit_cs, exit_cl)
+            ):
+                logger.warning(
+                    f"[IronCondor] Exit orders for {underlying} partially rejected — "
+                    f"keeping position in tracking to retry next cycle."
+                )
+                continue
 
             net_pnl = (
                 (c["put_short_premium"]  - cur_ps)
@@ -1295,18 +1409,32 @@ class LiveTradingEngine:
             await self._persist_state()
 
     async def _exit_all_options_for(self, underlying: str) -> None:
+        from src.market_data.option_chain import get_option_quote
         positions = await self._safe_get_positions()
         expiry = get_near_month_expiry()
         dte    = (expiry - now_ist().replace(tzinfo=None)).days
         for pos in positions:
             if pos.get("quantity", 0) <= 0 or not pos.get("symbol", "").startswith(underlying):
                 continue
+            contract = pos["symbol"]
             entry_p = float(pos.get("avg_price") or 0)
             md = await self._get_market_data(underlying)
             atr = float(md.get("atr14", 0)) if md else 0
-            exit_p = estimate_option_premium(atr, dte) if atr > 0 else entry_p
-            await self.order_manager.place_order(pos["symbol"], "SELL", abs(pos["quantity"]), exit_p, is_exit_order=True)
-            self._peak_premiums.pop(pos["symbol"], None)
+            _live_p = await get_option_quote(contract, getattr(self, "_kite", None), getattr(self, "_redis", None))
+            if _live_p and _live_p > 0:
+                exit_p = _live_p
+            elif atr > 0:
+                exit_p = estimate_option_premium(atr, dte)
+            else:
+                exit_p = entry_p
+            await self.order_manager.place_order(contract, "SELL", abs(pos["quantity"]), exit_p, is_exit_order=True)
+            self._peak_premiums.pop(contract, None)
+        if underlying in self._active_spreads:
+            del self._active_spreads[underlying]
+        if underlying in self._active_condors:
+            del self._active_condors[underlying]
+        self._exited_today.add(underlying)
+        await self._persist_state()
 
     async def _square_off_all(self) -> None:
         positions = await self._safe_get_positions()
@@ -1325,9 +1453,14 @@ class LiveTradingEngine:
             if underlying:
                 md = await self._get_market_data(underlying)
                 if md:
-                    atr = float(md.get("atr14", 0))
-                    if atr > 0:
-                        exit_p = estimate_option_premium(atr, dte)
+                    from src.market_data.option_chain import get_option_quote
+                    _live_p = await get_option_quote(contract, getattr(self, "_kite", None), getattr(self, "_redis", None))
+                    if _live_p and _live_p > 0:
+                        exit_p = _live_p
+                    else:
+                        atr = float(md.get("atr14", 0))
+                        if atr > 0:
+                            exit_p = estimate_option_premium(atr, dte)
             await self.order_manager.place_order(contract, side, abs(qty), exit_p, is_exit_order=True)
             self._peak_premiums.pop(contract, None)
             closed += 1
