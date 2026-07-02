@@ -159,10 +159,10 @@ class RiskManager:
                     f"[{strategy_name}] — options too cheap, skipping."
                 )
                 return False
-            if vix is not None and vix < 14.0:
+            if vix is not None and vix < 12.0:
                 logger.warning(
-                    f"Risk: India VIX {vix:.1f} < 14 — options too cheap market-wide, "
-                    f"skipping [{strategy_name}]."
+                    f"Risk: India VIX {vix:.1f} < 12 — market unusually quiet, "
+                    f"premiums too cheap market-wide, skipping [{strategy_name}]."
                 )
                 return False
 

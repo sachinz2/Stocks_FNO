@@ -175,12 +175,14 @@ async def fetch_and_cache_vix(kite, redis) -> Optional[float]:
 def vix_allows_selling(vix: Optional[float]) -> bool:
     """
     Selling options is attractive only when IV is elevated (premium is rich).
-    VIX > 14: reasonable to sell   VIX < 11: premium too cheap, skip
+    Threshold = 12.0 (aligns with LOW_VOL boundary in regime_detector.py).
+    Below 12: market is unusually dead, premiums are too cheap everywhere.
+    Between 12-14: quiet but normal — let per-symbol IV Rank decide instead.
     If VIX is unknown (None), allow the trade (fail-open for paper mode).
     """
     if vix is None:
         return True
-    return vix >= 14.0
+    return vix >= 12.0
 
 
 def iv_rank_allows_selling(iv_rank: Optional[float]) -> bool:
