@@ -23,10 +23,19 @@ _NSE_PREFIX = "NSE:"
 REDIS_TOKEN_KEY = "zerodha:access_token"
 
 
+_NFO_PREFIX = "NFO:"
+# Redis key prefix for active option contract LTPs (written every 5 s)
+REDIS_OPTLTP_PREFIX = "optltp:"
+
+
 class ZerodhaLTPPoller:
     """
     Near-real-time LTP refresh using kite.ltp() REST API.
     Use when KiteTicker WebSocket is unavailable.
+
+    Tracks two categories of instruments:
+      • F&O underlying stocks (NSE:SYMBOL)   — fixed list, set at startup
+      • Active option contracts (NFO:CONTRACT) — dynamic, added/removed as positions open/close
     """
 
     def __init__(self, kite, redis_client, symbols: List[str]) -> None:
@@ -34,8 +43,26 @@ class ZerodhaLTPPoller:
         self._redis  = redis_client
         self._instruments = [f"{_NSE_PREFIX}{s}" for s in symbols]
         self._symbol_map  = {f"{_NSE_PREFIX}{s}": s for s in symbols}
+        # Active option contracts (added dynamically when positions open)
+        self._option_instruments: set = set()
         self._permission_ok = True   # set False on first "Insufficient permission"
         self._last_known_token: Optional[str] = None
+
+    def register_option_contracts(self, contracts: List[str]) -> None:
+        """
+        Start tracking option contracts in real time (every 5 s).
+        Call when a spread or condor position is opened.
+        contracts: bare NSE F&O symbols, e.g. ['BPCL26JUL315CE', 'BPCL26JUL325CE']
+        """
+        for c in contracts:
+            self._option_instruments.add(f"{_NFO_PREFIX}{c}")
+        logger.info(f"ZerodhaLTPPoller: now tracking {len(self._option_instruments)} option contract(s)")
+
+    def unregister_option_contracts(self, contracts: List[str]) -> None:
+        """Stop tracking option contracts after a position is closed."""
+        for c in contracts:
+            self._option_instruments.discard(f"{_NFO_PREFIX}{c}")
+        logger.info(f"ZerodhaLTPPoller: tracking {len(self._option_instruments)} option contract(s) after removal")
 
     async def _try_refresh_token(self) -> bool:
         """
@@ -113,6 +140,26 @@ class ZerodhaLTPPoller:
             except Exception as e:
                 logger.debug(f"ZerodhaLTPPoller: Redis write failed [{symbol}]: {e}")
 
+        # ── Active option contracts — polled every 5 s once a position is open ──
+        if self._option_instruments:
+            try:
+                opt_quotes = await loop.run_in_executor(
+                    None, self._kite.ltp, list(self._option_instruments)
+                )
+                for nfo_key, data in opt_quotes.items():
+                    ltp = data.get("last_price", 0)
+                    if ltp <= 0:
+                        continue
+                    contract = nfo_key.removeprefix(_NFO_PREFIX)
+                    await self._redis.set(
+                        f"{REDIS_OPTLTP_PREFIX}{contract}",
+                        str(ltp),
+                        ex=15,   # 15-second TTL — auto-expire stale data
+                    )
+                    updated += 1
+            except Exception as e:
+                logger.debug(f"ZerodhaLTPPoller: option LTP refresh failed: {e}")
+
         if updated:
-            logger.debug(f"ZerodhaLTPPoller: refreshed LTP for {updated} symbols")
+            logger.debug(f"ZerodhaLTPPoller: refreshed LTP for {updated} instruments")
         return updated

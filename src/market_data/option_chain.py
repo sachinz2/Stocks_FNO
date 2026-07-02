@@ -199,22 +199,41 @@ def iv_rank_allows_selling(iv_rank: Optional[float]) -> bool:
 async def get_option_quote(contract: str, kite, redis) -> Optional[float]:
     """
     Fetch real LTP for an option contract from Zerodha.
-    Caches the result in Redis for 30 seconds to avoid rate limiting.
 
-    contract: NSE F&O symbol, e.g. "HDFCBANK25JUL1600CE"
+    Priority order:
+      1. optltp:{contract}  — written every 5 s by ZerodhaLTPPoller when the
+                              contract is registered as an active position. This
+                              is the freshest source; TTL = 15 s so stale data
+                              auto-expires if the poller stops.
+      2. optq:{contract}    — 30-second on-demand cache from a previous kite.ltp()
+                              call (used before the position was registered, or as
+                              a fallback when the live cache has expired).
+      3. kite.ltp() live    — fresh REST call; result stored in optq cache.
+
+    contract: NSE F&O symbol, e.g. "BPCL26JUL315CE"
     Returns LTP (float) or None.
     """
-    cache_key = f"optq:{contract}"
-    try:
-        cached = await redis.get(cache_key)
-        if cached:
-            return float(cached)
-    except Exception:
-        pass
+    if redis is not None:
+        # 1. Live 5-second cache (written by ZerodhaLTPPoller for active positions)
+        try:
+            live = await redis.get(f"optltp:{contract}")
+            if live:
+                return float(live)
+        except Exception:
+            pass
+
+        # 2. On-demand 30-second cache
+        try:
+            cached = await redis.get(f"optq:{contract}")
+            if cached:
+                return float(cached)
+        except Exception:
+            pass
 
     if kite is None:
         return None
 
+    # 3. Fresh kite.ltp() REST call
     try:
         import asyncio
         loop = asyncio.get_event_loop()
@@ -224,7 +243,8 @@ async def get_option_quote(contract: str, kite, redis) -> Optional[float]:
         if ltp and float(ltp) > 0:
             ltp = float(ltp)
             try:
-                await redis.set(cache_key, str(ltp), ex=30)
+                if redis is not None:
+                    await redis.set(f"optq:{contract}", str(ltp), ex=30)
             except Exception:
                 pass
             return ltp

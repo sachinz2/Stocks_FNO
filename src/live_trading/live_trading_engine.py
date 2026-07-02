@@ -86,7 +86,8 @@ class LiveTradingEngine:
         # Maps option contract → {journal_id, underlying, strategy_name}
         # so _check_open_option_exits can write the exit to trade_journal.
         self._single_leg_journals:  Dict[str, Dict[str, Any]] = {}
-        self._kite = None   # attached in live mode for real quotes + VIX
+        self._kite = None        # attached in live mode for real quotes + VIX
+        self._ltp_poller = None  # ZerodhaLTPPoller — registers active option contracts
 
         logger.info(f"LiveTradingEngine initialised — mode: {self.mode.value.upper()}")
 
@@ -101,6 +102,11 @@ class LiveTradingEngine:
     def attach_kite(self, kite: Any) -> None:
         """Attach a live KiteConnect instance for real option quotes + VIX."""
         self._kite = kite
+
+    def attach_ltp_poller(self, poller: Any) -> None:
+        """Attach ZerodhaLTPPoller so the engine can register/unregister active
+        option contracts for 5-second real-time tracking."""
+        self._ltp_poller = poller
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -861,6 +867,8 @@ class LiveTradingEngine:
             "journal_id":     journal_id,
             "strategy_name":  strategy.name,
         }
+        if self._ltp_poller:
+            self._ltp_poller.register_option_contracts([short_contract, long_contract])
         await self._persist_state()
 
         await self._notify(
@@ -966,6 +974,10 @@ class LiveTradingEngine:
                 pnl=net_pnl, exit_reason=exit_reason,
                 market_data=market_data,
             )
+            if self._ltp_poller:
+                self._ltp_poller.unregister_option_contracts(
+                    [spread["short_contract"], spread["long_contract"]]
+                )
             to_close.append(underlying)
             await self._notify(
                 f"CREDIT SPREAD CLOSED\n"
@@ -1145,6 +1157,8 @@ class LiveTradingEngine:
             "journal_id":          journal_id,
             "strategy_name":       strategy.name,
         }
+        if self._ltp_poller:
+            self._ltp_poller.register_option_contracts([psc, plc, csc, clc])
         await self._persist_state()
 
         await self._notify(
@@ -1250,6 +1264,11 @@ class LiveTradingEngine:
                 pnl=net_pnl, exit_reason=exit_reason,
                 market_data=market_data,
             )
+            if self._ltp_poller:
+                self._ltp_poller.unregister_option_contracts([
+                    c["put_short_contract"], c["put_long_contract"],
+                    c["call_short_contract"], c["call_long_contract"],
+                ])
             to_close.append(underlying)
             await self._notify(
                 f"IRON CONDOR CLOSED\n"

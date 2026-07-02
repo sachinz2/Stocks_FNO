@@ -244,6 +244,7 @@ async def lifespan(app: FastAPI):
             misfire_grace_time=3,
         )
         logger.info("ZerodhaLTPPoller: REST-based LTP refresh every 5 s (WebSocket fallback).")
+        engine.attach_ltp_poller(zerodha_ltp_poller)
     start_scheduler()
 
     app.state.trading_engine    = engine
