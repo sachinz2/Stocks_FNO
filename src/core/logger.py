@@ -1,3 +1,4 @@
+import datetime
 import logging
 import os
 import sys
@@ -5,11 +6,21 @@ from logging.handlers import TimedRotatingFileHandler
 
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 
+_IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+
+
+class _ISTFormatter(logging.Formatter):
+    """Logging formatter that always stamps records in IST (UTC+5:30)."""
+
+    def formatTime(self, record: logging.LogRecord, datefmt: str = None) -> str:
+        dt = datetime.datetime.fromtimestamp(record.created, tz=_IST)
+        return dt.strftime(datefmt or "%Y-%m-%d %H:%M:%S")
+
 
 def setup_logging(log_level: str = "INFO"):
     level = getattr(logging, log_level.upper(), logging.INFO)
 
-    formatter = logging.Formatter(
+    formatter = _ISTFormatter(
         fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
