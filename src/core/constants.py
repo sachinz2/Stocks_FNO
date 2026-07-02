@@ -15,13 +15,15 @@ FNO_SYMBOLS = [
     "SBIN", "BAJFINANCE", "KOTAKBANK", "AXISBANK", "LT",
     # Tier 2 — high liquidity
     "HINDUNILVR", "ITC", "WIPRO", "HCLTECH", "MARUTI",
-    "SUNPHARMA", "TATAMOTORS", "BHARTIARTL", "ADANIPORTS", "ASIANPAINT",
+    "SUNPHARMA", "M&M", "BHARTIARTL", "ADANIPORTS", "ASIANPAINT",
     # Tier 3 — good liquidity
     "TITAN", "BAJAJ-AUTO", "EICHERMOT", "INDUSINDBK", "DRREDDY",
     "CIPLA", "DIVISLAB", "JSWSTEEL", "HINDALCO", "GRASIM",
     # Tier 4 — moderate liquidity
     "TATACONSUM", "APOLLOHOSP", "NESTLEIND", "TECHM", "BPCL",
     "ONGC", "NTPC", "POWERGRID", "ULTRACEMCO", "TATASTEEL",
+    # Tier 5 — added
+    "COALINDIA",
 ]
 
 # Hardcoded lot sizes — fallback when Redis cache is empty.
@@ -33,7 +35,7 @@ FNO_LOT_SIZES = {
     "BAJFINANCE":  125,   "KOTAKBANK":   400,   "AXISBANK":   1200,
     "LT":          150,   "HINDUNILVR":  300,   "ITC":        3200,
     "WIPRO":      1500,   "HCLTECH":     700,   "MARUTI":       25,
-    "SUNPHARMA":   700,   "TATAMOTORS":  900,   "BHARTIARTL":  500,
+    "SUNPHARMA":   700,   "M&M":         700,   "BHARTIARTL":  500,
     "ADANIPORTS": 1250,   "ASIANPAINT":  200,   "TITAN":       375,
     "BAJAJ-AUTO":   75,   "EICHERMOT":    50,   "INDUSINDBK":  500,
     "DRREDDY":     125,   "CIPLA":       650,   "DIVISLAB":    200,
@@ -41,7 +43,7 @@ FNO_LOT_SIZES = {
     "TATACONSUM":  900,   "APOLLOHOSP":  125,   "NESTLEIND":    40,
     "TECHM":       600,   "BPCL":       1800,   "ONGC":       1950,
     "NTPC":       3750,   "POWERGRID":  4700,   "ULTRACEMCO":  100,
-    "TATASTEEL":  5500,
+    "TATASTEEL":  5500,   "COALINDIA":  4200,
 }
 
 # Gap between consecutive strikes on NSE for each symbol
@@ -51,7 +53,7 @@ FNO_STRIKE_INTERVALS = {
     "BAJFINANCE": 100,   "KOTAKBANK":   20,   "AXISBANK":    10,
     "LT":          50,   "HINDUNILVR":  20,   "ITC":          5,
     "WIPRO":        5,   "HCLTECH":     20,   "MARUTI":     100,
-    "SUNPHARMA":   20,   "TATAMOTORS":   5,   "BHARTIARTL":  10,
+    "SUNPHARMA":   20,   "M&M":          50,  "BHARTIARTL":  10,
     "ADANIPORTS":  10,   "ASIANPAINT":  50,   "TITAN":       25,
     "BAJAJ-AUTO": 100,   "EICHERMOT":  100,   "INDUSINDBK":  10,
     "DRREDDY":     50,   "CIPLA":       10,   "DIVISLAB":    50,
@@ -59,7 +61,7 @@ FNO_STRIKE_INTERVALS = {
     "TATACONSUM":  10,   "APOLLOHOSP":  50,   "NESTLEIND":  100,
     "TECHM":       10,   "BPCL":         5,   "ONGC":         5,
     "NTPC":         5,   "POWERGRID":    5,   "ULTRACEMCO":  50,
-    "TATASTEEL":    5,
+    "TATASTEEL":    5,   "COALINDIA":    5,
 }
 
 # How many stocks to trade at a time per strategy regime
@@ -83,7 +85,7 @@ FNO_SECTORS = {
     "HCLTECH":     "IT",
     "MARUTI":      "Auto",
     "SUNPHARMA":   "Pharma",
-    "TATAMOTORS":  "Auto",
+    "M&M":         "Auto",
     "BHARTIARTL":  "Telecom",
     "ADANIPORTS":  "Infrastructure",
     "ASIANPAINT":  "Chemicals",
@@ -107,6 +109,7 @@ FNO_SECTORS = {
     "POWERGRID":   "Power",
     "ULTRACEMCO":  "Cement",
     "TATASTEEL":   "Metals",
+    "COALINDIA":   "Mining",
 }
 
 # Capital fraction allocated to each strategy (must sum to <= 1.0)
