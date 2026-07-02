@@ -235,55 +235,83 @@ class LiveTradingEngine:
             logger.error(f"Position sync failed: {exc}")
 
     async def send_daily_report(self) -> None:
-        if self._today_order_count == 0:
-            logger.info("EOD: no trades today, skipping report.")
-        else:
-            # Read today's realized PnL from trade_journal (the authoritative source).
-            # positions.realized_pnl is not reliably populated in paper mode.
-            try:
-                from datetime import date as _date, datetime as _datetime
-                from src.database.connection import AsyncSessionLocal
-                from src.database.models.trade_journal import TradeJournal
-                from src.database.repositories.base import BaseRepository
-                from sqlalchemy import select as _select
-                today = _date.today()
-                today_start = _datetime(today.year, today.month, today.day, 0, 0, 0)
-                async with AsyncSessionLocal() as session:
-                    result = await session.execute(
-                        _select(TradeJournal).where(
-                            TradeJournal.exit_time.isnot(None),
-                            TradeJournal.exit_time >= today_start,
-                        )
+        expiry = get_near_month_expiry()
+        dte    = (expiry - now_ist().replace(tzinfo=None)).days
+
+        # Read today's realized PnL from trade_journal (the authoritative source).
+        try:
+            from datetime import date as _date, datetime as _datetime
+            from src.database.connection import AsyncSessionLocal
+            from src.database.models.trade_journal import TradeJournal
+            from sqlalchemy import select as _select
+            today = _date.today()
+            today_start = _datetime(today.year, today.month, today.day, 0, 0, 0)
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    _select(TradeJournal).where(
+                        TradeJournal.exit_time.isnot(None),
+                        TradeJournal.exit_time >= today_start,
                     )
-                    closed_today = result.scalars().all()
-                today_realized = sum(float(t.pnl or 0) for t in closed_today)
-                closed_count   = len(closed_today)
-            except Exception as e:
-                logger.error(f"EOD: failed to read trade_journal: {e}")
-                today_realized = 0.0
-                closed_count   = 0
+                )
+                closed_today = result.scalars().all()
+            today_realized = sum(float(t.pnl or 0) for t in closed_today)
+            closed_count   = len(closed_today)
+        except Exception as e:
+            logger.error(f"EOD: failed to read trade_journal: {e}")
+            today_realized = 0.0
+            closed_count   = 0
 
-            positions = await self._safe_get_positions()
-            open_unrealized = sum(p.get("unrealized_pnl", 0) for p in positions)
+        positions      = await self._safe_get_positions()
+        open_unrealized = sum(p.get("unrealized_pnl", 0) for p in positions)
 
-            await self._notify(
-                f"EOD REPORT\n"
-                f"Date: {now_ist().strftime('%d-%b-%Y')}\n"
-                f"Mode: {self.mode.value.upper()}\n"
-                f"Orders placed today: {self._today_order_count}\n"
-                f"Closed trades today: {closed_count}\n"
-                f"Realized PnL today:  Rs{today_realized:,.2f}\n"
-                f"Open positions:      {len(positions)}\n"
-                f"Unrealized PnL:      Rs{open_unrealized:,.2f}\n"
-                f"Net PnL today:       Rs{today_realized + open_unrealized:,.2f}"
+        # ── Overnight positions summary ───────────────────────────────────────
+        overnight_spreads = len(self._active_spreads)
+        overnight_condors = len(self._active_condors)
+        overnight_lines   = []
+        if overnight_spreads:
+            for sym, s in self._active_spreads.items():
+                overnight_lines.append(
+                    f"  SPREAD {sym}: {s.get('spread_type','?')} | "
+                    f"credit ₹{s.get('net_credit',0):.2f} x {s.get('lot_size',0)}"
+                )
+        if overnight_condors:
+            for sym, c in self._active_condors.items():
+                overnight_lines.append(
+                    f"  CONDOR {sym}: credit ₹{c.get('net_credit',0):.2f} x {c.get('lot_size',0)}"
+                )
+
+        report_lines = [
+            f"EOD REPORT — {now_ist().strftime('%d-%b-%Y')} | {self.mode.value.upper()}",
+            f"Orders today:    {self._today_order_count}",
+            f"Closed trades:   {closed_count}",
+            f"Realized PnL:    ₹{today_realized:,.2f}",
+            f"Open positions:  {len(positions)}",
+            f"Unrealized PnL:  ₹{open_unrealized:,.2f}",
+            f"Net PnL today:   ₹{today_realized + open_unrealized:,.2f}",
+        ]
+        if overnight_lines:
+            report_lines.append(
+                f"\nOVERNIGHT HOLD ({overnight_spreads} spread(s) + {overnight_condors} condor(s)) "
+                f"— DTE {dte} days remaining:"
             )
+            report_lines.extend(overnight_lines)
+            report_lines.append("Exit conditions (SL / profit / DTE<7) checked every minute tomorrow.")
+        else:
+            report_lines.append("No overnight positions.")
+
+        if self._today_order_count > 0 or overnight_spreads or overnight_condors:
+            await self._notify("\n".join(report_lines))
+        else:
+            logger.info("EOD: no trades today and no open positions, skipping report.")
 
         await self._persist_state()
         self._today_order_count = 0
         self._peak_premiums.clear()
-        self._active_spreads.clear()
-        self._active_condors.clear()
-        self._exited_today.clear()
+        # _active_spreads and _active_condors are intentionally NOT cleared here —
+        # credit spreads and iron condors are multi-day theta strategies that must
+        # carry overnight. They are managed by _check_spread_exits / _check_condor_exits
+        # and will only close when: SL hit, 75% profit reached, DTE < 7, or expiry day.
+        self._exited_today.clear()  # allow same symbols to trade again next day if position closed
 
     # ── State persistence ─────────────────────────────────────────────────────
 
@@ -750,12 +778,30 @@ class LiveTradingEngine:
         )
         interval = FNO_STRIKE_INTERVALS.get(symbol, 50)
         expiry   = get_near_month_expiry()
-        dte      = (expiry - now_ist().replace(tzinfo=None)).days
+        now      = now_ist()
+        dte      = (expiry - now.replace(tzinfo=None)).days
         min_dte  = getattr(strategy, "min_dte", 7)
         if dte < min_dte:
             logger.info(
                 f"[CreditSpread] {symbol} skipped — DTE={dte} < min_dte={min_dte}, too close to expiry"
             )
+            return
+
+        # Don't enter when DTE < 10 — insufficient theta runway before the
+        # min_dte=7 exit fires, leaving only 3 days to collect (not worth the margin).
+        _ENTRY_MIN_DTE = 10
+        if dte < _ENTRY_MIN_DTE:
+            logger.info(
+                f"[CreditSpread] {symbol} skipped — DTE={dte} < {_ENTRY_MIN_DTE} entry floor, "
+                "not enough theta runway."
+            )
+            return
+
+        # No new entries after 14:30 IST — at least one exit-check cycle before
+        # the 15:20 EOD window, and avoids rushed afternoon entries.
+        _ENTRY_CUTOFF_HOUR, _ENTRY_CUTOFF_MIN = 14, 30
+        if (now.replace(tzinfo=None).hour, now.replace(tzinfo=None).minute) >= (_ENTRY_CUTOFF_HOUR, _ENTRY_CUTOFF_MIN):
+            logger.debug(f"[CreditSpread] {symbol} skipped — past entry cutoff 14:30 IST.")
             return
 
         lot_size = await self._get_lot_size(symbol)
@@ -1084,12 +1130,30 @@ class LiveTradingEngine:
         from src.market_data.option_chain import atr_to_annualised_vol, find_delta_strike
         interval = FNO_STRIKE_INTERVALS.get(symbol, 50)
         expiry   = get_near_month_expiry()
-        dte      = (expiry - now_ist().replace(tzinfo=None)).days
+        now      = now_ist()
+        dte      = (expiry - now.replace(tzinfo=None)).days
         min_dte  = getattr(strategy, "min_dte", 7)
         if dte < min_dte:
             logger.info(
                 f"[IronCondor] {symbol} skipped — DTE={dte} < min_dte={min_dte}, too close to expiry"
             )
+            return
+
+        # Don't enter when DTE < 10 — insufficient theta runway before the
+        # min_dte=7 exit fires, leaving only 3 days to collect (not worth the margin).
+        _ENTRY_MIN_DTE = 10
+        if dte < _ENTRY_MIN_DTE:
+            logger.info(
+                f"[IronCondor] {symbol} skipped — DTE={dte} < {_ENTRY_MIN_DTE} entry floor, "
+                "not enough theta runway."
+            )
+            return
+
+        # No new entries after 14:30 IST — at least one exit-check cycle before
+        # the 15:20 EOD window, and avoids rushed afternoon entries.
+        _ENTRY_CUTOFF_HOUR, _ENTRY_CUTOFF_MIN = 14, 30
+        if (now.replace(tzinfo=None).hour, now.replace(tzinfo=None).minute) >= (_ENTRY_CUTOFF_HOUR, _ENTRY_CUTOFF_MIN):
+            logger.debug(f"[IronCondor] {symbol} skipped — past entry cutoff 14:30 IST.")
             return
 
         lot_size = await self._get_lot_size(symbol)
@@ -1437,39 +1501,101 @@ class LiveTradingEngine:
         await self._persist_state()
 
     async def _square_off_all(self) -> None:
+        """
+        EOD square-off at 15:20 IST.
+
+        Strategy:
+        - EMA crossover single-leg long options: ALWAYS close (overnight gap risk).
+        - Credit spreads and iron condors: hold overnight unless DTE ≤ 1 (expiry day).
+          Theta decay is non-linear — the DTE 20→7 window is where we collect premium.
+          Closing nightly would destroy the entire edge of the strategy.
+        - Expiry day (DTE ≤ 1): force-close everything to avoid assignment/gamma risk.
+        """
+        from src.market_data.option_chain import get_option_quote
+
+        expiry      = get_near_month_expiry()
+        dte         = (expiry - now_ist().replace(tzinfo=None)).days
+        is_expiry   = dte <= 1
+        kite        = getattr(self, "_kite", None)
+        redis       = getattr(self, "_redis", None)
+
+        # Build set of contracts belonging to active multi-leg positions
+        spread_condor_contracts: set = set()
+        if not is_expiry:
+            for s in self._active_spreads.values():
+                for key in ("short_contract", "long_contract"):
+                    if s.get(key):
+                        spread_condor_contracts.add(s[key])
+            for c in self._active_condors.values():
+                for key in ("put_short_contract", "put_long_contract",
+                            "call_short_contract", "call_long_contract"):
+                    if c.get(key):
+                        spread_condor_contracts.add(c[key])
+
         positions = await self._safe_get_positions()
-        expiry = get_near_month_expiry()
-        dte    = (expiry - now_ist().replace(tzinfo=None)).days
-        closed = 0
+        closed_ema = 0
+        closed_expiry = 0
+
         for pos in positions:
             qty = pos.get("quantity", 0)
             if qty == 0:
                 continue
-            contract   = pos["symbol"]
-            side       = "SELL" if qty > 0 else "BUY"
-            entry_p    = float(pos.get("avg_price") or 0)
-            underlying = self._get_underlying_from_contract(contract)
-            exit_p     = entry_p
-            if underlying:
-                md = await self._get_market_data(underlying)
-                if md:
-                    from src.market_data.option_chain import get_option_quote
-                    _live_p = await get_option_quote(contract, getattr(self, "_kite", None), getattr(self, "_redis", None))
-                    if _live_p and _live_p > 0:
-                        exit_p = _live_p
-                    else:
+            contract = pos["symbol"]
+
+            # On normal days, skip spread/condor legs — they hold overnight
+            if not is_expiry and contract in spread_condor_contracts:
+                continue
+
+            side    = "SELL" if qty > 0 else "BUY"
+            entry_p = float(pos.get("avg_price") or 0)
+            exit_p  = entry_p
+
+            # Try live price first
+            live_p = await get_option_quote(contract, kite, redis)
+            if live_p and live_p > 0:
+                exit_p = live_p
+            else:
+                underlying = self._get_underlying_from_contract(contract)
+                if underlying:
+                    md = await self._get_market_data(underlying)
+                    if md:
                         atr = float(md.get("atr14", 0))
                         if atr > 0:
-                            exit_p = estimate_option_premium(atr, dte)
+                            exit_p = estimate_option_premium(atr, max(dte, 1))
+
             await self.order_manager.place_order(contract, side, abs(qty), exit_p, is_exit_order=True)
             self._peak_premiums.pop(contract, None)
-            closed += 1
 
-        self._active_spreads.clear()
-        self._active_condors.clear()
-        await self._persist_state()
-        if closed:
-            await self._notify(f"AUTO SQUARE-OFF\nClosed {closed} position(s) at 15:20 IST")
+            if is_expiry:
+                closed_expiry += 1
+            else:
+                closed_ema += 1
+
+        if is_expiry:
+            # Full expiry-day clear — all positions force-closed
+            self._active_spreads.clear()
+            self._active_condors.clear()
+            await self._persist_state()
+            if closed_expiry:
+                await self._notify(
+                    f"EXPIRY SQUARE-OFF (DTE={dte})\n"
+                    f"Force-closed {closed_expiry} position(s) to avoid assignment risk."
+                )
+        else:
+            # Normal day — only EMA crossover legs were closed
+            await self._persist_state()
+            held_spreads = len(self._active_spreads)
+            held_condors = len(self._active_condors)
+            parts = []
+            if closed_ema:
+                parts.append(f"Closed {closed_ema} EMA crossover leg(s).")
+            if held_spreads or held_condors:
+                parts.append(
+                    f"Holding overnight: {held_spreads} spread(s) + {held_condors} condor(s) "
+                    f"(DTE={dte}). Exit conditions (SL/profit/DTE<7) active tomorrow."
+                )
+            if parts:
+                await self._notify("EOD POSITION UPDATE\n" + "\n".join(parts))
 
     # ── Trade Journal helpers ─────────────────────────────────────────────────
 
