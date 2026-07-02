@@ -27,6 +27,9 @@ _ENGINE_REDIS_KEYS = [
     "engine:active_spreads",
     "engine:active_condors",
     "engine:single_leg_journals",
+    "engine:exited_today",
+    "engine:profit_closed_today",
+    "engine:order_count",
     "falcon:active_spreads",
     "falcon:active_condors",
 ]
@@ -55,7 +58,8 @@ async def reset_all_data(request: Request):
         if redis:
             for key in _ENGINE_REDIS_KEYS:
                 await redis.delete(key)
-            logger.info("Reset: cleared Redis engine state keys")
+            iv_cleared = await _clear_iv_history_keys(redis)
+            logger.info(f"Reset: cleared Redis engine state + IV history for {iv_cleared} symbols")
 
         # ── 3. Reset live trading engine in-memory state ─────────────────────
         engine = getattr(request.app.state, "trading_engine", None)
@@ -64,6 +68,9 @@ async def reset_all_data(request: Request):
             engine._active_condors.clear()
             engine._single_leg_journals.clear()
             engine._peak_premiums.clear()
+            engine._exited_today.clear()
+            engine._profit_closed_today.clear()
+            engine._close_on_first_cycle.clear()
             engine._today_order_count = 0
             engine.risk_manager.reset_daily_state()
             logger.info("Reset: cleared engine in-memory state")
@@ -83,6 +90,7 @@ async def reset_all_data(request: Request):
             "status": "ok",
             "message": "All trading data cleared. Platform ready for fresh start.",
             "tables_cleared": _TRADING_TABLES,
+            "note": "IV rank history also cleared — will rebuild correctly over ~30 trading days.",
         }
 
     except Exception as e:
@@ -123,6 +131,49 @@ async def get_email_alert_status(request: Request):
         "paused": notifier.paused,
         "configured": notifier.enabled,
     }
+
+
+@router.post("/reset-iv-history")
+async def reset_iv_history(request: Request):
+    """
+    Clear all IV rank history from Redis and restart accumulation with correct sigma.
+
+    Run this once after the 5-minute ATR sigma scaling fix (2026-07-02).
+    Previously, sigma was computed from 5-min ATR without scaling to daily units,
+    producing values ~7× too low. The IV rank percentile was self-consistent but
+    built on wrong absolute values. This endpoint wipes that history so correct
+    values start accumulating immediately.
+
+    With 30-40 trading days of correct history the IV rank gate (≥ 0.30) will work
+    as intended before go-live.
+    """
+    redis = getattr(request.app.state, "redis", None)
+    if not redis:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Redis not available."
+        )
+    cleared = await _clear_iv_history_keys(redis)
+    logger.warning(f"IV rank history reset for {cleared} symbols (sigma scaling fix applied)")
+    return {
+        "status": "ok",
+        "symbols_cleared": cleared,
+        "message": (
+            f"IV history wiped for {cleared} symbols. "
+            "Correct values will accumulate over the next 30-40 trading days. "
+            "IV rank gate will be meaningful within ~2 weeks."
+        ),
+    }
+
+
+async def _clear_iv_history_keys(redis) -> int:
+    """Delete all iv_history:{symbol} keys. Returns count of keys deleted."""
+    from src.core.constants import FNO_SYMBOLS
+    deleted = 0
+    for sym in FNO_SYMBOLS:
+        n = await redis.delete(f"iv_history:{sym}")
+        deleted += n
+    return deleted
 
 
 def _get_notifier(request: Request):

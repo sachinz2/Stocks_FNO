@@ -40,10 +40,19 @@ logger = logging.getLogger(__name__)
 
 _FNO_SYMBOLS_BY_LEN = sorted(FNO_SYMBOLS, key=len, reverse=True)
 
+# ATR from LTPPoller is computed from 5-minute candles (ATR14 over 14 five-min bars).
+# atr_to_annualised_vol() assumes daily ATR. To convert:
+#   daily_ATR_proxy = 5min_ATR × √(bars_per_day)
+#   NSE session = 375 min ÷ 5 = 75 bars/day → scale factor = √75 ≈ 8.66
+# Without this correction, sigma ≈ 4% when true annualised vol is ≈ 28%, causing
+# find_delta_strike() to place short strikes only ~1% OTM instead of ~5-6% OTM.
+_5MIN_ATR_SCALE: float = 75 ** 0.5
+
 _REDIS_ACTIVE_SPREADS  = "engine:active_spreads"
 _REDIS_ACTIVE_CONDORS  = "engine:active_condors"
 _REDIS_SINGLE_LEG_JRNL = "engine:single_leg_journals"
 _REDIS_EXITED_TODAY    = "engine:exited_today"
+_REDIS_PROFIT_CLOSED   = "engine:profit_closed_today"
 _REDIS_ORDER_COUNT     = "engine:order_count"
 
 
@@ -84,7 +93,8 @@ class LiveTradingEngine:
         self._peak_premiums:   Dict[str, float] = {}
         self._active_spreads:       Dict[str, Dict[str, Any]] = {}
         self._active_condors:       Dict[str, Dict[str, Any]] = {}
-        self._exited_today:         set = set()   # symbols that had a breach/exit today — no re-entry same day
+        self._exited_today:         set = set()   # adverse exits today — blocks same-day re-entry
+        self._profit_closed_today:  set = set()   # profit exits today — allows re-entry with lower DTE floor
         # Maps option contract → {journal_id, underlying, strategy_name}
         # so _check_open_option_exits can write the exit to trade_journal.
         self._single_leg_journals:  Dict[str, Dict[str, Any]] = {}
@@ -187,6 +197,7 @@ class LiveTradingEngine:
             await self._check_spread_exits(active_strategies)
             await self._check_condor_exits(active_strategies)
         await self._check_open_option_exits(positions, active_strategies)
+        await self._log_portfolio_delta()
 
         # Refresh risk state after exits so sector/position checks see current positions
         positions = await self._safe_get_positions()
@@ -318,7 +329,8 @@ class LiveTradingEngine:
         # credit spreads and iron condors are multi-day theta strategies that must
         # carry overnight. They are managed by _check_spread_exits / _check_condor_exits
         # and will only close when: SL hit, 75% profit reached, DTE < 7, or expiry day.
-        self._exited_today.clear()  # allow same symbols to trade again next day if position closed
+        self._exited_today.clear()         # reset adverse-exit blocks for next trading day
+        self._profit_closed_today.clear()  # reset profit-close re-entry tracking for next day
 
     # ── State persistence ─────────────────────────────────────────────────────
 
@@ -331,8 +343,9 @@ class LiveTradingEngine:
             await redis.set(_REDIS_ACTIVE_SPREADS,  json.dumps(self._active_spreads))
             await redis.set(_REDIS_ACTIVE_CONDORS,  json.dumps(self._active_condors))
             await redis.set(_REDIS_SINGLE_LEG_JRNL, json.dumps(self._single_leg_journals))
-            await redis.set(_REDIS_EXITED_TODAY, json.dumps({"date": today, "symbols": list(self._exited_today)}))
-            await redis.set(_REDIS_ORDER_COUNT,  json.dumps({"date": today, "count": self._today_order_count}))
+            await redis.set(_REDIS_EXITED_TODAY,  json.dumps({"date": today, "symbols": list(self._exited_today)}))
+            await redis.set(_REDIS_PROFIT_CLOSED, json.dumps({"date": today, "symbols": list(self._profit_closed_today)}))
+            await redis.set(_REDIS_ORDER_COUNT,   json.dumps({"date": today, "count": self._today_order_count}))
         except Exception as e:
             logger.error(f"Failed to persist engine state: {e}")
 
@@ -420,6 +433,12 @@ class LiveTradingEngine:
                 if exited_data.get("date") == today:
                     self._exited_today = set(exited_data.get("symbols", []))
                     logger.info(f"Restored _exited_today: {self._exited_today}")
+            profit_closed_raw = await redis.get(_REDIS_PROFIT_CLOSED)
+            if profit_closed_raw:
+                profit_data = json.loads(profit_closed_raw)
+                if profit_data.get("date") == today:
+                    self._profit_closed_today = set(profit_data.get("symbols", []))
+                    logger.info(f"Restored _profit_closed_today: {self._profit_closed_today}")
             count_raw = await redis.get(_REDIS_ORDER_COUNT)
             if count_raw:
                 count_data = json.loads(count_raw)
@@ -506,6 +525,33 @@ class LiveTradingEngine:
                 f"  {p.get('symbol')} qty={p.get('quantity')} avg=₹{p.get('avg_price','?')}"
                 for p in orphans
             )
+        )
+
+    # ── Portfolio delta monitoring ─────────────────────────────────────────────
+
+    async def _log_portfolio_delta(self) -> None:
+        """
+        Compute and log the aggregate directional exposure of all open spreads/condors.
+        Bullish structures (BULL_PUT_SPREAD) add positive delta; bearish ones subtract.
+        Iron condors are roughly delta-neutral (both wings offset).
+        Logged each signal cycle for monitoring — does not block entries yet.
+        """
+        if not self._active_spreads and not self._active_condors:
+            return
+        bullish = sum(
+            1 for s in self._active_spreads.values()
+            if s.get("spread_type") == "BULL_PUT_SPREAD"
+        )
+        bearish = sum(
+            1 for s in self._active_spreads.values()
+            if s.get("spread_type") == "BEAR_CALL_SPREAD"
+        )
+        condors = len(self._active_condors)
+        net_bias = bullish - bearish
+        logger.info(
+            f"[PortfolioDelta] spreads={len(self._active_spreads)} "
+            f"(bullish={bullish}, bearish={bearish}, net_bias={net_bias:+d}) "
+            f"condors={condors} (delta-neutral)"
         )
 
     # ── Gap check + fast exit job + GTT backstop ─────────────────────────────
@@ -944,6 +990,8 @@ class LiveTradingEngine:
     ) -> None:
         if symbol in self._active_spreads:
             return
+        if symbol in self._active_condors:
+            return  # already have a condor on this underlying — conflicting structures
         if symbol in self._exited_today:
             logger.debug(f"[CreditSpread] {symbol} skipped — already exited today, no re-entry.")
             return
@@ -970,10 +1018,24 @@ class LiveTradingEngine:
             )
             return
 
-        # Don't enter when DTE < 10 — insufficient theta runway before the
-        # min_dte=7 exit fires, leaving only 3 days to collect (not worth the margin).
-        _ENTRY_MIN_DTE = 10
-        if dte < _ENTRY_MIN_DTE:
+        # DTE floor logic:
+        #   Fresh entries need DTE ≥ 21 — enough theta runway for 2+ weeks of decay before
+        #   the min_dte=7 exit fires. At DTE 25 → enter; at DTE 18 → already in position.
+        #   Re-entries after a profitable same-day close use a lower floor (DTE ≥ 14) since
+        #   we proved the position was directionally correct and collected premium once already.
+        _ENTRY_MIN_DTE   = 21
+        _REENTRY_MIN_DTE = 14
+        if symbol in self._profit_closed_today:
+            if dte < _REENTRY_MIN_DTE:
+                logger.info(
+                    f"[CreditSpread] {symbol} skipped re-entry — DTE={dte} < {_REENTRY_MIN_DTE} "
+                    "re-entry floor (profit closed today)."
+                )
+                return
+            logger.info(
+                f"[CreditSpread] {symbol} re-entering after same-day profit close (DTE={dte})"
+            )
+        elif dte < _ENTRY_MIN_DTE:
             logger.info(
                 f"[CreditSpread] {symbol} skipped — DTE={dte} < {_ENTRY_MIN_DTE} entry floor, "
                 "not enough theta runway."
@@ -1017,7 +1079,7 @@ class LiveTradingEngine:
         lot_size = await self._get_lot_size(symbol)
         atr      = float(market_data.get("atr14", underlying_price * 0.01))
         iv_rank  = await self._get_iv_rank(symbol, underlying_price, atr, dte)
-        sigma    = atr_to_annualised_vol(atr, underlying_price)
+        sigma    = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, underlying_price)
 
         # VIX + IV Rank gates — only sell premium when it is worth selling
         from src.market_data.option_chain import vix_allows_selling, iv_rank_allows_selling
@@ -1043,6 +1105,26 @@ class LiveTradingEngine:
                 f"opposes {spread_type}"
             )
             return
+
+        # VWAP trend confirmation — VWAP here is computed from 10 days of 5-min candles
+        # (volume-weighted average over ~750 bars), making it a medium-term trend anchor.
+        # Price below this VWAP = 10-day downtrend → oppose BULL_PUT (stock may keep falling).
+        # Price above this VWAP = 10-day uptrend → oppose BEAR_CALL (stock may keep rising).
+        vwap = float(market_data.get("vwap", underlying_price))
+        if vwap > 0:
+            _vwap_buffer = 0.005  # 0.5% buffer — ignore tiny VWAP deviations
+            if spread_type == "BULL_PUT_SPREAD" and underlying_price < vwap * (1 - _vwap_buffer):
+                logger.info(
+                    f"[CreditSpread] {symbol} BULL_PUT skipped — price Rs{underlying_price:.2f} "
+                    f"below VWAP Rs{vwap:.2f} (intraday bearish momentum)"
+                )
+                return
+            if spread_type == "BEAR_CALL_SPREAD" and underlying_price > vwap * (1 + _vwap_buffer):
+                logger.info(
+                    f"[CreditSpread] {symbol} BEAR_CALL skipped — price Rs{underlying_price:.2f} "
+                    f"above VWAP Rs{vwap:.2f} (intraday bullish momentum)"
+                )
+                return
 
         if spread_type == "BULL_PUT_SPREAD":
             opt          = "PE"
@@ -1094,6 +1176,27 @@ class LiveTradingEngine:
         )
         net_credit = round(short_p - long_p, 2)
         total_credit = net_credit * lot_size
+
+        # HV/IV ratio filter — only sell premium when implied vol exceeds realized vol by ≥10%.
+        # sigma (ATR-based HV proxy) represents realized/historical volatility.
+        # If the market isn't pricing options richer than what stocks actually move,
+        # the edge of premium selling disappears.
+        if short_p > 0 and sigma > 0:
+            from src.market_data.option_chain import implied_vol as _iv_fn
+            _T = max(dte, 1) / 365.0
+            _market_iv = _iv_fn(short_p, underlying_price, short_strike, _T, opt)
+            if _market_iv is not None and _market_iv > 0:
+                _iv_hv_ratio = _market_iv / sigma
+                if _iv_hv_ratio < 1.1:
+                    logger.info(
+                        f"[CreditSpread] {symbol} skipped — IV/HV={_iv_hv_ratio:.2f} < 1.10: "
+                        f"market IV ({_market_iv:.1%}) not rich enough vs realized HV ({sigma:.1%})"
+                    )
+                    return
+                logger.debug(
+                    f"[CreditSpread] {symbol} IV/HV={_iv_hv_ratio:.2f} "
+                    f"(IV={_market_iv:.1%} / HV={sigma:.1%}) — premium selling edge confirmed"
+                )
 
         # Fee viability check — 2 entry + 2 exit orders × ₹20 brokerage = ₹80 minimum fees.
         # Require at least ₹350 net credit so fees (₹80–120 round trip) don't eat the trade.
@@ -1214,7 +1317,8 @@ class LiveTradingEngine:
 
         expiry   = get_near_month_expiry()
         dte      = (expiry - now_ist().replace(tzinfo=None)).days
-        to_close: List[str] = []
+        profit_closes: List[str] = []
+        adverse_closes: List[str] = []
 
         cs_strategy = next(
             (s for s in active_strategies.values()
@@ -1337,7 +1441,6 @@ class LiveTradingEngine:
                 self._ltp_poller.unregister_option_contracts(
                     [spread["short_contract"], spread["long_contract"]]
                 )
-            to_close.append(underlying)
             await self._notify(
                 f"CREDIT SPREAD CLOSED\n"
                 f"Underlying: {underlying}\nReason: {exit_reason}\n"
@@ -1368,10 +1471,23 @@ class LiveTradingEngine:
             # C: remove from near-expiry set
             self._close_on_first_cycle.discard(underlying)
 
-        for sym in to_close:
+            # Route to profit or adverse bucket for re-entry eligibility
+            _adverse_kw = ("breach", "Breach", "SL:", " SL ", "spike SL", "Regime shift",
+                           "Near-expiry", "forced close")
+            if any(kw in exit_reason for kw in _adverse_kw):
+                adverse_closes.append(underlying)
+            else:
+                # DTE exit, profit target, or VIX spike profit — premium decayed, we won
+                profit_closes.append(underlying)
+
+        for sym in adverse_closes:
             del self._active_spreads[sym]
             self._exited_today.add(sym)
-        if to_close:
+        for sym in profit_closes:
+            del self._active_spreads[sym]
+            self._profit_closed_today.add(sym)   # allow same-day re-entry with lower DTE floor
+            logger.info(f"[CreditSpread] {sym} → profit_closed_today (re-entry eligible at DTE≥14)")
+        if adverse_closes or profit_closes:
             await self._persist_state()
 
     async def _process_iron_condor(
@@ -1383,6 +1499,8 @@ class LiveTradingEngine:
     ) -> None:
         if symbol in self._active_condors:
             return
+        if symbol in self._active_spreads:
+            return  # don't stack condor on top of existing spread for same underlying
         if symbol in self._exited_today:
             logger.debug(f"[IronCondor] {symbol} skipped — already exited today, no re-entry.")
             return
@@ -1406,10 +1524,21 @@ class LiveTradingEngine:
             )
             return
 
-        # Don't enter when DTE < 10 — insufficient theta runway before the
-        # min_dte=7 exit fires, leaving only 3 days to collect (not worth the margin).
-        _ENTRY_MIN_DTE = 10
-        if dte < _ENTRY_MIN_DTE:
+        # Same DTE floor logic as credit spreads:
+        #   Fresh entries need DTE ≥ 21. Re-entries after same-day profit close need DTE ≥ 14.
+        _ENTRY_MIN_DTE   = 21
+        _REENTRY_MIN_DTE = 14
+        if symbol in self._profit_closed_today:
+            if dte < _REENTRY_MIN_DTE:
+                logger.info(
+                    f"[IronCondor] {symbol} skipped re-entry — DTE={dte} < {_REENTRY_MIN_DTE} "
+                    "re-entry floor (profit closed today)."
+                )
+                return
+            logger.info(
+                f"[IronCondor] {symbol} re-entering after same-day profit close (DTE={dte})"
+            )
+        elif dte < _ENTRY_MIN_DTE:
             logger.info(
                 f"[IronCondor] {symbol} skipped — DTE={dte} < {_ENTRY_MIN_DTE} entry floor, "
                 "not enough theta runway."
@@ -1451,7 +1580,7 @@ class LiveTradingEngine:
         lot_size = await self._get_lot_size(symbol)
         atr      = float(market_data.get("atr14", underlying_price * 0.01))
         iv_rank  = await self._get_iv_rank(symbol, underlying_price, atr, dte)
-        sigma    = atr_to_annualised_vol(atr, underlying_price)
+        sigma    = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, underlying_price)
 
         # VIX + IV Rank gates — only sell premium when it is worth selling
         from src.market_data.option_chain import vix_allows_selling, iv_rank_allows_selling
@@ -1594,10 +1723,8 @@ class LiveTradingEngine:
             order = await self.order_manager.place_order(contract, side, lot_size, price, **kwargs)
             if not order or order.order_status != "OPEN":
                 logger.error(f"[IronCondor] Leg failed: {side} {contract}. Unwinding {len(placed)} leg(s).")
-                if order and order.order_status in ("REJECTED", "REJECTED_BY_RISK", "CANCELLED"):
-                    self._exited_today.add(symbol)  # stop retrying every minute
-                else:
-                    self._exited_today.add(symbol)
+                if order and order.order_status == "REJECTED_BY_RISK":
+                    self._exited_today.add(symbol)  # risk manager blocked it — stop retrying today
                 from src.market_data.option_chain import get_option_quote as _gq
                 for (c, s, p, _) in placed:
                     rev = "BUY" if s == "SELL" else "SELL"
@@ -1660,7 +1787,8 @@ class LiveTradingEngine:
 
         expiry   = get_near_month_expiry()
         dte      = (expiry - now_ist().replace(tzinfo=None)).days
-        to_close: List[str] = []
+        to_close_adverse_c: List[str] = []
+        to_close_profit_c:  List[str] = []
 
         ic_strategy = next(
             (s for s in active_strategies.values()
@@ -1734,10 +1862,15 @@ class LiveTradingEngine:
                 elif cur_cs >= c["call_short_premium"] * sl_mult:
                     exit_reason = f"Call SL: Rs{c['call_short_premium']:.2f} -> Rs{cur_cs:.2f}"
             if exit_reason is None:
-                if (cur_ps <= c["put_short_premium"] * profit_pct
-                        and cur_cs <= c["call_short_premium"] * profit_pct):
+                _put_hit  = cur_ps <= c["put_short_premium"]  * profit_pct
+                _call_hit = cur_cs <= c["call_short_premium"] * profit_pct
+                if _put_hit or _call_hit:
+                    # Close entire condor when EITHER short decays to target.
+                    # If one wing is at 75% profit the stock has moved toward that wing's
+                    # short strike — keeping the trade open exposes the OTHER wing to breach.
+                    _which = "put" if _put_hit else "call"
                     profit_label = "75%+" if profit_pct <= 0.25 else "60%+ (VIX spike early exit)"
-                    exit_reason = f"Both wings at {profit_label} profit — closing condor"
+                    exit_reason = f"{_which.capitalize()} wing at {profit_label} profit — closing condor"
 
             # G: Regime shift post-entry — iron condors need RANGE_BOUND/LOW_VOL.
             # If regime has shifted to TRENDING or VOLATILE after entry, the neutrality
@@ -1803,7 +1936,6 @@ class LiveTradingEngine:
                     c["put_short_contract"], c["put_long_contract"],
                     c["call_short_contract"], c["call_long_contract"],
                 ])
-            to_close.append(underlying)
             await self._notify(
                 f"IRON CONDOR CLOSED\n"
                 f"Underlying: {underlying}\nReason: {exit_reason}\n"
@@ -1835,10 +1967,22 @@ class LiveTradingEngine:
             # C: remove from near-expiry set
             self._close_on_first_cycle.discard(underlying)
 
-        for sym in to_close:
+            # Route to profit or adverse bucket for re-entry eligibility
+            _adverse_kw_c = ("breach", "Breach", "SL:", " SL ", "spike SL", "Regime shift",
+                             "Near-expiry", "forced close")
+            if any(kw in exit_reason for kw in _adverse_kw_c):
+                to_close_adverse_c.append(underlying)
+            else:
+                to_close_profit_c.append(underlying)
+
+        for sym in to_close_adverse_c:
             del self._active_condors[sym]
             self._exited_today.add(sym)
-        if to_close:
+        for sym in to_close_profit_c:
+            del self._active_condors[sym]
+            self._profit_closed_today.add(sym)
+            logger.info(f"[IronCondor] {sym} → profit_closed_today (re-entry eligible at DTE≥14)")
+        if to_close_adverse_c or to_close_profit_c:
             await self._persist_state()
 
     async def _exit_all_options_for(self, underlying: str) -> None:
@@ -2137,7 +2281,7 @@ class LiveTradingEngine:
         if not redis:
             return None
         try:
-            sigma = atr_to_annualised_vol(atr, underlying_price)
+            sigma = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, underlying_price)
             await update_iv_history(symbol, sigma, redis)
             return await get_iv_rank(symbol, redis)
         except Exception:

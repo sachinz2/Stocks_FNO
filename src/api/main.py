@@ -66,7 +66,7 @@ async def lifespan(app: FastAPI):
     from src.database.models.trade_journal import TradeJournal
     from src.database.models.walk_forward import WalkForwardResult  # noqa: F401 — creates table
 
-    PHASE1_SYMBOLS = list(FNO_SYMBOLS[:5])
+    PHASE1_SYMBOLS = list(FNO_SYMBOLS)
 
     # ── DB tables ──────────────────────────────────────────────────────────────
     import src.database.models  # noqa: F401 — registers all ORM models with Base

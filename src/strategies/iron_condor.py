@@ -21,7 +21,7 @@ Exit triggers (managed by engine's _check_condor_exits):
   1. DTE < 7                        — close before gamma risk explodes near expiry
   2. Underlying breaches short put OR short call strike  — stop immediately
   3. Either short leg rises to 2× sold price             — stop loss on that wing
-  4. Both short legs decay to 25% of sold price          — 75% profit captured, close
+  4. Either short leg decays to 25% of sold price         — lock in profit, close entire condor
 """
 import logging
 from typing import Any, Dict, Optional
