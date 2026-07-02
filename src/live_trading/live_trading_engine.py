@@ -1067,10 +1067,20 @@ class LiveTradingEngine:
         csc = build_option_symbol(symbol, call_short_strike, "CE", expiry)
         clc = build_option_symbol(symbol, call_long_strike,  "CE", expiry)
 
-        put_short_p  = estimate_option_premium(atr, dte, otm_intervals=1)
-        put_long_p   = estimate_option_premium(atr, dte, otm_intervals=3)
-        call_short_p = estimate_option_premium(atr, dte, otm_intervals=1)
-        call_long_p  = estimate_option_premium(atr, dte, otm_intervals=3)
+        # Fetch real Kite LTPs for all 4 legs — same as credit spread entry.
+        # ATR estimates are CE/PE-blind (put_short_p == call_short_p always), which
+        # causes immediate SL fires when the exit check sees real market prices.
+        from src.market_data.option_chain import get_entry_prices_for_spread
+        _kite  = getattr(self, "_kite",  None)
+        _redis = getattr(self, "_redis", None)
+        put_short_p, put_long_p = await get_entry_prices_for_spread(
+            symbol, psc, plc, _kite, _redis, atr, dte,
+            short_otm_intervals=1, long_otm_intervals=3,
+        )
+        call_short_p, call_long_p = await get_entry_prices_for_spread(
+            symbol, csc, clc, _kite, _redis, atr, dte,
+            short_otm_intervals=1, long_otm_intervals=3,
+        )
         net_credit   = round((put_short_p - put_long_p) + (call_short_p - call_long_p), 2)
         total_credit = net_credit * lot_size
 
