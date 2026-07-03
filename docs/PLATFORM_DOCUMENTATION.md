@@ -1,8 +1,8 @@
 # Falcon Quant Platform — Complete Technical Documentation
 
-**Version:** 2.0  
-**Last Updated:** June 2026  
-**Mode:** Paper Trading (live trading target: July 2026)
+**Version:** 3.0  
+**Last Updated:** July 2026  
+**Mode:** Paper Trading (live trading target: ~July 29, 2026)
 
 ---
 
@@ -72,7 +72,7 @@ Falcon Quant Platform is an automated algorithmic trading system built for NSE F
 
 ### 1.3 Trading Universe
 
-40 NSE F&O stocks across 4 liquidity tiers. The LTP Poller dynamically selects the top 5 stocks per strategy each minute based on current market regime scores. RSRanker additionally filters by Relative Strength vs NIFTY50.
+41 NSE F&O stocks across 5 liquidity tiers. The LTP Poller dynamically selects the top 5 stocks per strategy each minute based on current market regime scores. RSRanker additionally filters by Relative Strength vs NIFTY50. All 41 symbols are passed to the engine; the three strategy pools each surface the best 5 candidates from this full universe.
 
 ### 1.4 Key Design Principles
 
@@ -466,21 +466,25 @@ Stores IS and OOS metrics from walk-forward analysis windows.
 ### 5.3 Redis Key Schema
 
 ```
-tick:{SYMBOL}              ← Full indicator tick (JSON) — written by LTPPoller,
-                             overwritten for 'close' by ZerodhaTicker/ZerodhaLTPPoller
-nfo:top5                   ← EMA crossover top-5 (JSON array of symbols)
-nfo:top5:spread            ← Credit spread top-5
-nfo:top5:condor            ← Iron condor top-5
-nfo:rs_ranks               ← Full RS rank list [{symbol, rs_score, rank}, ...]
-nfo:rs_top10               ← Top-10 symbols by RS score (JSON array)
-market:regime              ← Current regime JSON {regime, vix, atr_pct, ...}
-lot:{SYMBOL}               ← Lot size (refreshed daily from live instruments)
-iv_hist:{SYMBOL}           ← Rolling IV history for IV rank calculation
-vix:india                  ← Cached India VIX (5 min TTL)
-falcon:active_spreads      ← Persisted _active_spreads state
-falcon:active_condors      ← Persisted _active_condors state
-zerodha:access_token       ← Live session token (24h TTL)
-nse_oi_prev:{SYMBOL}       ← Previous OI snapshot for change-delta signal
+tick:{SYMBOL}                  ← Full indicator tick (JSON) — written by LTPPoller,
+                                 overwritten for 'close' by ZerodhaTicker/ZerodhaLTPPoller
+nfo:top5                       ← EMA crossover top-5 (JSON array of symbols)
+nfo:top5:spread                ← Credit spread top-5
+nfo:top5:condor                ← Iron condor top-5
+nfo:rs_ranks                   ← Full RS rank list [{symbol, rs_score, rank}, ...]
+nfo:rs_top10                   ← Top-10 symbols by RS score (JSON array)
+market:regime                  ← Current regime JSON {regime, vix, atr_pct, ...}
+lot:{SYMBOL}                   ← Lot size (refreshed daily from live instruments)
+iv_history:{SYMBOL}            ← Rolling daily IV readings for IV percentile rank (up to 252 entries)
+vix:india                      ← Cached India VIX (5 min TTL)
+falcon:active_spreads          ← Persisted _active_spreads state (survives restarts)
+falcon:active_condors          ← Persisted _active_condors state (survives restarts)
+engine:profit_closed_today     ← JSON {date, symbols} — symbols profit-closed this session; cleared at EOD
+engine:exited_today            ← JSON {date, symbols} — symbols with adverse exits (breach/SL) today
+engine:order_count             ← Today's order count (JSON, cleared at market open)
+sl_freq:{SYMBOL}               ← Adverse exit counter (5-day TTL); circuit breaker fires at 2
+zerodha:access_token           ← Live session token (24h TTL)
+nse_oi_prev:{SYMBOL}           ← Previous OI snapshot for change-delta signal
 ```
 
 ### 5.4 Indexes
@@ -648,7 +652,26 @@ POST /api/v1/backtest/run
 GET  /api/v1/backtest/{run_id}
 ```
 
-### 6.12 Logs
+### 6.12 Admin
+
+```http
+POST /api/v1/admin/reset                ← Wipe all trading data + reset in-memory engine state
+POST /api/v1/admin/reset-iv-history     ← Clear iv_history:{symbol} keys for all 41 F&O symbols
+POST /api/v1/admin/email-alerts/pause   ← Pause email notifications
+POST /api/v1/admin/email-alerts/resume  ← Resume email notifications
+GET  /api/v1/admin/email-alerts         ← Check current email alert state
+```
+
+`POST /api/v1/admin/reset` clears:
+- All trading DB tables (orders, positions, trades, trade_journal, audit_logs, signals, walk_forward_results)
+- All engine Redis keys (active_spreads, active_condors, exited_today, profit_closed_today, order_count)
+- All `iv_history:{symbol}` keys
+- In-memory engine state (_active_spreads, _active_condors, _exited_today, _profit_closed_today, _close_on_first_cycle, _peak_premiums)
+- PaperBroker virtual balance (restored to INITIAL_CAPITAL)
+
+`POST /api/v1/admin/reset-iv-history` clears only the IV rank history keys without touching trading data. Use this after a sigma calibration change to restart IV percentile accumulation with correct values.
+
+### 6.13 Logs
 
 ```http
 GET /api/v1/logs/?token=<LOGS_API_TOKEN>
@@ -752,47 +775,59 @@ Additionally, `RSRanker` publishes `nfo:rs_top10` — the top 10 by Relative Str
 
 ### 7.5 Exit Management
 
+Exits are checked in two places:
+- **`_check_spread_exits` / `_check_condor_exits`** run inside `run_signal_cycle()` (every 60 s)
+- A **dedicated 10-second exit check job** (APScheduler) calls these same methods more frequently for faster stop-loss execution; `_exit_cycle_lock` (asyncio.Lock) prevents concurrent runs
+
+All exits are classified as either **adverse** (breach/SL/regime shift/near-expiry/forced close) or **profit** (75%+ target hit). This routing is critical: adverse exits populate `_exited_today` (blocks re-entry today), while profit exits populate `_profit_closed_today` (allows re-entry at DTE ≥ 14).
+
 #### Spread Exits (`_check_spread_exits`)
 
 For each spread in `_active_spreads`:
-1. **DTE < min_dte (7):** Close immediately (gamma risk)
-2. **Underlying crosses short strike:** Emergency stop (spread in-the-money)
-3. **Short leg rises to 2× sold price:** Stop loss
-4. **Short leg decays to 25% of sold price:** 75% profit captured, close
+1. **DTE < 7:** Close immediately — gamma risk near expiry (adverse)
+2. **Underlying crosses short strike:** Emergency stop — spread in-the-money (adverse)
+3. **Short leg rises to 2× sold price:** Stop loss (adverse)
+4. **Short leg decays to 25% of sold price:** 75% profit captured, close (profit)
 
 #### Condor Exits (`_check_condor_exits`)
 
 For each condor in `_active_condors`:
-1. **DTE < min_dte (7):** Close all 4 legs
-2. **Underlying breaches short put OR short call strike:** Close
-3. **Either short leg rises to 2× sold price:** Close entire condor
-4. **Both short legs decay to 25% of sold price:** Close (75% profit)
+1. **DTE < 7:** Close all 4 legs (adverse)
+2. **Underlying breaches short put OR short call strike:** Close entire condor (adverse)
+3. **Either short leg rises to 2× sold price:** Close entire condor (adverse)
+4. **Either short leg decays to 25% of sold price:** Close entire condor (profit) — when one wing wins, the stock has moved toward that side, putting the other wing at increasing risk; closing immediately locks in the gain
 
 #### Single-Leg Exits (`_check_open_option_exits`)
 
-For EMA crossover long option positions:
+For EMA crossover long option positions (intraday only — closed at EOD if not already out):
 - Hard stop loss: premium fell ≥ 50%
 - Profit target: premium rose ≥ 100% (doubled)
 - Trailing stop: fell ≥ 25% from peak
 
 ### 7.6 State Persistence
 
-Active spreads and condors are persisted to Redis on every change:
+Active spreads, condors, and session state are persisted to Redis on every change:
 ```
-falcon:active_spreads  ← JSON dict of _active_spreads
-falcon:active_condors  ← JSON dict of _active_condors
+falcon:active_spreads          ← JSON dict of _active_spreads
+falcon:active_condors          ← JSON dict of _active_condors
+engine:profit_closed_today     ← JSON {date, symbols} for profit-closed symbols this session
+engine:exited_today            ← JSON {date, symbols} for adverse-exit symbols this session
 ```
 
-On startup, `_restore_state()` reloads from Redis. The engine survives restarts without losing track of open multi-leg structures.
+On startup, `_restore_state()` reloads all four keys from Redis. The engine survives restarts without losing track of open multi-leg structures or today's exit history.
+
+**DTE roll detection on restart:** If the engine restarts and finds an active spread/condor that now has a different (lower) DTE than when it was opened — indicating the position rolled through an expiry — that symbol is added to `_close_on_first_cycle`. The position is closed immediately on the first signal cycle rather than being held into gamma risk territory.
 
 ### 7.7 Market Open/Close Hooks
 
 | Time (IST) | Job | Action |
 |------------|-----|--------|
 | 09:15 | `on_market_open` | Reset `_today_order_count`, `risk_manager.reset_daily_state()` |
-| 15:20 | `is_square_off_time()` check | `_square_off_all()` |
+| 15:20 | `is_square_off_time()` check | `_square_off_all()` — closes **EMA crossover single-leg positions only**; credit spreads and iron condors are multi-day and are NOT force-closed at EOD |
 | 15:30 | `on_market_close` | Cleanup |
-| 15:45 | `send_daily_report` | Email PnL summary |
+| 15:45 | `send_daily_report` | Email PnL summary; clears `_profit_closed_today` set |
+
+**Multi-day holding:** Credit spreads and iron condors persist overnight. They are only closed when their own exit conditions trigger (DTE < 7, breach, SL, or profit target) — not by the 15:20 square-off. This allows theta to compound over days without forced intraday closes.
 
 ---
 
@@ -843,7 +878,7 @@ Crossover must persist for signal_confirm_bars=2 to filter whipsaws.
 
 **File:** `src/strategies/credit_spread.py` | **Capital:** 40% (₹1,20,000)
 
-Sells a near-ATM option, buys a further-OTM option for net credit. Profits from time decay (theta). Defined risk.
+Sells a near-ATM option, buys a further-OTM option for net credit. Profits from multi-day time decay (theta). Defined risk. Positions held overnight until exit conditions trigger — not closed at EOD.
 
 **Parameters:**
 
@@ -853,7 +888,7 @@ Sells a near-ATM option, buys a further-OTM option for net credit. Profits from 
 | `spread_width` | 2 | Strike intervals between legs |
 | `profit_close_pct` | 0.25 | Close at 75% profit capture |
 | `stop_loss_multiple` | 2.0 | Close at 2× original premium |
-| `min_dte` | 7 | Minimum DTE for entry |
+| `min_dte` | 7 | DTE at which exit is triggered (gamma risk) |
 
 **Signal logic:**
 ```
@@ -862,13 +897,21 @@ EMA20 > EMA50 → BULL_PUT_SPREAD
 EMA20 < EMA50 → BEAR_CALL_SPREAD
 ```
 
-**Entry gates:** DTE ≥ 7, net credit ≥ ₹350, PCR alignment, no crowded OI at short strike.
+**Entry gates (all must pass):**
+- DTE ≥ 21 for fresh entries; DTE ≥ 14 for re-entries after a same-day profit close (`_profit_closed_today`)
+- Not already in `_exited_today` (adverse exit blocks re-entry for the day)
+- Not already in `_active_condors` (stacking guard — no spread on top of live condor)
+- VWAP alignment: underlying price ≥ VWAP × 0.995 for BULL_PUT_SPREAD; ≤ VWAP × 1.005 for BEAR_CALL_SPREAD (medium-term trend confirmation from 10-day 5-minute candles)
+- HV/IV ratio: market implied vol (from live short-leg LTP) ÷ realized vol (sigma) ≥ 1.10 — only sell premium when the market is paying at least 10% more than realized volatility
+- Net credit ≥ ₹350 total
+- PCR alignment with spread direction
+- No crowded OI at short strike
 
 ### 8.4 Iron Condor Strategy
 
 **File:** `src/strategies/iron_condor.py` | **Capital:** 20% (₹60,000)
 
-Sells both a put spread and a call spread simultaneously. Profits when underlying stays within the range of both short strikes.
+Sells both a put spread and a call spread simultaneously. Profits when underlying stays within the range of both short strikes. Positions held overnight — not closed at EOD.
 
 **Parameters:**
 
@@ -878,9 +921,9 @@ Sells both a put spread and a call spread simultaneously. Profits when underlyin
 | `flat_threshold` | 0.1 | EMA spread% must be below this |
 | `short_offset` | 1 | Short strikes 1 interval from ATM |
 | `hedge_offset` | 2 | Long strikes 2 intervals beyond short |
-| `profit_close_pct` | 0.25 | Close at 75% profit capture |
-| `stop_loss_multiple` | 2.0 | Close if either short leg 2× original |
-| `min_dte` | 7 | Minimum DTE for entry |
+| `profit_close_pct` | 0.25 | Close when either short leg hits 75% profit |
+| `stop_loss_multiple` | 2.0 | Close entire condor if either short leg 2× original |
+| `min_dte` | 7 | DTE at which exit is triggered (gamma risk) |
 
 **Signal logic:**
 ```
@@ -889,7 +932,11 @@ EMA_spread% >= 0.1% → HOLD (credit spread handles directional)
 → IRON_CONDOR
 ```
 
-**Entry gate:** Net credit ≥ ₹600 (covers 8-order round-trip fees).
+**Entry gates:**
+- DTE ≥ 21 for fresh entries; DTE ≥ 14 for re-entries after same-day profit close
+- Not already in `_active_spreads` (stacking guard — no condor on top of live spread for same symbol)
+- Net credit ≥ ₹600 (covers 8-order round-trip fees)
+- HV/IV ratio and VWAP alignment apply via the sigma computation (same as credit spread)
 
 ### 8.5 Strategy Regime Assignment
 
@@ -925,10 +972,18 @@ Three layers of risk control operate in parallel:
 
 ### 9.2 RiskManager — 7-Layer Validation
 
-#### Layer 1: Kill Switch / Circuit Breaker
+#### Layer 0: Exit Orders — Always Pass
+```python
+if is_exit_order:
+    return True  # all layers bypassed — an open position must always be closeable
+```
+
+This is checked before anything else. Kill switch, daily loss limit, position count — none of these apply to exit orders. Trapping open losses behind a risk gate is more dangerous than the exit order itself.
+
+#### Layer 1: Kill Switch / Circuit Breaker (entries only)
 ```python
 if kill_switch_active or circuit_breaker_active:
-    return False
+    return False  # new entries blocked; exits already returned True above
 ```
 
 #### Layer 2: Daily Loss Limit
@@ -976,7 +1031,7 @@ Spread legs (is_spread_leg=True) skip layers 3–7 and return True after just la
 ROLLING_WINDOW = 30        # last 30 closed trades per strategy
 ROLLING_PF_FLOOR = 0.9    # pause if profit factor < 0.9
 DRAWDOWN_MULTIPLIER = 1.5  # pause if drawdown > 1.5× expected
-MIN_TRADES_REQUIRED = 10  # minimum trades before evaluation
+MIN_TRADES_REQUIRED = 30  # minimum trades before evaluation (< 30 is statistically meaningless)
 
 DEFAULT_EXPECTED_DRAWDOWN = {
     "ema_crossover": 15000,
@@ -1196,7 +1251,25 @@ get_entry_prices_for_spread(symbol, short_contract, long_contract, kite, redis, 
 
 get_india_vix(redis)       → reads cached VIX
 fetch_and_cache_vix(kite, redis)  → fetches + caches (5-min TTL)
+
+atr_to_annualised_vol(atr, price)
+    → (atr / price) * sqrt(252) — assumes DAILY ATR input
+
+implied_vol(premium, spot, strike, T, option_type)
+    → Black-Scholes implied volatility from a live option price
 ```
+
+**Critical: ATR scaling before sigma computation**
+
+LTPPoller supplies a 5-minute ATR (ATR14 over 14 five-minute bars). `atr_to_annualised_vol()` assumes daily ATR. Without correction, sigma is ~7× too low, causing `find_delta_strike()` to place short strikes only ~1% OTM instead of the intended ~5-6%.
+
+The fix applied in all three sigma computations (credit spread, iron condor, IV rank):
+```python
+_5MIN_ATR_SCALE: float = 75 ** 0.5   # sqrt(375 min/day ÷ 5 min/bar) = sqrt(75)
+sigma = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, underlying_price)
+```
+
+This scales 5-minute ATR to daily-equivalent before annualising, producing correct sigma (~28% for typical F&O stocks) and correctly placed delta strikes (~5-6% OTM for short legs).
 
 ### 11.7 NSE Open Interest Data
 
@@ -1363,12 +1436,13 @@ Tests: instrument tokens, REST LTP, 5-min OHLC, daily OHLC, NIFTY 50, WebSocket 
 | LTP poll | Every 60s | `ltp_poller.poll()` | Zerodha 5-min OHLC + indicators |
 | Zerodha LTP REST | Every 5s | `zerodha_ltp_poller.refresh_ltp()` | Fast LTP update via kite.ltp() |
 | RS Ranking | Every 300s | `rs_ranker.rank()` | Daily OHLC + NIFTY relative strength |
-| Signal cycle | Every 60s | `engine.run_signal_cycle()` | Market hours only |
+| Signal cycle | Every 60s | `engine.run_signal_cycle()` | Market hours only; includes entry signals |
+| **Exit check** | **Every 10s** | **`engine._check_spread_exits` + `engine._check_condor_exits`** | **Market hours; faster stop-loss response; `_exit_cycle_lock` prevents concurrent runs** |
 | Order sync | Every 30s | `engine.sync_orders()` | Always |
 | Position sync | Every 60s | `engine.sync_positions()` | Always |
 | Market open | 09:15 IST | `engine.on_market_open()` | Weekdays |
 | Market close | 15:30 IST | `engine.on_market_close()` | Weekdays |
-| Daily report | 15:45 IST | `engine.send_daily_report()` | Weekdays |
+| Daily report | 15:45 IST | `engine.send_daily_report()` | Weekdays; clears `_profit_closed_today` |
 | Zerodha auth | 08:30 IST | `zerodha_auto_auth.py` (cron) | Weekdays, headless Playwright |
 
 ### 15.2 Zerodha Auto-Auth Cron
@@ -1537,8 +1611,8 @@ curl "http://<host>/api/v1/logs/download/falcon.log.1?token=<LOGS_API_TOKEN>"
 
 | Log Pattern | Meaning |
 |------------|---------|
-| `ZerodhaTicker: WebSocket connected — subscribed 40 symbols in LTP mode` | Live WebSocket active |
-| `ZerodhaLTPPoller: refreshed LTP for 40 symbols` | REST LTP working |
+| `ZerodhaTicker: WebSocket connected — subscribed 41 symbols in LTP mode` | Live WebSocket active |
+| `ZerodhaLTPPoller: refreshed LTP for 41 symbols` | REST LTP working |
 | `kite.historical_data failed for SYMBOL: ...` | OHLC fetch issue (check token) |
 | `RSRanker: top-5 = [EICHERMOT, TITAN, ...]` | RS ranking complete |
 | `Regime: TRENDING (VIX=16.2, ATR%=1.8)` | Regime classified |
@@ -1548,6 +1622,11 @@ curl "http://<host>/api/v1/logs/download/falcon.log.1?token=<LOGS_API_TOKEN>"
 | `Access token stored in Redis` | Auth successful |
 | `KILL SWITCH ACTIVATED: Max Daily Loss Reached` | Emergency stop |
 | `Expired 1 stale order(s).` | Order auto-cancelled after 5 min |
+| `[PortfolioDelta] bulls=2 bears=1 condors=1` | Portfolio directional balance logged each cycle |
+| `[CreditSpread] INFY re-entering after same-day profit close (DTE=16)` | Re-entry after profit close |
+| `[CreditSpread] RELIANCE skipped — VWAP filter (price below VWAP − 0.5%)` | VWAP direction filter rejected entry |
+| `[CreditSpread] TCS skipped — IV/HV ratio 0.92 < 1.10` | HV/IV filter rejected entry |
+| `[IronCondor] HDFCBANK skipped — already in active_spreads` | Condor stacking guard |
 
 ---
 
@@ -1581,21 +1660,23 @@ curl "http://<host>/api/v1/logs/download/falcon.log.1?token=<LOGS_API_TOKEN>"
 ### 22.1 Complete Example: Iron Condor on JSWSTEEL
 
 ```
-09:00 IST — zerodha_auto_auth.py has already run at 08:30
-  → access_token in Redis, lot sizes refreshed
+Day 1, 08:30 IST — zerodha_auto_auth.py runs
+  → access_token in Redis, lot sizes refreshed (JSWSTEEL lot = 1350)
 
-09:45 IST — LTPPoller.poll()
-  kite.historical_data(JSWSTEEL_token, ..., "5minute") → 150 candles
+Day 1, 09:45 IST — LTPPoller.poll()
+  kite.historical_data(JSWSTEEL_token, ..., "5minute") → 2,000 candles (10 days)
   JSWSTEEL tick:
     close=890.5, ema20=889.3, ema50=889.8
-    atr14=8.2, atr_pct=0.92% (< 1.2% → low vol)
+    atr14=8.2 (5-min), atr_daily=8.2 × √75 = 71.0
+    atr_pct=0.92% (< 1.2% → low vol)
     ema_spread_pct=0.056% (< 0.1% → flat)
+    vwap (10-day)=888.0
     condor_score=0.38 (high), ltp_source="zerodha_historical"
 
   ZerodhaTicker overwrites: close=890.7, ltp_source="zerodha_realtime"
   Redis: nfo:top5:condor = ["JSWSTEEL", "NTPC", ...]
 
-09:46 IST — LiveTradingEngine.run_signal_cycle()
+Day 1, 09:46 IST — LiveTradingEngine.run_signal_cycle()
 
   StrategyMonitor.evaluate_all()  → all strategies healthy (PF > 0.9)
   RegimeDetector.detect()         → RANGE_BOUND (VIX=16.2, ATR%=0.92%)
@@ -1604,29 +1685,47 @@ curl "http://<host>/api/v1/logs/download/falcon.log.1?token=<LOGS_API_TOKEN>"
   IronCondorStrategy.generate_signal(tick):
     ATR%=0.92 < 1.2 ✓ | EMA_spread%=0.056 < 0.1 ✓ → IRON_CONDOR
 
-  PortfolioAnalyzer: no concentration alerts
+  PortfolioAnalyzer: no concentration alerts (Metals sector: 0/2 open)
 
   _process_iron_condor("JSWSTEEL"):
-    DTE=35 ≥ 7 ✓ | sigma=0.19 | lot_size=600
-    put_short=850, put_long=800, call_short=930, call_long=980
-    net_credit = (3.2-1.4) + (3.1-1.3) = ₹3.6 / lot → ₹2,160 total ≥ ₹600 ✓
+    DTE=28 ≥ 21 ✓ (fresh entry floor)
+    JSWSTEEL not in _active_spreads ✓ (stacking guard)
+    sigma = atr_to_annualised_vol(71.0, 890.5) = 28.3%
 
-  4 legs placed → condor registered → Redis + DB updated → Email sent
+    put_short=840 (delta ~-0.20), put_long=820
+    call_short=940 (delta ~+0.20), call_long=960
+
+    Live LTP from kite.ltp():
+      put_short: ₹14.00, put_long: ₹4.50 → put wing credit = ₹9.50
+      call_short: ₹12.00, call_long: ₹3.80 → call wing credit = ₹8.20
+      total net credit = ₹17.70 × 1350 = ₹23,895 ≥ ₹600 ✓
+
+    IV/HV check:
+      Implied vol from ₹14.00 put_short ≈ 31.2%
+      IV/HV ratio = 31.2% / 28.3% = 1.10 ✓ (≥ 1.10 threshold, barely passes)
+
+  4 legs placed → condor registered in _active_condors
+  Persisted to Redis: falcon:active_condors
+  GTT backstop placed on short legs at 2.5× entry (₹35 put / ₹30 call)
+  Email: "IRON CONDOR OPENED — JSWSTEEL — Net credit ₹17.70 × 1350 = ₹23,895"
 
   Trade journal record:
-    day_of_week=3 (Thursday)
-    hour_of_day=9
-    vix_at_entry=16.2
-    market_regime=RANGE_BOUND
+    day_of_week=3 (Thursday), hour_of_day=9
+    vix_at_entry=16.2, market_regime=RANGE_BOUND
 
----  Eventually (profit target hit) ---
+---  Day 6 (theta has decayed significantly) ---
 
-  _check_condor_exits():
-    Both short legs at 25% of sold price → CLOSE
-    4 exit orders placed, fills recorded with fill_price + slippage
-    Trade journal updated:
-      atr_at_exit, vix_at_exit, regime_label, total_slippage_pts, pnl
-    Email: "IRON CONDOR CLOSED — JSWSTEEL — Profit ₹1,384"
+  _check_condor_exits() [runs every 10 seconds]:
+    call_short current price: ₹2.90  ≤  ₹12.00 × 0.25 = ₹3.00  → TRIGGER (call wing at 75%)
+
+  Exit reason: "Call wing at 75%+ profit — closing condor"
+  → Classified as PROFIT close → _profit_closed_today.add("JSWSTEEL")
+
+  4 exit orders placed, fills recorded with fill_price + slippage
+  Trade journal updated: atr_at_exit, vix_at_exit, regime_label, total_slippage_pts, pnl
+  Email: "IRON CONDOR CLOSED — JSWSTEEL — Call wing at 75%+ profit | PnL ₹+14,200"
+
+  JSWSTEEL can now re-enter same day if DTE ≥ 14 and conditions remain good.
 ```
 
 ---
@@ -1635,18 +1734,18 @@ curl "http://<host>/api/v1/logs/download/falcon.log.1?token=<LOGS_API_TOKEN>"
 
 ### 23.1 DTE Churn (Fixed — June 2026)
 
-DTE gate at ENTRY prevents rapid open→close→open near expiry. No new entries when DTE < 7.
+DTE gate at ENTRY prevents opening positions without sufficient time runway. No new entries when DTE < 21 (fresh entry) or DTE < 14 (re-entry after same-day profit close). Exit trigger at DTE < 7 captures most theta while avoiding gamma explosion.
 
 ### 23.2 NSE Monthly Expiry
 
 NSE F&O expiry: last Thursday of the month.
-- July 2026 = Thursday July 30
+- July 2026 = Thursday July 31
 
-System goes quiet in the week before expiry (DTE < 7) and resumes after roll (DTE ≈ 28–42).
+System enters quiet period when DTE < 7 (no new entries). Resumes entry after roll to next expiry (DTE ≈ 28–42). Multi-day positions already open are exited at DTE < 7.
 
 ### 23.3 Stale Risk State After Exits (Fixed — June 2026)
 
-Second `_refresh_risk_state()` call after exits ensures sector concentration check sees the post-exit position list.
+Second `_refresh_risk_state()` call after exits ensures sector concentration check sees the post-exit position list before evaluating new entries.
 
 ### 23.4 SEBI Fee Formula (Fixed — June 2026)
 
@@ -1676,18 +1775,41 @@ With 5 credit spread symbols (10 position legs) and 5 iron condor symbols (20 po
 - Increase `MAX_OPEN_POSITIONS` to 35 in `.env`
 - Reduce active symbols per strategy to 4 (8 + 16 = 24 ≤ 25)
 
+### 23.9 Sigma Calibration Fix (July 2026)
+
+LTPPoller computes ATR14 over 5-minute bars. `atr_to_annualised_vol()` assumes daily ATR. Without the `_5MIN_ATR_SCALE = sqrt(75)` correction, sigma ≈ 4% when true annualized volatility ≈ 28%, causing `find_delta_strike()` to place short strikes only ~1% OTM instead of the intended ~5-6% OTM.
+
+All three sigma computations (credit spread, iron condor, `_get_iv_rank`) now apply this scale factor. After applying the fix, run:
+```bash
+docker exec -it falcon_api curl -X POST http://localhost:8000/api/v1/admin/reset-iv-history
+```
+This clears the corrupted IV rank history so correct values accumulate from the fix date forward.
+
+### 23.10 Adverse vs Profit Exit Routing
+
+The `_check_spread_exits` and `_check_condor_exits` methods classify each exit as adverse (breach, SL, regime shift, near-expiry, forced close) or profit (75%+ target). Only adverse exits populate `_exited_today` (which blocks same-day re-entry). Profit exits populate `_profit_closed_today`, which allows re-entry at DTE ≥ 14 — enabling two trades per expiry cycle on the same symbol if conditions remain good.
+
+This distinction matters during code review: any new exit reason string must be added to `_adverse_kw` in `_check_spread_exits` if it should block re-entry, otherwise it will be treated as a profit close and re-entry will be allowed.
+
+### 23.11 IV Rank History Rebuild Timeline
+
+`iv_history:{SYMBOL}` accumulates one daily IV reading per market day. After clearing history (post-sigma fix), the IV rank gate (`≥ 0.30`) requires enough history to compute a meaningful percentile. With 30-40 trading days before go-live, the gate becomes meaningful within ~2 weeks and produces reliable percentile rankings by go-live.
+
 ---
 
 ## 24. F&O Trading Reference
 
-### 24.1 NSE F&O Universe (40 Symbols)
+### 24.1 NSE F&O Universe (41 Symbols)
 
 | Tier | Symbols |
 |------|---------|
 | Tier 1 (liquid) | RELIANCE, TCS, INFY, HDFCBANK, ICICIBANK, SBIN, BAJFINANCE, KOTAKBANK, AXISBANK, LT |
-| Tier 2 | HINDUNILVR, ITC, WIPRO, HCLTECH, MARUTI, SUNPHARMA, TATAMOTORS, BHARTIARTL, ADANIPORTS, ASIANPAINT |
+| Tier 2 | HINDUNILVR, ITC, WIPRO, HCLTECH, MARUTI, SUNPHARMA, M&M, BHARTIARTL, ADANIPORTS, ASIANPAINT |
 | Tier 3 | TITAN, BAJAJ-AUTO, EICHERMOT, INDUSINDBK, DRREDDY, CIPLA, DIVISLAB, JSWSTEEL, HINDALCO, GRASIM |
 | Tier 4 | TATACONSUM, APOLLOHOSP, NESTLEIND, TECHM, BPCL, ONGC, NTPC, POWERGRID, ULTRACEMCO, TATASTEEL |
+| Tier 5 | COALINDIA |
+
+> TATAMOTORS removed (Jun 2026) — replaced by M&M (Auto) and COALINDIA (Mining) for better sector diversity.
 
 ### 24.2 Lot Sizes
 
@@ -1712,7 +1834,7 @@ Sample current lot sizes (may change with SEBI revisions):
 | NBFC | BAJFINANCE |
 | Infrastructure | LT, ADANIPORTS |
 | FMCG | HINDUNILVR, ITC, TATACONSUM, NESTLEIND |
-| Auto | MARUTI, TATAMOTORS, BAJAJ-AUTO, EICHERMOT |
+| Auto | MARUTI, M&M, BAJAJ-AUTO, EICHERMOT |
 | Pharma | SUNPHARMA, DRREDDY, CIPLA, DIVISLAB |
 | Telecom | BHARTIARTL |
 | Chemicals | ASIANPAINT, GRASIM |
@@ -1721,6 +1843,7 @@ Sample current lot sizes (may change with SEBI revisions):
 | Metals | JSWSTEEL, HINDALCO, TATASTEEL |
 | Power | NTPC, POWERGRID |
 | Cement | ULTRACEMCO |
+| Mining | COALINDIA |
 
 ### 24.4 Option Pricing Model
 

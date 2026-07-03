@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 ROLLING_WINDOW      = 30    # number of recent closed trades to evaluate
 ROLLING_PF_FLOOR    = 0.9   # pause if gross_wins / gross_losses < this
 DRAWDOWN_MULTIPLIER = 1.5   # pause if rolling_dd > multiplier × expected_dd
-MIN_TRADES_REQUIRED = 10    # don't kill a strategy with fewer trades (too little data)
+MIN_TRADES_REQUIRED = 30    # don't evaluate with fewer trades — 10 is statistically meaningless
 
 # Expected per-strategy max drawdown (₹) — operator-configurable at startup.
 # These are conservative defaults; override via constructor.

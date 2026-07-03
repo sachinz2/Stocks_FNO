@@ -1,8 +1,8 @@
 # Falcon Trader — Strategy Documentation
 
-**Version:** 1.1  
-**Last Updated:** 2026-06-25  
-**Platform Version:** 2.0  
+**Version:** 2.0  
+**Last Updated:** 2026-07-02  
+**Platform Version:** 3.0  
 
 ---
 
@@ -37,9 +37,10 @@ The platform runs three strategies simultaneously on the same set of F&O symbols
 
 Only one strategy will fire signals for a given stock at any given time. If market conditions don't match any regime cleanly, all three return HOLD.
 
-**Symbols traded (Phase 1):** RELIANCE, TCS, INFY, HDFCBANK, ICICIBANK  
+**Symbols traded:** All 41 NSE F&O symbols (full universe — top 5 per strategy are ranked dynamically each cycle from the full pool)  
 **Instruments:** NSE F&O options (near-month expiry, equity options on lot-size basis)  
-**Execution:** Every signal cycle runs once per minute, 9:15 AM – 3:30 PM IST
+**Execution:** Signal cycle runs once per minute, 9:15 AM – 3:30 PM IST  
+**Hold period:** EMA Crossover positions are intraday (closed by 3:20 PM). Credit Spread and Iron Condor positions are **multi-day** — held overnight until their exit conditions trigger (DTE < 7, profit target, or stop loss). Intraday square-off does NOT apply to spreads/condors.
 
 ---
 
@@ -122,14 +123,22 @@ In **live mode**, actual option LTP is fetched from Zerodha `kite.ltp()` for all
 
 Strikes are chosen using the **Black-Scholes delta model**:
 
-- ATR is converted to annualised volatility: `σ = (ATR / Price) × sqrt(252)`
+- ATR is converted to annualised volatility: `σ = (ATR_daily / Price) × sqrt(252)`
 - `find_delta_strike()` finds the strike where the option has the target delta
 - Short legs target **delta ≈ 0.20** (roughly 80% probability of expiring worthless)
 - Long legs (hedges) target **delta ≈ 0.10** (further OTM, cheaper hedge)
 
-The ATM strike is rounded to the symbol's standard interval (e.g. RELIANCE: ₹50, HDFCBANK: ₹50, TCS: ₹100).
+The ATM strike is rounded to the symbol's standard interval (e.g. RELIANCE: ₹50, HDFCBANK: ₹20, TCS: ₹100).
 
-**Known limitation:** Option chain Greeks (delta, vega, actual IV) are derived from the ATR-based volatility estimate rather than live option chain data. In live mode, actual Zerodha LTP replaces the estimated fill price, but strike *selection* still uses the ATR-derived sigma. Integrating live option chain Greeks would improve strike accuracy.
+**ATR scaling (critical):** LTPPoller supplies 5-minute ATR14. The sigma formula requires daily ATR. Without correction, sigma is ~7× too low and short strikes are placed only ~1% OTM instead of ~5-6% OTM. The engine applies `_5MIN_ATR_SCALE = sqrt(75)` (since one NSE trading day = 375 min ÷ 5 min/bar = 75 bars):
+
+```
+sigma = atr_to_annualised_vol(atr_5min × sqrt(75), price)
+```
+
+With this correction, sigma ≈ 25-30% for typical F&O stocks, producing correctly placed strikes at ~5-6% OTM for 0.20-delta short legs.
+
+**Known limitation:** Strike *selection* uses ATR-derived sigma, not live option chain Greeks. In live mode, actual Zerodha LTP replaces the estimated fill price, but strike placement is still ATR-based. Live option chain Greeks would improve delta accuracy further.
 
 ### 2.8 Market Open Warm-Up
 
@@ -173,7 +182,7 @@ if total_daily_pnl ≤ max_allowed_loss → kill switch activated, all trading s
 
 With ₹3,00,000 capital, this caps total portfolio loss at ₹15,000 per day. Since unrealized losses count toward this limit, a single large open loss can trigger the cap even before any position closes.
 
-When the daily loss limit triggers, the kill switch is automatically activated. No new entries or exits are processed until it is manually deactivated via the API or dashboard.
+When the daily loss limit triggers, the kill switch is automatically activated. **New entries are blocked. Exit orders are always allowed through — the kill switch never traps you in an open position.** Deactivate manually via the API or dashboard to re-enable entries.
 
 ### 3.3 IV Rank / VIX Gate (Layer 3 — Exact Thresholds)
 
@@ -188,12 +197,16 @@ EMA Crossover (which **buys** options) has no IV gate — it actually benefits f
 
 ### 3.4 End-of-Day Square-Off
 
-At **3:15 PM IST**, the engine forcibly closes all open positions, regardless of PnL:
+At **3:20 PM IST**, the engine closes **EMA Crossover single-leg positions only**:
 - All open single-leg option positions: SELL at estimated current premium
-- All active credit spreads: BUY back short leg, SELL long leg
-- All active iron condors: close all 4 legs
 
-This ensures no overnight option positions are held.
+**Credit spreads and iron condors are NOT closed at EOD.** They are multi-day theta strategies and are designed to be held overnight. They close only when their own exit conditions trigger:
+- DTE falls below 7 (gamma risk near expiry)
+- Underlying breaches a short strike (emergency stop)
+- Short leg premium doubles (stop loss)
+- Short leg decays to 25% (profit target)
+
+This prevents premature theta capture loss. A spread opened on Day 1 with 25 DTE may not reach its 75% profit target for 10-15 days — closing it intraday would forfeit most of the expected profit.
 
 ---
 
@@ -320,13 +333,26 @@ Sells premium and collects it upfront. A two-leg structure: SELL one leg (collec
 | 1 | ATR% below low-volatility threshold | < 1.2% |
 | 2 | EMA directional (not flat) | EMA spread% > 0.1% |
 | 3 | No existing spread for this symbol | Must be flat |
-| 4 | Minimum DTE | ≥ 7 days |
+| 3a | No existing condor for this symbol | Stacking guard — no spread on top of live condor |
+| 4 | **Minimum DTE (fresh entry)** | **≥ 21 days** |
+| 4a | **Minimum DTE (re-entry after same-day profit close)** | **≥ 14 days** |
+| 4b | Not in `_exited_today` | Adverse exits (breach/SL) block same-day re-entry entirely |
 | 5 | PCR aligns with spread direction | PCR filters by put-call sentiment |
 | 6 | Short strike not crowded OI | Moves 1 interval further if crowded |
 | 7 | Absolute net credit minimum | ≥ ₹350 total per spread |
 | 8 | Net credit ≥ 20% of wing width | Guards risk/reward ratio |
 | 9 | Margin available | (short − long strike) × lot_size |
 | 10 | IV Rank ≥ 0.30 and VIX ≥ 14 | Premium must be worth selling |
+| 11 | **VWAP alignment** | BULL_PUT_SPREAD: underlying ≥ VWAP × 0.995; BEAR_CALL_SPREAD: underlying ≤ VWAP × 1.005 |
+| 12 | **HV/IV ratio** | Market implied vol (from live short-leg LTP) ÷ realized vol (sigma) ≥ 1.10 |
+
+**On condition 4 (DTE rationale):** With a DTE < 7 exit trigger, a fresh position needs at least 14 days of runway before the exit fires. The 21-day floor provides a full theta curve segment — theta decay accelerates from DTE 25 toward DTE 7, capturing the steepest portion of the curve. Entering at DTE 21 means the position typically closes profitably (75% target) before DTE 7 is reached.
+
+**On condition 4a (re-entry):** If a spread closes at 75% profit on day 1 (DTE 18 remaining), the system may re-enter the same symbol the same day at DTE ≥ 14. This enables two complete theta trades per expiry cycle on the same symbol without carrying excessive gamma risk into the final week.
+
+**On condition 11 (VWAP):** VWAP is computed from 10 days of 5-minute candles — it is a medium-term trend anchor, not an intraday signal. A BULL_PUT_SPREAD selling puts below the market is only appropriate when the stock is trading at or above the medium-term VWAP (bullish context). Trading against VWAP increases the probability the short put gets tested.
+
+**On condition 12 (HV/IV ratio):** Selling options when market implied volatility exceeds realized volatility by at least 10% ensures there is an IV risk premium to collect. If the ratio is below 1.10, the market is pricing options cheaply relative to actual realized movement — the expected edge is absent.
 
 **On condition 8 (risk/reward):** A spread with a 50-point wing must collect at least 10 points of premium per share. If a spread can only collect 5 points on a 50-point wing, the R/R is 1:9 (risk ₹45 to make ₹5), which requires a very high win rate to be profitable over time. The minimum 20% ensures R/R never exceeds approximately 1:4.
 
@@ -344,25 +370,32 @@ Delta ≈ 0.20 means the short option has ~80% probability of expiring worthless
 ### 5.4 Entry Example
 
 ```
-INFY @ ₹1,620  |  ATR14 (5-min) = ₹16  →  ATR% = 0.99%  |  DTE = 18  |  Lot = 400
+INFY @ ₹1,620  |  ATR14 (5-min) = ₹16  →  ATR_daily = ₹16 × √75 = ₹138.6
+σ = (₹138.6 / ₹1,620) × √252 ≈ 0.285 (28.5% annualized vol)
+DTE = 25  ✓ (≥ 21 minimum)  |  Lot = 400
 EMA20 = 1,625 > EMA50 = 1,608  →  EMA spread% = 1.05%  →  BULL_PUT_SPREAD
+VWAP (10-day) = 1,615  |  INFY (₹1,620) ≥ VWAP × 0.995 (₹1,607)  ✓
 
-Strike selection (delta model):
-  Short PE: 1,550  (delta ~−0.20)
-  Long  PE: 1,500  (delta ~−0.10)
-  Wing width: 50 points
-  Minimum credit: 50 × 20% = ₹10 per share
+Strike selection (delta model, σ = 28.5%):
+  Short PE: 1,510  (delta ~−0.20, ~6.8% OTM)
+  Long  PE: 1,480  (delta ~−0.10)
+  Wing width: 30 points
+  Minimum credit: 30 × 20% = ₹6 per share
 
-Premium estimates:
-  SELL INFY25JUN1550PE @ ₹18.00
-  BUY  INFY25JUN1500PE @ ₹8.00
-  Net credit = ₹10.00  ✓ (≥ ₹10 minimum)
-  Total credit = ₹10 × 400 = ₹4,000  ✓ (≥ ₹350 minimum)
+Live LTP from kite.ltp():
+  SELL INFY25JUL1510PE @ ₹12.50
+  BUY  INFY25JUL1480PE @ ₹5.00
+  Net credit = ₹7.50  ✓ (≥ ₹6 minimum)
+  Total credit = ₹7.50 × 400 = ₹3,000  ✓ (≥ ₹350 minimum)
 
-Max profit: ₹4,000  |  Max loss: (₹50 − ₹10) × 400 = ₹16,000  |  R/R = 1:4
+HV/IV check:
+  Implied vol from ₹12.50 short leg price ≈ 32%
+  IV/HV ratio = 32% / 28.5% = 1.12  ✓ (≥ 1.10)
+
+Max profit: ₹3,000  |  Max loss: (₹30 − ₹7.50) × 400 = ₹9,000  |  R/R = 1:3
 ```
 
-Email: `CREDIT SPREAD OPENED — BULL_PUT_SPREAD INFY | Net credit: ₹10.00 × 400 = ₹4,000`
+Email: `CREDIT SPREAD OPENED — BULL_PUT_SPREAD INFY | Net credit: ₹7.50 × 400 = ₹3,000 | DTE=25`
 
 ### 5.5 Exit Conditions (Priority Order)
 
@@ -434,8 +467,11 @@ Max loss = wider wing spread minus net credit (capped, fully defined).
 | 1 | ATR% below low-volatility threshold | < 1.2% |
 | 2 | EMA is flat (no directional trend) | EMA spread% < 0.1% |
 | 3 | No existing condor for this symbol | Must be flat |
-| 4 | Minimum DTE | ≥ 7 days |
-| 5 | Absolute net credit minimum | ≥ ₹600 total |
+| 3a | No existing spread for this symbol | Stacking guard — no condor on top of live spread |
+| 4 | **Minimum DTE (fresh entry)** | **≥ 21 days** |
+| 4a | **Minimum DTE (re-entry after same-day profit close)** | **≥ 14 days** |
+| 4b | Not in `_exited_today` | Adverse exits block same-day re-entry entirely |
+| 5 | Absolute net credit minimum | ≥ ₹600 total (covers 8-order round-trip fees) |
 | 6 | Each wing credit ≥ 20% of wing width | Both wings individually checked |
 | 7 | Margin available | max_wing_width × lot_size |
 | 8 | IV Rank ≥ 0.30 and VIX ≥ 14 | Premium must be worth selling |
@@ -486,15 +522,15 @@ Call short sold at ₹14 → stop at ₹28 (2×)
 If either triggers → close entire condor
 ```
 
-#### Exit 4: Both Legs at 75% Profit
+#### Exit 4: Either Wing at 75% Profit
 ```
-Both short legs must simultaneously be ≤ 25% of their sold value.
-Put short: ₹15 → must be ≤ ₹3.75
-Call short: ₹14 → must be ≤ ₹3.50
-Only if BOTH met → EXIT
+Either short leg decays to ≤ 25% of its sold value → EXIT entire condor.
+Put short: ₹15 → triggers if ≤ ₹3.75
+Call short: ₹14 → triggers if ≤ ₹3.50
+EITHER condition met → close all 4 legs immediately
 ```
 
-If only one leg has decayed, the other may still reverse — wait for both.
+**Rationale for OR logic:** If one wing decays to 75% profit, it means the underlying has moved significantly toward that side. This increases directional risk on the opposite wing. Waiting for both wings to hit the target simultaneously allows the winning position to reverse while the losing wing comes under pressure. Locking in the winner immediately and closing the full condor is the correct risk-managed response.
 
 ### 6.6 PnL Calculation
 
@@ -512,33 +548,41 @@ Net PnL = [(put_short_sold − put_short_close)
 ### 7.1 Timeline
 
 ```
-08:00 AM  Zerodha auto-authentication (daily cron)
+08:30 AM  Zerodha auto-authentication (daily cron)
+           Lot sizes refreshed from kite.instruments("NFO")
 
 09:00 AM  Platform running
            LTP poller fetches 10-day 5-min OHLC history from Zerodha
-           RS Ranker ranks symbols by relative strength
+           RS Ranker ranks all 41 symbols by relative strength
 
 09:15 AM  Market opens
            Signal cycle starts (every 60 seconds)
+           Exit check starts (every 10 seconds — faster stop-loss response)
            ⚠ WARM-UP: exit checks run, entries blocked
 
 09:30 AM  Warm-up complete — entries enabled
 
-09:30 AM – 03:15 PM  (every 60 seconds):
+09:30 AM – 03:20 PM  (every 60 seconds — signal cycle):
            1. Check market data freshness — skip symbols with >90s stale data
-           2. Refresh all position market prices (live LTP or ATR estimate)
-           3. Cancel stale pending orders (>5 min old)
-           4. Check spread exits (_check_spread_exits)
-           5. Check condor exits (_check_condor_exits)
-           6. Check single-leg exits (_check_open_option_exits)
-           7. Re-read positions (post-exit state)
-           8. StrategyMonitor evaluates statistical performance
-           9. MarketRegimeDetector updates regime label
-           10. PortfolioAnalyzer logs correlation / concentration warnings
+           2. Expire stale pending orders (>5 min old)
+           3. Check spread exits (_check_spread_exits)
+           4. Check condor exits (_check_condor_exits)
+           5. Check single-leg exits (_check_open_option_exits)
+           6. Re-read positions (post-exit risk state refresh)
+           7. StrategyMonitor evaluates rolling PF / drawdown
+           8. MarketRegimeDetector updates regime label
+           9. PortfolioAnalyzer logs concentration / correlation warnings
+           10. Log portfolio delta ([PortfolioDelta] bulls/bears/condors)
            11. Entry signals: each strategy × each symbol in its pool
 
-03:15 PM  Square-off: all positions closed
-03:25 PM  EOD report email sent
+09:30 AM – 03:20 PM  (every 10 seconds — exit check only):
+           - _check_spread_exits + _check_condor_exits
+           - _exit_cycle_lock prevents concurrent execution with 60s cycle
+
+03:20 PM  Square-off: EMA Crossover single-leg positions closed
+           ⚠ Credit spreads and iron condors are NOT closed — held overnight
+
+03:45 PM  EOD report email sent; _profit_closed_today cleared for next session
 03:30 PM  Market closes
 ```
 
@@ -554,19 +598,72 @@ Net PnL = [(put_short_sold − put_short_close)
 
 ---
 
+## 7A. Multi-Day Holding — Loss Mitigation Controls
+
+Credit spreads and iron condors are multi-day positions. The following controls guard against adverse multi-day scenarios:
+
+### 7A.1 DTE Floors
+
+| Gate | Value | Purpose |
+|------|-------|---------|
+| Entry (fresh) | DTE ≥ 21 | Ensures 14-day runway before the DTE < 7 exit fires |
+| Entry (re-entry) | DTE ≥ 14 | Allows 2nd trade in same expiry cycle after profit close |
+| Exit trigger | DTE < 7 | Avoids gamma explosion in final week |
+
+### 7A.2 Adverse Exit Circuit Breaker
+
+Redis key `sl_freq:{symbol}` (5-day TTL) counts adverse exits (breach/SL) for each symbol. After 2 adverse exits within 5 trading days on the same symbol, a circuit breaker fires and blocks further entries on that symbol until the TTL expires. This prevents repeatedly entering a symbol that has been stopped out twice in a row.
+
+### 7A.3 Regime Shift Exit
+
+If `MarketRegimeDetector` detects a significant regime change while a position is open (e.g. VIX spikes from RANGE_BOUND into VOLATILE), open positions may be flagged for exit. This prevents holding through a volatility regime transition that invalidates the original entry thesis.
+
+### 7A.4 VIX Spike Early Exit
+
+When India VIX spikes (VOLATILE regime detected), the profit target is tightened from 75% to 60% (short leg decays to 40% of sold price instead of 25%). This captures available profit faster rather than waiting for the full 75% while IV expansion is increasing adverse wing risk.
+
+### 7A.5 GTT Backstop (Zerodha Exchange-Level Stop)
+
+For live mode, a Good Till Triggered (GTT) order is placed on the short leg at **2.5× the entry premium** after every spread or condor entry. If the platform goes offline overnight (network failure, crash) and the short leg doubles or more, Zerodha's exchange-level GTT fires automatically — without the platform running.
+
+This is a last-resort backstop only. The engine's own stop-loss at 2× will typically fire first during normal operation. The GTT at 2.5× is the safety net for platform-offline scenarios.
+
+### 7A.6 DTE Roll Detection on Restart
+
+If the platform restarts while a multi-day position is open and the DTE in Redis has changed from the stored entry DTE (indicating the position rolled through an expiry), `_close_on_first_cycle` flags the symbol for immediate close on the next signal cycle rather than continuing to hold a potentially mismatched position.
+
+### 7A.7 Portfolio Delta Logging
+
+Every signal cycle logs `[PortfolioDelta] bulls=N bears=N condors=N` — a count of bullish spreads (BULL_PUT_SPREAD), bearish spreads (BEAR_CALL_SPREAD), and iron condors currently open. This gives a quick directional bias check; a portfolio of 4 BULL_PUT_SPREADs and 0 bearish structures is concentrated long in an implicit way.
+
+### 7A.8 Sector Concentration Check
+
+Maximum 2 open structures per sector (`MAX_SECTOR_POSITIONS = 2`). Banking sector with HDFCBANK + ICICIBANK open already blocks further banking entries. This prevents correlated sector blow-ups (two Banking spreads losing simultaneously in a sector sell-off).
+
+### 7A.9 Re-Entry After Profit
+
+`_profit_closed_today` tracks symbols where a position closed at 75%+ profit the same day. These symbols are eligible for re-entry at DTE ≥ 14 (instead of the 21-day fresh-entry floor). This enables a second trade in the same expiry cycle when conditions remain favourable — roughly doubling the theta trades per expiry without increasing overnight gamma risk.
+
+Adverse exits (`_exited_today`) do NOT allow re-entry at any DTE floor until the next session.
+
+---
+
 ## 8. Position Sizing & Margin Rules
 
 ### 8.1 Lot Sizes
 
-| Symbol | Lot Size |
-|--------|---------|
-| RELIANCE | 250 |
-| TCS | 150 |
-| INFY | 400 |
-| HDFCBANK | 550 |
-| ICICIBANK | 700 |
+Lot sizes are fetched from Zerodha's live instrument data every morning (`kite.instruments("NFO")`) and cached in Redis. The values in `src/core/constants.py` serve as hardcoded fallbacks for startup-before-auth scenarios. Sample lot sizes:
 
-All positions are placed in exactly 1 lot. No position scaling currently.
+| Symbol | Lot Size | Symbol | Lot Size |
+|--------|---------|--------|---------|
+| RELIANCE | 250 | SBIN | 1500 |
+| TCS | 150 | ITC | 3200 |
+| INFY | 300 | M&M | 700 |
+| HDFCBANK | 550 | COALINDIA | 4200 |
+| ICICIBANK | 700 | TATASTEEL | 5500 |
+| BAJFINANCE | 125 | MARUTI | 25 |
+
+All positions are placed in exactly 1 lot. No position scaling currently. Full lot size table in `src/core/constants.py → FNO_LOT_SIZES`.
 
 ### 8.2 Margin Requirements
 
@@ -729,10 +826,19 @@ All alerts have `[Falcon Trader]` prefix in the subject line.
 | `fast_period` | 20 | Fast EMA period |
 | `slow_period` | 50 | Slow EMA period |
 | `low_vol_threshold` | 1.2 | ATR% below which credit spreads activate |
-| `profit_close_pct` | 0.25 | Close when short decays to 25% of sold price |
+| `profit_close_pct` | 0.25 | Close when short decays to 25% of sold price (75% profit) |
 | `stop_loss_multiple` | 2.0 | Close when short rises to 2× sold price |
-| `min_dte` | 7 | Minimum DTE for entry and exit trigger |
+| `min_dte` | 7 | DTE at which exit is forced (gamma risk) |
 | `min_credit_pct` | 0.20 | Minimum net credit as fraction of wing width (hard-coded) |
+
+Engine-level constants (not strategy parameters):
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `_ENTRY_MIN_DTE` | 21 | Minimum DTE for a fresh credit spread entry |
+| `_REENTRY_MIN_DTE` | 14 | Minimum DTE for re-entry after same-day profit close |
+| `_vwap_buffer` | 0.005 (0.5%) | Price must be within 0.5% of VWAP on the correct side |
+| `_5MIN_ATR_SCALE` | `sqrt(75)` ≈ 8.66 | Converts 5-min ATR to daily equivalent before sigma computation |
 
 ### Iron Condor (`iron_condor_v1`)
 
@@ -742,10 +848,12 @@ All alerts have `[Falcon Trader]` prefix in the subject line.
 | `slow_period` | 50 | Slow EMA period |
 | `low_vol_threshold` | 1.2 | ATR% below which condor activates |
 | `flat_threshold` | 0.1 | EMA spread% below which EMA is flat |
-| `profit_close_pct` | 0.25 | Close when BOTH shorts decay to 25% |
-| `stop_loss_multiple` | 2.0 | Close condor if EITHER short rises to 2× |
-| `min_dte` | 7 | Minimum DTE for entry and exit trigger |
+| `profit_close_pct` | 0.25 | Close entire condor when EITHER short leg decays to 25% |
+| `stop_loss_multiple` | 2.0 | Close condor if EITHER short leg rises to 2× |
+| `min_dte` | 7 | DTE at which exit is forced (gamma risk) |
 | `min_wing_credit_pct` | 0.20 | Minimum credit per wing as fraction of wing width (hard-coded) |
+
+Same engine-level constants as credit spread apply (DTE floors, sigma scaling, VWAP buffer).
 
 ---
 
@@ -767,9 +875,9 @@ The `StrategyMonitor` class evaluates performance every signal cycle using the `
 
 ### 13.2 StrategyMonitor Auto-Kill Thresholds
 
-StrategyMonitor pauses a strategy automatically when it detects deterioration. Current detection uses a rolling window of recent trades — if the win rate or profit factor falls significantly below historical baseline, a strategy-level kill switch activates and an alert is sent.
+StrategyMonitor pauses a strategy automatically when it detects deterioration. Minimum 30 completed trades are required before evaluation — fewer trades produce statistically meaningless signals (2 losses in 5 trades would give PF = 0.2, which means nothing without sample size). Once 30+ trades accumulate, rolling profit factor and drawdown are checked every cycle.
 
-Check `src/risk/strategy_monitor.py` for current window size and threshold values.
+Current thresholds: `ROLLING_WINDOW=30, ROLLING_PF_FLOOR=0.9, DRAWDOWN_MULTIPLIER=1.5, MIN_TRADES_REQUIRED=30`. See `src/risk/strategy_monitor.py`.
 
 ### 13.3 Reviewing Performance
 
@@ -794,11 +902,13 @@ These are the known constraints and design assumptions of the current system. Re
 
 | Assumption | Notes |
 |-----------|-------|
-| Sufficient option liquidity | F&O stocks in Phase 1 (RELIANCE, TCS, INFY, HDFCBANK, ICICIBANK) have high liquidity; far-OTM hedge legs may have wider spreads |
-| No overnight positions | End-of-day square-off at 3:15 PM is mandatory |
+| Sufficient option liquidity | All 41 F&O symbols have reasonable liquidity; far-OTM hedge legs may have wider bid-ask spreads |
+| Multi-day spread/condor holding | Credit spreads and iron condors are held overnight. Ensure sufficient margin is maintained across overnight sessions. |
+| EMA Crossover positions are intraday | Single-leg positions closed at 3:20 PM regardless of PnL |
 | Zerodha API available during market hours | Platform is Zerodha-dependent for both data and execution |
-| Single-session paper trading | Redis state is preserved across restarts; DB state is permanent |
-| Not validated on black swan events | Circuit breakers and daily limits reduce risk; extreme gap-downs or circuit-limit events are not modelled |
+| Multi-session state preserved | Redis persists active spreads, condors, and today's exit history across restarts; DB state is permanent |
+| Overnight gap risk | Multi-day positions are exposed to overnight gap risk (large gap-down/up on news). GTT backstop orders provide exchange-level protection at 2.5× entry premium on short legs. |
+| Not validated on black swan events | Circuit breakers and daily limits reduce risk; extreme gap-downs or circuit-limit events are not fully modelled |
 | NSE F&O equities only | No index options (NIFTY/BANKNIFTY), no currencies, no commodities |
 
 ### 14.3 Known Gaps (Roadmap)
@@ -813,10 +923,12 @@ These are the known constraints and design assumptions of the current system. Re
 
 ### 14.4 Not Suitable For
 
-- Overnight or multi-day holds (system is designed for intraday exit by 3:15 PM)
-- High-frequency trading (minimum signal granularity = 60 seconds)
-- Stocks outside the configured F&O symbol list
-- Index options, currency futures, or commodity derivatives
+- High-frequency trading (minimum signal granularity = 60 seconds for entries; 10 seconds for exits)
+- Stocks outside the 41-symbol F&O universe
+- Index options (NIFTY/BANKNIFTY), currency futures, or commodity derivatives
+- Capital requirements below ₹3,00,000 (margin requirements for multi-day option spreads require sufficient buffer)
+
+**Note:** Overnight / multi-day holding of credit spreads and iron condors is now fully supported and is the intended operating mode. EMA Crossover single-leg positions remain intraday-only.
 
 ---
 
