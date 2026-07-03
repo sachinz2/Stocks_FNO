@@ -1,6 +1,7 @@
 import logging
+import random
 import uuid
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
 from src.brokers.base import AbstractBroker
 
@@ -46,6 +47,29 @@ class PaperBroker(AbstractBroker):
         return round(brokerage + stt + exchange + gst + sebi + stamp, 2)
 
     @staticmethod
+    def _fill_simulation(price: float) -> Tuple[float, float]:
+        """
+        Return (rejection_probability, extra_slippage_fraction) based on option price.
+
+        Rejection simulates exchange/broker failures (margin, connectivity, no-quote).
+        Extra slippage is added on top of the bid-ask half-spread for illiquid options
+        where the fill price can drift significantly from the last-traded price.
+
+        Price tiers:
+          ≤ ₹0.30  (deep OTM hedge legs): 5% rejection, up to 30% extra slippage
+          ≤ ₹1.00  (cheap near-expiry / far-OTM): 2% rejection, up to 15% extra slippage
+          ≤ ₹5.00  (typical short legs): 1% rejection, up to 5% extra slippage
+          > ₹5.00  (liquid / near-ATM): 0.5% rejection, no extra slippage
+        """
+        if price <= 0.30:
+            return 0.05, 0.30
+        if price <= 1.00:
+            return 0.02, 0.15
+        if price <= 5.00:
+            return 0.01, 0.05
+        return 0.005, 0.0
+
+    @staticmethod
     def _bid_ask_half_spread(price: float) -> float:
         """
         Estimate half the bid-ask spread for an NSE F&O option.
@@ -72,18 +96,35 @@ class PaperBroker(AbstractBroker):
 
     async def place_order(self, symbol: str, side: str, quantity: int, price: float) -> str:
         """
-        Simulates instant execution with realistic bid-ask slippage and fees.
+        Simulates order execution with realistic bid-ask slippage, occasional
+        rejection, and enhanced slippage for illiquid/cheap options.
 
-        Expected price (engine estimate) → fill price (bid or ask):
-          BUY  fills at the ask: price + half_spread  (worse for buyer)
-          SELL fills at the bid: price - half_spread  (worse for seller)
+        Fill model:
+          1. Rejection check   — random draw against price-tier rejection probability
+          2. Bid-ask slippage  — BUY at ask, SELL at bid
+          3. Extra slippage    — additional random drift for illiquid options
         """
         order_id  = str(uuid.uuid4())
         timestamp = datetime.utcnow()
 
+        # Simulated rejection (exchange connectivity, no market maker, stale quote)
+        reject_prob, extra_slip_frac = self._fill_simulation(price)
+        if random.random() < reject_prob:
+            reject_reason = (
+                "no market maker quote" if price <= 0.30
+                else "exchange order rejection"
+            )
+            logger.warning(
+                f"PaperBroker: {side} {quantity} {symbol} @ ₹{price:.2f} — "
+                f"REJECTED ({reject_reason}, simulated {reject_prob:.0%} rate)"
+            )
+            raise ValueError(f"Order rejected by exchange: {reject_reason}")
+
         # Apply bid-ask slippage
         half_spread  = self._bid_ask_half_spread(price)
-        fill_price   = price + half_spread if side == "BUY" else price - half_spread
+        # Extra random slippage for illiquid options (0 to extra_slip_frac of price)
+        extra_slip   = price * extra_slip_frac * random.random() if extra_slip_frac > 0 else 0.0
+        fill_price   = price + half_spread + extra_slip if side == "BUY" else price - half_spread - extra_slip
         fill_price   = round(max(fill_price, 0.05), 2)   # floor at NSE min tick
         slippage_ppu = round(fill_price - price, 4)      # per-unit (negative for SELL)
 
@@ -119,11 +160,12 @@ class PaperBroker(AbstractBroker):
             self.balance += cost - fees
 
         self.total_fees_paid += fees
-        slip_pct = abs(slippage_ppu / price * 100) if price > 0 else 0
+        slip_pct   = abs(slippage_ppu / price * 100) if price > 0 else 0
+        extra_note = f" +extra_slip ₹{extra_slip:.2f}" if extra_slip > 0 else ""
         logger.info(
             f"PaperBroker: {side} {quantity} {symbol} "
             f"@ expected ₹{price:.2f} → fill ₹{fill_price:.2f} "
-            f"(slip {slippage_ppu:+.3f}, {slip_pct:.1f}%) | "
+            f"(slip {slippage_ppu:+.3f}, {slip_pct:.1f}%{extra_note}) | "
             f"Fees: ₹{fees:.2f} | Balance: ₹{self.balance:.2f}"
         )
         return order_id

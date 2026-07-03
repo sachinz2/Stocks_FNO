@@ -1,6 +1,6 @@
 # Falcon Quant Platform — Complete Technical Documentation
 
-**Version:** 3.0  
+**Version:** 3.1  
 **Last Updated:** July 2026  
 **Mode:** Paper Trading (live trading target: ~July 29, 2026)
 
@@ -1256,20 +1256,35 @@ atr_to_annualised_vol(atr, price)
     → (atr / price) * sqrt(252) — assumes DAILY ATR input
 
 implied_vol(premium, spot, strike, T, option_type)
-    → Black-Scholes implied volatility from a live option price
+    → Newton-Raphson Black-Scholes IV solver — returns annualised implied vol
 ```
 
-**Critical: ATR scaling before sigma computation**
+**ATR scaling before sigma computation**
 
 LTPPoller supplies a 5-minute ATR (ATR14 over 14 five-minute bars). `atr_to_annualised_vol()` assumes daily ATR. Without correction, sigma is ~7× too low, causing `find_delta_strike()` to place short strikes only ~1% OTM instead of the intended ~5-6%.
 
-The fix applied in all three sigma computations (credit spread, iron condor, IV rank):
+The correction applied first:
 ```python
 _5MIN_ATR_SCALE: float = 75 ** 0.5   # sqrt(375 min/day ÷ 5 min/bar) = sqrt(75)
-sigma = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, underlying_price)
+_atr_sigma = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, underlying_price)
 ```
 
-This scales 5-minute ATR to daily-equivalent before annualising, producing correct sigma (~28% for typical F&O stocks) and correctly placed delta strikes (~5-6% OTM for short legs).
+**Live IV for strike selection (`_get_live_sigma()`)**
+
+In live mode, the engine upgrades the ATR-derived sigma to live market-implied vol before calling `find_delta_strike()`. This ensures delta targets are met against the actual option pricing surface, not a historical vol proxy.
+
+```python
+# Called before find_delta_strike() in _process_credit_spread and _process_iron_condor
+sigma = await self._get_live_sigma(symbol, underlying_price, dte, interval, expiry, _atr_sigma)
+```
+
+`_get_live_sigma()` flow:
+1. Fetch ATM CE and PE quotes via `get_option_quote()` (hits live Redis cache → on-demand kite.ltp())
+2. Solve `implied_vol()` for each; require 0.05 ≤ IV ≤ 3.0 to reject bad quotes
+3. Return the average of the two IVs (averaging CE/PE cancels out put-call skew at ATM)
+4. Fall back to `_atr_sigma` if kite is unavailable (paper mode) or the fetch fails for any reason
+
+The ATR-derived `_atr_sigma` is retained separately as the **realized vol baseline** for the HV/IV ratio filter (`market_iv / _atr_sigma ≥ 1.10`). Using live ATM IV there instead would compare OTM implied vol against ATM implied vol (measuring skew, not the vol risk premium).
 
 ### 11.7 NSE Open Interest Data
 
@@ -1295,21 +1310,52 @@ Previous OI snapshot stored in `nse_oi_prev:{symbol}` for change calculation.
 
 ### 12.1 Tiered Bid-Ask Slippage Model
 
-PaperBroker now applies a realistic bid-ask half-spread based on option premium:
+PaperBroker applies a realistic bid-ask half-spread based on option premium:
 
-| Premium Range | Half-Spread (per unit) |
-|--------------|------------------------|
-| ≥ ₹50 | ₹0.50 |
-| ₹10 – ₹50 | ₹0.25 |
-| ₹2 – ₹10 | ₹0.10 |
-| < ₹2 | ₹0.05 |
+| Premium Range | Half-Spread | Typical Scenario |
+|--------------|-------------|-----------------|
+| ≤ ₹0.30 | 40% of premium | Deep-OTM hedge, near-expiry |
+| ₹0.31 – ₹0.75 | 20% of premium | Cheap far-OTM leg |
+| ₹0.76 – ₹2.00 | 10% of premium | Standard hedge leg |
+| ₹2.01 – ₹5.00 | 6% of premium | Short leg near expiry |
+| > ₹5.00 | 3% of premium | Liquid near-ATM contract |
 
 - **BUY** fill = price + half_spread (pay the ask)
 - **SELL** fill = price − half_spread (receive the bid)
 
-`fill_price` and `slippage` are returned in the order dict so OrderManager can persist them.
+`fill_price` and `slippage` are recorded in the order dict so OrderManager can persist them.
 
-### 12.2 Fee Structure
+### 12.2 Fill Simulation (Rejection + Enhanced Slippage)
+
+Beyond the deterministic bid-ask spread, PaperBroker simulates stochastic execution failures to bridge the paper-to-live gap:
+
+**Rejection probability** (`_fill_simulation(price)`):
+
+| Premium Range | Rejection Rate | Reason |
+|--------------|---------------|--------|
+| ≤ ₹0.30 | 5% | No market maker quote (deep OTM, near expiry) |
+| ₹0.31 – ₹1.00 | 2% | Exchange order rejection (illiquid contract) |
+| ₹1.01 – ₹5.00 | 1% | Exchange/broker connectivity |
+| > ₹5.00 | 0.5% | Connectivity / margin edge case |
+
+Rejected orders raise `ValueError("Order rejected by exchange: <reason>")`. The engine's existing leg-unwind logic handles this identically to an insufficient-margin rejection.
+
+**Extra slippage** (applied in addition to bid-ask half-spread):
+
+For illiquid options the fill price can drift from the last-traded price while the order sits in queue. A random extra slippage of `0 → max%` of premium is sampled uniformly:
+
+| Premium Range | Max Extra Slippage |
+|--------------|-------------------|
+| ≤ ₹0.30 | 30% of premium |
+| ₹0.31 – ₹1.00 | 15% of premium |
+| ₹1.01 – ₹5.00 | 5% of premium |
+| > ₹5.00 | 0% |
+
+The average extra cost is half the maximum (uniform distribution), so backtested P&L reflects a realistic expected fill rather than best-case mid-price.
+
+Log output includes the extra slippage when non-zero: `(slip +0.234, 8.2% +extra_slip ₹0.18)`.
+
+### 12.3 Fee Structure
 
 | Component | Formula | Notes |
 |-----------|---------|-------|
@@ -1794,6 +1840,20 @@ This distinction matters during code review: any new exit reason string must be 
 ### 23.11 IV Rank History Rebuild Timeline
 
 `iv_history:{SYMBOL}` accumulates one daily IV reading per market day. After clearing history (post-sigma fix), the IV rank gate (`≥ 0.30`) requires enough history to compute a meaningful percentile. With 30-40 trading days before go-live, the gate becomes meaningful within ~2 weeks and produces reliable percentile rankings by go-live.
+
+### 23.12 Live IV for Strike Selection (July 2026)
+
+Before this change, `find_delta_strike()` was called with ATR-derived sigma even in live mode. This meant that even though actual fill prices came from Zerodha, the *strikes chosen* were not based on what the market was actually pricing. The result: on high-skew days or when realized vol diverged from implied vol, the actual delta of the chosen strikes differed from the intended 0.20.
+
+`_get_live_sigma()` now fetches ATM CE + PE quotes at entry time, computes their average implied vol, and passes that as sigma to `find_delta_strike()`. In paper mode (kite = None) it falls back to ATR sigma automatically so paper trading is unaffected.
+
+The HV/IV ratio filter retains `_atr_sigma` (ATR-based) as the denominator — correctly measuring whether market implied vol is at least 10% above realized historical vol.
+
+### 23.13 Paper Broker Rejection + Enhanced Slippage (July 2026)
+
+Paper fills previously never failed and always filled at the theoretical mid ± bid-ask. In live trading, ~0.5–5% of orders fail (deep-OTM contracts with no market maker, exchange connectivity, margin edge cases) and illiquid contracts fill at much worse prices than the last-traded price.
+
+`_fill_simulation()` now applies tier-based rejection probability (0.5–5% depending on option price) and an additional random extra slippage (up to 30% for very cheap options). This closes the most common gap between paper P&L and live P&L: paper systems that always fill at best price overestimate returns on illiquid legs.
 
 ---
 

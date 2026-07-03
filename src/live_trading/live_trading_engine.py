@@ -1076,10 +1076,11 @@ class LiveTradingEngine:
                 )
                 return
 
-        lot_size = await self._get_lot_size(symbol)
-        atr      = float(market_data.get("atr14", underlying_price * 0.01))
-        iv_rank  = await self._get_iv_rank(symbol, underlying_price, atr, dte)
-        sigma    = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, underlying_price)
+        lot_size   = await self._get_lot_size(symbol)
+        atr        = float(market_data.get("atr14", underlying_price * 0.01))
+        iv_rank    = await self._get_iv_rank(symbol, underlying_price, atr, dte)
+        _atr_sigma = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, underlying_price)
+        sigma      = await self._get_live_sigma(symbol, underlying_price, dte, interval, expiry, _atr_sigma)
 
         # VIX + IV Rank gates — only sell premium when it is worth selling
         from src.market_data.option_chain import vix_allows_selling, iv_rank_allows_selling
@@ -1178,24 +1179,25 @@ class LiveTradingEngine:
         total_credit = net_credit * lot_size
 
         # HV/IV ratio filter — only sell premium when implied vol exceeds realized vol by ≥10%.
-        # sigma (ATR-based HV proxy) represents realized/historical volatility.
+        # _atr_sigma (ATR-based HV proxy) represents realized/historical volatility.
+        # sigma is now live ATM IV used for strike selection; _atr_sigma is the HV baseline here.
         # If the market isn't pricing options richer than what stocks actually move,
         # the edge of premium selling disappears.
-        if short_p > 0 and sigma > 0:
+        if short_p > 0 and _atr_sigma > 0:
             from src.market_data.option_chain import implied_vol as _iv_fn
             _T = max(dte, 1) / 365.0
             _market_iv = _iv_fn(short_p, underlying_price, short_strike, _T, opt)
             if _market_iv is not None and _market_iv > 0:
-                _iv_hv_ratio = _market_iv / sigma
+                _iv_hv_ratio = _market_iv / _atr_sigma
                 if _iv_hv_ratio < 1.1:
                     logger.info(
                         f"[CreditSpread] {symbol} skipped — IV/HV={_iv_hv_ratio:.2f} < 1.10: "
-                        f"market IV ({_market_iv:.1%}) not rich enough vs realized HV ({sigma:.1%})"
+                        f"market IV ({_market_iv:.1%}) not rich enough vs realized HV ({_atr_sigma:.1%})"
                     )
                     return
                 logger.debug(
                     f"[CreditSpread] {symbol} IV/HV={_iv_hv_ratio:.2f} "
-                    f"(IV={_market_iv:.1%} / HV={sigma:.1%}) — premium selling edge confirmed"
+                    f"(IV={_market_iv:.1%} / HV={_atr_sigma:.1%}) — premium selling edge confirmed"
                 )
 
         # Fee viability check — 2 entry + 2 exit orders × ₹20 brokerage = ₹80 minimum fees.
@@ -1577,10 +1579,11 @@ class LiveTradingEngine:
                 )
                 return
 
-        lot_size = await self._get_lot_size(symbol)
-        atr      = float(market_data.get("atr14", underlying_price * 0.01))
-        iv_rank  = await self._get_iv_rank(symbol, underlying_price, atr, dte)
-        sigma    = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, underlying_price)
+        lot_size   = await self._get_lot_size(symbol)
+        atr        = float(market_data.get("atr14", underlying_price * 0.01))
+        iv_rank    = await self._get_iv_rank(symbol, underlying_price, atr, dte)
+        _atr_sigma = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, underlying_price)
+        sigma      = await self._get_live_sigma(symbol, underlying_price, dte, interval, expiry, _atr_sigma)
 
         # VIX + IV Rank gates — only sell premium when it is worth selling
         from src.market_data.option_chain import vix_allows_selling, iv_rank_allows_selling
@@ -2286,6 +2289,61 @@ class LiveTradingEngine:
             return await get_iv_rank(symbol, redis)
         except Exception:
             return None
+
+    async def _get_live_sigma(
+        self,
+        symbol: str,
+        underlying_price: float,
+        dte: int,
+        interval: int,
+        expiry,
+        atr_sigma: float,
+    ) -> float:
+        """
+        Fetch live implied vol from ATM option prices for delta-based strike selection.
+
+        Averages CE and PE ATM implied vols to cancel out put-call parity skew.
+        Falls back to ATR-derived sigma if kite is unavailable (paper mode) or
+        the quote fetch fails for any reason.
+        """
+        from src.market_data.option_chain import get_option_quote, implied_vol as _iv
+        from src.core.utils import build_option_symbol
+
+        kite  = getattr(self, "_kite",  None)
+        redis = getattr(self, "_redis", None)
+        if kite is None:
+            return atr_sigma  # paper mode or pre-login — use ATR sigma
+
+        try:
+            atm   = round(underlying_price / interval) * interval
+            T     = max(dte, 1) / 365.0
+            ce_c  = build_option_symbol(symbol, atm, "CE", expiry)
+            pe_c  = build_option_symbol(symbol, atm, "PE", expiry)
+            ce_p  = await get_option_quote(ce_c, kite, redis)
+            pe_p  = await get_option_quote(pe_c, kite, redis)
+
+            ivs: list = []
+            if ce_p and ce_p > 0:
+                iv = _iv(ce_p, underlying_price, atm, T, "CE")
+                if iv and 0.05 <= iv <= 3.0:
+                    ivs.append(iv)
+            if pe_p and pe_p > 0:
+                iv = _iv(pe_p, underlying_price, atm, T, "PE")
+                if iv and 0.05 <= iv <= 3.0:
+                    ivs.append(iv)
+
+            if ivs:
+                live_iv = sum(ivs) / len(ivs)
+                logger.debug(
+                    f"[LiveIV] {symbol}: ATM IV={live_iv:.1%} "
+                    f"(ATR HV={atr_sigma:.1%}, ratio={live_iv/atr_sigma:.2f})"
+                )
+                return live_iv
+
+        except Exception as exc:
+            logger.debug(f"[LiveIV] {symbol}: fallback to ATR sigma — {exc}")
+
+        return atr_sigma
 
     # ── Misc helpers ──────────────────────────────────────────────────────────
 

@@ -1,7 +1,7 @@
 # Falcon Trader — Strategy Documentation
 
-**Version:** 2.0  
-**Last Updated:** 2026-07-02  
+**Version:** 2.1  
+**Last Updated:** 2026-07-03  
 **Platform Version:** 3.0  
 
 ---
@@ -123,22 +123,29 @@ In **live mode**, actual option LTP is fetched from Zerodha `kite.ltp()` for all
 
 Strikes are chosen using the **Black-Scholes delta model**:
 
-- ATR is converted to annualised volatility: `σ = (ATR_daily / Price) × sqrt(252)`
 - `find_delta_strike()` finds the strike where the option has the target delta
 - Short legs target **delta ≈ 0.20** (roughly 80% probability of expiring worthless)
 - Long legs (hedges) target **delta ≈ 0.10** (further OTM, cheaper hedge)
 
 The ATM strike is rounded to the symbol's standard interval (e.g. RELIANCE: ₹50, HDFCBANK: ₹20, TCS: ₹100).
 
-**ATR scaling (critical):** LTPPoller supplies 5-minute ATR14. The sigma formula requires daily ATR. Without correction, sigma is ~7× too low and short strikes are placed only ~1% OTM instead of ~5-6% OTM. The engine applies `_5MIN_ATR_SCALE = sqrt(75)` (since one NSE trading day = 375 min ÷ 5 min/bar = 75 bars):
+**ATR scaling (step 1):** LTPPoller supplies 5-minute ATR14. The sigma formula requires daily ATR. Without correction, sigma is ~7× too low and short strikes are placed only ~1% OTM instead of ~5-6% OTM. The engine first computes a realized-vol baseline:
 
 ```
-sigma = atr_to_annualised_vol(atr_5min × sqrt(75), price)
+_atr_sigma = atr_to_annualised_vol(atr_5min × sqrt(75), price)
+             # _5MIN_ATR_SCALE = sqrt(375 min/day ÷ 5 min/bar) = sqrt(75)
 ```
 
-With this correction, sigma ≈ 25-30% for typical F&O stocks, producing correctly placed strikes at ~5-6% OTM for 0.20-delta short legs.
+With this correction, `_atr_sigma` ≈ 25-30% for typical F&O stocks.
 
-**Known limitation:** Strike *selection* uses ATR-derived sigma, not live option chain Greeks. In live mode, actual Zerodha LTP replaces the estimated fill price, but strike placement is still ATR-based. Live option chain Greeks would improve delta accuracy further.
+**Live IV upgrade (step 2, live mode only):** Before calling `find_delta_strike()`, the engine calls `_get_live_sigma()` which fetches the ATM CE and PE quotes from Zerodha, solves their implied vols, and returns the average. This ensures that delta targets are met against the actual market pricing surface rather than a historical vol proxy.
+
+```
+sigma = _get_live_sigma(symbol, price, dte, interval, expiry, fallback=_atr_sigma)
+        # Falls back to _atr_sigma in paper mode or if kite is unavailable
+```
+
+`_atr_sigma` is retained as the **realized vol baseline** for the HV/IV ratio filter (`market_iv / _atr_sigma ≥ 1.10`). Using live ATM IV in that denominator would measure volatility skew instead of the vol risk premium, which is the intended check.
 
 ### 2.8 Market Open Warm-Up
 
@@ -689,7 +696,7 @@ All positions are placed in exactly 1 lot. No position scaling currently. Full l
 
 ### 9.1 Paper Trading Fill Model
 
-The PaperBroker simulates realistic execution with two components applied to every order:
+The PaperBroker simulates realistic execution with three components applied to every order:
 
 **A) Bid-Ask Spread Slippage**
 
@@ -706,7 +713,22 @@ Options are quoted at the mid-price. The engine's estimated premium is treated a
 Example: BUY at estimated ₹62 → half-spread = 3% → fill at ₹63.86.  
 Example: SELL at estimated ₹62 → fill at ₹60.14.
 
-**B) Transaction Fees (per order)**
+**B) Stochastic Rejection + Enhanced Slippage**
+
+In live trading, some orders fail (no market maker, margin edge cases, exchange connectivity). Cheap options also fill at worse prices than the bid-ask model alone because the last-traded price can be stale when the order reaches the exchange.
+
+| Premium Range | Rejection Rate | Max Extra Slippage |
+|--------------|---------------|-------------------|
+| ≤ ₹0.30 | 5% | 30% of premium |
+| ₹0.31 – ₹1.00 | 2% | 15% of premium |
+| ₹1.01 – ₹5.00 | 1% | 5% of premium |
+| > ₹5.00 | 0.5% | 0% |
+
+Rejected orders raise `ValueError("Order rejected by exchange: <reason>")`. The engine's unwind logic handles this identically to an insufficient-margin rejection, ensuring consistent position cleanup.
+
+Extra slippage is sampled uniformly from 0 → max (expected cost = max/2). Applied in addition to the bid-ask half-spread.
+
+**C) Transaction Fees (per order)**
 
 Modelled on actual Zerodha F&O fee structure:
 
@@ -915,7 +937,6 @@ These are the known constraints and design assumptions of the current system. Re
 
 | Gap | Impact | Priority |
 |-----|--------|---------|
-| Live option chain Greeks for strike selection | Better delta accuracy | Medium |
 | Position correlation cap (> 0.8 between symbols) | Two banking stocks may move together | Medium |
 | Partial-lot sizing (scale in/out) | Currently always 1 lot | Low |
 | Multi-expiry support (weekly options) | Near-month only currently | Low |
