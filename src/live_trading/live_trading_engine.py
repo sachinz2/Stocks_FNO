@@ -448,8 +448,59 @@ class LiveTradingEngine:
         except Exception as e:
             logger.error(f"Failed to restore engine state: {e}")
 
+        # In paper mode, PaperBroker._positions is in-memory and lost on restart.
+        # Reconstruct it from the restored spread/condor state so that:
+        #   a) _safe_get_positions() returns correct data for risk manager
+        #   b) _reconcile_broker_positions() sees broker positions matching engine state
+        if hasattr(self.broker, "_positions"):
+            self._rebuild_paper_broker_positions()
+
         # After Redis restore, cross-check broker positions for orphans
         await self._reconcile_broker_positions()
+
+    def _rebuild_paper_broker_positions(self) -> None:
+        """
+        Reconstruct PaperBroker._positions from restored spread/condor state.
+
+        PaperBroker keeps positions in an in-memory dict that is lost on container
+        restart. Without this rebuild, _safe_get_positions() returns empty after
+        restart, causing the risk manager to think there are 0 open positions and
+        potentially allowing duplicate entries for the same underlying.
+        """
+        broker = self.broker
+        broker._positions.clear()
+
+        for sym, spread in self._active_spreads.items():
+            lot = spread.get("lot_size", 0)
+            for contract, qty, price in [
+                (spread.get("short_contract", ""), -lot, spread.get("short_premium", 0.0)),
+                (spread.get("long_contract",  ""),  lot, spread.get("long_premium",  0.0)),
+            ]:
+                if contract and lot:
+                    broker._positions[contract] = {
+                        "symbol": contract, "quantity": qty, "avg_price": float(price)
+                    }
+
+        for sym, cond in self._active_condors.items():
+            lot = cond.get("lot_size", 0)
+            for contract, qty, price in [
+                (cond.get("put_short_contract",  ""), -lot, cond.get("put_short_premium",  0.0)),
+                (cond.get("put_long_contract",   ""),  lot, cond.get("put_long_premium",   0.0)),
+                (cond.get("call_short_contract", ""), -lot, cond.get("call_short_premium", 0.0)),
+                (cond.get("call_long_contract",  ""),  lot, cond.get("call_long_premium",  0.0)),
+            ]:
+                if contract and lot:
+                    broker._positions[contract] = {
+                        "symbol": contract, "quantity": qty, "avg_price": float(price)
+                    }
+
+        total = len(broker._positions)
+        if total:
+            logger.info(
+                f"Rebuilt PaperBroker positions after restart: "
+                f"{len(self._active_spreads)} spread(s) + {len(self._active_condors)} condor(s) "
+                f"→ {total} contract legs"
+            )
 
     async def _reconcile_broker_positions(self) -> None:
         """
