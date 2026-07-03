@@ -986,6 +986,49 @@ class LiveTradingEngine:
             )
             return
 
+        # RVOL filter — require above-average volume (RVOL > 1.3) for momentum entries.
+        # Low-volume breakouts have higher false-positive rates and wider bid-ask spreads.
+        _rvol = float(market_data.get("rvol", 0))
+        if _rvol > 0 and _rvol < 1.3:
+            logger.info(
+                f"[{strategy.name}] {symbol} skipped — RVOL={_rvol:.2f} < 1.3 "
+                "(below-average volume; weak breakout confirmation)"
+            )
+            return
+
+        # ADX filter — require strong trend (ADX > 25) for EMA crossover momentum plays.
+        # A crossover in a low-ADX environment is likely noise rather than a trend change.
+        _adx_ema = float(market_data.get("adx14", 0))
+        if _adx_ema > 0 and _adx_ema < 25:
+            logger.info(
+                f"[{strategy.name}] {symbol} skipped — ADX={_adx_ema:.1f} < 25 "
+                "(trend not strong enough for momentum entry)"
+            )
+            return
+
+        # Multi-timeframe confirmation — 15-min EMA direction must agree with 5-min signal.
+        # A 5-min crossover against the 15-min trend is counter-trend and fails more often.
+        _redis_mtf = getattr(self, "_redis", None)
+        if _redis_mtf:
+            try:
+                _raw15 = await _redis_mtf.get(f"tick15:{symbol}")
+                if _raw15:
+                    _d15       = json.loads(_raw15)
+                    _ema20_15  = float(_d15.get("ema20", 0))
+                    _ema50_15  = float(_d15.get("ema50", 0))
+                    if _ema20_15 > 0 and _ema50_15 > 0:
+                        _tf15_bull = _ema20_15 > _ema50_15
+                        _tf5_bull  = signal_str == "BUY"
+                        if _tf15_bull != _tf5_bull:
+                            logger.info(
+                                f"[{strategy.name}] {symbol} skipped — "
+                                f"15-min EMA trend ({'bullish' if _tf15_bull else 'bearish'}) "
+                                f"contradicts 5-min signal ({signal_str})"
+                            )
+                            return
+            except Exception:
+                pass  # MTF data unavailable — proceed without filter
+
         lot_size = await self._get_lot_size(symbol)
         atr      = float(market_data.get("atr14", underlying_price * 0.01))
         iv_rank  = await self._get_iv_rank(symbol, underlying_price, atr, dte)
@@ -1201,6 +1244,59 @@ class LiveTradingEngine:
                     f"above VWAP Rs{vwap:.2f} (intraday bullish momentum)"
                 )
                 return
+
+        # Market breadth filter — align spread direction with broad market sentiment.
+        # breadth > 0.65: market advancing → skip BEAR_CALL (would contradict trend)
+        # breadth < 0.35: market declining → skip BULL_PUT (would contradict trend)
+        _breadth_cs = None
+        _redis_cs   = getattr(self, "_redis", None)
+        if _redis_cs:
+            try:
+                _b_raw = await _redis_cs.get("market:breadth")
+                if _b_raw:
+                    _breadth_cs = json.loads(_b_raw).get("breadth")
+            except Exception:
+                pass
+        if _breadth_cs is not None:
+            if spread_type == "BEAR_CALL_SPREAD" and _breadth_cs > 0.65:
+                logger.info(
+                    f"[CreditSpread] {symbol} BEAR_CALL skipped — "
+                    f"market breadth {_breadth_cs:.1%} > 65% (broad market advancing)"
+                )
+                return
+            if spread_type == "BULL_PUT_SPREAD" and _breadth_cs < 0.35:
+                logger.info(
+                    f"[CreditSpread] {symbol} BULL_PUT skipped — "
+                    f"market breadth {_breadth_cs:.1%} < 35% (broad market declining)"
+                )
+                return
+
+        # ADX filter — credit spreads need a moderate directional trend (ADX 15–30).
+        # ADX < 15: no trend, stock is ranging → condor territory not spread territory.
+        # ADX > 30: trend too strong → risk of blowthrough on short strike.
+        _adx_cs = float(market_data.get("adx14", 0))
+        if _adx_cs > 0:
+            if _adx_cs < 15:
+                logger.info(
+                    f"[CreditSpread] {symbol} skipped — ADX={_adx_cs:.1f} < 15 "
+                    "(no trend; condor regime)"
+                )
+                return
+            if _adx_cs > 30:
+                logger.info(
+                    f"[CreditSpread] {symbol} skipped — ADX={_adx_cs:.1f} > 30 "
+                    "(trend too strong; blowthrough risk)"
+                )
+                return
+
+        # Event/earnings calendar filter — block entries within 5 trading days.
+        # Earnings and RBI events cause IV crush and gap risk that destroys spread edge.
+        from src.market_data.event_calendar import has_event_within_days as _has_event
+        if await _has_event(symbol, getattr(self, "_redis", None), days=5):
+            logger.info(
+                f"[CreditSpread] {symbol} skipped — earnings or NSE event within 5 days"
+            )
+            return
 
         if spread_type == "BULL_PUT_SPREAD":
             opt          = "PE"
@@ -1470,6 +1566,18 @@ class LiveTradingEngine:
                                 f"60% captured ({pnl_pct:.1f}%) — exiting early"
                             )
 
+            # DTE-tiered profit target — accept less profit as gamma risk rises near expiry.
+            # DTE > 21: 75% profit; DTE 15–21: 65%; DTE 8–14: 55%; DTE ≤ 7: 45%.
+            # (DTE ≤ 7 is caught by min_dte above, but the threshold is set defensively.)
+            if exit_reason is None:
+                _dte_profit_pct = 0.25 if dte > 21 else (0.35 if dte > 14 else 0.45)
+                if cur_short <= spread["short_premium"] * _dte_profit_pct:
+                    _captured = round((1 - cur_short / spread["short_premium"]) * 100, 1)
+                    exit_reason = (
+                        f"DTE-tiered profit (DTE={dte}): "
+                        f"{_captured}% captured — target {100 - int(_dte_profit_pct * 100)}%"
+                    )
+
             if exit_reason is None and cs_strategy:
                 result = cs_strategy.manage_position(
                     {"short_premium": spread["short_premium"]}, cur_short
@@ -1480,6 +1588,24 @@ class LiveTradingEngine:
                         f"{cs_strategy.name} short Rs{spread['short_premium']:.2f} "
                         f"-> Rs{cur_short:.2f} ({pnl_pct:+.1f}%)"
                     )
+
+            # Delta-based exit — short leg delta > 0.40 signals the strike is under threat.
+            if exit_reason is None and atr > 0 and current_price > 0:
+                try:
+                    from src.market_data.option_chain import atr_to_annualised_vol, bs_delta
+                    _sig = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, current_price)
+                    if _sig > 0:
+                        _T = max(dte, 1) / 365.0
+                        _delta = bs_delta(
+                            current_price, spread["short_strike"], _T, _sig, spread["option_type"]
+                        )
+                        if _delta is not None and abs(_delta) > 0.40:
+                            exit_reason = (
+                                f"Delta breach: short δ={_delta:.2f} (|δ|>0.40, "
+                                f"strike {spread['short_strike']} at risk)"
+                            )
+                except Exception as _de:
+                    logger.debug(f"[DeltaExit] {underlying}: delta check error — {_de}")
 
             if exit_reason is None:
                 continue
@@ -1684,6 +1810,43 @@ class LiveTradingEngine:
             logger.info(
                 f"[IronCondor] {symbol} skipped — PCR={pcr:.2f} is extreme "
                 f"(need 0.7–1.4 for neutral condor). Market too directional."
+            )
+            return
+
+        # Market breadth filter — iron condors need a neutral market.
+        # When breadth is extreme (very bullish or very bearish), range-bound
+        # structures are at risk from a one-sided move.
+        _breadth_ic = None
+        _redis_ic2  = getattr(self, "_redis", None)
+        if _redis_ic2:
+            try:
+                _b_raw_ic = await _redis_ic2.get("market:breadth")
+                if _b_raw_ic:
+                    _breadth_ic = json.loads(_b_raw_ic).get("breadth")
+            except Exception:
+                pass
+        if _breadth_ic is not None and (_breadth_ic < 0.35 or _breadth_ic > 0.65):
+            logger.info(
+                f"[IronCondor] {symbol} skipped — market breadth {_breadth_ic:.1%} "
+                "outside neutral zone 35–65% (market too directional for condor)"
+            )
+            return
+
+        # ADX filter — iron condors require low trend strength (ADX < 20).
+        # ADX ≥ 20 indicates a developing trend that could breach either wing.
+        _adx_ic = float(market_data.get("adx14", 0))
+        if _adx_ic > 0 and _adx_ic >= 20:
+            logger.info(
+                f"[IronCondor] {symbol} skipped — ADX={_adx_ic:.1f} >= 20 "
+                "(market trending; range-bound thesis invalid)"
+            )
+            return
+
+        # Event/earnings calendar filter — block entries within 5 trading days.
+        from src.market_data.event_calendar import has_event_within_days as _has_event_ic
+        if await _has_event_ic(symbol, getattr(self, "_redis", None), days=5):
+            logger.info(
+                f"[IronCondor] {symbol} skipped — earnings or NSE event within 5 days"
             )
             return
 
@@ -1921,6 +2084,13 @@ class LiveTradingEngine:
                         f"(+{(_cur_vix_c/_entry_vix_c - 1)*100:.0f}%) — thresholds tightened"
                     )
 
+            # DTE-tiered profit target — lower the hurdle as expiry approaches.
+            # DTE > 21: 75% profit (0.25); DTE 15–21: 65% (0.35); DTE ≤ 14: 55% (0.45).
+            if dte <= 14:
+                profit_pct = max(profit_pct, 0.45)
+            elif dte <= 21:
+                profit_pct = max(profit_pct, 0.35)
+
             exit_reason: Optional[str] = None
 
             # C: near-expiry restore — force close on first cycle after restart
@@ -1970,6 +2140,28 @@ class LiveTradingEngine:
                                     )
                     except Exception:
                         pass
+
+            # Delta-based exit — if either short leg delta exceeds 0.40, that wing is in danger.
+            if exit_reason is None and atr > 0 and current_price > 0:
+                try:
+                    from src.market_data.option_chain import atr_to_annualised_vol, bs_delta
+                    _sig_c = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, current_price)
+                    if _sig_c > 0:
+                        _T_c   = max(dte, 1) / 365.0
+                        _ps_d  = bs_delta(current_price, c["put_short_strike"],  _T_c, _sig_c, "PE")
+                        _cs_d  = bs_delta(current_price, c["call_short_strike"], _T_c, _sig_c, "CE")
+                        if _ps_d is not None and abs(_ps_d) > 0.40:
+                            exit_reason = (
+                                f"Delta breach: put short δ={_ps_d:.2f} (|δ|>0.40, "
+                                f"put strike {c['put_short_strike']} at risk)"
+                            )
+                        elif _cs_d is not None and abs(_cs_d) > 0.40:
+                            exit_reason = (
+                                f"Delta breach: call short δ={_cs_d:.2f} (|δ|>0.40, "
+                                f"call strike {c['call_short_strike']} at risk)"
+                            )
+                except Exception as _de:
+                    logger.debug(f"[DeltaExit] {underlying}: condor delta check error — {_de}")
 
             if exit_reason is None:
                 continue

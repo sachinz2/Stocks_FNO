@@ -3,7 +3,7 @@ LTP Poller — fetches 5-min OHLC from Zerodha and computes indicators.
 
 Runs every 60 s via APScheduler:
   1. Polls all 40 F&O symbols via kite.historical_data() (5-min OHLC, 10-day window)
-  2. Computes EMA20, EMA50, ATR14, VWAP for each symbol
+  2. Computes EMA20, EMA50, ATR14, VWAP, ADX14, RVOL, prev_close for each symbol
   3. Writes enriched tick to Redis (tick:SYMBOL)
   4. Scores all 40 symbols THREE WAYS — one per strategy regime:
        - EMA Crossover pool  (nfo:top5)         : high ATR% + strong EMA trend
@@ -11,6 +11,8 @@ Runs every 60 s via APScheduler:
        - Iron Condor pool    (nfo:top5:condor)   : low ATR% (<1.2%) + EMA flat (<0.1%)
   5. Trading engine reads the right pool for each strategy so the correct 5 stocks
      are always fed to the right strategy on any given day.
+  6. Publishes market breadth (advancing/declining ratio) to Redis (market:breadth)
+  7. Fetches 15-min OHLC for multi-timeframe EMA confirmation (tick15:SYMBOL)
 """
 import asyncio
 import json
@@ -32,7 +34,8 @@ from src.core.constants import (
 
 logger = logging.getLogger(__name__)
 
-HISTORY_REFRESH_SECONDS = 300  # reload OHLC history every 5 min
+HISTORY_REFRESH_SECONDS      = 300  # reload 5-min OHLC every 5 min
+_HISTORY_15M_REFRESH_SECONDS = 900  # reload 15-min OHLC every 15 min
 
 # ATR% thresholds that must match strategy parameters
 _LOW_VOL_THRESHOLD = 1.2   # below = low volatility regime
@@ -54,6 +57,8 @@ class LTPPoller:
         self.symbols  = symbols or FNO_SYMBOLS  # default: all 40
         self._history: Dict[str, pd.DataFrame] = {}
         self._history_loaded_at: Dict[str, datetime] = {}
+        self._history_15m: Dict[str, pd.DataFrame] = {}
+        self._history_15m_loaded_at: Dict[str, datetime] = {}
         self._no_token_warned: set = set()    # suppress repeat "no token" warnings per symbol
         self._no_history_warned: set = set()  # suppress repeat "not enough history" warnings
 
@@ -68,6 +73,7 @@ class LTPPoller:
         ema_scores: Dict[str, float] = {}
         spread_scores: Dict[str, float] = {}
         condor_scores: Dict[str, float] = {}
+        all_ticks: list = []  # collected for market-breadth computation after the loop
 
         for symbol in self.symbols:
             try:
@@ -81,6 +87,13 @@ class LTPPoller:
                 ltp = float(df["close"].iloc[-1])
                 tick = self._enrich(symbol, df, ltp)
                 await self._redis.set(f"{REDIS_TICK_PREFIX}{symbol}", json.dumps(tick))
+                all_ticks.append(tick)
+
+                # 15-min OHLC for multi-timeframe EMA confirmation (MTF feature)
+                df15 = await self._get_history_15m(symbol, loop)
+                if df15 is not None and len(df15) >= 50:
+                    tick15 = self._enrich_15m(symbol, df15)
+                    await self._redis.set(f"tick15:{symbol}", json.dumps(tick15), ex=1800)
 
                 e, s, c = self._score_all(tick)
                 ema_scores[symbol] = e
@@ -91,10 +104,28 @@ class LTPPoller:
 
                 logger.debug(
                     f"Tick: {symbol} ltp={ltp:.2f} "
-                    f"ema_score={e:.3f} spread_score={s:.3f} condor_score={c:.3f}"
+                    f"ema_score={e:.3f} spread_score={s:.3f} condor_score={c:.3f} "
+                    f"adx={tick.get('adx14', 0):.1f} rvol={tick.get('rvol', 0):.2f}"
                 )
             except Exception as exc:
                 logger.error(f"LTP poll failed for {symbol}: {exc}")
+
+        # Market breadth — advancing/declining ratio across all polled symbols
+        if all_ticks:
+            _adv = sum(1 for t in all_ticks if t.get("close", 0) > t.get("prev_close", 0))
+            _dec = sum(1 for t in all_ticks if t.get("close", 0) < t.get("prev_close", 0))
+            _tot = _adv + _dec
+            _breadth = round(_adv / _tot, 4) if _tot > 0 else 0.5
+            await self._redis.set(
+                "market:breadth",
+                json.dumps({
+                    "breadth": _breadth, "advancing": _adv,
+                    "declining": _dec,   "total": _tot,
+                    "timestamp": datetime.now().isoformat(),
+                }),
+                ex=120,  # 2-min TTL — poll runs every 60 s
+            )
+            logger.info(f"[Breadth] {_breadth:.1%} advancing ({_adv}/{_tot})")
 
         n = ACTIVE_TRADING_SYMBOLS
 
@@ -167,10 +198,10 @@ class LTPPoller:
 
     @staticmethod
     def _enrich(symbol: str, df: pd.DataFrame, ltp: float) -> dict:
-        """Compute EMA20, EMA50, ATR14, VWAP from OHLC dataframe."""
+        """Compute EMA20, EMA50, ATR14, ADX14, RVOL, VWAP, prev_close from OHLC."""
         close = df["close"]
-        high = df["high"]
-        low = df["low"]
+        high  = df["high"]
+        low   = df["low"]
         volume = df["volume"]
 
         ema20 = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
@@ -179,17 +210,43 @@ class LTPPoller:
         tr = pd.concat([
             high - low,
             (high - close.shift()).abs(),
-            (low - close.shift()).abs(),
+            (low  - close.shift()).abs(),
         ], axis=1).max(axis=1)
         atr14 = float(tr.rolling(14).mean().iloc[-1])
+
+        # ADX14 — Wilder's smoothed average directional index
+        _alpha     = 1.0 / 14
+        _hdiff     = high.diff()
+        _ldiff     = -low.diff()    # prev_low - low
+        _dm_plus   = pd.Series(
+            np.where((_hdiff > _ldiff) & (_hdiff > 0), _hdiff, 0.0),
+            index=high.index, dtype=float,
+        )
+        _dm_minus  = pd.Series(
+            np.where((_ldiff > _hdiff) & (_ldiff > 0), _ldiff, 0.0),
+            index=low.index, dtype=float,
+        )
+        _tr_w  = tr.ewm(alpha=_alpha, adjust=False).mean()
+        _dmp_w = _dm_plus.ewm(alpha=_alpha, adjust=False).mean()
+        _dmm_w = _dm_minus.ewm(alpha=_alpha, adjust=False).mean()
+        _di_p  = 100.0 * _dmp_w / _tr_w.replace(0, np.nan)
+        _di_m  = 100.0 * _dmm_w / _tr_w.replace(0, np.nan)
+        _dx    = 100.0 * (_di_p - _di_m).abs() / (_di_p + _di_m).replace(0, np.nan)
+        _adx_raw = _dx.ewm(alpha=_alpha, adjust=False).mean().iloc[-1]
+        adx14  = round(float(_adx_raw), 2) if not np.isnan(float(_adx_raw)) else 0.0
+
+        # RVOL — current bar volume relative to 20-period average
+        _vol_avg20 = volume.rolling(20).mean().iloc[-1]
+        rvol = round(float(volume.iloc[-1] / _vol_avg20), 2) if (_vol_avg20 and _vol_avg20 > 0) else 0.0
 
         typical = (high + low + close) / 3
         vol_nonzero = volume.replace(0, np.nan)
         cum_vol = vol_nonzero.sum()
         vwap = float((typical * vol_nonzero).sum() / cum_vol) if cum_vol > 0 else ltp
 
-        atr_pct       = round((atr14 / ltp * 100) if ltp > 0 else 0, 4)
+        atr_pct        = round((atr14 / ltp * 100) if ltp > 0 else 0, 4)
         ema_spread_pct = round((abs(ema20 - ema50) / ema50 * 100) if ema50 > 0 else 0, 4)
+        prev_close     = round(float(close.iloc[-2]), 4) if len(close) > 1 else ltp
 
         # ohlc_bar_key — changes once per 5-min bar; strategies use this for true-bar
         # confirmation so that `signal_confirm_bars=2` means 2 distinct candles, not
@@ -200,17 +257,20 @@ class LTPPoller:
             ohlc_bar_key = str(last_date)
 
         return {
-            "symbol":        symbol,
-            "close":         ltp,
-            "ema20":         round(ema20, 4),
-            "ema50":         round(ema50, 4),
-            "atr14":         round(atr14, 4),
-            "atr_pct":       atr_pct,
+            "symbol":         symbol,
+            "close":          ltp,
+            "prev_close":     prev_close,
+            "ema20":          round(ema20, 4),
+            "ema50":          round(ema50, 4),
+            "atr14":          round(atr14, 4),
+            "atr_pct":        atr_pct,
+            "adx14":          adx14,
+            "rvol":           rvol,
             "ema_spread_pct": ema_spread_pct,
-            "vwap":          round(vwap, 4),
-            "ohlc_bar_key":  ohlc_bar_key,
-            "timestamp":     datetime.now().isoformat(),
-            "ltp_source":    "zerodha_historical",
+            "vwap":           round(vwap, 4),
+            "ohlc_bar_key":   ohlc_bar_key,
+            "timestamp":      datetime.now().isoformat(),
+            "ltp_source":     "zerodha_historical",
         }
 
     @staticmethod
@@ -264,3 +324,54 @@ class LTPPoller:
             condor_score = 0.0
 
         return ema_score, spread_score, condor_score
+
+    # ── 15-min multi-timeframe helpers ────────────────────────────────────────
+
+    async def _get_history_15m(self, symbol: str, loop) -> Optional[pd.DataFrame]:
+        """Return Zerodha 15-min OHLC, refreshing cache every 15 minutes."""
+        now  = datetime.now()
+        last = self._history_15m_loaded_at.get(symbol)
+        stale = last is None or (now - last).total_seconds() > _HISTORY_15M_REFRESH_SECONDS
+
+        if stale:
+            if self._kite and symbol in self._tokens:
+                df = await loop.run_in_executor(None, self._fetch_kite_ohlc_15m, symbol)
+            else:
+                df = None
+            self._history_15m_loaded_at[symbol] = now
+            if df is not None and not df.empty:
+                self._history_15m[symbol] = df
+
+        return self._history_15m.get(symbol)
+
+    def _fetch_kite_ohlc_15m(self, symbol: str) -> Optional[pd.DataFrame]:
+        """Blocking — runs in thread executor. Fetches 30 days of 15-min candles."""
+        from datetime import timedelta
+        token     = self._tokens[symbol]
+        to_date   = datetime.now()
+        from_date = to_date - timedelta(days=30)
+        try:
+            records = self._kite.historical_data(
+                token, from_date, to_date, "15minute", continuous=False, oi=False
+            )
+            if not records:
+                return None
+            df = pd.DataFrame(records)
+            cols = [c for c in ["open", "high", "low", "close"] if c in df.columns]
+            return df[cols].dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
+        except Exception as e:
+            logger.warning(f"kite.historical_data(15m) failed for {symbol}: {e}")
+            return None
+
+    @staticmethod
+    def _enrich_15m(symbol: str, df: pd.DataFrame) -> dict:
+        """Compute EMA20 and EMA50 on 15-min candles for multi-timeframe confirmation."""
+        close = df["close"]
+        ema20 = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
+        ema50 = float(close.ewm(span=50, adjust=False).mean().iloc[-1])
+        return {
+            "symbol": symbol,
+            "ema20":  round(ema20, 4),
+            "ema50":  round(ema50, 4),
+            "tf":     "15m",
+        }

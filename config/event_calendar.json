@@ -1,0 +1,7 @@
+{
+  "_comment": "NSE event calendar — populate with dates when new entries should be blocked.",
+  "_format": "{ 'SYMBOL': ['YYYY-MM-DD', ...] }  — use '*' for market-wide events (RBI, Budget).",
+  "_usage": "Loaded by src/market_data/event_calendar.py. Also stored in Redis key event:calendar.",
+  "_update": "Refresh quarterly with earnings dates from NSE corporate actions. RBI MPC dates are 6/year.",
+  "*": []
+}
