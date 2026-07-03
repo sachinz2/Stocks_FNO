@@ -167,6 +167,10 @@ class LiveTradingEngine:
         self._today_order_count = 0
         self.risk_manager.reset_daily_state()
 
+        # Auto-refresh event calendar every Monday so earnings/RBI dates stay current.
+        if now_ist().weekday() == 0:  # 0 = Monday
+            asyncio.create_task(self._refresh_event_calendar())
+
         if self.mode == TradingMode.LIVE:
             redis = getattr(self, "_redis", None)
             if redis:
@@ -2711,3 +2715,16 @@ class LiveTradingEngine:
                 await self.notifier.send(message)
             except Exception as exc:
                 logger.error(f"Notify failed: {exc}")
+
+    async def _refresh_event_calendar(self) -> None:
+        """Auto-refresh earnings/event calendar from NSE (runs every Monday at open)."""
+        try:
+            from src.market_data.calendar_refresh import refresh_calendar
+            redis = getattr(self, "_redis", None)
+            ok = await refresh_calendar(redis)
+            if ok:
+                logger.info("[EventCalendar] Weekly calendar refresh complete")
+            else:
+                logger.warning("[EventCalendar] Weekly refresh returned empty — keeping existing calendar")
+        except Exception as exc:
+            logger.error(f"[EventCalendar] Weekly refresh failed: {exc}")
