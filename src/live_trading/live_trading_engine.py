@@ -1439,10 +1439,23 @@ class LiveTradingEngine:
             logger.error(f"[CreditSpread] Long leg failed: {long_contract}. Unwinding short.")
             from src.market_data.option_chain import get_option_quote as _gq
             _unwind_p = await _gq(short_contract, getattr(self, "_kite", None), getattr(self, "_redis", None)) or short_p
-            await self.order_manager.place_order(
+            _unwind_order = await self.order_manager.place_order(
                 short_contract, "BUY", lot_size, _unwind_p, is_spread_leg=True
             )
-            self._exited_today.add(symbol)
+            _bad_uw = {"REJECTED", "REJECTED_BY_RISK", "CANCELLED", "FAILED"}
+            if _unwind_order is None or getattr(_unwind_order, "order_status", "") in _bad_uw:
+                logger.critical(
+                    f"[CreditSpread] UNWIND FAILED for {short_contract} — "
+                    f"naked short may remain open. MANUAL INTERVENTION REQUIRED."
+                )
+                await self._notify(
+                    f"CRITICAL: CreditSpread unwind FAILED\n"
+                    f"Contract: {short_contract}\nSymbol: {symbol}\n"
+                    f"Action required: manually close BUY {lot_size} {short_contract}"
+                )
+                # Do NOT add to _exited_today so operator can investigate
+            else:
+                self._exited_today.add(symbol)
             return
 
         self._today_order_count += 2
@@ -1976,10 +1989,24 @@ class LiveTradingEngine:
                 if order and order.order_status == "REJECTED_BY_RISK":
                     self._exited_today.add(symbol)  # risk manager blocked it — stop retrying today
                 from src.market_data.option_chain import get_option_quote as _gq
+                _bad_uw = {"REJECTED", "REJECTED_BY_RISK", "CANCELLED", "FAILED"}
+                _failed_unwinds = []
                 for (c, s, p, _) in placed:
                     rev = "BUY" if s == "SELL" else "SELL"
                     _unwind_p = await _gq(c, getattr(self, "_kite", None), getattr(self, "_redis", None)) or p
-                    await self.order_manager.place_order(c, rev, lot_size, _unwind_p, is_spread_leg=True)
+                    _uw = await self.order_manager.place_order(c, rev, lot_size, _unwind_p, is_spread_leg=True)
+                    if _uw is None or getattr(_uw, "order_status", "") in _bad_uw:
+                        _failed_unwinds.append(f"{rev} {c}")
+                if _failed_unwinds:
+                    logger.critical(
+                        f"[IronCondor] UNWIND FAILED for {symbol} legs: {_failed_unwinds} — "
+                        f"naked position(s) may remain open. MANUAL INTERVENTION REQUIRED."
+                    )
+                    await self._notify(
+                        f"CRITICAL: IronCondor unwind FAILED\n"
+                        f"Symbol: {symbol}\nFailed legs: {', '.join(_failed_unwinds)}\n"
+                        f"Action required: manually close the listed contracts"
+                    )
                 return
             placed.append((contract, side, price, is_leg))
 
