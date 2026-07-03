@@ -104,6 +104,9 @@ class LiveTradingEngine:
         self._exit_cycle_lock: asyncio.Lock = asyncio.Lock()
         # Symbols flagged during _restore_state() for immediate close (C)
         self._close_on_first_cycle: set = set()
+        # Holds references to fire-and-forget background tasks so the GC cannot
+        # collect them before they complete (asyncio discards unreferenced tasks).
+        self._background_tasks: set = set()
 
         logger.info(f"LiveTradingEngine initialised — mode: {self.mode.value.upper()}")
 
@@ -169,7 +172,9 @@ class LiveTradingEngine:
 
         # Auto-refresh event calendar every Monday so earnings/RBI dates stay current.
         if now_ist().weekday() == 0:  # 0 = Monday
-            asyncio.create_task(self._refresh_event_calendar())
+            _cal_task = asyncio.create_task(self._refresh_event_calendar())
+            self._background_tasks.add(_cal_task)
+            _cal_task.add_done_callback(self._background_tasks.discard)
 
         if self.mode == TradingMode.LIVE:
             redis = getattr(self, "_redis", None)
@@ -1618,7 +1623,7 @@ class LiveTradingEngine:
             exit_short = await self.order_manager.place_order(spread["short_contract"], "BUY",  lot, cur_short, is_spread_leg=True)
             exit_long  = await self.order_manager.place_order(spread["long_contract"],  "SELL", lot, cur_long,  is_spread_leg=True)
 
-            _bad = {"REJECTED", "REJECTED_BY_RISK", "CANCELLED"}
+            _bad = {"REJECTED", "REJECTED_BY_RISK", "CANCELLED", "FAILED"}
             if exit_short is None or exit_long is None or \
                getattr(exit_short, "order_status", "") in _bad or \
                getattr(exit_long,  "order_status", "") in _bad:
@@ -2176,7 +2181,7 @@ class LiveTradingEngine:
             exit_cs = await self.order_manager.place_order(c["call_short_contract"], "BUY",  lot, cur_cs, is_spread_leg=True)
             exit_cl = await self.order_manager.place_order(c["call_long_contract"],  "SELL", lot, cur_cl, is_spread_leg=True)
 
-            _bad = {"REJECTED", "REJECTED_BY_RISK", "CANCELLED"}
+            _bad = {"REJECTED", "REJECTED_BY_RISK", "CANCELLED", "FAILED"}
             if any(
                 o is None or getattr(o, "order_status", "") in _bad
                 for o in (exit_ps, exit_pl, exit_cs, exit_cl)
@@ -2352,6 +2357,20 @@ class LiveTradingEngine:
 
             await self.order_manager.place_order(contract, side, abs(qty), exit_p, is_exit_order=True)
             self._peak_premiums.pop(contract, None)
+
+            # Write exit to trade journal so EOD/expiry closes appear in PnL analytics
+            _jrnl_info = self._single_leg_journals.pop(contract, None)
+            if _jrnl_info:
+                _entry_p = float(pos.get("avg_price") or 0)
+                _signed  = 1 if qty > 0 else -1
+                _pnl     = round((exit_p - _entry_p) * abs(qty) * _signed, 2)
+                _reason  = "Expiry day force-close" if is_expiry else "EOD square-off"
+                await self._log_trade_close(
+                    journal_id=_jrnl_info.get("journal_id"),
+                    exit_price=exit_p,
+                    pnl=_pnl,
+                    exit_reason=_reason,
+                )
 
             if is_expiry:
                 closed_expiry += 1
@@ -2665,8 +2684,11 @@ class LiveTradingEngine:
                     from datetime import datetime as _dt, timezone as _tz
                     ts = _dt.fromisoformat(ts_str)
                     if ts.tzinfo is None:
-                        ts = ts.replace(tzinfo=_tz.utc)
-                    age = (_dt.now(_tz.utc) - ts).total_seconds()
+                        # LTPPoller stores naive local-time (IST). Compare against
+                        # naive local-time now() — do NOT mix with UTC-aware now().
+                        age = (_dt.now() - ts).total_seconds()
+                    else:
+                        age = (_dt.now(_tz.utc) - ts).total_seconds()
                     if age > self._MARKET_DATA_MAX_AGE_SECONDS:
                         logger.warning(
                             f"Stale market data for {symbol}: {age:.0f}s old "

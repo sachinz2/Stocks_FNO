@@ -54,6 +54,9 @@ async def refresh_calendar(redis=None) -> bool:
         None, _fetch_nse_events
     )
 
+    # Track whether NSE returned any stock-level data before we add metadata
+    nse_had_stock_data = bool(nse_data)
+
     # Always include RBI MPC and Budget dates under the "*" market-wide key
     today = date.today()
     upcoming_global = [
@@ -101,7 +104,9 @@ async def refresh_calendar(redis=None) -> bool:
         except Exception as exc:
             logger.error(f"[EventCalendar] Failed to write Redis: {exc}")
 
-    return bool(nse_data)
+    # Return True only if NSE provided stock-level earnings data.
+    # False means NSE was unreachable — existing calendar was left intact.
+    return nse_had_stock_data
 
 
 def _fetch_nse_events(days_ahead: int = 90) -> Dict[str, List[str]]:
@@ -191,8 +196,7 @@ def _parse_nse_rows(rows: list, results: dict, today: date, cutoff: date) -> Non
     """Parse an NSE API row list into {SYMBOL: [iso_date]} entries."""
     _RESULT_KEYWORDS = ("result", "board meeting", "quarterly", "annual", "financial")
     _DATE_FIELDS     = ("date", "bcastDate", "exDate", "recDate", "setDate", "ndDate")
-    _DATE_FORMATS    = ("%d-%b-%Y", "%d-%b-%y", "%d-%m-%Y", "%Y-%m-%d",
-                        "%d-%B-%Y", "%d-%b-%Y".upper())
+    _DATE_FORMATS    = ("%d-%b-%Y", "%d-%b-%y", "%d-%m-%Y", "%Y-%m-%d", "%d-%B-%Y")
 
     for item in (rows or []):
         if not isinstance(item, dict):

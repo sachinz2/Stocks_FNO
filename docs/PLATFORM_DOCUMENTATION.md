@@ -1,6 +1,6 @@
 # Falcon Quant Platform — Complete Technical Documentation
 
-**Version:** 3.1  
+**Version:** 3.2  
 **Last Updated:** July 2026  
 **Mode:** Paper Trading (live trading target: ~July 29, 2026)
 
@@ -170,13 +170,17 @@ Zerodha kite.historical_data() (5-min OHLC)
       │
       ▼
 LTPPoller.poll()  [every 60s]
-  ├─ Compute EMA20/50, ATR14, VWAP per symbol
+  ├─ Compute EMA20/50, ATR14, VWAP, ADX14, RVOL, prev_close per symbol
+  ├─ Fetch 15-min OHLC → compute EMA20/EMA50 on 15-min bars
+  ├─ Compute market breadth (advancing / total) across all 41 symbols
   ├─ Score all 40 symbols × 3 regimes
   └─ Write to Redis:
-       tick:{SYMBOL}    ← full indicator tick (ltp_source=zerodha_historical)
-       nfo:top5         ← EMA crossover pool
-       nfo:top5:spread  ← credit spread pool
-       nfo:top5:condor  ← iron condor pool
+       tick:{SYMBOL}      ← full indicator tick (includes adx14, rvol, prev_close)
+       tick15:{SYMBOL}    ← 15-min EMA20/EMA50 for MTF confirmation (TTL 30 min)
+       market:breadth     ← advancing/declining ratio (TTL 2 min)
+       nfo:top5           ← EMA crossover pool
+       nfo:top5:spread    ← credit spread pool
+       nfo:top5:condor    ← iron condor pool
 
 ZerodhaTicker (WebSocket)  [continuous]
   └─ Overwrites tick:{SYMBOL}.close with real-time LTP  (ltp_source=zerodha_realtime)
@@ -783,19 +787,26 @@ All exits are classified as either **adverse** (breach/SL/regime shift/near-expi
 
 #### Spread Exits (`_check_spread_exits`)
 
-For each spread in `_active_spreads`:
+For each spread in `_active_spreads` (checked in priority order; first match triggers exit):
 1. **DTE < 7:** Close immediately — gamma risk near expiry (adverse)
 2. **Underlying crosses short strike:** Emergency stop — spread in-the-money (adverse)
-3. **Short leg rises to 2× sold price:** Stop loss (adverse)
-4. **Short leg decays to 25% of sold price:** 75% profit captured, close (profit)
+3. **VIX spike:** VIX ≥ 1.5× entry VIX AND short ≥ 1.5× sold → close; or take accelerated profit at 60% (adverse/profit)
+4. **DTE-tiered profit target:** Short leg decays below threshold × sold value (profit)
+   - DTE > 21: threshold 25% (75% captured)
+   - DTE 15–21: threshold 35% (65% captured)
+   - DTE ≤ 14: threshold 45% (55% captured)
+5. **Strategy stop loss:** Short leg rises to ≥ 2× sold price (adverse)
+6. **Delta breach:** Short leg |δ| > 0.40 computed from ATR-derived vol — more than 40% probability of expiring ITM (adverse)
 
 #### Condor Exits (`_check_condor_exits`)
 
-For each condor in `_active_condors`:
+For each condor in `_active_condors` (priority order):
 1. **DTE < 7:** Close all 4 legs (adverse)
 2. **Underlying breaches short put OR short call strike:** Close entire condor (adverse)
 3. **Either short leg rises to 2× sold price:** Close entire condor (adverse)
-4. **Either short leg decays to 25% of sold price:** Close entire condor (profit) — when one wing wins, the stock has moved toward that side, putting the other wing at increasing risk; closing immediately locks in the gain
+4. **VIX spike:** Adjusted profit threshold; close at 60% if VIX spikes (adverse/profit)
+5. **DTE-tiered profit target:** Either short leg decays below threshold (same DTE tiers as spreads); threshold is `max(DTE_threshold, VIX_spike_threshold)` to never lower the bar below what VIX spiking has already set (profit)
+6. **Delta breach on either wing:** Put short or call short |δ| > 0.40 → close entire condor (adverse)
 
 #### Single-Leg Exits (`_check_open_option_exits`)
 
@@ -822,7 +833,7 @@ On startup, `_restore_state()` reloads all four keys from Redis. The engine surv
 
 | Time (IST) | Job | Action |
 |------------|-----|--------|
-| 09:15 | `on_market_open` | Reset `_today_order_count`, `risk_manager.reset_daily_state()` |
+| 09:15 | `on_market_open` | Reset `_today_order_count`, `risk_manager.reset_daily_state()`. On Mondays: fire `_refresh_event_calendar()` as background task (NSE fetch + RBI dates → Redis + JSON) |
 | 15:20 | `is_square_off_time()` check | `_square_off_all()` — closes **EMA crossover single-leg positions only**; credit spreads and iron condors are multi-day and are NOT force-closed at EOD |
 | 15:30 | `on_market_close` | Cleanup |
 | 15:45 | `send_daily_report` | Email PnL summary; clears `_profit_closed_today` set |
@@ -872,6 +883,8 @@ Buys ATM options in the direction of EMA20/50 crossover. Directional momentum st
 EMA20 crosses above EMA50 → BUY CE (bullish crossover)
 EMA20 crosses below EMA50 → BUY PE (bearish crossover)
 Crossover must persist for signal_confirm_bars=2 to filter whipsaws.
+Additional entry filters: RVOL ≥ 1.3 (volume confirmation),
+ADX ≥ 25 (trend strength), 15-min EMA direction must agree (MTF).
 ```
 
 ### 8.3 Credit Spread Strategy
@@ -1854,6 +1867,44 @@ The HV/IV ratio filter retains `_atr_sigma` (ATR-based) as the denominator — c
 Paper fills previously never failed and always filled at the theoretical mid ± bid-ask. In live trading, ~0.5–5% of orders fail (deep-OTM contracts with no market maker, exchange connectivity, margin edge cases) and illiquid contracts fill at much worse prices than the last-traded price.
 
 `_fill_simulation()` now applies tier-based rejection probability (0.5–5% depending on option price) and an additional random extra slippage (up to 30% for very cheap options). This closes the most common gap between paper P&L and live P&L: paper systems that always fill at best price overestimate returns on illiquid legs.
+
+### 23.14 Seven System Improvements (July 2026)
+
+The following 7 improvements were added to strengthen entry quality and exit management for multi-day option positions:
+
+**Entry filters added:**
+
+| Improvement | Strategy affected | Gate |
+|-------------|------------------|------|
+| Event/Earnings Calendar filter | Credit Spread, Iron Condor | Block entry ≤ 5 days before earnings / RBI / Budget |
+| ADX Trend filter | All 3 strategies | CS: 15 < ADX < 30; IC: ADX < 20; EMA: ADX ≥ 25 |
+| RVOL Volume Confirmation | EMA Crossover | RVOL ≥ 1.3 (above-average volume at signal) |
+| Market Breadth filter | Credit Spread, Iron Condor | CS: direction aligns with breadth; IC: breadth 35–65% |
+| Multi-Timeframe (MTF) Confirmation | EMA Crossover | 15-min EMA direction must agree with 5-min signal |
+
+**Exit improvements added:**
+
+| Improvement | Strategy affected | Change |
+|-------------|-----------------|--------|
+| DTE-Tiered Profit Targets | Credit Spread, Iron Condor | 75%/65%/55% target at DTE >21/15–21/≤14 (vs. flat 75%) |
+| Delta-Based Exit | Credit Spread, Iron Condor | Exit when short leg |δ| > 0.40 (entry was ~0.20) |
+
+All entry filters fail open (if indicator data is unavailable in Redis, the filter is skipped — no trades are blocked due to data unavailability). All exit conditions are additive — they never remove existing exit triggers.
+
+### 23.15 Bug Fixes Applied (July 2026)
+
+Several bugs identified during a full code review were fixed:
+
+| # | Severity | Fix |
+|---|----------|-----|
+| 1 | CRITICAL | `"FAILED"` added to exit order bad-status set — broker timeouts during exits no longer cause orphaned naked shorts |
+| 2 | CRITICAL | UTC/IST mismatch in `_get_market_data` stale check fixed — age was always computed as negative (~−5.5 h), so stale data was never rejected |
+| 3 | CRITICAL | `estimate_option_premium` BS path now applies `_5MIN_ATR_SCALE` — sigma was 8× too low in paper mode, causing option premiums to be severely underestimated |
+| 4 | HIGH | `asyncio.create_task` reference stored in `_background_tasks` set — calendar refresh background task could previously be GC'd before completing |
+| 5 | HIGH | EOD EMA crossover closes (`_square_off_all`) now write to trade journal via `_log_trade_close` — these exits were previously invisible in PnL analytics |
+| 6 | HIGH | `GET /positions/{symbol}` and `GET /positions/{symbol}/pnl` now use engine-first path (same as `GET /positions`) — previously always returned 404 since MySQL positions table is never written by the engine |
+| 7 | MEDIUM | `refresh_calendar()` now returns `True` only when NSE provided stock-level earnings data — previously always returned `True`, masking NSE API failures |
+| 8 | LOW | Invalid strptime format `"%D-%B-%Y"` (from `str.upper()` on `"%d-%b-%Y"`) removed from date-parsing list in `calendar_refresh.py` |
 
 ---
 

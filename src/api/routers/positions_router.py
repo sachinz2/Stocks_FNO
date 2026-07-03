@@ -157,8 +157,19 @@ async def get_positions(request: Request):
 
 
 @router.get("/{symbol}")
-async def get_position(symbol: str):
-    """Get specific position by symbol — no auth required."""
+async def get_position(symbol: str, request: Request):
+    """Get specific position by contract symbol — no auth required."""
+    engine = getattr(request.app.state, "trading_engine", None)
+    if engine is not None:
+        redis = getattr(request.app.state, "redis", None)
+        kite  = getattr(request.app.state, "kite",  None)
+        all_pos = await _positions_from_engine(engine, kite, redis)
+        matches = [p for p in all_pos if p["symbol"] == symbol]
+        if matches:
+            return matches[0]
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"No position found for {symbol}")
+
+    # Fallback: MySQL (engine never writes here — always empty in normal operation)
     try:
         pos_repo = BaseRepository(Position, AsyncSessionLocal)
         positions = await pos_repo.filter(symbol=symbol)
@@ -183,8 +194,25 @@ async def get_position(symbol: str):
 
 
 @router.get("/{symbol}/pnl")
-async def get_position_pnl(symbol: str):
-    """Get PnL for specific position — no auth required."""
+async def get_position_pnl(symbol: str, request: Request):
+    """Get PnL for specific position by contract symbol — no auth required."""
+    engine = getattr(request.app.state, "trading_engine", None)
+    if engine is not None:
+        redis = getattr(request.app.state, "redis", None)
+        kite  = getattr(request.app.state, "kite",  None)
+        all_pos = await _positions_from_engine(engine, kite, redis)
+        matches = [p for p in all_pos if p["symbol"] == symbol]
+        if not matches:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"No position found for {symbol}")
+        p = matches[0]
+        return {
+            "symbol":         p["symbol"],
+            "unrealized_pnl": p.get("unrealized_pnl", 0.0),
+            "realized_pnl":   p.get("realized_pnl",   0.0),
+            "total_pnl":      p.get("unrealized_pnl", 0.0) + p.get("realized_pnl", 0.0),
+        }
+
+    # Fallback: MySQL (engine never writes here — always empty in normal operation)
     try:
         pos_repo = BaseRepository(Position, AsyncSessionLocal)
         positions = await pos_repo.filter(symbol=symbol)

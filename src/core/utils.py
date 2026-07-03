@@ -171,7 +171,10 @@ def estimate_option_premium(
         from src.market_data.option_chain import bs_price
         T = dte / 365.0
         if atr > 0 and underlying_price > 0:
-            daily_vol = atr / underlying_price
+            # atr14 from LTPPoller is computed on 5-min candles; convert to daily ATR
+            # proxy before annualising: daily_ATR ≈ 5min_ATR × √(75 bars/day)
+            _daily_atr = atr * (75 ** 0.5)
+            daily_vol  = _daily_atr / underlying_price
             sigma = daily_vol * math.sqrt(252)
             sigma = max(0.05, min(sigma, 2.0))
         else:

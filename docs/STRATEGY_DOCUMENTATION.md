@@ -1,8 +1,8 @@
 # Falcon Trader — Strategy Documentation
 
-**Version:** 2.1  
+**Version:** 2.2  
 **Last Updated:** 2026-07-03  
-**Platform Version:** 3.0  
+**Platform Version:** 3.1  
 
 ---
 
@@ -79,6 +79,17 @@ Signals **can and do change intraday** as new 5-minute bars form. A crossover th
 | **IV Rank** | Current implied volatility vs 52-week range [0, 1] | Risk layer 3 |
 | **VIX** | Nifty VIX from Zerodha | Risk layer 3 |
 | **PCR** | Put-Call Ratio from NSE OI data | Credit spread direction filter |
+| **ADX14** | Wilder's Average Directional Index on 5-min bars — trend strength 0–100 | Entry filter (all strategies) |
+| **RVOL** | Relative Volume: current bar volume ÷ 20-bar average volume | EMA Crossover entry filter |
+| **Market Breadth** | Advancing symbols ÷ (advancing + declining) across all 41 symbols | Credit spread / condor entry filter |
+| **EMA20 (15-min)** | 20-bar EMA on 15-minute candles | MTF confirmation for EMA Crossover |
+| **EMA50 (15-min)** | 50-bar EMA on 15-minute candles | MTF confirmation for EMA Crossover |
+
+**ADX14** uses Wilder's exponential smoothing (α = 1/14) — the same smoothing convention as ATR14. It is computed in the LTPPoller from the same 5-min OHLC history.
+
+**Market Breadth** is computed after every LTP poll cycle, once per 60 seconds. It counts all 41 symbols where `close > prev_close` (advancing) and `close < prev_close` (declining) and publishes the ratio to Redis key `market:breadth` with a 2-minute TTL. A breadth above 0.65 means ≥ 65% of the universe is advancing (bullish); below 0.35 means ≥ 65% are declining (bearish).
+
+**15-min OHLC** is fetched separately from Zerodha (`kite.historical_data` with interval `"15minute"`, 30 days of history) and cached in Redis key `tick15:{SYMBOL}` with 30-minute TTL. The cache is refreshed every 15 minutes. The LTPPoller computes EMA20 and EMA50 on these 15-min candles and stores them for the MTF filter.
 
 ### 2.4 Symbol Scoring (Three Separate Pools)
 
@@ -92,7 +103,27 @@ The LTP poller doesn't just compute indicators — it **ranks all 40 F&O symbols
 
 Each strategy reads from its own pool, so EMA Crossover always operates on the most volatile stocks of the day and Iron Condor always operates on the most range-bound.
 
-### 2.5 Stale Data Circuit Breaker
+### 2.5 Event / Earnings Calendar Filter
+
+**File:** `src/market_data/event_calendar.py`, `src/market_data/calendar_refresh.py`
+
+Entry signals are blocked within **5 calendar days** of a scheduled corporate event (quarterly results, board meetings) or a market-wide macro event (RBI MPC meeting, Union Budget).
+
+**Data sources (in order of priority):**
+1. Redis key `event:calendar` — JSON dict `{SYMBOL: ["YYYY-MM-DD", ...], "*": [...]}`. Updated every Monday at market open by an automatic NSE fetch.
+2. `config/event_calendar.json` — static fallback file (updated by the weekly auto-refresh; can also be manually edited for custom overrides).
+
+**Auto-refresh:** Every Monday at 9:15 AM, the engine fires `_refresh_event_calendar()` as a background task. It fetches upcoming results dates from two NSE API endpoints and merges them with hardcoded RBI MPC dates (`"*"` key). On success, both Redis and the JSON file are updated. If NSE is unreachable, the existing calendar is left intact.
+
+**Hardcoded market-wide dates (FY 2026-27):**
+- RBI MPC: Aug 7, Oct 8, Dec 5 2026; Feb 5 2027
+- Union Budget: Feb 1 2027
+
+**Blocking logic:** If `has_event_within_days(symbol, redis, days=5)` returns True, the credit spread or iron condor entry for that symbol is skipped silently. EMA Crossover entries are not blocked by the calendar.
+
+**Failure mode:** If the Redis lookup fails for any reason, `has_event_within_days` returns `False` (safe default — does not block trading due to a data issue).
+
+### 2.6 Stale Data Circuit Breaker
 
 Market data is considered stale if the Redis tick timestamp is older than **90 seconds**. If `_get_market_data()` returns a tick older than 90 seconds, it returns `None` for that symbol — no signal is generated, no order is placed.
 
@@ -103,7 +134,7 @@ This protects against:
 
 During the warm-up window (9:15–9:30 AM), stale ticks from the previous session's close are automatically rejected by this check.
 
-### 2.6 Option Pricing
+### 2.7 Option Pricing
 
 In paper trading mode, option premiums are **estimated** using an ATR-based model:
 
@@ -119,7 +150,7 @@ Where `OTM_discount` reduces the premium for each strike interval away from ATM:
 
 In **live mode**, actual option LTP is fetched from Zerodha `kite.ltp()` for all open contracts every cycle. ATR-based estimates are not used for live fills.
 
-### 2.7 Strike Selection
+### 2.8 Strike Selection
 
 Strikes are chosen using the **Black-Scholes delta model**:
 
@@ -147,7 +178,7 @@ sigma = _get_live_sigma(symbol, price, dte, interval, expiry, fallback=_atr_sigm
 
 `_atr_sigma` is retained as the **realized vol baseline** for the HV/IV ratio filter (`market_iv / _atr_sigma ≥ 1.10`). Using live ATM IV in that denominator would measure volatility skew instead of the vol risk premium, which is the intended check.
 
-### 2.8 Market Open Warm-Up
+### 2.9 Market Open Warm-Up
 
 A 15-minute warm-up window blocks all **entry** signals until 9:30 AM. At 9:15 AM, the 5-min bar history from the previous session may produce misleading EMA/ATR readings for the current day's conditions. Exit checks and position management still run during warm-up.
 
@@ -253,7 +284,23 @@ This ensures true 2-candle confirmation, not 2 engine-cycle confirmation within 
 
 If a CE option for the symbol is already open, a new BUY CE order is skipped. The engine first closes any opposite-type option (PE) if open (reversal), then checks for an existing CE before placing.
 
-**Step 4 — Market open warm-up:**
+**Step 4 — Volume Confirmation (RVOL filter):**
+
+RVOL (Relative Volume) must be ≥ **1.3**. RVOL = current bar volume ÷ 20-bar average volume. A momentum crossover on below-average volume is not trusted — it may be a false breakout or thin market. A value of 0 (indicator not yet available) bypasses this check.
+
+**Step 5 — ADX Trend Strength filter:**
+
+ADX14 must be ≥ **25**. ADX < 25 indicates the trend is too weak to sustain a momentum trade; the EMA crossover is likely noise in a ranging market. A value of 0 bypasses this check.
+
+**Step 6 — Multi-Timeframe (MTF) Confirmation:**
+
+The 15-minute EMA direction must **agree** with the 5-minute EMA signal:
+- BUY signal (5-min EMA20 > EMA50): requires 15-min EMA20 > 15-min EMA50
+- SELL signal (5-min EMA20 < EMA50): requires 15-min EMA20 < 15-min EMA50
+
+If the 15-min EMA alignment contradicts the 5-min signal (or 15-min data is unavailable), the entry is skipped. This eliminates counter-trend trades at intermediate timeframe resistance/support levels.
+
+**Step 7 — Market open warm-up:**
 
 No entries before 9:30 AM regardless of signals.
 
@@ -352,6 +399,9 @@ Sells premium and collects it upfront. A two-leg structure: SELL one leg (collec
 | 10 | IV Rank ≥ 0.30 and VIX ≥ 14 | Premium must be worth selling |
 | 11 | **VWAP alignment** | BULL_PUT_SPREAD: underlying ≥ VWAP × 0.995; BEAR_CALL_SPREAD: underlying ≤ VWAP × 1.005 |
 | 12 | **HV/IV ratio** | Market implied vol (from live short-leg LTP) ÷ realized vol (sigma) ≥ 1.10 |
+| 13 | **Market Breadth alignment** | BULL_PUT_SPREAD: breadth must not be ≤ 0.35 (heavily bearish market). BEAR_CALL_SPREAD: breadth must not be ≥ 0.65 (heavily bullish market). Neutral breadth (0.35–0.65) allows both directions. |
+| 14 | **ADX range filter** | ADX14 must be between 15 and 30 (exclusive). ADX < 15 = no clear trend (condor regime); ADX > 30 = trend too strong for a directional spread (blowthrough risk). Both extremes are blocked. |
+| 15 | **Event calendar** | No scheduled earnings / RBI MPC / Budget within 5 calendar days of today. See §2.5. |
 
 **On condition 4 (DTE rationale):** With a DTE < 7 exit trigger, a fresh position needs at least 14 days of runway before the exit fires. The 21-day floor provides a full theta curve segment — theta decay accelerates from DTE 25 toward DTE 7, capturing the steepest portion of the curve. Entering at DTE 21 means the position typically closes profitably (75% target) before DTE 7 is reached.
 
@@ -415,13 +465,22 @@ Close spread before gamma risk explodes near expiry. Locks in most theta profit.
 
 Emergency stop — the short leg is moving into the money.
 
-#### Exit 3: Profit Target
-Short leg decays to ≤ 25% of sold value (75% of max profit captured).
+#### Exit 3: DTE-Tiered Profit Target
+
+The profit target threshold scales with the remaining DTE — closer to expiry we take profit sooner to avoid gamma risk:
+
+| DTE | Short leg target (% of sold value) | Profit captured |
+|-----|------------------------------------|-----------------|
+| > 21 days | ≤ 25% | 75% |
+| 15 – 21 days | ≤ 35% | 65% |
+| ≤ 14 days | ≤ 45% | 55% |
 
 ```
-Short sold at ₹18 → target at ₹4.50
-If current short ≤ ₹4.50: EXIT
+DTE = 10, short sold at ₹18 → target at ₹18 × 45% = ₹8.10
+If current short ≤ ₹8.10: EXIT (55% profit captured)
 ```
+
+**Rationale:** With fewer days to expiry, a sudden move can quickly convert a 55%-profitable position into a loss. Taking profit earlier at DTE ≤ 14 locks in gains before gamma amplification. At DTE > 21, the full 75% target remains — there is still significant theta decay to capture.
 
 #### Exit 4: Stop Loss
 Short leg rises to ≥ 2× sold value.
@@ -430,6 +489,17 @@ Short leg rises to ≥ 2× sold value.
 Short sold at ₹18 → stop at ₹36
 If current short ≥ ₹36: EXIT
 ```
+
+#### Exit 5: Delta-Based Adverse Exit
+
+If the short leg's Black-Scholes delta (computed from current price, ATR-derived vol, and remaining DTE) exceeds **|δ| > 0.40**, the position is exited. At entry the short strike has delta ≈ 0.20 (~80% probability of expiring worthless). When delta grows to 0.40+, the option has become ~40% likely to expire in-the-money — the original thesis is invalidated.
+
+```
+BULL_PUT_SPREAD short put — entry delta: −0.20
+If current delta < −0.40 (e.g. −0.43): EXIT
+```
+
+This exit fires at the same priority as stop loss — whichever triggers first wins.
 
 ### 5.6 PnL Calculation
 
@@ -482,6 +552,9 @@ Max loss = wider wing spread minus net credit (capped, fully defined).
 | 6 | Each wing credit ≥ 20% of wing width | Both wings individually checked |
 | 7 | Margin available | max_wing_width × lot_size |
 | 8 | IV Rank ≥ 0.30 and VIX ≥ 14 | Premium must be worth selling |
+| 9 | **Market Breadth neutral** | Breadth must be between 0.35 and 0.65 — condors need a market neither clearly advancing nor declining. |
+| 10 | **ADX low filter** | ADX14 must be < 20. A rising ADX (≥ 20) indicates a developing trend; condors are exposed in trending markets. |
+| 11 | **Event calendar** | No scheduled earnings / RBI MPC / Budget within 5 calendar days of today. See §2.5. |
 
 ### 6.3 Leg Placement — All-or-Nothing
 
@@ -529,15 +602,32 @@ Call short sold at ₹14 → stop at ₹28 (2×)
 If either triggers → close entire condor
 ```
 
-#### Exit 4: Either Wing at 75% Profit
+#### Exit 4: DTE-Tiered Profit Target (Either Wing)
+
+Same DTE-tiered thresholds as credit spreads — the profit target for each short wing scales down as expiry approaches:
+
+| DTE | Short leg target (% of sold value) | Profit captured |
+|-----|------------------------------------|-----------------|
+| > 21 days | ≤ 25% | 75% |
+| 15 – 21 days | ≤ 35% | 65% |
+| ≤ 14 days | ≤ 45% | 55% |
+
+The threshold never goes below any VIX-spike-adjusted threshold (whichever is higher triggers).
+
 ```
-Either short leg decays to ≤ 25% of its sold value → EXIT entire condor.
-Put short: ₹15 → triggers if ≤ ₹3.75
-Call short: ₹14 → triggers if ≤ ₹3.50
-EITHER condition met → close all 4 legs immediately
+Either short leg decays to ≤ threshold × sold value → EXIT entire condor.
 ```
 
-**Rationale for OR logic:** If one wing decays to 75% profit, it means the underlying has moved significantly toward that side. This increases directional risk on the opposite wing. Waiting for both wings to hit the target simultaneously allows the winning position to reverse while the losing wing comes under pressure. Locking in the winner immediately and closing the full condor is the correct risk-managed response.
+**Rationale for OR logic:** If one wing decays to profit threshold, the underlying has moved toward that side. Directional risk on the opposite wing increases. Lock in the winner and exit the full structure.
+
+#### Exit 5: Delta-Based Adverse Exit (Either Wing)
+
+If either the put short or call short leg's |delta| exceeds **0.40**, the entire condor is closed:
+```
+Put short entry delta ≈ −0.20 → exit if |delta| > 0.40
+Call short entry delta ≈ +0.20 → exit if |delta| > 0.40
+```
+Either condition triggers a full condor exit, since the breached wing is increasingly likely to expire in-the-money.
 
 ### 6.6 PnL Calculation
 
@@ -607,7 +697,9 @@ Net PnL = [(put_short_sold − put_short_close)
 
 ## 7A. Multi-Day Holding — Loss Mitigation Controls
 
-Credit spreads and iron condors are multi-day positions. The following controls guard against adverse multi-day scenarios:
+Credit spreads and iron condors are multi-day positions. The following controls guard against adverse multi-day scenarios.
+
+> **v3.1 additions (2026-07-03):** Controls 7A.10–7A.14 were added as part of a 7-improvement package. Controls 7A.5–7A.9 below are unchanged.
 
 ### 7A.1 DTE Floors
 
@@ -652,6 +744,29 @@ Maximum 2 open structures per sector (`MAX_SECTOR_POSITIONS = 2`). Banking secto
 `_profit_closed_today` tracks symbols where a position closed at 75%+ profit the same day. These symbols are eligible for re-entry at DTE ≥ 14 (instead of the 21-day fresh-entry floor). This enables a second trade in the same expiry cycle when conditions remain favourable — roughly doubling the theta trades per expiry without increasing overnight gamma risk.
 
 Adverse exits (`_exited_today`) do NOT allow re-entry at any DTE floor until the next session.
+
+### 7A.10 DTE-Tiered Profit Targets
+
+The 75% profit target from 7A (flat across all DTE) has been replaced with a tiered schedule that takes profit earlier as expiry approaches. See §5.5 Exit 3 and §6.5 Exit 4 for the full table. The tiering reflects the non-linear gamma expansion in the final two weeks before expiry.
+
+### 7A.11 Delta-Based Exit
+
+When a short leg's Black-Scholes |delta| exceeds 0.40 (vs. ~0.20 at entry), the position is exited regardless of other conditions. This is a probability-based exit: at |delta| > 0.40, the short strike has more than a 40% chance of expiring in-the-money. See §5.5 Exit 5 and §6.5 Exit 5.
+
+### 7A.12 ADX Entry Filter
+
+Credit spreads require ADX14 between 15 and 30 (mild trend confirmed, not too strong). Iron condors require ADX14 < 20 (low trend — market is ranging). These filters prevent entering credit spreads in choppy markets and condors in trending markets, where each structure would be exposed to the wrong regime.
+
+### 7A.13 Market Breadth Filter
+
+`market:breadth` (advancing / total) is computed each poll cycle from all 41 symbols:
+- Credit spreads: BEAR_CALL_SPREAD blocked when breadth > 0.65 (too bullish to sell calls); BULL_PUT_SPREAD blocked when breadth < 0.35 (too bearish to sell puts).
+- Iron condors: blocked when breadth < 0.35 or > 0.65 (market not neutral enough for range-bound strategy).
+- Neutral zone (0.35–0.65) is permissive for all structures.
+
+### 7A.14 Event / Earnings Calendar Filter
+
+No new spread or condor entry is made within 5 calendar days of a scheduled corporate event (quarterly results, board meeting) or market-wide macro event (RBI MPC decision, Union Budget). The calendar is auto-refreshed every Monday from NSE's public API. See §2.5 for full details.
 
 ---
 
