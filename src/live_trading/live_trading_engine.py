@@ -143,12 +143,16 @@ class LiveTradingEngine:
                 c = cond.get(key)
                 if c:
                     contracts.append(c)
+        for contract in self._single_leg_journals:
+            if contract:
+                contracts.append(contract)
         if contracts:
             poller.register_option_contracts(contracts)
             logger.info(
                 f"LTP poller attached — re-registered {len(contracts)} contract(s) "
                 f"from {len(self._active_spreads)} spread(s) + "
-                f"{len(self._active_condors)} condor(s) restored from Redis"
+                f"{len(self._active_condors)} condor(s) + "
+                f"{len(self._single_leg_journals)} single-leg(s) restored from Redis"
             )
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -169,6 +173,21 @@ class LiveTradingEngine:
         logger.info("Market OPEN — 09:15 IST")
         self._today_order_count = 0
         self.risk_manager.reset_daily_state()
+
+        # Rebuild per-strategy deployed capital from overnight multi-day positions so
+        # the per-strategy budget check (risk layer 5) stays accurate next morning.
+        for _sym, _s in self._active_spreads.items():
+            _lp = _s.get("long_premium", 0) * _s.get("lot_size", 0)
+            if _lp > 0:
+                self.risk_manager.add_deployed_capital(
+                    _s.get("strategy_name", "credit_spread_v1"), _lp
+                )
+        for _sym, _c in self._active_condors.items():
+            _lp = (_c.get("put_long_premium", 0) + _c.get("call_long_premium", 0)) * _c.get("lot_size", 0)
+            if _lp > 0:
+                self.risk_manager.add_deployed_capital(
+                    _c.get("strategy_name", "iron_condor_v1"), _lp
+                )
 
         # Auto-refresh event calendar every Monday so earnings/RBI dates stay current.
         if now_ist().weekday() == 0:  # 0 = Monday
@@ -711,7 +730,7 @@ class LiveTradingEngine:
             return None
         trigger_price = round(entry_price * trigger_mult, 2)
         try:
-            loop   = asyncio.get_event_loop()
+            loop   = asyncio.get_running_loop()
             result = await loop.run_in_executor(
                 None,
                 lambda: kite.place_gtt(
@@ -747,7 +766,7 @@ class LiveTradingEngine:
         if not kite:
             return
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, lambda: kite.delete_gtt(gtt_id))
             logger.info(f"[GTT] Cancelled backstop #{gtt_id} ({contract})")
         except Exception as e:
@@ -779,7 +798,7 @@ class LiveTradingEngine:
                 import asyncio as _asyncio
                 keys = [f"NFO:{p['symbol']}" for p in positions if p.get("symbol")]
                 if keys:
-                    quotes = await _asyncio.get_event_loop().run_in_executor(
+                    quotes = await _asyncio.get_running_loop().run_in_executor(
                         None, self._kite.ltp, keys
                     )
                     for pos in positions:
@@ -913,7 +932,9 @@ class LiveTradingEngine:
                 )
                 if db_order and db_order.order_status not in ("REJECTED_BY_RISK", "FAILED"):
                     self._peak_premiums.pop(contract, None)
-                    pnl = (current_p - entry_p) * abs(qty)
+                    _fill_p = getattr(db_order, "avg_price", None) or current_p
+                    _slip   = abs(_fill_p - current_p)
+                    pnl = (_fill_p - entry_p) * abs(qty)
 
                     # Write exit to trade_journal so PnL appears in analytics + dashboard
                     info = self._single_leg_journals.pop(contract, None)
@@ -921,10 +942,11 @@ class LiveTradingEngine:
                         md = await self._get_market_data(info["underlying"])
                         await self._log_trade_close(
                             journal_id=info["journal_id"],
-                            exit_price=current_p,
+                            exit_price=_fill_p,
                             pnl=pnl,
                             exit_reason=exit_reason,
                             market_data=md,
+                            total_slippage_pts=round(_slip, 4) if _slip > 0 else None,
                         )
                         await self._persist_state()
 
@@ -1066,6 +1088,8 @@ class LiveTradingEngine:
                     "strategy_name": strategy.name,
                     "date":          now_ist().date().isoformat(),
                 }
+                if self._ltp_poller:
+                    self._ltp_poller.register_option_contracts([contract])
                 await self._persist_state()
             await self._notify(
                 f"ORDER PLACED\nStrategy: {strategy.name}\n"
@@ -1656,11 +1680,15 @@ class LiveTradingEngine:
                 spread["long_premium"] * lot,
             )
 
+            _short_fill = getattr(exit_short, "avg_price", None) or cur_short
+            _long_fill  = getattr(exit_long,  "avg_price", None) or cur_long
+            _slippage   = abs(_short_fill - cur_short) + abs(_long_fill - cur_long)
             await self._log_trade_close(
                 journal_id=spread.get("journal_id"),
                 exit_price=round(cur_short - cur_long, 2),
                 pnl=net_pnl, exit_reason=exit_reason,
                 market_data=market_data,
+                total_slippage_pts=round(_slippage, 4) if _slippage > 0 else None,
             )
             if self._ltp_poller:
                 self._ltp_poller.unregister_option_contracts(
@@ -2231,11 +2259,18 @@ class LiveTradingEngine:
                 (c["put_long_premium"] + c["call_long_premium"]) * lot,
             )
 
+            _ps_fill = getattr(exit_ps, "avg_price", None) or cur_ps
+            _pl_fill = getattr(exit_pl, "avg_price", None) or cur_pl
+            _cs_fill = getattr(exit_cs, "avg_price", None) or cur_cs
+            _cl_fill = getattr(exit_cl, "avg_price", None) or cur_cl
+            _slippage = (abs(_ps_fill - cur_ps) + abs(_pl_fill - cur_pl)
+                         + abs(_cs_fill - cur_cs) + abs(_cl_fill - cur_cl))
             await self._log_trade_close(
                 journal_id=c.get("journal_id"),
                 exit_price=round(cur_ps + cur_cs - cur_pl - cur_cl, 2),
                 pnl=net_pnl, exit_reason=exit_reason,
                 market_data=market_data,
+                total_slippage_pts=round(_slippage, 4) if _slippage > 0 else None,
             )
             if self._ltp_poller:
                 self._ltp_poller.unregister_option_contracts([
@@ -2405,6 +2440,14 @@ class LiveTradingEngine:
                 closed_ema += 1
 
         if is_expiry:
+            # Cancel GTT backstops before clearing so exchange-level orders don't
+            # fire after our positions are already closed by the square-off above.
+            for _s in self._active_spreads.values():
+                await self._cancel_gtt(_s.get("gtt_id"), _s.get("short_contract", ""))
+            for _c in self._active_condors.values():
+                await self._cancel_gtt(_c.get("put_short_gtt_id"),  _c.get("put_short_contract",  ""))
+                await self._cancel_gtt(_c.get("call_short_gtt_id"), _c.get("call_short_contract", ""))
+
             # Full expiry-day clear — all positions force-closed
             self._active_spreads.clear()
             self._active_condors.clear()
@@ -2547,7 +2590,7 @@ class LiveTradingEngine:
         """
         if self.mode == TradingMode.LIVE and self._kite:
             try:
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 margins   = await loop.run_in_executor(None, self._kite.margins)
                 available = float(margins.get("equity", {}).get("net", 0))
                 if available < required:
@@ -2682,7 +2725,63 @@ class LiveTradingEngine:
     async def _refresh_risk_state(self, positions: List[Dict]) -> None:
         realized   = sum(p.get("realized_pnl",   0) for p in positions)
         unrealized = sum(p.get("unrealized_pnl", 0) for p in positions)
+
+        # In paper mode broker.get_positions() has unrealized_pnl=0.
+        # Compute it from the engine's in-memory active positions instead.
+        if unrealized == 0.0 and (self._active_spreads or self._active_condors):
+            redis = getattr(self, "_redis", None)
+            if redis:
+                unrealized = await self._compute_engine_unrealized_pnl(redis)
+
         self.risk_manager.update_state(positions, realized, unrealized)
+
+    async def _compute_engine_unrealized_pnl(self, redis) -> float:
+        """Sum unrealized PnL across active spreads and condors using Redis option price cache."""
+
+        async def _get_price(contract: str) -> float:
+            if not contract:
+                return 0.0
+            try:
+                v = await redis.get(f"optltp:{contract}")
+                if v:
+                    return float(v)
+                v = await redis.get(f"optq:{contract}")
+                if v:
+                    return float(v)
+            except Exception:
+                pass
+            return 0.0
+
+        total = 0.0
+        for s in self._active_spreads.values():
+            lot = s.get("lot_size", 0)
+            if not lot:
+                continue
+            cur_short = await _get_price(s.get("short_contract", ""))
+            cur_long  = await _get_price(s.get("long_contract", ""))
+            if cur_short > 0 and cur_long > 0:
+                total += (
+                    (s.get("short_premium", 0) - cur_short)
+                    + (cur_long - s.get("long_premium", 0))
+                ) * lot
+
+        for c in self._active_condors.values():
+            lot = c.get("lot_size", 0)
+            if not lot:
+                continue
+            cur_ps = await _get_price(c.get("put_short_contract",  ""))
+            cur_pl = await _get_price(c.get("put_long_contract",   ""))
+            cur_cs = await _get_price(c.get("call_short_contract", ""))
+            cur_cl = await _get_price(c.get("call_long_contract",  ""))
+            if all(p > 0 for p in (cur_ps, cur_pl, cur_cs, cur_cl)):
+                total += (
+                    (c.get("put_short_premium",  0) - cur_ps)
+                    + (c.get("call_short_premium", 0) - cur_cs)
+                    - (cur_pl - c.get("put_long_premium",  0))
+                    - (cur_cl - c.get("call_long_premium", 0))
+                ) * lot
+
+        return total
 
     async def _safe_get_positions(self) -> List[Dict[str, Any]]:
         try:

@@ -68,7 +68,7 @@ class LTPPoller:
         if not is_market_open():
             return
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         ema_scores: Dict[str, float] = {}
         spread_scores: Dict[str, float] = {}
@@ -212,7 +212,7 @@ class LTPPoller:
             (high - close.shift()).abs(),
             (low  - close.shift()).abs(),
         ], axis=1).max(axis=1)
-        atr14 = float(tr.rolling(14).mean().iloc[-1])
+        atr14 = float(tr.ewm(alpha=1.0/14, adjust=False).mean().iloc[-1])
 
         # ADX14 — Wilder's smoothed average directional index
         _alpha     = 1.0 / 14
@@ -301,7 +301,7 @@ class LTPPoller:
         ema50 = tick.get("ema50", close)
 
         atr_pct = (atr / close) * 100
-        ema_spread_pct = abs(ema20 - ema50) / close * 100
+        ema_spread_pct = abs(ema20 - ema50) / ema50 * 100 if ema50 > 0 else 0.0
 
         # Regime 1: EMA crossover — always gets a score
         ema_score = round(atr_pct * 0.6 + ema_spread_pct * 0.4, 4)

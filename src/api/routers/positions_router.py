@@ -47,7 +47,7 @@ async def _fetch_market_prices(contracts: list, kite, redis) -> dict:
         try:
             import asyncio
             nfo_syms = [f"NFO:{c}" for c in uncached]
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             data = await loop.run_in_executor(None, lambda: kite.ltp(nfo_syms))
             for contract in uncached:
                 ltp = data.get(f"NFO:{contract}", {}).get("last_price")

@@ -158,7 +158,7 @@ async def fetch_and_cache_vix(kite, redis) -> Optional[float]:
     """
     try:
         import asyncio
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         data = await loop.run_in_executor(
             None, lambda: kite.ltp(["NSE:INDIA VIX"])
         )
@@ -238,7 +238,7 @@ async def get_option_quote(contract: str, kite, redis) -> Optional[float]:
     # 3. Fresh kite.ltp() REST call
     try:
         import asyncio
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         nfo_sym = f"NFO:{contract}"
         data = await loop.run_in_executor(None, lambda: kite.ltp([nfo_sym]))
         ltp = data.get(nfo_sym, {}).get("last_price")

@@ -174,7 +174,7 @@ async def get_oi_data(symbol: str, redis) -> Optional[Dict]:
         pass
 
     # Cache miss — fetch from NSE in a thread
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     records = await loop.run_in_executor(None, _fetch_option_chain_blocking, symbol)
     if not records:
         return None

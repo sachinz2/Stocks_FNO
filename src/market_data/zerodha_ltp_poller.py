@@ -92,7 +92,7 @@ class ZerodhaLTPPoller:
             return 0
 
         try:
-            loop  = asyncio.get_event_loop()
+            loop  = asyncio.get_running_loop()
             quotes = await loop.run_in_executor(
                 None, self._kite.ltp, self._instruments
             )
