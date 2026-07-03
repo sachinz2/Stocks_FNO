@@ -9,17 +9,38 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/positions", tags=["Positions"])
 
 
-def _positions_from_engine(engine) -> list:
+async def _get_ltp(contract: str, redis) -> float:
+    """
+    Look up the current LTP for an option contract from Redis.
+    Tries the 5-second live cache first (optltp:), then the 30-second
+    on-demand cache (optq:). Returns 0.0 if neither is available.
+    """
+    if not redis:
+        return 0.0
+    try:
+        v = await redis.get(f"optltp:{contract}")
+        if v:
+            return round(float(v), 2)
+        v = await redis.get(f"optq:{contract}")
+        if v:
+            return round(float(v), 2)
+    except Exception:
+        pass
+    return 0.0
+
+
+async def _positions_from_engine(engine, redis) -> list:
     """
     Build per-contract position rows from the engine's active spreads and condors.
 
-    The dashboard groups rows by underlying (JSWSTEEL26JUL1210PE → JSWSTEEL) and
-    identifies multi-leg structures by checking for both positive and negative
-    quantities under the same underlying. So we return one row per contract leg
-    with signed quantity: negative for SELL legs, positive for BUY legs.
+    Returns one row per contract leg with signed quantity (negative = SELL, positive = BUY)
+    so the dashboard's multi-leg grouping logic correctly identifies spreads and condors.
 
-    market_price and unrealized_pnl are 0 here; the dashboard falls back to
-    avg_price when market_price is 0, so the display is correct without live quotes.
+    Market prices are fetched from Redis (optltp: written every 5 s by the LTP poller,
+    or optq: written on-demand by get_option_quote). Unrealized PnL uses the formula
+    (market_price − avg_price) × signed_quantity, which is correct for both sides:
+      SELL leg (qty < 0): profit when market price falls below entry
+      BUY  leg (qty > 0): profit when market price rises above entry
     """
     rows = []
 
@@ -31,16 +52,20 @@ def _positions_from_engine(engine) -> list:
             (spread.get("short_contract", ""), -lot, spread.get("short_premium", 0.0)),
             (spread.get("long_contract",  ""),  lot, spread.get("long_premium",  0.0)),
         ]
-        for contract, qty, price in legs:
-            if contract:
-                rows.append({
-                    "symbol":         contract,
-                    "quantity":       qty,
-                    "avg_price":      round(float(price), 2),
-                    "market_price":   0.0,
-                    "unrealized_pnl": 0.0,
-                    "realized_pnl":   0.0,
-                })
+        for contract, qty, entry in legs:
+            if not contract:
+                continue
+            entry    = round(float(entry), 2)
+            mkt      = await _get_ltp(contract, redis)
+            unreal   = round((mkt - entry) * qty, 2) if mkt else 0.0
+            rows.append({
+                "symbol":         contract,
+                "quantity":       qty,
+                "avg_price":      entry,
+                "market_price":   mkt,
+                "unrealized_pnl": unreal,
+                "realized_pnl":   0.0,
+            })
 
     for sym, cond in engine._active_condors.items():
         lot = cond.get("lot_size", 0)
@@ -52,16 +77,20 @@ def _positions_from_engine(engine) -> list:
             (cond.get("call_short_contract", ""), -lot, cond.get("call_short_premium", 0.0)),
             (cond.get("call_long_contract",  ""),  lot, cond.get("call_long_premium",  0.0)),
         ]
-        for contract, qty, price in legs:
-            if contract:
-                rows.append({
-                    "symbol":         contract,
-                    "quantity":       qty,
-                    "avg_price":      round(float(price), 2),
-                    "market_price":   0.0,
-                    "unrealized_pnl": 0.0,
-                    "realized_pnl":   0.0,
-                })
+        for contract, qty, entry in legs:
+            if not contract:
+                continue
+            entry  = round(float(entry), 2)
+            mkt    = await _get_ltp(contract, redis)
+            unreal = round((mkt - entry) * qty, 2) if mkt else 0.0
+            rows.append({
+                "symbol":         contract,
+                "quantity":       qty,
+                "avg_price":      entry,
+                "market_price":   mkt,
+                "unrealized_pnl": unreal,
+                "realized_pnl":   0.0,
+            })
 
     return rows
 
@@ -69,16 +98,17 @@ def _positions_from_engine(engine) -> list:
 @router.get("")
 async def get_positions(request: Request):
     """
-    Get all open positions from the live trading engine's in-memory state.
+    Get all open positions from the live trading engine's in-memory state,
+    enriched with live market prices and unrealized PnL from Redis.
 
     Engine state is persisted to Redis and restored on every restart, so this
     endpoint is accurate even immediately after docker compose restart.
-    Falls back to the MySQL positions table if the engine is not running
-    (it will be empty since the engine never writes to it).
+    Falls back to the MySQL positions table if the engine is not running.
     """
     engine = getattr(request.app.state, "trading_engine", None)
     if engine is not None:
-        return _positions_from_engine(engine)
+        redis = getattr(request.app.state, "redis", None)
+        return await _positions_from_engine(engine, redis)
 
     # Fallback: MySQL (legacy — engine never writes here, will always be empty)
     try:

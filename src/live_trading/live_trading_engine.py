@@ -121,8 +121,32 @@ class LiveTradingEngine:
 
     def attach_ltp_poller(self, poller: Any) -> None:
         """Attach ZerodhaLTPPoller so the engine can register/unregister active
-        option contracts for 5-second real-time tracking."""
+        option contracts for 5-second real-time tracking.
+
+        Called after engine.start() / _restore_state(), so we immediately
+        re-register any contracts restored from Redis so their prices are
+        refreshed by the first LTP poll cycle.
+        """
         self._ltp_poller = poller
+        contracts: list = []
+        for spread in self._active_spreads.values():
+            for key in ("short_contract", "long_contract"):
+                c = spread.get(key)
+                if c:
+                    contracts.append(c)
+        for cond in self._active_condors.values():
+            for key in ("put_short_contract", "put_long_contract",
+                        "call_short_contract", "call_long_contract"):
+                c = cond.get(key)
+                if c:
+                    contracts.append(c)
+        if contracts:
+            poller.register_option_contracts(contracts)
+            logger.info(
+                f"LTP poller attached — re-registered {len(contracts)} contract(s) "
+                f"from {len(self._active_spreads)} spread(s) + "
+                f"{len(self._active_condors)} condor(s) restored from Redis"
+            )
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
