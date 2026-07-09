@@ -257,31 +257,40 @@ def check_regime_data_is_live(api_base: str) -> Result:
 def check_no_duplicate_eod_notifications(repo: Path) -> Result:
     """
     Flags rapid-fire repeats (the actual bug pattern: same notification re-sent
-    every cycle for the whole 15:20-15:30 window), not just ">1 per calendar
-    day" — a fix deployed mid-window on the day the bug was caught will always
-    show pre-fix sends earlier that same day, which is history, not a live
-    regression. Two sends under 15 minutes apart is the real signal.
+    every cycle for the whole 15:20-15:30 window) that happened SINCE THE
+    CURRENT PROCESS STARTED — not anywhere in the log file's whole history.
+    The log persists across restarts, so a fix deployed mid-window leaves
+    genuine pre-fix spam sitting earlier in the same file; scoping to "since
+    the last engine start" is what makes this a check of the code currently
+    running, rather than a permanent trip-wire on that historical incident.
     """
-    name = "No rapid-fire duplicate EOD notifications"
+    name = "No rapid-fire duplicate EOD notifications since this deploy"
     log_path = repo / "logs" / "falcon.log"
     if not log_path.exists():
         return SKIP, name, "falcon.log not found at expected path."
-    timestamps: List[datetime] = []
+    ts_re = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+    last_start: datetime = None
+    eod_timestamps: List[datetime] = []
     try:
         with log_path.open(encoding="utf-8", errors="ignore") as f:
             for line in f:
-                if "Email sent: EOD POSITION UPDATE" not in line:
+                m = ts_re.match(line)
+                if not m:
                     continue
-                m = re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
-                if m:
-                    timestamps.append(datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"))
+                ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+                if "Trading engine STARTED" in line:
+                    last_start = ts
+                    eod_timestamps = []  # only care about sends after the latest start
+                elif "Email sent: EOD POSITION UPDATE" in line:
+                    eod_timestamps.append(ts)
     except Exception as e:
         return WARN, name, f"Could not read log: {e}"
-    timestamps.sort()
-    for a, b in zip(timestamps, timestamps[1:]):
+    if last_start is None:
+        return WARN, name, "Could not find a 'Trading engine STARTED' line to scope the check to."
+    for a, b in zip(eod_timestamps, eod_timestamps[1:]):
         if (b - a) < timedelta(minutes=15):
-            return FAIL, name, f"Two sends only {int((b - a).total_seconds())}s apart ({a} -> {b}) — the once-per-day guard may not be working."
-    return PASS, name, f"{len(timestamps)} EOD notification(s) in the log, none within 15 min of each other."
+            return FAIL, name, f"Two sends only {int((b - a).total_seconds())}s apart since the last start ({a} -> {b}) — the once-per-day guard may not be working."
+    return PASS, name, f"{len(eod_timestamps)} EOD notification(s) since the engine last started ({last_start}), none within 15 min of each other."
 
 
 RUNTIME_CHECKS: List[Callable[[str], Result]] = [
