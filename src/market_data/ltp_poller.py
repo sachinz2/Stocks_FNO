@@ -12,7 +12,9 @@ Runs every 60 s via APScheduler:
   5. Trading engine reads the right pool for each strategy so the correct 5 stocks
      are always fed to the right strategy on any given day.
   6. Publishes market breadth (advancing/declining ratio) to Redis (market:breadth)
-  7. Fetches 15-min OHLC for multi-timeframe EMA confirmation (tick15:SYMBOL)
+  7. Publishes market-wide avg ATR%/EMA-spread% to Redis (market:trend_stats) —
+     the regime detector's proxy for "NIFTY ATR%" since no index tick is subscribed
+  8. Fetches 15-min OHLC for multi-timeframe EMA confirmation (tick15:SYMBOL)
 """
 import asyncio
 import json
@@ -25,6 +27,7 @@ import pandas as pd
 
 from src.core.constants import (
     ACTIVE_TRADING_SYMBOLS,
+    FIVE_MIN_ATR_DAILY_SCALE,
     FNO_SYMBOLS,
     REDIS_TICK_PREFIX,
     REDIS_TOP_SYMBOLS_KEY,
@@ -126,6 +129,28 @@ class LTPPoller:
                 ex=120,  # 2-min TTL — poll runs every 60 s
             )
             logger.info(f"[Breadth] {_breadth:.1%} advancing ({_adv}/{_tot})")
+
+        # Market-wide trend stats — regime detector's proxy for "NIFTY ATR%/EMA spread%"
+        # since no NIFTY50 index tick is subscribed. atr_pct here is raw 5-min-bar ATR%,
+        # scaled to a daily-equivalent figure so it's comparable to a daily-ATR% threshold
+        # (see FIVE_MIN_ATR_DAILY_SCALE). ema_spread_pct is already a price-level stat and
+        # needs no such scaling.
+        if all_ticks:
+            _atrs = [t["atr_pct"] for t in all_ticks if t.get("atr_pct") is not None]
+            _emas = [t["ema_spread_pct"] for t in all_ticks if t.get("ema_spread_pct") is not None]
+            if _atrs and _emas:
+                _avg_atr_pct_daily  = round((sum(_atrs) / len(_atrs)) * FIVE_MIN_ATR_DAILY_SCALE, 4)
+                _avg_ema_spread_pct = round(sum(_emas) / len(_emas), 4)
+                await self._redis.set(
+                    "market:trend_stats",
+                    json.dumps({
+                        "avg_atr_pct_daily":  _avg_atr_pct_daily,
+                        "avg_ema_spread_pct": _avg_ema_spread_pct,
+                        "n_symbols":          len(_atrs),
+                        "timestamp":          datetime.now().isoformat(),
+                    }),
+                    ex=120,  # 2-min TTL — poll runs every 60 s
+                )
 
         n = ACTIVE_TRADING_SYMBOLS
 

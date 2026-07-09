@@ -67,6 +67,15 @@ FNO_STRIKE_INTERVALS = {
 # How many stocks to trade at a time per strategy regime
 ACTIVE_TRADING_SYMBOLS = 5
 
+# ATR from LTPPoller is computed from 5-minute candles (ATR14 over 14 five-min bars).
+# A single 5-min bar's range is much smaller than a full day's range, so raw 5-min
+# ATR% is not comparable to thresholds calibrated in daily-ATR% terms. To convert:
+#   daily_ATR_proxy = 5min_ATR x sqrt(bars_per_day)
+#   NSE session = 375 min / 5 = 75 bars/day -> scale factor = sqrt(75) ~= 8.66
+# Shared by live_trading_engine.py (sigma/strike calcs) and regime_detector.py
+# (TRENDING classification) — both must use the same factor to stay consistent.
+FIVE_MIN_ATR_DAILY_SCALE: float = 75 ** 0.5
+
 # Sector classification for concentration check (max 2 open structures per sector)
 FNO_SECTORS = {
     "RELIANCE":    "Energy",

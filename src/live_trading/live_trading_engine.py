@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 from src.brokers.base import AbstractBroker
 from src.core.config import settings
 from src.core.constants import (
+    FIVE_MIN_ATR_DAILY_SCALE,
     FNO_SECTORS,
     FNO_SYMBOLS,
     MAX_SECTOR_POSITIONS,
@@ -41,13 +42,11 @@ logger = logging.getLogger(__name__)
 
 _FNO_SYMBOLS_BY_LEN = sorted(FNO_SYMBOLS, key=len, reverse=True)
 
-# ATR from LTPPoller is computed from 5-minute candles (ATR14 over 14 five-min bars).
-# atr_to_annualised_vol() assumes daily ATR. To convert:
-#   daily_ATR_proxy = 5min_ATR × √(bars_per_day)
-#   NSE session = 375 min ÷ 5 = 75 bars/day → scale factor = √75 ≈ 8.66
-# Without this correction, sigma ≈ 4% when true annualised vol is ≈ 28%, causing
-# find_delta_strike() to place short strikes only ~1% OTM instead of ~5-6% OTM.
-_5MIN_ATR_SCALE: float = 75 ** 0.5
+# atr_to_annualised_vol() assumes daily ATR — see FIVE_MIN_ATR_DAILY_SCALE in
+# core/constants.py for why 5-min ATR must be scaled before use here. Without this
+# correction, sigma ≈ 4% when true annualised vol is ≈ 28%, causing find_delta_strike()
+# to place short strikes only ~1% OTM instead of ~5-6% OTM.
+_5MIN_ATR_SCALE: float = FIVE_MIN_ATR_DAILY_SCALE
 
 _REDIS_ACTIVE_SPREADS  = "engine:active_spreads"
 _REDIS_ACTIVE_CONDORS  = "engine:active_condors"
