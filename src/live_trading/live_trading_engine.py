@@ -91,6 +91,10 @@ class LiveTradingEngine:
         self._symbols: List[str] = []
         self._today_order_count: int = 0
         self._max_daily_orders: int  = getattr(settings, "MAX_DAILY_ORDERS", 30)
+        # Max simultaneous open EMA Crossover (single-leg, intraday) positions across all
+        # symbols. Blocks a 3rd entry while 1-2 are already open; independent of the
+        # per-symbol duplicate check and the portfolio-wide daily order count.
+        self._max_concurrent_intraday: int = getattr(settings, "MAX_CONCURRENT_INTRADAY", 2)
         self._peak_premiums:   Dict[str, float] = {}
         self._active_spreads:       Dict[str, Dict[str, Any]] = {}
         self._active_condors:       Dict[str, Dict[str, Any]] = {}
@@ -1003,6 +1007,18 @@ class LiveTradingEngine:
 
         await self._close_option_positions(symbol, opposite, market_data)
         if await self._has_open_option(symbol, option_type):
+            return
+
+        # Portfolio-wide cap on simultaneous intraday (EMA Crossover) positions — counted
+        # via _single_leg_journals since that dict holds exactly the currently-open
+        # single-leg positions this strategy family produces, across all symbols.
+        _open_intraday = len(self._single_leg_journals)
+        if _open_intraday >= self._max_concurrent_intraday:
+            logger.info(
+                f"[{strategy.name}] {symbol} skipped — {_open_intraday}/"
+                f"{self._max_concurrent_intraday} intraday positions already open "
+                "(concurrency cap)."
+            )
             return
 
         expiry   = get_near_month_expiry()
