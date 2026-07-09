@@ -255,22 +255,33 @@ def check_regime_data_is_live(api_base: str) -> Result:
 
 
 def check_no_duplicate_eod_notifications(repo: Path) -> Result:
-    name = "No duplicate EOD notifications in today's log"
+    """
+    Flags rapid-fire repeats (the actual bug pattern: same notification re-sent
+    every cycle for the whole 15:20-15:30 window), not just ">1 per calendar
+    day" — a fix deployed mid-window on the day the bug was caught will always
+    show pre-fix sends earlier that same day, which is history, not a live
+    regression. Two sends under 15 minutes apart is the real signal.
+    """
+    name = "No rapid-fire duplicate EOD notifications"
     log_path = repo / "logs" / "falcon.log"
     if not log_path.exists():
         return SKIP, name, "falcon.log not found at expected path."
-    today = datetime.now(IST).strftime("%Y-%m-%d")
-    count = 0
+    timestamps: List[datetime] = []
     try:
         with log_path.open(encoding="utf-8", errors="ignore") as f:
             for line in f:
-                if line.startswith(today) and "Email sent: EOD POSITION UPDATE" in line:
-                    count += 1
+                if "Email sent: EOD POSITION UPDATE" not in line:
+                    continue
+                m = re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+                if m:
+                    timestamps.append(datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"))
     except Exception as e:
         return WARN, name, f"Could not read log: {e}"
-    if count > 1:
-        return FAIL, name, f"Found {count} EOD notification emails today — the once-per-day guard may not be working."
-    return PASS, name, f"{count} EOD notification(s) today."
+    timestamps.sort()
+    for a, b in zip(timestamps, timestamps[1:]):
+        if (b - a) < timedelta(minutes=15):
+            return FAIL, name, f"Two sends only {int((b - a).total_seconds())}s apart ({a} -> {b}) — the once-per-day guard may not be working."
+    return PASS, name, f"{len(timestamps)} EOD notification(s) in the log, none within 15 min of each other."
 
 
 RUNTIME_CHECKS: List[Callable[[str], Result]] = [
