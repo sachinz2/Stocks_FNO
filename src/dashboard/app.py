@@ -6,6 +6,8 @@ import requests
 import pandas as pd
 from datetime import datetime, date
 
+from src.core.constants import FNO_SYMBOLS
+
 st.set_page_config(page_title="Falcon Quant Platform", layout="wide", page_icon="🦅")
 
 API_BASE_URL = os.environ.get("API_BASE_URL", "http://api:8000/api/v1")
@@ -159,28 +161,15 @@ elif page == "Positions":
     if not positions:
         st.info("No open positions.")
     else:
-        # Detect spread/condor legs by reading Redis state via API (best-effort grouping)
-        spread_symbols: set = set()
-        condor_symbols: set = set()
-
         # Try to identify multi-leg groups from position contracts
         # A contract is a spread/condor leg if there is another contract with the same underlying
         # and opposite qty sign (short + long pair)
-        # Build known underlying list from a fixed set so extraction is reliable.
-        # A contract like RELIANCE25JUN2850CE → underlying = RELIANCE.
-        _KNOWN_UNDERLYINGS = [
-            "HDFCBANK", "ICICIBANK", "RELIANCE", "INFY", "TCS",
-            "AXISBANK", "KOTAKBANK", "SBIN", "BAJFINANCE", "MARUTI",
-            "WIPRO", "LTIM", "HCLTECH", "SUNPHARMA", "TATAMOTORS",
-            "TATACONSUM", "HINDUNILVR", "ASIANPAINT", "NESTLEIND",
-            "TITAN", "ULTRACEMCO", "POWERGRID", "NTPC", "ONGC",
-            "ADANIENT", "ADANIPORTS", "BAJAJ-AUTO", "BAJAJFINSV",
-            "BPCL", "BRITANNIA", "CIPLA", "COALINDIA", "DIVISLAB",
-            "DRREDDY", "EICHERMOT", "GRASIM", "HEROMOTOCO", "HINDALCO",
-            "INDUSINDBK", "ITC", "JSWSTEEL", "LT", "M&M", "SBILIFE",
-            "SHRIRAMFIN", "TATASTEEL", "TECHM", "UPL",
-        ]
-        _UND_BY_LEN = sorted(_KNOWN_UNDERLYINGS, key=len, reverse=True)
+        # A contract like RELIANCE25JUN2850CE → underlying = RELIANCE. Uses the same
+        # FNO_SYMBOLS list the engine actually trades — a separate hand-maintained copy
+        # used to live here and had drifted (missing BHARTIARTL/APOLLOHOSP, and included
+        # several symbols — TATAMOTORS, ADANIENT, BAJAJFINSV, etc. — that aren't in the
+        # live-traded universe), which silently broke multi-leg grouping for those symbols.
+        _UND_BY_LEN = sorted(FNO_SYMBOLS, key=len, reverse=True)
 
         def _extract_underlying(contract: str) -> str:
             for u in _UND_BY_LEN:
@@ -338,13 +327,25 @@ elif page == "Strategies":
                 if not is_active and paused_reason:
                     st.caption(f"Paused: {paused_reason}")
 
+                # Auto-kill health — how close this strategy is to being paused for
+                # statistical deterioration, not just whether it currently is.
+                _rpf, _rdd = health.get("rolling_pf"), health.get("rolling_drawdown")
+                _pff, _ddt = health.get("pf_floor"),   health.get("dd_threshold")
+                if _rpf is not None or _rdd is not None:
+                    _bits = []
+                    if _rpf is not None and _pff is not None:
+                        _bits.append(f"Rolling PF {_rpf:.2f} (auto-pause below {_pff:.2f})")
+                    if _rdd is not None and _ddt is not None:
+                        _bits.append(f"Rolling drawdown {fmt_inr(_rdd)} (auto-pause at {fmt_inr(_ddt)})")
+                    st.caption(f"Health ({health.get('trades_in_window', 0)} recent trades): " + " · ".join(_bits))
+
                 act_col, deact_col, _ = st.columns([1, 1, 5])
                 if act_col.button("Activate", key=f"act_{sid}", disabled=is_active):
                     r = requests.post(f"{API_BASE_URL}/strategies/activate", json={"strategy_id": sid})
                     st.success("Activated." if r.ok else r.text)
                     st.rerun()
                 if deact_col.button("Pause", key=f"deact_{sid}", disabled=not is_active):
-                    r = requests.post(f"{API_BASE}/strategies/deactivate", json={"strategy_id": sid})
+                    r = requests.post(f"{API_BASE_URL}/strategies/deactivate", json={"strategy_id": sid})
                     st.success("Paused." if r.ok else r.text)
                     st.rerun()
 
@@ -353,6 +354,14 @@ elif page == "Strategies":
 
 elif page == "Risk & PnL":
     st.title("Risk Engine & PnL Report")
+
+    ks_status = fetch("admin/kill-switch") or {}
+    if ks_status.get("active"):
+        st.error(
+            f"🔴 Kill switch ACTIVE — no new entries can be placed. "
+            f"Reason: {ks_status.get('reason') or 'unknown'}. Reset from the Admin tab."
+        )
+        st.markdown("---")
 
     positions  = fetch("positions") or []
     orders     = fetch("orders") or []
@@ -481,27 +490,35 @@ elif page == "Analytics":
 
         # ── By symbol ──────────────────────────────────────────────────────
         col_l, col_r = st.columns(2)
+        # by_sym is pre-sorted descending by total_pnl. Split by the SIGN of total_pnl
+        # rather than taking top-10 / bottom-10 of the whole list — with fewer than 10
+        # distinct symbols (the common case early on), a naive top/bottom split shows
+        # the exact same symbols in both boxes, just reversed (e.g. a single losing
+        # symbol among 3 total would appear as both a "best" and a "worst" symbol).
+        winners = [s for s in by_sym if s["total_pnl"] > 0]
+        losers  = list(reversed([s for s in by_sym if s["total_pnl"] < 0]))
+
+        def _render_symbol_table(rows):
+            df = pd.DataFrame(rows)
+            df["total_pnl"] = df["total_pnl"].apply(fmt_inr)
+            df["avg_pnl"]   = df["avg_pnl"].apply(fmt_inr)
+            df["win_rate"]  = df["win_rate"].apply(lambda v: f"{v*100:.1f}%")
+            df.columns      = ["Symbol", "Trades", "Total PnL", "Avg PnL", "Win Rate"]
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
         with col_l:
             st.subheader("Best Symbols")
-            if by_sym:
-                top = by_sym[:10]
-                df_sym = pd.DataFrame(top)
-                df_sym["total_pnl"] = df_sym["total_pnl"].apply(lambda v: fmt_inr(v))
-                df_sym["avg_pnl"]   = df_sym["avg_pnl"].apply(lambda v: fmt_inr(v))
-                df_sym["win_rate"]  = df_sym["win_rate"].apply(lambda v: f"{v*100:.1f}%")
-                df_sym.columns      = ["Symbol", "Trades", "Total PnL", "Avg PnL", "Win Rate"]
-                st.dataframe(df_sym, use_container_width=True, hide_index=True)
+            if winners:
+                _render_symbol_table(winners[:10])
+            else:
+                st.info("No profitable symbols yet.")
 
         with col_r:
             st.subheader("Worst Symbols")
-            if by_sym:
-                bot = list(reversed(by_sym))[:10]
-                df_bot = pd.DataFrame(bot)
-                df_bot["total_pnl"] = df_bot["total_pnl"].apply(lambda v: fmt_inr(v))
-                df_bot["avg_pnl"]   = df_bot["avg_pnl"].apply(lambda v: fmt_inr(v))
-                df_bot["win_rate"]  = df_bot["win_rate"].apply(lambda v: f"{v*100:.1f}%")
-                df_bot.columns      = ["Symbol", "Trades", "Total PnL", "Avg PnL", "Win Rate"]
-                st.dataframe(df_bot, use_container_width=True, hide_index=True)
+            if losers:
+                _render_symbol_table(losers[:10])
+            else:
+                st.info("No losing symbols yet.")
 
         st.markdown("---")
 
@@ -626,6 +643,32 @@ elif page == "Admin":
                 if result:
                     st.warning("Email alerts paused.")
                     st.rerun()
+
+    st.markdown("---")
+
+    # ── Kill Switch ──────────────────────────────────────────────────────────
+    st.subheader("Kill Switch")
+    ks_status  = fetch("admin/kill-switch") or {}
+    ks_active  = ks_status.get("active", False)
+
+    if ks_active:
+        st.error(
+            f"Kill switch is ACTIVE — no new entries can be placed. "
+            f"Reason: {ks_status.get('reason') or 'unknown'} "
+            f"(tripped at {ks_status.get('activated_at') or 'unknown time'} UTC)"
+        )
+        st.caption("Existing positions can still be closed — only new entries are blocked.")
+        st.markdown(
+            "Confirm the underlying issue is actually resolved before resetting — "
+            "this does not re-check anything, it only unblocks new entries."
+        )
+        if st.button("Reset Kill Switch", type="primary"):
+            result = post("admin/kill-switch/reset")
+            if result:
+                st.success("Kill switch reset. New entries can resume.")
+                st.rerun()
+    else:
+        st.success("Kill switch is inactive — trading is not blocked.")
 
     st.markdown("---")
 
