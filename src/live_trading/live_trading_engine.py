@@ -872,6 +872,17 @@ class LiveTradingEngine:
         expiry = get_near_month_expiry()
         dte    = (expiry - now_ist().replace(tzinfo=None)).days
 
+        # Single-leg positions are only ever opened by EMA Crossover, so only that
+        # strategy's manage_position() is relevant here. Previously this called every
+        # loaded strategy's manage_position() with EMA-shaped args ({"avg_price",
+        # "peak_premium"}) — harmless today only because CreditSpread/IronCondor both
+        # default a missing "short_premium" to 0 and return HOLD, but fragile: a future
+        # strategy without that same defensive guard could produce a false exit here.
+        ema_strategy = next(
+            (s for s in active_strategies.values()
+             if s.__class__.__name__ == "EMACrossoverStrategy"), None
+        )
+
         managed: set = set()
         for s in self._active_spreads.values():
             managed.update([s.get("short_contract", ""), s.get("long_contract", "")])
@@ -916,18 +927,16 @@ class LiveTradingEngine:
             if dte < 4:
                 exit_reason = f"DTE={dte} — entering illiquid expiry window"
 
-            if exit_reason is None:
-                for strategy in active_strategies.values():
-                    result = strategy.manage_position(
-                        {"avg_price": entry_p, "peak_premium": peak}, current_p
+            if exit_reason is None and ema_strategy is not None:
+                result = ema_strategy.manage_position(
+                    {"avg_price": entry_p, "peak_premium": peak}, current_p
+                )
+                if result == "EXIT":
+                    pnl_pct = (current_p - entry_p) / entry_p * 100
+                    exit_reason = (
+                        f"{ema_strategy.name} entry=Rs{entry_p:.2f} "
+                        f"now=Rs{current_p:.2f} ({pnl_pct:+.1f}%)"
                     )
-                    if result == "EXIT":
-                        pnl_pct = (current_p - entry_p) / entry_p * 100
-                        exit_reason = (
-                            f"{strategy.name} entry=Rs{entry_p:.2f} "
-                            f"now=Rs{current_p:.2f} ({pnl_pct:+.1f}%)"
-                        )
-                        break
 
             if exit_reason:
                 logger.info(f"EXIT [{contract}]: {exit_reason}")
@@ -951,6 +960,9 @@ class LiveTradingEngine:
                             exit_reason=exit_reason,
                             market_data=md,
                             total_slippage_pts=round(_slip, 4) if _slip > 0 else None,
+                        )
+                        self.risk_manager.release_deployed_capital(
+                            info.get("strategy_name", "ema_crossover_v1"), entry_p * abs(qty),
                         )
                         await self._persist_state()
 
@@ -1144,6 +1156,9 @@ class LiveTradingEngine:
                     pnl=pnl,
                     exit_reason=f"Reversal exit ({opposite_type} signal)",
                     market_data=market_data,
+                )
+                self.risk_manager.release_deployed_capital(
+                    jrnl.get("strategy_name", "ema_crossover_v1"), entry_p * abs(qty),
                 )
                 await self._persist_state()
 
@@ -1484,7 +1499,8 @@ class LiveTradingEngine:
             from src.market_data.option_chain import get_option_quote as _gq
             _unwind_p = await _gq(short_contract, getattr(self, "_kite", None), getattr(self, "_redis", None)) or short_p
             _unwind_order = await self.order_manager.place_order(
-                short_contract, "BUY", lot_size, _unwind_p, is_spread_leg=True
+                short_contract, "BUY", lot_size, _unwind_p,
+                is_spread_leg=True, is_exit_order=True,
             )
             _bad_uw = {"REJECTED", "REJECTED_BY_RISK", "CANCELLED", "FAILED"}
             if _unwind_order is None or getattr(_unwind_order, "order_status", "") in _bad_uw:
@@ -1633,10 +1649,16 @@ class LiveTradingEngine:
                             )
 
             # DTE-tiered profit target — accept less profit as gamma risk rises near expiry.
-            # DTE > 21: 75% profit; DTE 15–21: 65%; DTE 8–14: 55%; DTE ≤ 7: 45%.
-            # (DTE ≤ 7 is caught by min_dte above, but the threshold is set defensively.)
+            # Base tier (DTE > 21) comes from the strategy's own profit_close_pct so tuning
+            # that parameter actually changes behavior (it previously didn't — the engine
+            # hardcoded 0.25 here, matching iron condor's already-correct pattern below).
+            # DTE 15–21: 65% profit; DTE 8–14: 55% profit; DTE ≤ 7 is caught by min_dte above.
             if exit_reason is None:
-                _dte_profit_pct = 0.25 if dte > 21 else (0.35 if dte > 14 else 0.45)
+                _dte_profit_pct = getattr(cs_strategy, "profit_close_pct", 0.25) if cs_strategy else 0.25
+                if dte <= 14:
+                    _dte_profit_pct = max(_dte_profit_pct, 0.45)
+                elif dte <= 21:
+                    _dte_profit_pct = max(_dte_profit_pct, 0.35)
                 if cur_short <= spread["short_premium"] * _dte_profit_pct:
                     _captured = round((1 - cur_short / spread["short_premium"]) * 100, 1)
                     exit_reason = (
@@ -1744,13 +1766,14 @@ class LiveTradingEngine:
             # C: remove from near-expiry set
             self._close_on_first_cycle.discard(underlying)
 
-            # Route to profit or adverse bucket for re-entry eligibility
-            _adverse_kw = ("breach", "Breach", "SL:", " SL ", "spike SL", "Regime shift",
-                           "Near-expiry", "forced close")
-            if any(kw in exit_reason for kw in _adverse_kw):
+            # Route to profit or adverse bucket for re-entry eligibility — by realized
+            # P&L, not by scanning exit_reason text. A plain DTE-floor timeout ("DTE=6
+            # < 7") matches no adverse keyword even when the position lost money, which
+            # previously let losing trades qualify for the lenient same-day re-entry
+            # floor meant for genuine wins.
+            if net_pnl < 0:
                 adverse_closes.append(underlying)
             else:
-                # DTE exit, profit target, or VIX spike profit — premium decayed, we won
                 profit_closes.append(underlying)
 
         for sym in adverse_closes:
@@ -2045,7 +2068,9 @@ class LiveTradingEngine:
                 for (c, s, p, _) in placed:
                     rev = "BUY" if s == "SELL" else "SELL"
                     _unwind_p = await _gq(c, getattr(self, "_kite", None), getattr(self, "_redis", None)) or p
-                    _uw = await self.order_manager.place_order(c, rev, lot_size, _unwind_p, is_spread_leg=True)
+                    _uw = await self.order_manager.place_order(
+                        c, rev, lot_size, _unwind_p, is_spread_leg=True, is_exit_order=True,
+                    )
                     if _uw is None or getattr(_uw, "order_status", "") in _bad_uw:
                         _failed_unwinds.append(f"{rev} {c}")
                 if _failed_unwinds:
@@ -2331,10 +2356,10 @@ class LiveTradingEngine:
             # C: remove from near-expiry set
             self._close_on_first_cycle.discard(underlying)
 
-            # Route to profit or adverse bucket for re-entry eligibility
-            _adverse_kw_c = ("breach", "Breach", "SL:", " SL ", "spike SL", "Regime shift",
-                             "Near-expiry", "forced close")
-            if any(kw in exit_reason for kw in _adverse_kw_c):
+            # Route to profit or adverse bucket for re-entry eligibility — by realized
+            # P&L (see matching comment in _check_spread_exits for why text-matching
+            # the exit reason was wrong).
+            if net_pnl < 0:
                 to_close_adverse_c.append(underlying)
             else:
                 to_close_profit_c.append(underlying)
@@ -2412,6 +2437,7 @@ class LiveTradingEngine:
         positions = await self._safe_get_positions()
         closed_ema = 0
         closed_expiry = 0
+        _exit_prices: Dict[str, float] = {}   # contract -> exit price, for expiry-day journal below
 
         for pos in positions:
             qty = pos.get("quantity", 0)
@@ -2442,6 +2468,7 @@ class LiveTradingEngine:
 
             await self.order_manager.place_order(contract, side, abs(qty), exit_p, is_exit_order=True)
             self._peak_premiums.pop(contract, None)
+            _exit_prices[contract] = exit_p
 
             # Write exit to trade journal so EOD/expiry closes appear in PnL analytics
             _jrnl_info = self._single_leg_journals.pop(contract, None)
@@ -2455,6 +2482,10 @@ class LiveTradingEngine:
                     exit_price=exit_p,
                     pnl=_pnl,
                     exit_reason=_reason,
+                )
+                self.risk_manager.release_deployed_capital(
+                    _jrnl_info.get("strategy_name", "ema_crossover_v1"),
+                    _entry_p * abs(qty),
                 )
 
             if is_expiry:
@@ -2470,6 +2501,47 @@ class LiveTradingEngine:
             for _c in self._active_condors.values():
                 await self._cancel_gtt(_c.get("put_short_gtt_id"),  _c.get("put_short_contract",  ""))
                 await self._cancel_gtt(_c.get("call_short_gtt_id"), _c.get("call_short_contract", ""))
+
+            # Log trade_journal close for spread/condor structures force-closed above.
+            # Their legs aren't in _single_leg_journals (that dict is EMA-only), so the
+            # per-leg loop above can't log them — without this, these trades would keep
+            # exit_time/pnl = NULL forever despite being genuinely closed by real orders.
+            for _s in self._active_spreads.values():
+                _short_x = _exit_prices.get(_s.get("short_contract", ""), _s.get("short_premium", 0))
+                _long_x  = _exit_prices.get(_s.get("long_contract", ""),  _s.get("long_premium", 0))
+                _lot     = _s.get("lot_size", 0)
+                _net     = ((_s.get("short_premium", 0) - _short_x) - (_s.get("long_premium", 0) - _long_x)) * _lot
+                self.risk_manager.release_deployed_capital(
+                    _s.get("strategy_name", "credit_spread_v1"), _s.get("long_premium", 0) * _lot,
+                )
+                await self._log_trade_close(
+                    journal_id=_s.get("journal_id"),
+                    exit_price=round(_short_x - _long_x, 2),
+                    pnl=round(_net, 2),
+                    exit_reason=f"Expiry day force-close (DTE={dte})",
+                )
+            for _c in self._active_condors.values():
+                _ps_x = _exit_prices.get(_c.get("put_short_contract", ""),  _c.get("put_short_premium", 0))
+                _pl_x = _exit_prices.get(_c.get("put_long_contract", ""),   _c.get("put_long_premium", 0))
+                _cs_x = _exit_prices.get(_c.get("call_short_contract", ""), _c.get("call_short_premium", 0))
+                _cl_x = _exit_prices.get(_c.get("call_long_contract", ""),  _c.get("call_long_premium", 0))
+                _lot_c = _c.get("lot_size", 0)
+                _net_c = (
+                    (_c.get("put_short_premium", 0)  - _ps_x)
+                    + (_c.get("call_short_premium", 0) - _cs_x)
+                    - (_c.get("put_long_premium", 0)   - _pl_x)
+                    - (_c.get("call_long_premium", 0)  - _cl_x)
+                ) * _lot_c
+                self.risk_manager.release_deployed_capital(
+                    _c.get("strategy_name", "iron_condor_v1"),
+                    (_c.get("put_long_premium", 0) + _c.get("call_long_premium", 0)) * _lot_c,
+                )
+                await self._log_trade_close(
+                    journal_id=_c.get("journal_id"),
+                    exit_price=round(_ps_x + _cs_x - _pl_x - _cl_x, 2),
+                    pnl=round(_net_c, 2),
+                    exit_reason=f"Expiry day force-close (DTE={dte})",
+                )
 
             # Full expiry-day clear — all positions force-closed
             self._active_spreads.clear()

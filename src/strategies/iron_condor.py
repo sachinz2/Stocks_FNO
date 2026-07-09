@@ -98,6 +98,13 @@ class IronCondorStrategy(StrategyBase):
         Called by the engine with 'short_premium' (original sold price of that wing's short leg).
         Returns 'EXIT' if the wing's stop or profit target is triggered, else 'HOLD'.
         The engine closes the ENTIRE condor when either wing returns EXIT.
+
+        NOT actually called by the live engine: _check_condor_exits() in
+        live_trading_engine.py reimplements this same threshold logic inline instead,
+        since a condor needs both wings evaluated independently against different
+        strikes in the same pass, which this single-wing signature can't express in
+        one call. Kept only to satisfy StrategyBase's abstract-method contract — the
+        two implementations should be kept in sync by hand if either changes.
         """
         short_premium = float(current_position.get("short_premium") or 0)
         if short_premium <= 0:

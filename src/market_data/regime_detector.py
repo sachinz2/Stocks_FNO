@@ -61,13 +61,6 @@ REGIME_STRATEGY_MAP: Dict[str, list] = {
     "LOW_VOL":     [STRATEGY_SPREAD, STRATEGY_CONDOR],   # quiet market = premium seller heaven
 }
 
-# Regimes where each strategy is explicitly forbidden
-STRATEGY_DISABLE_IN: Dict[str, list] = {
-    STRATEGY_EMA:    ["RANGE_BOUND", "LOW_VOL"],   # EMA whipsaws in flat markets
-    STRATEGY_CONDOR: ["TRENDING", "VOLATILE"],      # condors blow up in big moves
-    STRATEGY_SPREAD: [],                            # credit spreads allowed in all regimes
-}
-
 
 class MarketRegimeDetector:
     """

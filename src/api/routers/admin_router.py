@@ -133,6 +133,48 @@ async def get_email_alert_status(request: Request):
     }
 
 
+@router.get("/kill-switch")
+async def get_kill_switch_status(request: Request):
+    """Return whether the risk-manager kill switch is currently tripped, and why."""
+    engine = getattr(request.app.state, "trading_engine", None)
+    if not engine:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Trading engine not initialised."
+        )
+    return engine.risk_manager.get_kill_switch_status()
+
+
+@router.post("/kill-switch/reset")
+async def reset_kill_switch(request: Request):
+    """
+    Clear a tripped kill switch so new entries can resume.
+
+    The kill switch trips on the 5% daily loss limit or a missing Zerodha
+    token at market open, and blocks every new entry (existing positions can
+    still be closed) until this is called. Previously the only way to clear
+    it was restarting the whole platform. Confirm the underlying issue is
+    actually resolved before calling this — it does not re-check anything,
+    it only unblocks new entries.
+    """
+    engine = getattr(request.app.state, "trading_engine", None)
+    if not engine:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Trading engine not initialised."
+        )
+    was_active = engine.risk_manager.rules.get("kill_switch_active", False)
+    prior_reason = engine.risk_manager.kill_switch_reason
+    engine.risk_manager.deactivate_kill_switch()
+    logger.warning(f"Kill switch reset via admin API (was_active={was_active}, prior_reason={prior_reason!r})")
+    return {
+        "status": "ok",
+        "was_active": was_active,
+        "prior_reason": prior_reason,
+        "kill_switch": engine.risk_manager.get_kill_switch_status(),
+    }
+
+
 @router.post("/reset-iv-history")
 async def reset_iv_history(request: Request):
     """

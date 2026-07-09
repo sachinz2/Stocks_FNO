@@ -4,7 +4,7 @@ import math
 from datetime import date, datetime, timedelta
 import pytz
 
-from src.core.constants import FNO_LOT_SIZES, FNO_STRIKE_INTERVALS
+from src.core.constants import FIVE_MIN_ATR_DAILY_SCALE, FNO_LOT_SIZES, FNO_STRIKE_INTERVALS
 
 logger = logging.getLogger(__name__)
 
@@ -194,8 +194,8 @@ def estimate_option_premium(
         T = dte / 365.0
         if atr > 0 and underlying_price > 0:
             # atr14 from LTPPoller is computed on 5-min candles; convert to daily ATR
-            # proxy before annualising: daily_ATR ≈ 5min_ATR × √(75 bars/day)
-            _daily_atr = atr * (75 ** 0.5)
+            # proxy before annualising (see FIVE_MIN_ATR_DAILY_SCALE in core/constants.py)
+            _daily_atr = atr * FIVE_MIN_ATR_DAILY_SCALE
             daily_vol  = _daily_atr / underlying_price
             sigma = daily_vol * math.sqrt(252)
             sigma = max(0.05, min(sigma, 2.0))

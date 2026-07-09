@@ -269,7 +269,8 @@ def find_delta_strike(
     Find the strike K whose Black-Scholes delta is closest to target_delta.
     target_delta: positive for CE (e.g. 0.20), negative for PE (e.g. -0.20)
 
-    Binary searches within ±20 strikes from ATM.
+    Linear scan over 33 candidate strikes (2 ITM to 30 OTM from ATM) — cheap enough
+    at this size that a binary search isn't worth the complexity.
     Returns the nearest valid strike (rounded to strike_interval).
     """
     T = max(dte, 1) / 365.0

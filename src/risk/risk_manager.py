@@ -1,5 +1,6 @@
 import logging
 from collections import defaultdict
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from src.core.constants import (
@@ -38,6 +39,8 @@ class RiskManager:
             "circuit_breaker_active":     False,
             "kill_switch_active":         False,
         }
+        self.kill_switch_reason: Optional[str] = None
+        self.kill_switch_activated_at: Optional[str] = None
 
         self.current_open_positions: List[Dict[str, Any]] = []
         self.daily_realized_pnl:   float = 0.0
@@ -83,10 +86,21 @@ class RiskManager:
     def activate_kill_switch(self, reason: str) -> None:
         logger.critical(f"KILL SWITCH ACTIVATED: {reason}")
         self.rules["kill_switch_active"] = True
+        self.kill_switch_reason = reason
+        self.kill_switch_activated_at = datetime.utcnow().isoformat()
 
     def deactivate_kill_switch(self) -> None:
         logger.warning("KILL SWITCH DEACTIVATED. Trading resumed.")
         self.rules["kill_switch_active"] = False
+        self.kill_switch_reason = None
+        self.kill_switch_activated_at = None
+
+    def get_kill_switch_status(self) -> Dict[str, Any]:
+        return {
+            "active":       self.rules["kill_switch_active"],
+            "reason":       self.kill_switch_reason,
+            "activated_at": self.kill_switch_activated_at,
+        }
 
     # ── Core validation ───────────────────────────────────────────────────────
 

@@ -121,11 +121,15 @@ FNO_SECTORS = {
     "COALINDIA":   "Mining",
 }
 
-# Capital fraction allocated to each strategy (must sum to <= 1.0)
+# Capital fraction allocated to each strategy (must sum to <= 1.0).
+# Keys must match the instance_id StrategyRegistry.load_strategy() is called with in
+# api/main.py (e.g. "ema_crossover_v1") — that's the exact string RiskManager sees as
+# strategy_name at every order call, not the uppercase registry name used to look up
+# the strategy CLASS. A mismatch here makes this budget check silently never fire.
 STRATEGY_CAPITAL_ALLOCATION = {
-    "EMA_CROSSOVER": 0.40,   # ₹1,20,000 at ₹3L capital
-    "CREDIT_SPREAD": 0.40,   # ₹1,20,000
-    "IRON_CONDOR":   0.20,   # ₹60,000
+    "ema_crossover_v1": 0.40,   # ₹1,20,000 at ₹3L capital
+    "credit_spread_v1": 0.40,   # ₹1,20,000
+    "iron_condor_v1":   0.20,   # ₹60,000
 }
 
 # Max open structures per sector (prevents correlated blow-ups)
