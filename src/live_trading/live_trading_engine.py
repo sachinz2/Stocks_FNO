@@ -21,6 +21,7 @@ from src.core.utils import (
     build_option_symbol,
     estimate_option_premium,
     get_atm_strike,
+    get_entry_expiry,
     get_lot_size,
     get_near_month_expiry,
     is_market_open,
@@ -1174,6 +1175,9 @@ class LiveTradingEngine:
         #   the min_dte=7 exit fires. At DTE 25 → enter; at DTE 18 → already in position.
         #   Re-entries after a profitable same-day close use a lower floor (DTE ≥ 14) since
         #   we proved the position was directionally correct and collected premium once already.
+        #   If the near-month contract itself is short on runway for a *fresh* entry, roll
+        #   straight to next month instead of going dark until the 7-day exit rollover —
+        #   otherwise every symbol is unenterable for ~2 weeks before each monthly expiry.
         _ENTRY_MIN_DTE   = 21
         _REENTRY_MIN_DTE = 14
         if symbol in self._profit_closed_today:
@@ -1187,11 +1191,12 @@ class LiveTradingEngine:
                 f"[CreditSpread] {symbol} re-entering after same-day profit close (DTE={dte})"
             )
         elif dte < _ENTRY_MIN_DTE:
+            expiry = get_entry_expiry(_ENTRY_MIN_DTE)
+            dte    = (expiry - now.replace(tzinfo=None)).days
             logger.info(
-                f"[CreditSpread] {symbol} skipped — DTE={dte} < {_ENTRY_MIN_DTE} entry floor, "
-                "not enough theta runway."
+                f"[CreditSpread] {symbol} near-month DTE < {_ENTRY_MIN_DTE} — "
+                f"rolling fresh entry to next month's expiry (DTE={dte})"
             )
-            return
 
         # No new entries after 14:30 IST — at least one exit-check cycle before
         # the 15:20 EOD window, and avoids rushed afternoon entries.
@@ -1779,6 +1784,8 @@ class LiveTradingEngine:
 
         # Same DTE floor logic as credit spreads:
         #   Fresh entries need DTE ≥ 21. Re-entries after same-day profit close need DTE ≥ 14.
+        #   If the near-month contract is short on runway for a fresh entry, roll straight to
+        #   next month rather than going dark until the 7-day exit rollover kicks in.
         _ENTRY_MIN_DTE   = 21
         _REENTRY_MIN_DTE = 14
         if symbol in self._profit_closed_today:
@@ -1792,11 +1799,12 @@ class LiveTradingEngine:
                 f"[IronCondor] {symbol} re-entering after same-day profit close (DTE={dte})"
             )
         elif dte < _ENTRY_MIN_DTE:
+            expiry = get_entry_expiry(_ENTRY_MIN_DTE)
+            dte    = (expiry - now.replace(tzinfo=None)).days
             logger.info(
-                f"[IronCondor] {symbol} skipped — DTE={dte} < {_ENTRY_MIN_DTE} entry floor, "
-                "not enough theta runway."
+                f"[IronCondor] {symbol} near-month DTE < {_ENTRY_MIN_DTE} — "
+                f"rolling fresh entry to next month's expiry (DTE={dte})"
             )
-            return
 
         # No new entries after 14:30 IST — at least one exit-check cycle before
         # the 15:20 EOD window, and avoids rushed afternoon entries.

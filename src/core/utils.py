@@ -129,6 +129,28 @@ def get_near_month_expiry() -> datetime:
     return expiry
 
 
+def get_entry_expiry(min_dte: int) -> datetime:
+    """
+    Return the expiry to use for a *fresh* credit-spread/iron-condor entry.
+
+    get_near_month_expiry() only rolls to next month once DTE < 7, but fresh
+    entries require DTE >= min_dte (typically 21) for enough theta runway.
+    Without this, the near-month contract sits in a dead zone for ~2 weeks
+    before every monthly expiry — still "current" (DTE >= 7) but too close
+    for a new position (DTE < min_dte) — and no new trades can be placed at
+    all until the 7-day rollover finally kicks in. Roll straight to next
+    month instead so fresh entries always have adequate runway.
+    """
+    today = datetime.now(IST).replace(tzinfo=None)
+    expiry = get_near_month_expiry()
+    if (expiry - today).days < min_dte:
+        if expiry.month == 12:
+            expiry = _last_thursday(expiry.year + 1, 1)
+        else:
+            expiry = _last_thursday(expiry.year, expiry.month + 1)
+    return expiry
+
+
 def build_option_symbol(symbol: str, strike: int, option_type: str, expiry: datetime = None) -> str:
     """
     Build the NSE/Zerodha tradingsymbol for a stock option.
