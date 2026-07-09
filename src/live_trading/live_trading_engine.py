@@ -54,6 +54,7 @@ _REDIS_SINGLE_LEG_JRNL = "engine:single_leg_journals"
 _REDIS_EXITED_TODAY    = "engine:exited_today"
 _REDIS_PROFIT_CLOSED   = "engine:profit_closed_today"
 _REDIS_ORDER_COUNT     = "engine:order_count"
+_REDIS_EMA_STATE       = "engine:ema_crossover_state"
 
 
 class LiveTradingEngine:
@@ -99,6 +100,10 @@ class LiveTradingEngine:
         self._active_condors:       Dict[str, Dict[str, Any]] = {}
         self._exited_today:         set = set()   # adverse exits today — blocks same-day re-entry
         self._profit_closed_today:  set = set()   # profit exits today — allows re-entry with lower DTE floor
+        # is_square_off_time() is true for the whole 15:20-15:30 window, and
+        # run_signal_cycle() calls _square_off_all() every minute in that window —
+        # this stops the EOD/expiry notification from being re-sent on every cycle.
+        self._eod_notified_today:  bool = False
         # Maps option contract → {journal_id, underlying, strategy_name}
         # so _check_open_option_exits can write the exit to trade_journal.
         self._single_leg_journals:  Dict[str, Dict[str, Any]] = {}
@@ -164,6 +169,7 @@ class LiveTradingEngine:
     async def start(self) -> None:
         self.is_running = True
         await self._restore_state()
+        await self._restore_ema_state()
         logger.info(f"Trading engine STARTED — {self.mode.value.upper()} mode")
 
     async def stop(self) -> None:
@@ -176,6 +182,7 @@ class LiveTradingEngine:
     async def on_market_open(self) -> None:
         logger.info("Market OPEN — 09:15 IST")
         self._today_order_count = 0
+        self._eod_notified_today = False
         self.risk_manager.reset_daily_state()
 
         # Rebuild per-strategy deployed capital from overnight multi-day positions so
@@ -296,6 +303,10 @@ class LiveTradingEngine:
                 except Exception as exc:
                     logger.error(f"Signal error [{strategy_id}:{symbol}]: {exc}")
 
+        # Persist EMA crossover's per-symbol confirmation progress every cycle so a
+        # restart mid-confirmation doesn't silently reset it back to zero.
+        await self._persist_ema_state()
+
     async def sync_orders(self) -> None:
         try:
             await self.order_manager.sync_orders()
@@ -404,6 +415,66 @@ class LiveTradingEngine:
             await redis.set(_REDIS_ORDER_COUNT,   json.dumps({"date": today, "count": self._today_order_count}))
         except Exception as e:
             logger.error(f"Failed to persist engine state: {e}")
+
+    def _find_ema_strategy(self):
+        """Return the loaded EMACrossoverStrategy instance, if any."""
+        for inst in StrategyRegistry.get_active_strategies().values():
+            if inst.__class__.__name__ == "EMACrossoverStrategy":
+                return inst
+        return None
+
+    async def _persist_ema_state(self) -> None:
+        """
+        Persist EMA Crossover's per-symbol crossover-confirmation state every cycle.
+
+        Every deploy/restart re-creates the strategy instance from scratch, wiping
+        prev_fast_ema/prev_slow_ema/_pending_signal/_pending_count/_pending_bar_key —
+        a crossover that was 1 bar away from confirming has to start over from zero.
+        During active development (frequent deploys), this can silently prevent the
+        strategy from ever completing a 2-bar confirmation. Persisted separately from
+        _persist_state() (position/order state) because this needs saving every
+        cycle regardless of whether any position actually changed.
+        """
+        redis = getattr(self, "_redis", None)
+        if not redis:
+            return
+        strategy = self._find_ema_strategy()
+        if not strategy:
+            return
+        try:
+            await redis.set(_REDIS_EMA_STATE, json.dumps({
+                "prev_fast_ema":   strategy.prev_fast_ema,
+                "prev_slow_ema":   strategy.prev_slow_ema,
+                "pending_signal":  strategy._pending_signal,
+                "pending_count":   strategy._pending_count,
+                "pending_bar_key": strategy._pending_bar_key,
+            }))
+        except Exception as e:
+            logger.debug(f"Failed to persist EMA crossover state: {e}")
+
+    async def _restore_ema_state(self) -> None:
+        redis = getattr(self, "_redis", None)
+        if not redis:
+            return
+        strategy = self._find_ema_strategy()
+        if not strategy:
+            return
+        try:
+            raw = await redis.get(_REDIS_EMA_STATE)
+            if not raw:
+                return
+            state = json.loads(raw)
+            strategy.prev_fast_ema    = state.get("prev_fast_ema", {})
+            strategy.prev_slow_ema    = state.get("prev_slow_ema", {})
+            strategy._pending_signal  = state.get("pending_signal", {})
+            strategy._pending_count   = state.get("pending_count", {})
+            strategy._pending_bar_key = state.get("pending_bar_key", {})
+            logger.info(
+                f"Restored EMA crossover state: {len(strategy.prev_fast_ema)} symbol(s) tracked, "
+                f"{len(strategy._pending_signal)} pending confirmation(s)"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to restore EMA crossover state: {e}")
 
     async def _restore_state(self) -> None:
         redis = getattr(self, "_redis", None)
@@ -2547,7 +2618,8 @@ class LiveTradingEngine:
             self._active_spreads.clear()
             self._active_condors.clear()
             await self._persist_state()
-            if closed_expiry:
+            if closed_expiry and not self._eod_notified_today:
+                self._eod_notified_today = True
                 await self._notify(
                     f"EXPIRY SQUARE-OFF (DTE={dte})\n"
                     f"Force-closed {closed_expiry} position(s) to avoid assignment risk."
@@ -2565,7 +2637,8 @@ class LiveTradingEngine:
                     f"Holding overnight: {held_spreads} spread(s) + {held_condors} condor(s) "
                     f"(DTE={dte}). Exit conditions (SL/profit/DTE<7) active tomorrow."
                 )
-            if parts:
+            if parts and not self._eod_notified_today:
+                self._eod_notified_today = True
                 await self._notify("EOD POSITION UPDATE\n" + "\n".join(parts))
 
     # ── Trade Journal helpers ─────────────────────────────────────────────────

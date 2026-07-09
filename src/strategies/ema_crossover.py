@@ -26,11 +26,15 @@ class EMACrossoverStrategy(StrategyBase):
         self.min_dte: int = self.parameters.get("min_dte", 10)
         self.max_dte: int = self.parameters.get("max_dte", 25)
 
-        self.prev_fast_ema: Optional[float] = None
-        self.prev_slow_ema: Optional[float] = None
-        self._pending_signal: Optional[str] = None
-        self._pending_count: int = 0
-        self._pending_bar_key: Optional[str] = None  # tracks last 5-min bar seen
+        # Keyed by symbol — this single strategy instance evaluates every symbol in
+        # its rotating top-5 pool each cycle (see LiveTradingEngine.run_signal_cycle),
+        # so flat scalars here would let one symbol's EMA state leak into the next
+        # symbol's crossover check within the same cycle.
+        self.prev_fast_ema: Dict[str, float] = {}
+        self.prev_slow_ema: Dict[str, float] = {}
+        self._pending_signal: Dict[str, str] = {}
+        self._pending_count: Dict[str, int] = {}
+        self._pending_bar_key: Dict[str, str] = {}  # tracks last 5-min bar seen, per symbol
 
         logger.info(
             f"Initialized EMA Crossover '{self.name}' ({self.fast_period}/{self.slow_period}) | "
@@ -41,11 +45,14 @@ class EMACrossoverStrategy(StrategyBase):
     def generate_signal(self, data: Dict[str, Any]) -> Optional[str]:
         """
         Expects data dict containing:
+        - symbol: which underlying this tick belongs to — required to keep this
+          strategy's per-symbol crossover state straight across its rotating pool.
         - ema20 (or dynamic fast_period key)
         - ema50 (or dynamic slow_period key)
         - ohlc_bar_key (optional): changes once per 5-min bar; used so that
           signal_confirm_bars counts distinct completed candles, not engine cycles.
         """
+        symbol   = data.get("symbol", "")
         fast_ema = data.get(f"ema{self.fast_period}")
         slow_ema = data.get(f"ema{self.slow_period}")
         bar_key  = data.get("ohlc_bar_key")  # None in test/backtest contexts
@@ -55,49 +62,51 @@ class EMACrossoverStrategy(StrategyBase):
             return "HOLD"
 
         signal = "HOLD"
+        prev_fast = self.prev_fast_ema.get(symbol)
+        prev_slow = self.prev_slow_ema.get(symbol)
 
-        if self.prev_fast_ema is not None and self.prev_slow_ema is not None:
-            if self.prev_fast_ema <= self.prev_slow_ema and fast_ema > slow_ema:
+        if prev_fast is not None and prev_slow is not None:
+            if prev_fast <= prev_slow and fast_ema > slow_ema:
                 raw = "BUY"
-            elif self.prev_fast_ema >= self.prev_slow_ema and fast_ema < slow_ema:
+            elif prev_fast >= prev_slow and fast_ema < slow_ema:
                 raw = "SELL"
             else:
                 raw = None
 
             if raw is not None:
-                if raw != self._pending_signal:
+                if raw != self._pending_signal.get(symbol):
                     # New crossover direction — start fresh
-                    self._pending_signal = raw
-                    self._pending_count = 1
-                    self._pending_bar_key = bar_key
-                elif bar_key is None or bar_key != self._pending_bar_key:
+                    self._pending_signal[symbol] = raw
+                    self._pending_count[symbol] = 1
+                    self._pending_bar_key[symbol] = bar_key
+                elif bar_key is None or bar_key != self._pending_bar_key.get(symbol):
                     # Same direction AND we're on a new 5-min bar (or bar_key unavailable)
-                    self._pending_count += 1
-                    self._pending_bar_key = bar_key
+                    self._pending_count[symbol] = self._pending_count.get(symbol, 0) + 1
+                    self._pending_bar_key[symbol] = bar_key
                 # else: same bar as last cycle — don't double-count
 
-                if self._pending_count >= self.signal_confirm_bars:
+                if self._pending_count.get(symbol, 0) >= self.signal_confirm_bars:
                     logger.info(
-                        f"[{self.name}] {raw} confirmed after "
-                        f"{self._pending_count} bars — firing."
+                        f"[{self.name}] {symbol} {raw} confirmed after "
+                        f"{self._pending_count[symbol]} bars — firing."
                     )
                     signal = raw
-                    self._pending_signal = None
-                    self._pending_count = 0
-                    self._pending_bar_key = None
+                    self._pending_signal.pop(symbol, None)
+                    self._pending_count.pop(symbol, None)
+                    self._pending_bar_key.pop(symbol, None)
                 else:
                     logger.debug(
-                        f"[{self.name}] {raw} crossover pending "
-                        f"({self._pending_count}/{self.signal_confirm_bars} bars)"
+                        f"[{self.name}] {symbol} {raw} crossover pending "
+                        f"({self._pending_count.get(symbol, 0)}/{self.signal_confirm_bars} bars)"
                     )
             else:
                 # No crossover this bar — clear pending
-                self._pending_signal = None
-                self._pending_count = 0
-                self._pending_bar_key = None
+                self._pending_signal.pop(symbol, None)
+                self._pending_count.pop(symbol, None)
+                self._pending_bar_key.pop(symbol, None)
 
-        self.prev_fast_ema = fast_ema
-        self.prev_slow_ema = slow_ema
+        self.prev_fast_ema[symbol] = fast_ema
+        self.prev_slow_ema[symbol] = slow_ema
 
         return signal
 
@@ -150,15 +159,16 @@ class EMACrossoverStrategy(StrategyBase):
         return "HOLD"
 
     def on_pause(self) -> None:
-        """Clear the confirmation buffer so a stale crossover can't fire on resume."""
+        """Clear the confirmation buffer so a stale crossover can't fire on resume.
+        Per-symbol prev EMA values are kept — no need to re-warm the baseline."""
         if self._pending_signal:
             logger.info(
-                f"[{self.name}] on_pause: clearing pending {self._pending_signal} signal "
-                f"({self._pending_count} bars accumulated)."
+                f"[{self.name}] on_pause: clearing pending signals for "
+                f"{list(self._pending_signal.keys())}"
             )
-        self._pending_signal = None
-        self._pending_count  = 0
-        self._pending_bar_key = None
+        self._pending_signal.clear()
+        self._pending_count.clear()
+        self._pending_bar_key.clear()
 
     def shutdown(self):
         logger.info(f"Shutting down EMA Crossover Strategy '{self.name}'")
