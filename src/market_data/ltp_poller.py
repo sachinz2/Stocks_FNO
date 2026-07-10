@@ -43,6 +43,10 @@ _HISTORY_15M_REFRESH_SECONDS = 900  # reload 15-min OHLC every 15 min
 # ATR% thresholds that must match strategy parameters
 _LOW_VOL_THRESHOLD = 1.2   # below = low volatility regime
 _FLAT_EMA_THRESHOLD = 0.1  # EMA spread below = EMAs are flat (no direction)
+# EMA crossover candidates should be NEAR a cross, not deep in an already-established
+# trend — once EMA20/50 have diverged past this, the cross happened bars ago and the
+# strategy's sign-change detection structurally cannot fire again without a reversal.
+_EMA_PROXIMITY_CAP = 0.5
 
 
 class LTPPoller:
@@ -304,9 +308,14 @@ class LTPPoller:
         Score a symbol for all three strategy regimes.
         Returns (ema_score, spread_score, condor_score).
 
-        EMA Crossover score (high = volatile + trending):
-          ATR% × 0.6 + EMA_spread% × 0.4
-          → rewards momentum stocks making big directional moves
+        EMA Crossover score (high = volatile + NEAR a crossover):
+          ATR% × 0.6 + max(0, EMA_PROXIMITY_CAP - EMA_spread%) × 0.4
+          → rewards stocks moving enough to matter AND close to EMA20/50 crossing —
+            NOT stocks already deep in an established trend. The strategy fires on
+            the sign change between adjacent cycles; once the gap has widened past
+            EMA_PROXIMITY_CAP, that already happened several bars ago and can't
+            recur without a reversal, so wide-spread stocks score ~0 on this term
+            regardless of how much they're moving.
 
         Credit Spread score (high = low-vol + directional, 0 if ATR% >= 1.2%):
           (1.2 - ATR%) × 0.4 + EMA_spread% × 0.6
@@ -329,7 +338,9 @@ class LTPPoller:
         ema_spread_pct = abs(ema20 - ema50) / ema50 * 100 if ema50 > 0 else 0.0
 
         # Regime 1: EMA crossover — always gets a score
-        ema_score = round(atr_pct * 0.6 + ema_spread_pct * 0.4, 4)
+        ema_score = round(
+            atr_pct * 0.6 + max(0.0, _EMA_PROXIMITY_CAP - ema_spread_pct) * 0.4, 4
+        )
 
         # Regime 2: Credit spread — only when low vol
         if atr_pct < _LOW_VOL_THRESHOLD:
