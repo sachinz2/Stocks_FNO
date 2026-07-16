@@ -220,7 +220,15 @@ class LTPPoller:
             df = pd.DataFrame(records)
             # Keep "date" so _enrich can produce ohlc_bar_key for true-bar confirmation
             cols = [c for c in ["date", "open", "high", "low", "close", "volume"] if c in df.columns]
-            return df[cols].dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
+            df = df[cols].dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
+            # TEMP DIAGNOSTIC (2026-07-16): market:trend_stats was observed pinned at an
+            # identical ATR%/breadth value for 5+ hours across multiple sessions, only
+            # moving late afternoon — i.e. regime detector may be scoring off historical
+            # candles that aren't advancing intraday. This confirms whether the fetch
+            # itself returns a fresh last bar each 5-min refresh. Remove once confirmed.
+            if not df.empty and "date" in df.columns:
+                logger.info(f"OHLC refresh: {symbol} bars={len(df)} last_bar={df['date'].iloc[-1]}")
+            return df
         except Exception as e:
             logger.warning(f"kite.historical_data failed for {symbol}: {e}")
             return None

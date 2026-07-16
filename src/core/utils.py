@@ -103,29 +103,37 @@ def get_atm_strike(price: float, symbol: str) -> int:
     return int(round(price / interval) * interval)
 
 
-def _last_thursday(year: int, month: int) -> datetime:
-    """Return the last Thursday of the given month (NSE monthly expiry day)."""
+def _last_expiry_weekday(year: int, month: int) -> datetime:
+    """
+    Return the last NSE monthly-expiry weekday of the given month.
+
+    NSE rationalized F&O expiries in 2025, moving monthly expiry off
+    Thursday onto Tuesday (e.g. Aug 2026 expiry falls on Tue 25 Aug,
+    not the previously-hardcoded last Thursday). Update this constant
+    again if NSE changes the expiry weekday in the future.
+    """
+    EXPIRY_WEEKDAY = 1  # Monday=0 ... Tuesday=1 ... Sunday=6
     last_day = calendar.monthrange(year, month)[1]
     d = datetime(year, month, last_day)
-    while d.weekday() != 3:
+    while d.weekday() != EXPIRY_WEEKDAY:
         d -= timedelta(days=1)
     return d
 
 
 def get_near_month_expiry() -> datetime:
     """
-    Return the near-month NSE option expiry (last Thursday of the month).
+    Return the near-month NSE option expiry (last expiry weekday of the month).
     Rolls to next month if fewer than 7 calendar days remain — aligns with
     the entry min_dte=7 check so we never enter a position that immediately
     fails the DTE floor on the next cycle.
     """
     today = datetime.now(IST).replace(tzinfo=None)
-    expiry = _last_thursday(today.year, today.month)
+    expiry = _last_expiry_weekday(today.year, today.month)
     if (expiry - today).days < 7:
         if today.month == 12:
-            expiry = _last_thursday(today.year + 1, 1)
+            expiry = _last_expiry_weekday(today.year + 1, 1)
         else:
-            expiry = _last_thursday(today.year, today.month + 1)
+            expiry = _last_expiry_weekday(today.year, today.month + 1)
     return expiry
 
 
@@ -145,9 +153,9 @@ def get_entry_expiry(min_dte: int) -> datetime:
     expiry = get_near_month_expiry()
     if (expiry - today).days < min_dte:
         if expiry.month == 12:
-            expiry = _last_thursday(expiry.year + 1, 1)
+            expiry = _last_expiry_weekday(expiry.year + 1, 1)
         else:
-            expiry = _last_thursday(expiry.year, expiry.month + 1)
+            expiry = _last_expiry_weekday(expiry.year, expiry.month + 1)
     return expiry
 
 
