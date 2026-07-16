@@ -109,7 +109,14 @@ class ZerodhaTicker:
             self._ticker = ticker
 
             logger.info("ZerodhaTicker: connecting to Zerodha WebSocket...")
-            ticker.connect(threaded=False)  # blocks until close()
+            # threaded=True: we're already inside our own background thread (see start()
+            # above), not the interpreter's main thread. KiteTicker.connect() only skips
+            # installing Twisted's SIGTERM/SIGINT handlers (installSignalHandlers=False)
+            # when threaded=True — with threaded=False it assumes it owns the main thread
+            # and crashes with "signal only works in main thread of the main interpreter"
+            # on every startup. This call becomes non-blocking (KiteTicker spawns its own
+            # daemon thread for the reactor), which is fine — nothing runs after it here.
+            ticker.connect(threaded=True)
 
         except ImportError:
             logger.error("ZerodhaTicker: kiteconnect package not installed — pip install kiteconnect")
