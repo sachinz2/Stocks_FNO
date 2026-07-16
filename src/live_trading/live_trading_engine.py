@@ -493,13 +493,20 @@ class LiveTradingEngine:
                 logger.info(f"Restored {len(self._active_condors)} active condor(s)")
 
             # Discard stale spreads/condors from a previous expiry cycle.
-            # IMPORTANT: when DTE < 7 (min_dte), get_near_month_expiry() rolls to the
-            # next month. Active positions from the CURRENT expiry will then appear
-            # "stale" because their stored expiry_date != new current_expiry. Instead
-            # of discarding them (which would leave orphaned Zerodha positions), we
-            # flag them for immediate close in the next exit cycle (_close_on_first_cycle).
-            current_expiry = get_near_month_expiry().isoformat()
-            today_str      = now_ist().replace(tzinfo=None).date().isoformat()
+            # NOTE: compare each position's OWN stored expiry to today directly — do NOT
+            # compare against get_near_month_expiry(). Credit-spread/condor entries
+            # deliberately roll to the NEXT month whenever near-month DTE < _ENTRY_MIN_DTE
+            # (21) for adequate theta runway (see _process_credit_spread /
+            # _process_iron_condor), so a held position's expiry routinely differs from
+            # the near-month contract by design — that is not staleness. Previously this
+            # compared to current_expiry = get_near_month_expiry(), which force-closed
+            # every spread/condor holding a next-month contract on every restart —
+            # including ones weeks away from expiry. A restored position only needs a
+            # forced close if it has drifted inside the exit DTE floor (7) since entry,
+            # mirroring the same floor the regular exit cycle enforces below.
+            today_dt         = now_ist().replace(tzinfo=None)
+            today_str        = today_dt.date().isoformat()
+            _RESTORE_MIN_DTE = 7
 
             truly_stale_spreads: List[str] = []
             for sym, s in self._active_spreads.items():
@@ -513,14 +520,14 @@ class LiveTradingEngine:
                         "was not closed properly. Discarding from tracking."
                     )
                     truly_stale_spreads.append(sym)
-                elif stored != current_expiry:
-                    # DTE rolled near-month expiry forward; this position is near expiry.
-                    # Keep it in tracking and force-close in the next exit cycle.
-                    logger.warning(
-                        f"Spread {sym}: expiry {stored} != current near-month {current_expiry} "
-                        "— DTE roll detected. Flagging for immediate close."
-                    )
-                    self._close_on_first_cycle.add(sym)
+                else:
+                    dte = (datetime.fromisoformat(stored) - today_dt).days
+                    if dte < _RESTORE_MIN_DTE:
+                        logger.warning(
+                            f"Spread {sym}: expiry {stored} is {dte} day(s) out "
+                            f"(< {_RESTORE_MIN_DTE}) — near-expiry restore. Flagging for immediate close."
+                        )
+                        self._close_on_first_cycle.add(sym)
             for sym in truly_stale_spreads:
                 del self._active_spreads[sym]
 
@@ -535,12 +542,14 @@ class LiveTradingEngine:
                         "was not closed properly. Discarding from tracking."
                     )
                     truly_stale_condors.append(sym)
-                elif stored != current_expiry:
-                    logger.warning(
-                        f"Condor {sym}: expiry {stored} != current near-month {current_expiry} "
-                        "— DTE roll detected. Flagging for immediate close."
-                    )
-                    self._close_on_first_cycle.add(sym)
+                else:
+                    dte = (datetime.fromisoformat(stored) - today_dt).days
+                    if dte < _RESTORE_MIN_DTE:
+                        logger.warning(
+                            f"Condor {sym}: expiry {stored} is {dte} day(s) out "
+                            f"(< {_RESTORE_MIN_DTE}) — near-expiry restore. Flagging for immediate close."
+                        )
+                        self._close_on_first_cycle.add(sym)
             for sym in truly_stale_condors:
                 del self._active_condors[sym]
             jrnl_raw = await redis.get(_REDIS_SINGLE_LEG_JRNL)
