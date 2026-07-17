@@ -225,6 +225,35 @@ def now_ist() -> datetime:
     return datetime.now(IST)
 
 
+def update_live_day_range(tick: dict, ltp: float) -> dict:
+    """
+    Maintain today's running open/high/low on a tick dict from live LTP updates,
+    in place. Called by ZerodhaTicker (WebSocket) and ZerodhaLTPPoller (REST
+    fallback) on every price update.
+
+    This is the SECONDARY price-range source. PRIMARY is Zerodha's
+    historical_data() API (5-min candles), used by LTPPoller for EMA/ATR/ADX.
+    historical_data() has been observed lagging same-day (intraday) candles by
+    5+ hours even with the Historical Data API subscription active — confirmed
+    2026-07-17 via a direct, uncached historical_data() call that returned
+    candles capped at 09:45 IST when queried at 15:16 IST. That's a live
+    characteristic of Zerodha's historical pipeline, not a caching bug on our
+    side. LTPPoller falls back to this live-tick-derived range only when it
+    detects the historical feed is stale (see PRIMARY_STALE_THRESHOLD_SECONDS
+    in ltp_poller.py) — under normal conditions this data is tracked but unused.
+    """
+    today_str = now_ist().date().isoformat()
+    if tick.get("day_range_date") != today_str:
+        tick["day_open"] = ltp
+        tick["day_high"] = ltp
+        tick["day_low"]  = ltp
+        tick["day_range_date"] = today_str
+    else:
+        tick["day_high"] = max(tick.get("day_high", ltp), ltp)
+        tick["day_low"]  = min(tick.get("day_low", ltp), ltp)
+    return tick
+
+
 def is_market_open() -> bool:
     now = now_ist()
     if now.weekday() >= 5:

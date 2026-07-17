@@ -14,6 +14,8 @@ import json
 import logging
 from typing import List, Optional
 
+from src.core.utils import update_live_day_range
+
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL_SECONDS = 5
@@ -135,6 +137,8 @@ class ZerodhaLTPPoller:
                         "close":      ltp,
                         "ltp_source": "zerodha_rest",
                     }
+                # SECONDARY price source — see update_live_day_range() in core/utils.py
+                update_live_day_range(tick, ltp)
                 await self._redis.set(redis_key, json.dumps(tick))
                 updated += 1
             except Exception as e:

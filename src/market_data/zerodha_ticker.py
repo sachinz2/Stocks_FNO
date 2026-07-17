@@ -132,9 +132,12 @@ class ZerodhaTicker:
         )
 
     def _on_ticks(self, ws, ticks) -> None:
-        """Called on every tick. Updates only 'close' in the existing Redis tick dict."""
+        """Called on every tick. Updates 'close' plus the running day range
+        (SECONDARY price source — see update_live_day_range() in core/utils.py)
+        in the existing Redis tick dict."""
         if not self._redis or not ticks:
             return
+        from src.core.utils import update_live_day_range
         for tick in ticks:
             token = tick.get("instrument_token")
             symbol = self._token_symbol.get(token)
@@ -157,6 +160,7 @@ class ZerodhaTicker:
                         "close": ltp,
                         "ltp_source": "zerodha_realtime",
                     }
+                update_live_day_range(data, ltp)
                 self._redis.set(redis_key, json.dumps(data))
             except Exception as e:
                 logger.debug(f"ZerodhaTicker: Redis write failed [{symbol}]: {e}")
