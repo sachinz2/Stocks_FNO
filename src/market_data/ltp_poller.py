@@ -17,18 +17,27 @@ Runs every 60 s via APScheduler:
      the regime detector's proxy for "NIFTY ATR%" since no index tick is subscribed
   8. Fetches 15-min OHLC for multi-timeframe EMA confirmation (tick15:SYMBOL)
 
-PRIMARY/SECONDARY data source fallback (added 2026-07-18):
+PRIMARY/SECONDARY data source fallback (added 2026-07-18, strengthened 2026-07-26):
   Zerodha's historical_data() API (PRIMARY, used above) has been observed lagging
-  same-day intraday candles by 5+ hours even with the Historical Data API
-  subscription active — confirmed via a direct, uncached call returning candles
-  capped at 09:45 IST when queried at 15:16 IST. That's a live characteristic of
-  Zerodha's historical pipeline, not something our own caching can fix.
+  same-day intraday candles by 5+ hours EVERY trading day from 2026-07-17 through
+  07-24 — confirmed via a direct, uncached call returning candles capped at
+  09:45 IST when queried at 15:16 IST, and confirmed to repeat fresh every
+  calendar day with no container restart in between, so it's not something a
+  restart or our own caching can fix.
+
   When a symbol's last historical candle is older than PRIMARY_STALE_THRESHOLD_SECONDS,
-  _enrich() falls back to a SECONDARY source: today's running high/low/close tracked
-  in real time from live ticks (ZerodhaTicker WebSocket / ZerodhaLTPPoller REST —
-  see update_live_day_range() in core/utils.py), appended as one synthetic "today"
-  bar on top of the (still valid) prior-day historical candles. Under normal
-  conditions the PRIMARY feed is fresh and this fallback never engages.
+  _enrich() falls back to a SECONDARY source: a real, growing series of 5-min OHLC
+  bars built by bucketing live ticks (ZerodhaTicker WebSocket / ZerodhaLTPPoller
+  REST — see update_intraday_bar() in core/utils.py), appended on top of the
+  (still valid) prior-day historical candles. Originally this was a single
+  synthetic "today" blob bar, but that only carries ~9.5%/3.9% weight against
+  ~750 stale historical bars in the EMA20/50 calc — too weak to flip an
+  already-close relationship on a normal trading day (confirmed against live
+  EMA-pool data 2026-07-24: zero EMA crossover entries all week despite the
+  regime gate resuming the strategy almost the full session). A real per-bar
+  series lets EMA20 in particular actually track today's intraday path the way
+  a genuine 20-period EMA should. Under normal conditions the PRIMARY feed is
+  fresh and this fallback never engages.
 """
 import asyncio
 import json
@@ -146,8 +155,12 @@ class LTPPoller:
 
                 tick = self._enrich(symbol, df, ltp, live_range=day_range if is_fallback else None)
                 if day_range:
-                    # Carry the live day-range fields forward across this overwrite.
-                    for k in ("day_open", "day_high", "day_low", "day_range_date"):
+                    # Carry the live day-range + intraday-bar fields forward across this
+                    # overwrite — otherwise bars_today would be wiped every 60s instead
+                    # of accumulating through the day (see update_intraday_bar()).
+                    for k in ("day_open", "day_high", "day_low", "day_range_date",
+                              "bars_today", "cur_bar_key", "cur_bar_open",
+                              "cur_bar_high", "cur_bar_low", "cur_bar_close"):
                         if k in day_range:
                             tick[k] = day_range[k]
                 await self._redis.set(f"{REDIS_TICK_PREFIX}{symbol}", json.dumps(tick))
@@ -261,9 +274,10 @@ class LTPPoller:
     async def _read_day_range(self, symbol: str) -> Optional[dict]:
         """
         Read today's tick (written by ZerodhaTicker / ZerodhaLTPPoller), which
-        carries live day_open/day_high/day_low/day_range_date fields maintained
-        by update_live_day_range() in core/utils.py — the SECONDARY price-range
-        source. Returns None if no live tick exists yet or it's not from today.
+        carries the live day_open/day_high/day_low/day_range_date fields plus
+        the real intraday bar series (bars_today, cur_bar_*) maintained by
+        update_intraday_bar() in core/utils.py — the SECONDARY price source.
+        Returns None if no live tick exists yet or it's not from today.
         """
         try:
             raw = await self._redis.get(f"{REDIS_TICK_PREFIX}{symbol}")
@@ -333,24 +347,58 @@ class LTPPoller:
         Compute EMA20, EMA50, ATR14, ADX14, RVOL, VWAP, prev_close from OHLC.
 
         live_range, when provided, means PRIMARY (historical_data) was detected
-        stale for `symbol` (see PRIMARY_STALE_THRESHOLD_SECONDS in poll()). A
-        synthetic "today" bar is appended from the SECONDARY live-tick-derived
-        day range (day_open/day_high/day_low + current ltp as close) so
-        indicators reflect today's real price action instead of a frozen
-        historical candle. Prior-day historical bars (still valid — only the
-        current day lags) are kept as the base for EMA/ATR continuity.
+        stale for `symbol` (see PRIMARY_STALE_THRESHOLD_SECONDS in poll()). The
+        SECONDARY live-tick-derived intraday bar series (bars_today, built by
+        update_intraday_bar() in core/utils.py) is appended on top of the
+        prior-day historical bars (still valid — only the current day lags),
+        plus the still-forming current bar. Any bars historical_data() already
+        has for today are dropped first to avoid double-counting the same
+        price action from two sources. This gives EMA20/50 a real per-bar
+        intraday series instead of one blob "today" bar — a single blob only
+        carries ~9.5%/3.9% weight in the EMA20/50 calc against ~750 stale
+        historical bars, too weak to flip an already-close relationship on a
+        normal trading day (confirmed against live data 2026-07-24).
         """
         is_fallback = live_range is not None
         if is_fallback:
-            synthetic_row = pd.DataFrame([{
-                "date":   now_ist(),
-                "open":   live_range.get("day_open", ltp),
-                "high":   live_range.get("day_high", ltp),
-                "low":    live_range.get("day_low", ltp),
-                "close":  ltp,
-                "volume": 0,
-            }])
-            df = pd.concat([df, synthetic_row], ignore_index=True)
+            if "date" in df.columns:
+                today_str = now_ist().date().isoformat()
+                df = df[df["date"].apply(lambda d: d.date().isoformat() != today_str)]
+
+            live_rows = [
+                {
+                    "date":   bar["date"],
+                    "open":   bar["open"],
+                    "high":   bar["high"],
+                    "low":    bar["low"],
+                    "close":  bar["close"],
+                    "volume": 0,
+                }
+                for bar in (live_range.get("bars_today") or [])
+            ]
+            if live_range.get("cur_bar_open") is not None:
+                # Still-forming bar — latest partial candle, always included.
+                live_rows.append({
+                    "date":   now_ist(),
+                    "open":   live_range.get("cur_bar_open", ltp),
+                    "high":   live_range.get("cur_bar_high", ltp),
+                    "low":    live_range.get("cur_bar_low", ltp),
+                    "close":  ltp,
+                    "volume": 0,
+                })
+            if not live_rows:
+                # No live bars accumulated yet (e.g. moments after market open) —
+                # fall back to a single blob bar from the day range so indicators
+                # are still defined rather than computed on stale data alone.
+                live_rows = [{
+                    "date":   now_ist(),
+                    "open":   live_range.get("day_open", ltp),
+                    "high":   live_range.get("day_high", ltp),
+                    "low":    live_range.get("day_low", ltp),
+                    "close":  ltp,
+                    "volume": 0,
+                }]
+            df = pd.concat([df, pd.DataFrame(live_rows)], ignore_index=True)
 
         close = df["close"]
         high  = df["high"]
@@ -538,21 +586,50 @@ class LTPPoller:
 
         live_range, when provided, means PRIMARY (historical_data, 15-min) was
         detected stale for `symbol` — same SECONDARY live-tick fallback as
-        _enrich()'s 5-min path (see that method's docstring). This feeds a hard
-        gate in live_trading_engine.py (15-min EMA must agree with the 5-min
-        signal), so leaving it stale would keep silently blocking EMA crossover
-        entries even after the 5-min fix.
+        _enrich()'s 5-min path (see that method's docstring), reusing the same
+        bars_today series but resampled into 15-min groups (3 bars each) rather
+        than one blob bar. This feeds a hard gate in live_trading_engine.py
+        (15-min EMA must agree with the 5-min signal), so leaving it as one weak
+        blob bar would keep silently blocking EMA crossover entries even after
+        the 5-min fix.
         """
         is_fallback = live_range is not None
         if is_fallback:
-            synthetic_row = pd.DataFrame([{
-                "date":  now_ist(),
-                "open":  live_range.get("day_open", 0),
-                "high":  live_range.get("day_high", 0),
-                "low":   live_range.get("day_low", 0),
-                "close": live_range.get("close", 0),
-            }])
-            df = pd.concat([df, synthetic_row], ignore_index=True)
+            if "date" in df.columns:
+                today_str = now_ist().date().isoformat()
+                df = df[df["date"].apply(lambda d: d.date().isoformat() != today_str)]
+
+            live_rows = []
+            bars5 = live_range.get("bars_today") or []
+            if bars5:
+                b5 = pd.DataFrame(bars5)
+                b5["date"] = pd.to_datetime(b5["date"])
+                b5["bucket15"] = b5["date"].apply(
+                    lambda d: d.replace(minute=(d.minute // 15) * 15, second=0, microsecond=0)
+                )
+                grouped = b5.groupby("bucket15").agg(
+                    open=("open", "first"), high=("high", "max"),
+                    low=("low", "min"), close=("close", "last"),
+                ).reset_index().rename(columns={"bucket15": "date"})
+                live_rows = grouped.to_dict("records")
+
+            if live_range.get("cur_bar_open") is not None:
+                live_rows.append({
+                    "date":  now_ist(),
+                    "open":  live_range.get("cur_bar_open", 0),
+                    "high":  live_range.get("cur_bar_high", 0),
+                    "low":   live_range.get("cur_bar_low", 0),
+                    "close": live_range.get("close", 0),
+                })
+            if not live_rows:
+                live_rows = [{
+                    "date":  now_ist(),
+                    "open":  live_range.get("day_open", 0),
+                    "high":  live_range.get("day_high", 0),
+                    "low":   live_range.get("day_low", 0),
+                    "close": live_range.get("close", 0),
+                }]
+            df = pd.concat([df, pd.DataFrame(live_rows)], ignore_index=True)
 
         close = df["close"]
         ema20 = float(close.ewm(span=20, adjust=False).mean().iloc[-1])

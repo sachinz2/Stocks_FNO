@@ -225,32 +225,86 @@ def now_ist() -> datetime:
     return datetime.now(IST)
 
 
-def update_live_day_range(tick: dict, ltp: float) -> dict:
+def update_intraday_bar(tick: dict, ltp: float) -> dict:
     """
-    Maintain today's running open/high/low on a tick dict from live LTP updates,
-    in place. Called by ZerodhaTicker (WebSocket) and ZerodhaLTPPoller (REST
+    Build real 5-min OHLC bars for today from live LTP updates, in place on a
+    tick dict. Called by ZerodhaTicker (WebSocket) and ZerodhaLTPPoller (REST
     fallback) on every price update.
 
-    This is the SECONDARY price-range source. PRIMARY is Zerodha's
-    historical_data() API (5-min candles), used by LTPPoller for EMA/ATR/ADX.
-    historical_data() has been observed lagging same-day (intraday) candles by
-    5+ hours even with the Historical Data API subscription active — confirmed
-    2026-07-17 via a direct, uncached historical_data() call that returned
-    candles capped at 09:45 IST when queried at 15:16 IST. That's a live
-    characteristic of Zerodha's historical pipeline, not a caching bug on our
-    side. LTPPoller falls back to this live-tick-derived range only when it
-    detects the historical feed is stale (see PRIMARY_STALE_THRESHOLD_SECONDS
-    in ltp_poller.py) — under normal conditions this data is tracked but unused.
+    This is the SECONDARY price-source. PRIMARY is Zerodha's historical_data()
+    API (5-min candles), used by LTPPoller for EMA/ATR/ADX. historical_data()
+    has been observed lagging same-day (intraday) candles by 5+ hours EVERY
+    trading day (2026-07-17 through 07-24) even with the Historical Data API
+    subscription active and confirmed active on the account — including via a
+    direct, uncached historical_data() call bypassing all our own caching.
+    Confirmed this repeats fresh every calendar day regardless of process
+    uptime (no restart between 07-17 and 07-24), so it's a live characteristic
+    of Zerodha's historical pipeline for the current session, not something a
+    container restart or better caching on our side can fix.
+
+    Maintains:
+      - day_open/day_high/day_low: today's full-day range (used directly for
+        ATR% when only the range matters).
+      - bars_today: a list of COMPLETED 5-min OHLC bars built by bucketing
+        ticks — a real, growing intraday candle series (up to ~75 bars by
+        close), not a single blob. This matters for EMA20/50: a single
+        synthetic "today" bar only carries ~9.5%/3.9% weight against ~750
+        stale historical bars (too weak to flip an already-close EMA
+        relationship on a normal trading day — confirmed on live EMA-pool
+        data 2026-07-24, e.g. INFY needed a ~4% same-direction move to flip,
+        but its real range that day was ~2.8%). A real per-bar series lets
+        EMA20 in particular actually track today's intraday path.
+      - cur_bar_*: the still-forming (incomplete) current 5-min bar.
+
+    LTPPoller falls back to this only when it detects the historical feed is
+    stale (see PRIMARY_STALE_THRESHOLD_SECONDS in ltp_poller.py) — under
+    normal conditions this data is tracked but unused.
     """
-    today_str = now_ist().date().isoformat()
+    today_str   = now_ist().date().isoformat()
+    now         = now_ist()
+    bucket_key  = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0).isoformat()
+
     if tick.get("day_range_date") != today_str:
-        tick["day_open"] = ltp
-        tick["day_high"] = ltp
-        tick["day_low"]  = ltp
+        # New trading day — reset everything, including any carried-over bars.
+        tick["day_open"]  = ltp
+        tick["day_high"]  = ltp
+        tick["day_low"]   = ltp
         tick["day_range_date"] = today_str
-    else:
-        tick["day_high"] = max(tick.get("day_high", ltp), ltp)
-        tick["day_low"]  = min(tick.get("day_low", ltp), ltp)
+        tick["bars_today"]    = []
+        tick["cur_bar_key"]   = bucket_key
+        tick["cur_bar_open"]  = ltp
+        tick["cur_bar_high"]  = ltp
+        tick["cur_bar_low"]   = ltp
+        tick["cur_bar_close"] = ltp
+        return tick
+
+    tick["day_high"] = max(tick.get("day_high", ltp), ltp)
+    tick["day_low"]  = min(tick.get("day_low", ltp), ltp)
+
+    if tick.get("cur_bar_key") == bucket_key:
+        # Still inside the same 5-min window — update the forming bar.
+        tick["cur_bar_high"]  = max(tick.get("cur_bar_high", ltp), ltp)
+        tick["cur_bar_low"]   = min(tick.get("cur_bar_low", ltp), ltp)
+        tick["cur_bar_close"] = ltp
+        return tick
+
+    # Bucket rolled over — finalize the just-completed bar before starting a new one.
+    if tick.get("cur_bar_key"):
+        bars = tick.get("bars_today") or []
+        bars.append({
+            "date":  tick["cur_bar_key"],
+            "open":  tick.get("cur_bar_open", ltp),
+            "high":  tick.get("cur_bar_high", ltp),
+            "low":   tick.get("cur_bar_low", ltp),
+            "close": tick.get("cur_bar_close", ltp),
+        })
+        tick["bars_today"] = bars[-100:]  # cap well above the ~75 bars/day expected
+
+    tick["cur_bar_key"]   = bucket_key
+    tick["cur_bar_open"]  = ltp
+    tick["cur_bar_high"]  = ltp
+    tick["cur_bar_low"]   = ltp
+    tick["cur_bar_close"] = ltp
     return tick
 
 
