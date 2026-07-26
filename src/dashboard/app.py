@@ -107,12 +107,22 @@ if page == "Home":
     orders_today = [o for o in orders if (o.get("created_at") or "").startswith(today_str)]
     open_orders = [o for o in orders if o.get("status") in ("PENDING", "OPEN")]
 
-    col1, col2, col3, col4 = st.columns(4)
+    # Live virtual cash balance (PaperBroker.balance) — decreases on every BUY,
+    # increases on every SELL, and gates whether a new order can be placed.
+    # None in live (Zerodha) mode, where real broker funds/margin apply instead.
+    available_cash = (health or {}).get("available_cash")
+
+    col1, col2, col3, col4, col5 = st.columns(5)
     pnl_delta = f"{(net_pnl / INITIAL_CAPITAL) * 100:.2f}%" if INITIAL_CAPITAL else "0%"
     col1.metric("Net PnL", fmt_inr(net_pnl), pnl_delta)
     col2.metric("Open Positions", str(open_positions), f"Max {MAX_OPEN_POSITIONS}")
     col3.metric("Orders Today", str(len(orders_today)), f"{len(open_orders)} open")
     col4.metric("Capital Deployed", fmt_inr(capital_deployed), f"{capital_pct:.1f}%")
+    if available_cash is not None:
+        cash_pct = (available_cash / INITIAL_CAPITAL) * 100 if INITIAL_CAPITAL else 0
+        col5.metric("Available Cash", fmt_inr(available_cash), f"{cash_pct:.1f}% of start")
+    else:
+        col5.metric("Available Cash", "—", "live mode")
 
     st.markdown("---")
 

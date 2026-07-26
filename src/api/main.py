@@ -346,12 +346,27 @@ async def health_check():
         "zerodha_historical":  "Zerodha historical OHLC (60 s)",
         "live_fallback_today": "Live-tick fallback (PRIMARY historical API stale)",
     }.get(ltp_source, ltp_source)
+
+    # Live virtual cash balance (PaperBroker only — this is the actual ledger
+    # that decreases on every BUY and increases on every SELL, gating whether a
+    # new order can be placed; see paper_broker.py place_order()). None in live
+    # (Zerodha) mode, where real broker margin/funds apply instead.
+    available_cash = None
+    try:
+        engine = getattr(app.state, "trading_engine", None)
+        broker = getattr(engine, "broker", None)
+        if broker is not None and hasattr(broker, "balance"):
+            available_cash = round(float(broker.balance), 2)
+    except Exception:
+        pass
+
     return {
-        "status":      overall,
-        "database":    db_status,
-        "redis":       redis_status,
-        "ltp_source":  source_label,
-        "data_source": data_source,
+        "status":         overall,
+        "database":       db_status,
+        "redis":          redis_status,
+        "ltp_source":     source_label,
+        "data_source":    data_source,
+        "available_cash": available_cash,
     }
 
 
