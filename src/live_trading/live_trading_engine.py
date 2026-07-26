@@ -590,9 +590,57 @@ class LiveTradingEngine:
         #   b) _reconcile_broker_positions() sees broker positions matching engine state
         if hasattr(self.broker, "_positions"):
             self._rebuild_paper_broker_positions()
+            await self._reconcile_paper_broker_balance()
 
         # After Redis restore, cross-check broker positions for orphans
         await self._reconcile_broker_positions()
+
+    async def _reconcile_paper_broker_balance(self) -> None:
+        """
+        Reconcile PaperBroker.balance after restart.
+
+        broker.balance is pure in-memory (see paper_broker.py __init__) and
+        resets to settings.INITIAL_CAPITAL on every process start — it has no
+        idea about realized P&L from trades closed before this restart, or
+        about the cash tied up in positions _rebuild_paper_broker_positions()
+        just repopulated above. Left alone, "Available Cash" would silently
+        show the full starting capital after every restart regardless of
+        actual trading history — caught this via the dashboard cash metric
+        showing exactly Rs300,000 right after a restart despite Rs65k+ of
+        real accumulated realized P&L in trade_journal.
+
+        Reconstructed from first principles:
+          balance = initial_capital + total_realized_pnl (all-time, from
+                    trade_journal) - cash tied up in currently open positions
+                    (quantity * avg_price: negative qty means a short/credit
+                    position, so this naturally adds back the premium already
+                    received for it rather than treating it as spent).
+        """
+        if not hasattr(self.broker, "balance"):
+            return
+        try:
+            from src.core.config import settings
+            from src.database.connection import AsyncSessionLocal
+            from src.database.models.trade_journal import TradeJournal
+            from sqlalchemy import select as _select, func as _func
+
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    _select(_func.sum(TradeJournal.pnl)).where(TradeJournal.exit_time.isnot(None))
+                )
+                total_realized = float(result.scalar() or 0.0)
+
+            deployed_cash = sum(
+                pos["quantity"] * pos["avg_price"] for pos in self.broker._positions.values()
+            )
+            self.broker.balance = round(settings.INITIAL_CAPITAL + total_realized - deployed_cash, 2)
+            logger.info(
+                f"Reconciled PaperBroker balance after restart: "
+                f"₹{settings.INITIAL_CAPITAL:,.0f} + ₹{total_realized:,.2f} realized "
+                f"- ₹{deployed_cash:,.2f} in open positions = ₹{self.broker.balance:,.2f}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to reconcile PaperBroker balance after restart: {e}")
 
     def _rebuild_paper_broker_positions(self) -> None:
         """
