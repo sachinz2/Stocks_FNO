@@ -21,6 +21,12 @@ logger = logging.getLogger(__name__)
 MAX_RECONNECT_ATTEMPTS = 5   # 403 is an auth error; stop fast rather than spamming
 RECONNECT_DELAY_SECONDS = 10
 
+REDIS_TOKEN_KEY = "zerodha:access_token"  # written by scripts/zerodha_auto_auth.py at 08:30 IST
+# After a 403 or exhausted reconnects, poll Redis for a fresher token instead of
+# giving up for the rest of the day. 60s x 480 = 8h, covers a full trading day.
+TOKEN_REFRESH_CHECK_INTERVAL_SECONDS = 60
+TOKEN_REFRESH_CHECK_MAX_ATTEMPTS     = 480
+
 
 class ZerodhaTicker:
     """Real-time NSE equity LTP via Zerodha KiteTicker WebSocket."""
@@ -35,6 +41,8 @@ class ZerodhaTicker:
         self._token_symbol: Dict[int, str] = {}         # token → symbol
         self._ticker = None
         self._redis = None   # sync redis client (in background thread)
+        self._retry_lock = threading.Lock()
+        self._retry_in_progress = False
 
     def fetch_instrument_tokens(self) -> int:
         """
@@ -177,7 +185,8 @@ class ZerodhaTicker:
                 "(2) re-run zerodha_auto_auth.py to refresh the access token."
             )
             if self._ticker:
-                self._ticker.close()   # stop reconnecting — 403 won't fix itself
+                self._ticker.close()   # stop reconnecting on this stale token
+            self._schedule_token_refresh_retry()
 
     def _on_reconnect(self, ws, attempts_count) -> None:
         logger.info(f"ZerodhaTicker: reconnecting (attempt {attempts_count})...")
@@ -185,5 +194,68 @@ class ZerodhaTicker:
     def _on_noreconnect(self, ws) -> None:
         logger.critical(
             f"ZerodhaTicker: max reconnect attempts ({MAX_RECONNECT_ATTEMPTS}) reached. "
-            "WebSocket unavailable — ZerodhaLTPPoller REST fallback (5 s delay) remains active."
+            "WebSocket unavailable — ZerodhaLTPPoller REST fallback (5 s delay) remains active "
+            "while we watch for a fresh token."
         )
+        self._schedule_token_refresh_retry()
+
+    # ------------------------------------------------------------------
+    # Token-refresh recovery — without this, a 403/exhausted-reconnect before
+    # the 08:30 daily auth job has run (e.g. yesterday's token still being used
+    # at market pre-open) leaves the WebSocket permanently down for the rest of
+    # the day, even once a fresh token is written to Redis. ZerodhaLTPPoller
+    # (the REST fallback) already does this same check on every cycle; the
+    # WebSocket ticker had no equivalent — confirmed 2026-07-17: died at 06:23
+    # on a stale token and silently stayed on REST-only for the entire session.
+    # ------------------------------------------------------------------
+
+    def _schedule_token_refresh_retry(self) -> None:
+        """Spawn a background thread that polls Redis for a fresher access
+        token and reconnects once one appears, instead of giving up for good.
+        Guarded so _on_error (403) and _on_noreconnect firing for the same
+        outage can't spin up two concurrent retry threads / two WebSockets."""
+        with self._retry_lock:
+            if self._retry_in_progress:
+                return
+            self._retry_in_progress = True
+        t = threading.Thread(
+            target=self._retry_with_fresh_token, daemon=True, name="ZerodhaTicker-TokenRetry"
+        )
+        t.start()
+
+    def _retry_with_fresh_token(self) -> None:
+        import time
+        try:
+            redis_client = self._redis
+            if redis_client is None:
+                try:
+                    import redis as sync_redis
+                    redis_client = sync_redis.from_url(self._redis_url, decode_responses=True)
+                except Exception as e:
+                    logger.error(f"ZerodhaTicker: token-retry could not open Redis: {e}")
+                    return
+
+            for attempt in range(1, TOKEN_REFRESH_CHECK_MAX_ATTEMPTS + 1):
+                time.sleep(TOKEN_REFRESH_CHECK_INTERVAL_SECONDS)
+                try:
+                    token = redis_client.get(REDIS_TOKEN_KEY)
+                except Exception as e:
+                    logger.debug(f"ZerodhaTicker: token-retry check failed: {e}")
+                    continue
+                if token and token != self._access_token:
+                    logger.info(
+                        f"ZerodhaTicker: fresh access token found in Redis (check #{attempt}) "
+                        "— reconnecting."
+                    )
+                    self._access_token = token
+                    self.start()
+                    return
+
+            logger.warning(
+                f"ZerodhaTicker: no fresh access token after {TOKEN_REFRESH_CHECK_MAX_ATTEMPTS} "
+                f"checks over {TOKEN_REFRESH_CHECK_MAX_ATTEMPTS * TOKEN_REFRESH_CHECK_INTERVAL_SECONDS // 3600}h "
+                "— giving up until next process restart."
+            )
+        finally:
+            with self._retry_lock:
+                self._retry_in_progress = False

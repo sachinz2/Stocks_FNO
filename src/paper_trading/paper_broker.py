@@ -7,6 +7,21 @@ from src.brokers.base import AbstractBroker
 
 logger = logging.getLogger(__name__)
 
+# Writing (SELL-to-open/increase) an option requires SPAN + exposure margin in
+# real trading, not just the premium received — but that margin is set by the
+# exchange based on the underlying's volatility/strike distance, and PaperBroker
+# only ever sees the option's own symbol/premium here, not the underlying price
+# or strike (that lives one layer up, in the strategy/engine code). Modeling
+# real SPAN margin isn't feasible at this layer, so this is a deliberately
+# simple, conservative proxy: block SHORT_MARGIN_MULTIPLE_OF_PREMIUM times the
+# premium per short lot as a stand-in "used margin" figure. It's meant as a
+# guardrail against unbounded short-selling in paper mode (previously there was
+# no capital check on SELL at all — see risk_manager.py's own comment "For SELL
+# legs the margin is taken by the broker, not our capital tracking", which
+# assumed this check existed and it didn't). In LIVE mode this is moot — the
+# real Zerodha/exchange margin engine handles it.
+SHORT_MARGIN_MULTIPLE_OF_PREMIUM = 10.0
+
 
 class PaperBroker(AbstractBroker):
     """
@@ -21,6 +36,7 @@ class PaperBroker(AbstractBroker):
         self.total_fees_paid = 0.0
         self._orders: Dict[str, Dict[str, Any]] = {}
         self._positions: Dict[str, Dict[str, Any]] = {}
+        self.margin_blocked: Dict[str, float] = {}  # symbol -> approx margin held for its short qty
         logger.info(f"Initialized PaperBroker with virtual balance: ₹{self.balance}")
 
     @staticmethod
@@ -139,6 +155,28 @@ class PaperBroker(AbstractBroker):
             )
             raise ValueError("Insufficient virtual funds.")
 
+        # Approximate margin check — SELL orders that open or add to a short
+        # position (see SHORT_MARGIN_MULTIPLE_OF_PREMIUM above for why this is
+        # a proxy, not real SPAN margin). SELL orders that only reduce/close an
+        # existing long need no margin — that's just realizing cash.
+        if side == "SELL":
+            current_qty = self._positions.get(symbol, {}).get("quantity", 0)
+            resulting_qty = current_qty - quantity
+            if resulting_qty < 0:
+                required_margin = abs(resulting_qty) * fill_price * SHORT_MARGIN_MULTIPLE_OF_PREMIUM
+                margin_other_symbols = sum(
+                    v for k, v in self.margin_blocked.items() if k != symbol
+                )
+                available_for_margin = self.balance - margin_other_symbols
+                if available_for_margin < required_margin:
+                    logger.warning(
+                        f"PaperBroker: Insufficient margin (approx.) to SELL {quantity} {symbol} "
+                        f"@ fill ₹{fill_price:.2f} — resulting short {abs(resulting_qty)} needs "
+                        f"~₹{required_margin:,.2f} margin, only ₹{available_for_margin:,.2f} free "
+                        f"(balance ₹{self.balance:,.2f} - ₹{margin_other_symbols:,.2f} margin held elsewhere)."
+                    )
+                    raise ValueError("Insufficient virtual margin (approx.) for short position.")
+
         order = {
             "order_id":     order_id,
             "symbol":       symbol,
@@ -154,6 +192,14 @@ class PaperBroker(AbstractBroker):
         self._orders[order_id] = order
         self._update_position(symbol, side, quantity, fill_price)
 
+        # Recompute (not increment) margin_blocked from the resulting position —
+        # self-correcting on partial covers rather than tracking deltas.
+        post_qty = self._positions.get(symbol, {}).get("quantity", 0)
+        if post_qty < 0:
+            self.margin_blocked[symbol] = abs(post_qty) * fill_price * SHORT_MARGIN_MULTIPLE_OF_PREMIUM
+        else:
+            self.margin_blocked.pop(symbol, None)
+
         if side == "BUY":
             self.balance -= cost + fees
         else:
@@ -162,11 +208,13 @@ class PaperBroker(AbstractBroker):
         self.total_fees_paid += fees
         slip_pct   = abs(slippage_ppu / price * 100) if price > 0 else 0
         extra_note = f" +extra_slip ₹{extra_slip:.2f}" if extra_slip > 0 else ""
+        total_margin = sum(self.margin_blocked.values())
+        margin_note  = f" | Margin held (approx.): ₹{total_margin:,.2f}" if total_margin > 0 else ""
         logger.info(
             f"PaperBroker: {side} {quantity} {symbol} "
             f"@ expected ₹{price:.2f} → fill ₹{fill_price:.2f} "
             f"(slip {slippage_ppu:+.3f}, {slip_pct:.1f}%{extra_note}) | "
-            f"Fees: ₹{fees:.2f} | Balance: ₹{self.balance:.2f}"
+            f"Fees: ₹{fees:.2f} | Balance: ₹{self.balance:.2f}{margin_note}"
         )
         return order_id
 

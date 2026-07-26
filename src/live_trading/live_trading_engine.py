@@ -678,6 +678,21 @@ class LiveTradingEngine:
                         "symbol": contract, "quantity": qty, "avg_price": float(price)
                     }
 
+        # Rebuild margin_blocked for restored short legs too — this bypasses
+        # place_order() entirely, so PaperBroker's own margin bookkeeping
+        # (see SHORT_MARGIN_MULTIPLE_OF_PREMIUM in paper_broker.py) never runs
+        # for these restored positions. Without this, every restart would
+        # silently forget that margin is held against them, understating how
+        # much of the account is actually committed.
+        if hasattr(broker, "margin_blocked"):
+            broker.margin_blocked.clear()
+            from src.paper_trading.paper_broker import SHORT_MARGIN_MULTIPLE_OF_PREMIUM
+            for contract, pos in broker._positions.items():
+                if pos["quantity"] < 0:
+                    broker.margin_blocked[contract] = (
+                        abs(pos["quantity"]) * pos["avg_price"] * SHORT_MARGIN_MULTIPLE_OF_PREMIUM
+                    )
+
         total = len(broker._positions)
         if total:
             logger.info(
