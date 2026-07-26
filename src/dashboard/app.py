@@ -565,6 +565,30 @@ elif page == "System Health":
             else:
                 st.info(f"**{label}**: {value}")
 
+        # PRIMARY/SECONDARY market-data source. Zerodha's historical_data() API
+        # (PRIMARY, used for EMA/ATR/ADX) has been observed lagging same-day
+        # intraday candles by 5+ hours despite the Historical Data API
+        # subscription being active — confirmed repeating fresh every calendar
+        # day regardless of container uptime (2026-07-17 through 07-24).
+        # SECONDARY is a live-tick-derived intraday bar series that LTPPoller
+        # switches individual symbols to automatically when it detects PRIMARY
+        # is stale for them (see update_intraday_bar() in core/utils.py).
+        ds = health.get("data_source") or {}
+        healthy    = ds.get("primary_source_healthy")
+        n_fallback = ds.get("fallback_symbols")
+        n_symbols  = ds.get("n_symbols")
+        if healthy is None:
+            st.info("**Market Data Source**: not yet reported (market closed, or LTPPoller hasn't run a cycle yet)")
+        elif healthy:
+            st.success(f"**Market Data Source**: PRIMARY (Zerodha historical API) — healthy, all {n_symbols} symbols current")
+        else:
+            st.warning(
+                f"**Market Data Source**: PRIMARY degraded — {n_fallback}/{n_symbols} symbols "
+                "on SECONDARY live-tick fallback (historical_data() feed is stale for them). "
+                "Strategies keep trading normally off the fallback; this just flags that "
+                "Zerodha's historical candle feed isn't current right now."
+            )
+
     st.markdown("---")
 
     # ── Live Log Tail ─────────────────────────────────────────────────────────

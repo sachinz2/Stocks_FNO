@@ -311,6 +311,17 @@ async def health_check():
     except Exception as e:
         db_status = f"DOWN: {e}"
 
+    # PRIMARY/SECONDARY data-source health — market:trend_stats is published by
+    # LTPPoller every poll cycle (see ltp_poller.py). fallback_symbols > 0 means
+    # historical_data() (PRIMARY) was detected stale for that many symbols and
+    # LTPPoller.py switched them to the live-tick SECONDARY source instead
+    # (see update_intraday_bar() in core/utils.py for why this exists).
+    data_source = {
+        "primary_source_healthy": None,
+        "fallback_symbols":       None,
+        "n_symbols":              None,
+    }
+
     try:
         import json
         if hasattr(app.state, "redis") and app.state.redis:
@@ -319,20 +330,28 @@ async def health_check():
             raw = await app.state.redis.get("tick:RELIANCE")
             if raw:
                 ltp_source = json.loads(raw).get("ltp_source", "unknown")
+            trend_raw = await app.state.redis.get("market:trend_stats")
+            if trend_raw:
+                trend = json.loads(trend_raw)
+                data_source["primary_source_healthy"] = trend.get("primary_source_healthy")
+                data_source["fallback_symbols"]        = trend.get("fallback_symbols")
+                data_source["n_symbols"]               = trend.get("n_symbols")
     except Exception as e:
         redis_status = f"DOWN: {e}"
 
     overall = "UP" if db_status == "UP" and redis_status == "UP" else "DEGRADED"
     source_label = {
-        "zerodha_realtime":   "Zerodha WebSocket (real-time)",
-        "zerodha_rest":       "Zerodha REST poll (5 s)",
-        "zerodha_historical": "Zerodha historical OHLC (60 s)",
+        "zerodha_realtime":    "Zerodha WebSocket (real-time)",
+        "zerodha_rest":        "Zerodha REST poll (5 s)",
+        "zerodha_historical":  "Zerodha historical OHLC (60 s)",
+        "live_fallback_today": "Live-tick fallback (PRIMARY historical API stale)",
     }.get(ltp_source, ltp_source)
     return {
-        "status":     overall,
-        "database":   db_status,
-        "redis":      redis_status,
-        "ltp_source": source_label,
+        "status":      overall,
+        "database":    db_status,
+        "redis":       redis_status,
+        "ltp_source":  source_label,
+        "data_source": data_source,
     }
 
 
