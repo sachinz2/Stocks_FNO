@@ -16,6 +16,19 @@ Detection logic:
 Regime is published to Redis key `market:regime` (JSON) every cycle and
 consumed by LiveTradingEngine for strategy regime-switching.
 
+Hysteresis on the TRENDING/RANGE_BOUND boundary (added 2026-07-30): confirmed
+live on 2026-07-30 that when market-wide ATR% sits right on ATR_TREND_THRESHOLD
+(1.5%), the regime flips back and forth every 1-3 minutes — observed a 50-min
+stretch (12:00-12:50) oscillating between 1.37% and 1.58%, flipping the regime
+~15 times. Each flip pauses/resumes ema_crossover_v1; a strategy that only gets
+1-3 min "active" windows (less than one 5-min bar most of the time) can barely
+ever observe two consecutive confirmed bars, even if a real crossover were
+forming right then. _classify() now takes the previous regime and applies a
+lower exit threshold (ATR_TREND_EXIT_THRESHOLD) once already in TRENDING, so a
+transient dip back toward 1.5% doesn't immediately kick it back out — the same
+debouncing principle EMACrossoverStrategy already applies to its own signal
+via signal_confirm_bars.
+
 Usage:
     detector = MarketRegimeDetector(redis_client)
     regime   = await detector.detect()       # e.g. "TRENDING"
@@ -36,6 +49,11 @@ VIX_HIGH_THRESHOLD   = 20.0   # above = VOLATILE
 # this threshold directly against raw 5-min-bar ATR%, which runs an order of magnitude
 # smaller (typically 0.2-0.4%) and would make TRENDING nearly unreachable.
 ATR_TREND_THRESHOLD  = 1.5    # daily-equivalent ATR% above = trending (within mid-VIX band)
+# Hysteresis: once already in TRENDING, require ATR% to drop below this LOWER
+# bar before reverting — not the same 1.5% entry line — so noise oscillating
+# around 1.5% doesn't flip the regime every cycle (confirmed live 2026-07-30:
+# ATR% bounced 1.37%-1.58% for 50 minutes, flipping the regime ~15 times).
+ATR_TREND_EXIT_THRESHOLD = 1.3
 EMA_FLAT_THRESHOLD   = 0.15   # EMA spread% below = range-bound / flat
 
 REDIS_REGIME_KEY      = "market:regime"
@@ -79,7 +97,8 @@ class MarketRegimeDetector:
         Falls back to RANGE_BOUND (most conservative) if data is missing.
         """
         vix, atr_pct, ema_spread_pct = await self._get_market_indicators()
-        regime = self._classify(vix, atr_pct, ema_spread_pct)
+        prev_regime = await self.get_cached_regime()
+        regime = self._classify(vix, atr_pct, ema_spread_pct, prev_regime)
 
         payload = {
             "regime":            regime,
@@ -139,10 +158,11 @@ class MarketRegimeDetector:
                 data = json.loads(raw)
                 data["strategy_map"] = REGIME_STRATEGY_MAP
                 data["thresholds"] = {
-                    "vix_low":      VIX_LOW_THRESHOLD,
-                    "vix_high":     VIX_HIGH_THRESHOLD,
-                    "atr_trend":    ATR_TREND_THRESHOLD,
-                    "ema_flat":     EMA_FLAT_THRESHOLD,
+                    "vix_low":            VIX_LOW_THRESHOLD,
+                    "vix_high":           VIX_HIGH_THRESHOLD,
+                    "atr_trend_enter":    ATR_TREND_THRESHOLD,
+                    "atr_trend_exit":     ATR_TREND_EXIT_THRESHOLD,
+                    "ema_flat":           EMA_FLAT_THRESHOLD,
                 }
                 return data
         except Exception:
@@ -199,7 +219,8 @@ class MarketRegimeDetector:
         return 15.0   # middle-of-road default
 
     @staticmethod
-    def _classify(vix: float, atr_pct: float, ema_spread_pct: float) -> str:
+    def _classify(vix: float, atr_pct: float, ema_spread_pct: float,
+                  prev_regime: Optional[str] = None) -> str:
         """
         Decision tree:
 
@@ -209,7 +230,7 @@ class MarketRegimeDetector:
                 VOLATILE        VIX < 12?
                               /          \\
                            YES            NO
-                          LOW_VOL     ATR% >= 1.5%?
+                          LOW_VOL     ATR% >= threshold?
                                      /             \\
                                   YES               NO
                                TRENDING         EMA_spread <= 0.15%?
@@ -218,12 +239,18 @@ class MarketRegimeDetector:
                                         RANGE_BOUND             RANGE_BOUND (default)
                                     (explicit flat)           (moderate/borderline —
                                                                treat conservatively)
+
+        The ATR% comparison uses a lower threshold (ATR_TREND_EXIT_THRESHOLD)
+        when prev_regime is already "TRENDING" — hysteresis so noise
+        oscillating around ATR_TREND_THRESHOLD doesn't flip the regime every
+        cycle (see module docstring).
         """
         if vix > VIX_HIGH_THRESHOLD:
             return "VOLATILE"
         if vix < VIX_LOW_THRESHOLD:
             return "LOW_VOL"
-        if atr_pct >= ATR_TREND_THRESHOLD:
+        atr_threshold = ATR_TREND_EXIT_THRESHOLD if prev_regime == "TRENDING" else ATR_TREND_THRESHOLD
+        if atr_pct >= atr_threshold:
             return "TRENDING"
         # ATR is moderate — EMAs are flat or borderline flat.
         # Default to RANGE_BOUND (not TRENDING) so iron condors and credit
