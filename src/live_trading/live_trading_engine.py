@@ -1268,6 +1268,20 @@ class LiveTradingEngine:
 
         # RVOL filter — require above-average volume (RVOL > 1.3) for momentum entries.
         # Low-volume breakouts have higher false-positive rates and wider bid-ask spreads.
+        #
+        # KNOWN GAP (found 2026-07-30, not fixed): this is silently a no-op almost all
+        # session, every day. RVOL's 20-period rolling volume average is computed over
+        # a blended historical+live-tick bar series (see ltp_poller._enrich()), but
+        # WebSocket ticks arrive in MODE_LTP (price only, no volume — see
+        # zerodha_ticker.py), so every live-tick bar carries volume=0. Once ~20 live
+        # bars exist (~100 min into the session), the entire rolling window is
+        # zero-volume and rvol computes to exactly 0.0. Since the check below only
+        # blocks when `_rvol > 0`, a value of exactly 0 always passes — meaning this
+        # filter has provided no real signal for most of every trading day since the
+        # live-tick redesign (2026-07-27). Properly fixing it needs either a real
+        # volume source (MODE_FULL WebSocket subscription instead of MODE_LTP) or a
+        # deliberate non-volume proxy — not attempting either without a decision on
+        # which, since a wrong proxy could be worse than no filter at all.
         _rvol = float(market_data.get("rvol", 0))
         if _rvol > 0 and _rvol < 1.3:
             logger.info(

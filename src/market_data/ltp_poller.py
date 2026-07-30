@@ -458,6 +458,17 @@ class LTPPoller:
         _vol_avg20 = volume.rolling(20).mean().iloc[-1]
         rvol = round(float(volume.iloc[-1] / _vol_avg20), 2) if (_vol_avg20 and _vol_avg20 > 0) else 0.0
 
+        # KNOWN GAP (found 2026-07-30, pre-existing, not fixed here): this is a
+        # multi-day cumulative VWAP over the whole `df` (~750 historical bars plus
+        # today's live bars), not a proper SESSION VWAP that resets each day. A real
+        # session VWAP should only weight today's own bars. Strategy code (e.g.
+        # credit_spread's "price below/above VWAP — intraday bearish/bullish
+        # momentum" skip reason) reads this value as if it were today's session
+        # VWAP, which it isn't — the two can diverge meaningfully. Also, today's own
+        # live bars all carry volume=0 (see the RVOL comment in live_trading_engine.py
+        # _process_signal for why), so even a session-scoped version would have no
+        # real volume weight for the current day specifically and would need its own
+        # design decision, not just narrowing the date range.
         typical = (high + low + close) / 3
         vol_nonzero = volume.replace(0, np.nan)
         cum_vol = vol_nonzero.sum()

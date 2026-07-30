@@ -142,10 +142,25 @@ class ZerodhaTicker:
     def _on_ticks(self, ws, ticks) -> None:
         """Called on every tick. Updates 'close' plus the running day range
         (SECONDARY price source — see update_intraday_bar() in core/utils.py)
-        in the existing Redis tick dict."""
+        in the existing Redis tick dict.
+
+        Guarded on is_market_open(): confirmed live 2026-07-30 that Zerodha's
+        WebSocket delivers ticks well outside market hours (an LTP snapshot
+        appears to arrive on every reconnect regardless of whether the market
+        is open — observed repeatedly ~19:30-20:00 IST, hours after the 15:30
+        close). Without this guard, each of those stray ticks rolled the
+        5-min bucket over and got recorded as a genuine "bar" in bars_today —
+        a degenerate, flat (open=high=low=close) candle that doesn't
+        represent real trading, permanently baked into that day's series
+        (bounded by the day_range_date check resetting it fresh the next
+        real trading day, but still live and readable for the rest of the
+        evening in the meantime).
+        """
         if not self._redis or not ticks:
             return
-        from src.core.utils import update_intraday_bar
+        from src.core.utils import is_market_open, update_intraday_bar
+        if not is_market_open():
+            return
         for tick in ticks:
             token = tick.get("instrument_token")
             symbol = self._token_symbol.get(token)

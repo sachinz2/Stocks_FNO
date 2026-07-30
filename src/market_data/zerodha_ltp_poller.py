@@ -14,8 +14,6 @@ import json
 import logging
 from typing import List, Optional
 
-from src.core.utils import update_intraday_bar
-
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL_SECONDS = 5
@@ -126,6 +124,20 @@ class ZerodhaLTPPoller:
 
             redis_key = f"tick:{symbol}"
             try:
+                # Only updates "close" here, deliberately NOT update_intraday_bar() —
+                # ZerodhaTicker (WebSocket) is the sole bar-builder (see its _on_ticks
+                # docstring). Both this REST poller and the WebSocket ran
+                # update_intraday_bar() concurrently on the same Redis key from
+                # 2026-07-27 to 07-30: a classic read-modify-write race (both read
+                # the same JSON blob, mutate their own copy, write back — whichever
+                # writes last silently discards the other's update). day_high/day_low
+                # mostly self-heal (next tick re-derives the same max/min), but a lost
+                # update to bars_today would silently drop a completed candle from
+                # that day's series with no error, corrupting the EMA/ATR calc it
+                # feeds. Single-writer (WebSocket only) removes the race entirely; the
+                # cost is bars_today not advancing during a WebSocket outage (close
+                # still updates via this poller) — a visible, bounded gap instead of
+                # a silent, unbounded one.
                 raw = await self._redis.get(redis_key)
                 if raw:
                     tick = json.loads(raw)
@@ -137,8 +149,6 @@ class ZerodhaLTPPoller:
                         "close":      ltp,
                         "ltp_source": "zerodha_rest",
                     }
-                # SECONDARY price source — see update_intraday_bar() in core/utils.py
-                update_intraday_bar(tick, ltp)
                 await self._redis.set(redis_key, json.dumps(tick))
                 updated += 1
             except Exception as e:
