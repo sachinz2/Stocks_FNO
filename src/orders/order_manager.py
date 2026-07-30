@@ -67,6 +67,7 @@ class OrderManager:
         strategy_name: Optional[str] = None,
         iv_rank:       Optional[float] = None,
         vix:           Optional[float] = None,
+        capital_at_risk: Optional[float] = None,
     ) -> Optional[Order]:
         """
         Main entry point for placing orders.
@@ -77,6 +78,8 @@ class OrderManager:
         strategy_name : Passed to RiskManager for capital allocation check
         iv_rank       : Per-symbol IV rank — gates spread/condor entries
         vix           : India VIX — market-wide IV gate
+        capital_at_risk : Explicit max-loss figure passed straight through to
+                        RiskManager.validate_trade() — see its docstring.
         """
         # 1. Create PENDING record in DB
         db_order = await self.order_repo.create({
@@ -100,6 +103,7 @@ class OrderManager:
             strategy_name=strategy_name,
             iv_rank=iv_rank,
             vix=vix,
+            capital_at_risk=capital_at_risk,
         ):
             # Capture the returned merged object so order_status is reflected correctly
             db_order = await self.order_repo.update(db_order, {"order_status": "REJECTED_BY_RISK"})
@@ -121,8 +125,15 @@ class OrderManager:
             await self._audit("ORDER_ROUTED", {
                 "order_id": db_order.id, "broker_order_id": broker_order_id,
             })
-            # Track per-strategy deployed capital for BUY legs
-            if side == "BUY" and strategy_name:
+            # Track per-strategy deployed capital for single-leg BUY entries
+            # (ema_crossover_v1, momentum_v1). Excludes is_spread_leg=True legs —
+            # for credit_spread_v1/iron_condor_v1 the hedge/long legs are placed
+            # with is_spread_leg=True and strategy_name set, which used to also
+            # hit this hook and double- (spread) or triple- (condor) count
+            # deployed capital on top of the engine's own explicit, max-loss-based
+            # add_deployed_capital() call for those two structures (found
+            # 2026-07-30) — the two mechanisms stacked instead of one owning it.
+            if side == "BUY" and strategy_name and not is_spread_leg:
                 self.risk_manager.add_deployed_capital(strategy_name, quantity * price)
             return db_order
         except asyncio.TimeoutError:

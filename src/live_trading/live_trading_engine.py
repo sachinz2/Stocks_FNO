@@ -1298,6 +1298,32 @@ class LiveTradingEngine:
             )
             return
 
+        # Relative Strength filter (wired in 2026-07-30 — RSRanker was computing
+        # and publishing ranks every cycle but nothing ever consulted them).
+        # Trend-following works best on stocks already outperforming NIFTY (see
+        # rs_ranker.py docstring: "Only the top-N by RS score are eligible for
+        # trading"). Applied to BUY only — RSRanker ranks strongest-to-weakest,
+        # which is the correct gate for "buy calls on strength," but it has no
+        # symmetric "weakest stocks" ranking that would justify gating SELL
+        # (put-buying) entries the same way, so SELL is intentionally left
+        # ungated here. Fails open (allows the trade) whenever ranks aren't
+        # available yet (e.g. first few minutes after market open, before
+        # RSRanker's first cycle has completed) rather than blocking on an
+        # empty/placeholder list.
+        if signal_str == "BUY" and self.rs_ranker:
+            try:
+                _rs_ranks = await self.rs_ranker.get_ranks()
+            except Exception:
+                _rs_ranks = []
+            if _rs_ranks:
+                _rs_top_syms = {e["symbol"] for e in _rs_ranks[:10]}
+                if symbol not in _rs_top_syms:
+                    logger.info(
+                        f"[{strategy.name}] {symbol} skipped — not in RS top-10 "
+                        "vs NIFTY (relative strength too weak for a long entry)"
+                    )
+                    return
+
         # Multi-timeframe confirmation — 15-min EMA direction must agree with 5-min signal.
         # A 5-min crossover against the 15-min trend is counter-trend and fails more often.
         _redis_mtf = getattr(self, "_redis", None)
@@ -1732,6 +1758,12 @@ class LiveTradingEngine:
             )
             return
 
+        # Max-loss figure for the per-strategy capital budget check (risk layer 5)
+        # — passed explicitly since the short leg below is a SELL (see
+        # RiskManager.validate_trade's capital_at_risk docstring for why the
+        # default computation can't see it).
+        _capital_at_risk = (spread_width - net_credit) * lot_size
+
         logger.info(
             f"[CreditSpread] {spread_type} {symbol} | SELL {short_contract}@Rs{short_p} "
             f"BUY {long_contract}@Rs{long_p} credit=Rs{net_credit}x{lot_size}=Rs{total_credit:.0f} "
@@ -1741,7 +1773,7 @@ class LiveTradingEngine:
         short_order = await self.order_manager.place_order(
             short_contract, "SELL", lot_size, short_p,
             is_spread_leg=False, strategy_name=strategy.name,
-            iv_rank=iv_rank, vix=vix,
+            iv_rank=iv_rank, vix=vix, capital_at_risk=_capital_at_risk,
         )
         if not short_order or short_order.order_status != "OPEN":
             logger.warning(f"[CreditSpread] Short leg rejected: {short_contract}")
@@ -1778,7 +1810,6 @@ class LiveTradingEngine:
             return
 
         self._today_order_count += 2
-        spread_width = abs(short_strike - long_strike)
 
         journal_id = await self._log_trade_open(
             strategy=strategy.name, underlying=symbol,
@@ -1795,10 +1826,10 @@ class LiveTradingEngine:
         # same-day credit spread entry. Max loss is also a far more accurate risk
         # figure than hedge-leg premium: a wide spread's long leg can cost almost
         # the same regardless of width, while the real capital at risk scales
-        # directly with width.
-        self.risk_manager.add_deployed_capital(
-            strategy.name, (spread_width - net_credit) * lot_size
-        )
+        # directly with width. Reuses _capital_at_risk computed before the short
+        # leg above (same max-loss figure already passed as the risk-layer-5
+        # budget check).
+        self.risk_manager.add_deployed_capital(strategy.name, _capital_at_risk)
         self._active_spreads[symbol] = {
             "spread_type":    spread_type,
             "short_contract": short_contract, "long_contract":  long_contract,
@@ -2319,6 +2350,11 @@ class LiveTradingEngine:
             )
             return
 
+        # Max-loss figure for the per-strategy capital budget check (risk layer 5)
+        # — passed explicitly on the first (SELL) leg only, same rationale as
+        # _process_credit_spread's capital_at_risk.
+        _capital_at_risk = (wing_spread - net_credit) * lot_size
+
         legs = [
             (psc, "SELL", put_short_p,  False),
             (plc, "BUY",  put_long_p,   True),
@@ -2331,6 +2367,7 @@ class LiveTradingEngine:
             if not is_leg:
                 kwargs["iv_rank"] = iv_rank
                 kwargs["vix"]     = vix
+                kwargs["capital_at_risk"] = _capital_at_risk
             order = await self.order_manager.place_order(contract, side, lot_size, price, **kwargs)
             if not order or order.order_status != "OPEN":
                 logger.error(f"[IronCondor] Leg failed: {side} {contract}. Unwinding {len(placed)} leg(s).")
@@ -2367,16 +2404,14 @@ class LiveTradingEngine:
             entry_price=net_credit, quantity=lot_size,
             market_data=market_data, iv_rank=iv_rank, vix=vix,
         )
-        wing_spread = abs(put_short_strike - put_long_strike)
-        _call_wing  = abs(call_short_strike - call_long_strike)
         # Track deployed capital by actual max loss, not just the long/hedge legs'
         # premium — same fix and rationale as _process_credit_spread. Max loss for
         # an iron condor is bounded by whichever wing is wider (price can't be
         # simultaneously above the call strikes and below the put strikes, so only
         # one wing is ever actually breached), minus total net credit collected.
-        self.risk_manager.add_deployed_capital(
-            strategy.name, (max(wing_spread, _call_wing) - net_credit) * lot_size
-        )
+        # Reuses _capital_at_risk computed before the legs loop above (same
+        # max-loss figure already passed as the risk-layer-5 budget check).
+        self.risk_manager.add_deployed_capital(strategy.name, _capital_at_risk)
         self._active_condors[symbol] = {
             "put_short_contract":  psc,  "put_long_contract":   plc,
             "call_short_contract": csc,  "call_long_contract":  clc,

@@ -239,17 +239,26 @@ class MarketRegimeDetector:
                           LOW_VOL     ATR% >= threshold?
                                      /             \\
                                   YES               NO
-                               TRENDING         EMA_spread <= 0.15%?
-                                               /                    \\
-                                            YES                      NO
-                                        RANGE_BOUND             RANGE_BOUND (default)
-                                    (explicit flat)           (moderate/borderline —
-                                                               treat conservatively)
+                               TRENDING          RANGE_BOUND
+                                            (ATR moderate — whether EMA_spread
+                                             is flat or moderately directional,
+                                             both are "not a strong trend",
+                                             and premium sellers are the
+                                             appropriate regime for either)
 
         The ATR% comparison uses a lower threshold (ATR_TREND_EXIT_THRESHOLD)
         when prev_regime is already "TRENDING" — hysteresis so noise
         oscillating around ATR_TREND_THRESHOLD doesn't flip the regime every
         cycle (see module docstring).
+
+        EMA_FLAT_THRESHOLD/ema_spread_pct are accepted for the API/reporting
+        payload (get_regime_report()) but no longer branch here — found
+        2026-07-30 that the "EMA flat" and "EMA not flat" branches both
+        returned RANGE_BOUND, so the comparison was dead code with no
+        observable effect on regime selection. Collapsed rather than left as
+        a misleading no-op; a genuinely distinct outcome for the
+        moderate-ATR/wide-EMA-spread case (if ever wanted) is a separate,
+        deliberate design decision, not a bug fix.
         """
         if vix > VIX_HIGH_THRESHOLD:
             return "VOLATILE"
@@ -258,10 +267,7 @@ class MarketRegimeDetector:
         atr_threshold = ATR_TREND_EXIT_THRESHOLD if prev_regime == "TRENDING" else ATR_TREND_THRESHOLD
         if atr_pct >= atr_threshold:
             return "TRENDING"
-        # ATR is moderate — EMAs are flat or borderline flat.
-        # Default to RANGE_BOUND (not TRENDING) so iron condors and credit
-        # spreads are available in quiet markets where they perform best.
-        # Changed < to <= so EMA_spread exactly at threshold rounds to flat.
-        if ema_spread_pct <= EMA_FLAT_THRESHOLD:
-            return "RANGE_BOUND"
+        # ATR is moderate (below the trend threshold) — default to RANGE_BOUND
+        # so iron condors and credit spreads are available where they perform
+        # best, regardless of EMA_spread_pct (see docstring above).
         return "RANGE_BOUND"

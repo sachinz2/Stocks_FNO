@@ -115,6 +115,7 @@ class RiskManager:
         strategy_name: Optional[str] = None,
         iv_rank: Optional[float] = None,
         vix: Optional[float] = None,
+        capital_at_risk: Optional[float] = None,
     ) -> bool:
         """
         Returns True if the trade passes all risk checks, False otherwise.
@@ -131,6 +132,20 @@ class RiskManager:
         strategy_name : Used for per-strategy capital allocation check
         iv_rank       : Per-symbol IV rank [0,1] — gates spread/condor entries
         vix           : India VIX — secondary IV gate
+        capital_at_risk : Explicit max-loss figure for the per-strategy capital
+                        budget check (layer 5). Needed for credit_spread_v1/
+                        iron_condor_v1: their only leg that reaches this check
+                        (is_spread_leg=False) is a SELL, and the default
+                        BUY-only trade_value computation below would always
+                        see 0 for it — silently disabling the budget check for
+                        both strategies entirely (found 2026-07-30). Callers
+                        that already know the structure's true max loss before
+                        placing the anchor leg (both spread strategies do —
+                        strikes/net-credit are computed before any leg is
+                        placed) should pass it here. Falls back to the
+                        BUY-quantity*price / 0-for-SELL default when omitted,
+                        so single-leg BUY strategies (ema_crossover_v1,
+                        momentum_v1) are unaffected.
         """
 
         # ── 0. Exit orders bypass ALL checks ─────────────────────────────────────
@@ -204,9 +219,17 @@ class RiskManager:
             alloc_pct = STRATEGY_CAPITAL_ALLOCATION[strategy_name]
             budget = self.initial_capital * alloc_pct
             deployed = self._strategy_deployed.get(strategy_name, 0.0)
-            trade_value = quantity * price if side == "BUY" else 0.0
-            # For SELL legs the margin is taken by the broker, not our capital tracking
-            if side == "BUY" and deployed + trade_value > budget:
+            if capital_at_risk is not None:
+                # Explicit max-loss figure from the caller (credit spreads/condors —
+                # see capital_at_risk in the docstring above).
+                trade_value = capital_at_risk
+            elif side == "BUY":
+                trade_value = quantity * price
+            else:
+                # For naked SELL legs (not covered by capital_at_risk) the margin is
+                # taken by the broker, not our capital tracking.
+                trade_value = 0.0
+            if trade_value > 0 and deployed + trade_value > budget:
                 logger.warning(
                     f"Risk: {strategy_name} budget ₹{budget:,.0f} would be exceeded. "
                     f"Deployed: ₹{deployed:,.0f} + new: ₹{trade_value:,.0f}. Skipping."

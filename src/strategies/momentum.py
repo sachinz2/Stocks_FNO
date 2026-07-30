@@ -190,5 +190,30 @@ class MomentumStrategy(StrategyBase):
 
         return "HOLD"
 
+    def on_pause(self) -> None:
+        """Clear the confirmation buffer so a stale pending signal can't fire
+        the moment this strategy resumes.
+
+        Without this (found 2026-07-30), a regime-triggered pause (this
+        strategy only runs in TRENDING — see regime_detector.py) freezes
+        _pending_count mid-confirmation instead of resetting it, since
+        generate_signal() is never called while paused (see
+        LiveTradingEngine._process_signal's `if not strategy.is_active:
+        return`). On resume, if the trend condition is still true, the very
+        first post-resume cycle can complete signal_confirm_bars using a
+        count accumulated before the pause plus a single fresh bar —
+        firing with zero genuinely fresh confirmation bars since resume.
+        EMACrossoverStrategy already guards against this same risk in its
+        own on_pause(); this mirrors it.
+        """
+        if self._pending_signal:
+            logger.info(
+                f"[{self.name}] on_pause: clearing pending signals for "
+                f"{list(self._pending_signal.keys())}"
+            )
+        self._pending_signal.clear()
+        self._pending_count.clear()
+        self._pending_bar_key.clear()
+
     def shutdown(self):
         pass
