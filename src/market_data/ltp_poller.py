@@ -99,6 +99,23 @@ class LTPPoller:
         self._no_history_warned: set = set()  # suppress repeat "not enough history" warnings
         self._no_live_data_warned: set = set()  # suppress repeat "no live tick data yet" warnings
 
+    def set_kite(self, kite, instrument_tokens: Dict[str, int]) -> None:
+        """
+        (Re)attach a kite client + instrument tokens after construction.
+
+        kite/instrument_tokens used to be a one-time constructor snapshot — if
+        no valid Zerodha token existed in Redis at the exact moment this
+        poller was created (e.g. a restart during a token-expiry window),
+        self._kite stayed None for the process's entire lifetime with no way
+        to recover, even once a fresh token showed up later. Confirmed this
+        silently broke all indicator/regime data for 3 full trading days
+        (2026-07-27 through 07-29) after one Sunday-evening restart. Called by
+        the periodic self-healing job in api/main.py once a working kite
+        client becomes available.
+        """
+        self._kite   = kite
+        self._tokens = instrument_tokens or {}
+
     async def poll(self) -> None:
         """Called every 60 s by APScheduler."""
         from src.core.utils import is_market_open

@@ -91,35 +91,42 @@ async def lifespan(app: FastAPI):
     # trading on live market data without risking real money.
     mode           = TradingMode(settings.TRADING_MODE)
     zerodha_ticker = None
-    kite_instance  = None
 
-    # ── Always try Zerodha for market data if a token exists ──────────────────
-    raw_token        = await redis_client.get("zerodha:access_token")
-    instrument_tokens: dict = {}   # symbol → Zerodha instrument_token int
-    if raw_token and settings.ZERODHA_API_KEY and settings.ZERODHA_API_SECRET:
+    async def _provision_kite():
+        """
+        Build a Zerodha kite client + instrument token map from whatever
+        access token currently sits in Redis. Returns (kite, tokens, token_str)
+        — (None, {}, None) if no valid token is available right now. Safe to
+        call repeatedly — see the self-healing job registered below for why
+        this is a function rather than inline one-shot startup code.
+        """
+        raw = await redis_client.get("zerodha:access_token")
+        if not (raw and settings.ZERODHA_API_KEY and settings.ZERODHA_API_SECRET):
+            return None, {}, None
+        token = raw.strip()
         from src.brokers.zerodha import ZerodhaBroker
-        access_token  = raw_token.strip()
-        _data_broker  = ZerodhaBroker.from_redis_token(
-            settings.ZERODHA_API_KEY, settings.ZERODHA_API_SECRET, access_token
+        _data_broker = ZerodhaBroker.from_redis_token(
+            settings.ZERODHA_API_KEY, settings.ZERODHA_API_SECRET, token
         )
-        kite_instance = _data_broker.kite
-        logger.info("Zerodha kite session ready for market data (VIX, option quotes).")
-
-        # Fetch instrument tokens once — shared by ticker, LTPPoller, RSRanker
+        kite = _data_broker.kite
+        tokens: dict = {}
         try:
             loop = asyncio.get_event_loop()
-            nse_instruments = await loop.run_in_executor(
-                None, kite_instance.instruments, "NSE"
-            )
+            nse_instruments = await loop.run_in_executor(None, kite.instruments, "NSE")
             fno_set = set(FNO_SYMBOLS)
             for inst in nse_instruments:
                 sym = inst.get("tradingsymbol", "")
                 if sym in fno_set:
-                    instrument_tokens[sym] = inst["instrument_token"]
-            logger.info(f"Instrument tokens loaded: {len(instrument_tokens)}/{len(fno_set)} F&O symbols.")
+                    tokens[sym] = inst["instrument_token"]
+            logger.info(f"Instrument tokens loaded: {len(tokens)}/{len(fno_set)} F&O symbols.")
         except Exception as e:
             logger.warning(f"Instrument token fetch failed: {e}")
+        return kite, tokens, token
 
+    # ── Always try Zerodha for market data if a token exists ──────────────────
+    kite_instance, instrument_tokens, access_token = await _provision_kite()
+    if kite_instance:
+        logger.info("Zerodha kite session ready for market data (VIX, option quotes).")
         try:
             from src.market_data.zerodha_ticker import ZerodhaTicker
             zerodha_ticker = ZerodhaTicker(
@@ -142,13 +149,14 @@ async def lifespan(app: FastAPI):
             zerodha_ticker = None
     else:
         logger.warning(
-            "No Zerodha access token in Redis — LTP and indicator data unavailable. "
-            "Run scripts/zerodha_auto_auth.py to fix this."
+            "No Zerodha access token in Redis — LTP and indicator data unavailable "
+            "until the self-healing kite-provisioning job (every 3 min, see below) "
+            "picks one up. Run scripts/zerodha_auto_auth.py to fix this immediately."
         )
 
     # ── Order execution broker ─────────────────────────────────────────────────
     if mode == TradingMode.LIVE:
-        if not raw_token:
+        if not access_token:
             logger.critical(
                 "LIVE mode: Zerodha access token missing. Falling back to PaperBroker."
             )
@@ -252,6 +260,83 @@ async def lifespan(app: FastAPI):
     app.state.zerodha_ticker    = zerodha_ticker
     app.state.kite              = kite_instance
     app.state.instrument_tokens = instrument_tokens
+    app.state.last_kite_token   = access_token
+
+    # ── Self-healing kite provisioning ───────────────────────────────────────
+    # kite_instance used to be a one-time startup snapshot: if Redis had no
+    # valid access token at that exact moment (e.g. a restart during the daily
+    # token's TTL gap — access tokens expire after 24h, ex=86400 in
+    # zerodha_auto_auth.py), LTPPoller/RSRanker/engine were permanently stuck
+    # with no market data for the rest of the process's lifetime, even once
+    # the next day's 08:30 auth wrote a fresh token — nothing ever rechecked.
+    # Confirmed this silently broke ALL THREE strategies (zero signals, zero
+    # trades) for 3 full trading days (2026-07-27 through 07-29) after one
+    # Sunday-evening restart, with no ERROR-level logs to flag it. This job
+    # covers both halves of that gap:
+    #   1. kite_instance still None -> try provisioning again; if it works,
+    #      wire it into ltp_poller/rs_ranker/engine and start the
+    #      ticker/REST-poller if they never got the chance to at startup.
+    #   2. kite_instance already exists but Redis has since rotated in a
+    #      newer token (normal daily 08:30 auth) -> refresh it in place with
+    #      set_access_token(). Every holder shares this same object, so this
+    #      alone keeps them all current — no re-wiring needed for this case.
+    async def _kite_self_heal():
+        raw = await redis_client.get("zerodha:access_token")
+        if not raw:
+            return
+        token = raw.strip()
+
+        if app.state.kite is None:
+            kite, tokens, tok = await _provision_kite()
+            if kite is None:
+                return
+            logger.info(
+                f"Kite provisioning recovered — {len(tokens)}/{len(FNO_SYMBOLS)} "
+                "tokens, wiring into live components."
+            )
+            ltp_poller.set_kite(kite, tokens)
+            rs_ranker.set_kite(kite, tokens)
+            engine.attach_kite(kite)
+            app.state.kite              = kite
+            app.state.instrument_tokens = tokens
+            app.state.last_kite_token   = tok
+
+            if app.state.zerodha_ticker is None and tokens:
+                from src.market_data.zerodha_ticker import ZerodhaTicker
+                zt = ZerodhaTicker(
+                    api_key=settings.ZERODHA_API_KEY, access_token=tok,
+                    redis_url=settings.get_redis_url(), symbols=set(FNO_SYMBOLS),
+                )
+                zt._instrument_tokens = tokens.copy()
+                zt._token_symbol      = {v: k for k, v in tokens.items()}
+                zt.start()
+                app.state.zerodha_ticker = zt
+                logger.info(f"ZerodhaTicker: live stream started late ({len(tokens)} symbols) after kite recovery.")
+
+            if scheduler.get_job("zerodha_ltp_rest") is None:
+                from src.market_data.zerodha_ltp_poller import ZerodhaLTPPoller
+                zlp = ZerodhaLTPPoller(kite, redis_client, list(FNO_SYMBOLS))
+                scheduler.add_job(
+                    zlp.refresh_ltp, IntervalTrigger(seconds=5),
+                    id="zerodha_ltp_rest", name="Zerodha LTP REST poller",
+                    replace_existing=True, misfire_grace_time=3,
+                )
+                engine.attach_ltp_poller(zlp)
+                logger.info("ZerodhaLTPPoller: REST-based LTP refresh started late after kite recovery.")
+
+        elif token != app.state.last_kite_token:
+            app.state.kite.set_access_token(token)
+            app.state.last_kite_token = token
+            logger.info("Kite access token rotated — refreshed in place on the shared client.")
+
+    scheduler.add_job(
+        _kite_self_heal,
+        IntervalTrigger(seconds=180),
+        id="kite_self_heal",
+        name="Kite provisioning self-heal",
+        replace_existing=True,
+        misfire_grace_time=60,
+    )
 
     # Restore email-pause state across restarts
     if await redis_client.get("alerts:email_paused"):

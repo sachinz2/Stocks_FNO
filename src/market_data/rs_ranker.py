@@ -63,6 +63,15 @@ class RSRanker:
         self._nifty:  Optional[pd.DataFrame]  = None
         self._last_fetch: Optional[datetime]  = None
 
+    def set_kite(self, kite, instrument_tokens: Dict[str, int]) -> None:
+        """
+        (Re)attach a kite client + instrument tokens after construction — see
+        LTPPoller.set_kite() for why this exists (a missing token at startup
+        used to strand this permanently with no data until the next restart).
+        """
+        self._kite   = kite
+        self._tokens = instrument_tokens or {}
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     async def rank(self) -> List[dict]:
