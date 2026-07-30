@@ -191,6 +191,12 @@ async def lifespan(app: FastAPI):
         "short_offset": 1, "hedge_offset": 2,
         "profit_close_pct": 0.25, "stop_loss_multiple": 2.0, "min_dte": 7,
     })
+    StrategyRegistry.load_strategy("MOMENTUM", "momentum_v1", {
+        "fast_period": 20, "slow_period": 50,
+        "adx_entry_threshold": 35, "adx_exit_threshold": 22,
+        "min_ema_spread_pct": 0.30,
+        "stop_loss_pct": 0.50, "target_pct": 1.50, "trailing_stop_pct": 0.30,
+    })
 
     trade_journal_repo = BaseRepository(TradeJournal, AsyncSessionLocal)
     strategy_monitor   = StrategyMonitor(trade_journal_repo)

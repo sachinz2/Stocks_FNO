@@ -16,6 +16,7 @@ from src.core.constants import (
     REDIS_TOP_SYMBOLS_KEY,
     REDIS_TOP_SYMBOLS_CREDIT_SPREAD,
     REDIS_TOP_SYMBOLS_IRON_CONDOR,
+    REDIS_TOP_SYMBOLS_MOMENTUM,
 )
 from src.core.enums import SignalType, TradingMode
 from src.core.utils import (
@@ -1015,17 +1016,6 @@ class LiveTradingEngine:
         expiry = get_near_month_expiry()
         dte    = (expiry - now_ist().replace(tzinfo=None)).days
 
-        # Single-leg positions are only ever opened by EMA Crossover, so only that
-        # strategy's manage_position() is relevant here. Previously this called every
-        # loaded strategy's manage_position() with EMA-shaped args ({"avg_price",
-        # "peak_premium"}) — harmless today only because CreditSpread/IronCondor both
-        # default a missing "short_premium" to 0 and return HOLD, but fragile: a future
-        # strategy without that same defensive guard could produce a false exit here.
-        ema_strategy = next(
-            (s for s in active_strategies.values()
-             if s.__class__.__name__ == "EMACrossoverStrategy"), None
-        )
-
         managed: set = set()
         for s in self._active_spreads.values():
             managed.update([s.get("short_contract", ""), s.get("long_contract", "")])
@@ -1070,14 +1060,35 @@ class LiveTradingEngine:
             if dte < 4:
                 exit_reason = f"DTE={dte} — entering illiquid expiry window"
 
-            if exit_reason is None and ema_strategy is not None:
-                result = ema_strategy.manage_position(
-                    {"avg_price": entry_p, "peak_premium": peak}, current_p
+            # Resolve the strategy that actually OPENED this position (via the
+            # strategy_name recorded in _single_leg_journals at entry) rather
+            # than assuming EMA Crossover — that assumption held only while it
+            # was the sole single-leg strategy. Now that momentum_v1 also opens
+            # single-leg positions, using the wrong strategy's manage_position()
+            # would apply the wrong SL/TP/trailing thresholds to it.
+            owner_info = self._single_leg_journals.get(contract, {})
+            owner_strategy = active_strategies.get(owner_info.get("strategy_name", ""))
+            if owner_strategy is None:
+                # Fallback for a position somehow missing its journal entry —
+                # matches the old EMA-only assumption as a safe default.
+                owner_strategy = next(
+                    (s for s in active_strategies.values()
+                     if s.__class__.__name__ == "EMACrossoverStrategy"), None
+                )
+
+            if exit_reason is None and owner_strategy is not None:
+                result = owner_strategy.manage_position(
+                    {
+                        "avg_price": entry_p,
+                        "peak_premium": peak,
+                        "current_adx": market_data.get("adx14"),
+                    },
+                    current_p,
                 )
                 if result == "EXIT":
                     pnl_pct = (current_p - entry_p) / entry_p * 100
                     exit_reason = (
-                        f"{ema_strategy.name} entry=Rs{entry_p:.2f} "
+                        f"{owner_strategy.name} entry=Rs{entry_p:.2f} "
                         f"now=Rs{current_p:.2f} ({pnl_pct:+.1f}%)"
                     )
 
@@ -1163,9 +1174,13 @@ class LiveTradingEngine:
         if await self._has_open_option(symbol, option_type):
             return
 
-        # Portfolio-wide cap on simultaneous intraday (EMA Crossover) positions — counted
-        # via _single_leg_journals since that dict holds exactly the currently-open
-        # single-leg positions this strategy family produces, across all symbols.
+        # Portfolio-wide cap on simultaneous single-leg long-option positions —
+        # shared across ALL strategies that emit BUY/SELL (ema_crossover_v1 and,
+        # since 2026-07-30, momentum_v1 too), since _single_leg_journals holds
+        # every currently-open single-leg position regardless of which strategy
+        # opened it. Intentionally shared, not per-strategy: this caps total
+        # naked-long-option concentration, which is the same risk whichever
+        # strategy generated it.
         _open_intraday = len(self._single_leg_journals)
         if _open_intraday >= self._max_concurrent_intraday:
             logger.info(
@@ -3087,6 +3102,8 @@ class LiveTradingEngine:
                 key = REDIS_TOP_SYMBOLS_CREDIT_SPREAD
             elif class_name == "IronCondorStrategy":
                 key = REDIS_TOP_SYMBOLS_IRON_CONDOR
+            elif class_name == "MomentumStrategy":
+                key = REDIS_TOP_SYMBOLS_MOMENTUM
             else:
                 key = REDIS_TOP_SYMBOLS_KEY
             try:

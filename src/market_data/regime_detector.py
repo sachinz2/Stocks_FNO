@@ -64,6 +64,7 @@ REDIS_VIX_KEY         = "market:india_vix"    # matches option_chain.fetch_and_c
 STRATEGY_EMA       = "ema_crossover_v1"
 STRATEGY_SPREAD    = "credit_spread_v1"
 STRATEGY_CONDOR    = "iron_condor_v1"
+STRATEGY_MOMENTUM  = "momentum_v1"
 
 # Regime → which strategies should be ACTIVE
 #
@@ -72,8 +73,13 @@ STRATEGY_CONDOR    = "iron_condor_v1"
 # price move.  This makes credit spreads safer in TRENDING markets than condors.
 # Iron condors are NEUTRAL — they need flat price action, so they are excluded
 # from TRENDING and VOLATILE where one wing reliably gets blown out.
+# Momentum (added 2026-07-30) only makes sense in TRENDING — its entire thesis
+# is an already-strong, established trend (high ADX), which by definition isn't
+# present in RANGE_BOUND/LOW_VOL, and VOLATILE is a VIX-spike/gap regime rather
+# than a sustained-directional one, so it's excluded there too, same as EMA
+# crossover.
 REGIME_STRATEGY_MAP: Dict[str, list] = {
-    "TRENDING":    [STRATEGY_EMA, STRATEGY_SPREAD],       # spread aligned with trend = low breach risk
+    "TRENDING":    [STRATEGY_EMA, STRATEGY_SPREAD, STRATEGY_MOMENTUM],  # spread aligned with trend = low breach risk
     "RANGE_BOUND": [STRATEGY_CONDOR, STRATEGY_SPREAD],   # both premium sellers thrive in flat market
     "VOLATILE":    [STRATEGY_SPREAD],                     # high IV = rich premium; condor wings blow
     "LOW_VOL":     [STRATEGY_SPREAD, STRATEGY_CONDOR],   # quiet market = premium seller heaven

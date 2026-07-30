@@ -9,10 +9,14 @@ Runs every 60 s via APScheduler:
      never from this call.
   2. Computes EMA20, EMA50, ATR14, VWAP, ADX14, RVOL, prev_close for each symbol
   3. Writes enriched tick to Redis (tick:SYMBOL)
-  4. Scores all 40 symbols THREE WAYS — one per strategy regime:
-       - EMA Crossover pool  (nfo:top5)         : high ATR% + strong EMA trend
+  4. Scores all 40 symbols FOUR WAYS — one per strategy regime:
+       - EMA Crossover pool  (nfo:top5)          : high ATR% + strong EMA trend, NEAR a cross
        - Credit Spread pool  (nfo:top5:spread)   : low ATR% (<1.2%) + EMA directional
        - Iron Condor pool    (nfo:top5:condor)   : low ATR% (<1.2%) + EMA flat (<0.1%)
+       - Momentum pool       (nfo:top5:momentum) : high ADX (>=25) + wide EMA spread —
+                                                    the mirror of the EMA crossover pool,
+                                                    rewarding an ALREADY established trend
+                                                    instead of penalizing it
   5. Trading engine reads the right pool for each strategy so the correct 5 stocks
      are always fed to the right strategy on any given day.
   6. Publishes market breadth (advancing/declining ratio) to Redis (market:breadth)
@@ -61,6 +65,7 @@ from src.core.constants import (
     REDIS_TOP_SYMBOLS_KEY,
     REDIS_TOP_SYMBOLS_CREDIT_SPREAD,
     REDIS_TOP_SYMBOLS_IRON_CONDOR,
+    REDIS_TOP_SYMBOLS_MOMENTUM,
 )
 from src.core.utils import now_ist
 
@@ -127,6 +132,7 @@ class LTPPoller:
         ema_scores: Dict[str, float] = {}
         spread_scores: Dict[str, float] = {}
         condor_scores: Dict[str, float] = {}
+        momentum_scores: Dict[str, float] = {}
         all_ticks: list = []  # collected for market-breadth computation after the loop
 
         for symbol in self.symbols:
@@ -182,17 +188,19 @@ class LTPPoller:
                     tick15 = self._enrich_15m(symbol, df15, live_range=day_range)
                     await self._redis.set(f"tick15:{symbol}", json.dumps(tick15), ex=1800)
 
-                e, s, c = self._score_all(tick)
+                e, s, c, m = self._score_all(tick)
                 ema_scores[symbol] = e
                 if s > 0:
                     spread_scores[symbol] = s
                 if c > 0:
                     condor_scores[symbol] = c
+                if m > 0:
+                    momentum_scores[symbol] = m
 
                 logger.debug(
                     f"Tick: {symbol} ltp={ltp:.2f} "
                     f"ema_score={e:.3f} spread_score={s:.3f} condor_score={c:.3f} "
-                    f"adx={tick.get('adx14', 0):.1f} rvol={tick.get('rvol', 0):.2f}"
+                    f"momentum_score={m:.3f} adx={tick.get('adx14', 0):.1f} rvol={tick.get('rvol', 0):.2f}"
                 )
             except Exception as exc:
                 logger.error(f"LTP poll failed for {symbol}: {exc}")
@@ -271,6 +279,15 @@ class LTPPoller:
         else:
             await self._redis.delete(REDIS_TOP_SYMBOLS_IRON_CONDOR)
             logger.info("Iron condor pool: no eligible symbols today (all have directional EMA or high ATR%)")
+
+        # Publish momentum pool (high ADX + wide EMA spread — established trend)
+        if momentum_scores:
+            top_momentum = sorted(momentum_scores, key=momentum_scores.__getitem__, reverse=True)[:n]
+            await self._redis.set(REDIS_TOP_SYMBOLS_MOMENTUM, json.dumps(top_momentum))
+            logger.info(f"Momentum pool top-{n}: {top_momentum}")
+        else:
+            await self._redis.delete(REDIS_TOP_SYMBOLS_MOMENTUM)
+            logger.info("Momentum pool: no eligible symbols today (ADX all < 25)")
 
     async def _read_day_range(self, symbol: str) -> Optional[dict]:
         """
@@ -504,14 +521,23 @@ class LTPPoller:
         Iron Condor score (high = low-vol + flat EMA, 0 if ATR% >= 1.2% or EMA spread >= 0.1%):
           (1.2 - ATR%) × 0.6 + (0.1 - EMA_spread%) × 0.4
           → rewards the most range-bound, stable stocks — ideal for both sides to expire
+
+        Momentum score (high = strong, ESTABLISHED trend, 0 if ADX < 25):
+          ADX × 0.7 + min(EMA_spread%, 1.0) × 0.3
+          → the mirror image of the EMA crossover score: rewards stocks ALREADY
+            deep in a strong trend (high ADX, wide EMA separation) instead of
+            penalizing them. ADX weighted higher since it's the primary
+            "is this trend for real" signal; EMA spread is capped at 1.0 so one
+            extreme outlier doesn't dominate over genuinely high-ADX candidates.
         """
         close = tick.get("close", 0)
         if close <= 0:
-            return 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0, 0.0
 
         atr = tick.get("atr14", 0)
         ema20 = tick.get("ema20", close)
         ema50 = tick.get("ema50", close)
+        adx = tick.get("adx14", 0)
 
         atr_pct = (atr / close) * 100
         ema_spread_pct = abs(ema20 - ema50) / ema50 * 100 if ema50 > 0 else 0.0
@@ -538,7 +564,13 @@ class LTPPoller:
         else:
             condor_score = 0.0
 
-        return ema_score, spread_score, condor_score
+        # Regime 4: Momentum — only when trend is already strong
+        if adx >= 25:
+            momentum_score = round(adx * 0.7 + min(ema_spread_pct, 1.0) * 0.3, 4)
+        else:
+            momentum_score = 0.0
+
+        return ema_score, spread_score, condor_score, momentum_score
 
     # ── 15-min multi-timeframe helpers ────────────────────────────────────────
 

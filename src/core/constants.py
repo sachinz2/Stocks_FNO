@@ -127,9 +127,15 @@ FNO_SECTORS = {
 # strategy_name at every order call, not the uppercase registry name used to look up
 # the strategy CLASS. A mismatch here makes this budget check silently never fire.
 STRATEGY_CAPITAL_ALLOCATION = {
-    "ema_crossover_v1": 0.40,   # ₹1,20,000 at ₹3L capital
-    "credit_spread_v1": 0.40,   # ₹1,20,000
-    "iron_condor_v1":   0.20,   # ₹60,000
+    # Rebalanced 2026-07-30 to make room for momentum_v1 (new — see
+    # strategies/momentum.py) while keeping the total at 100%. Trimmed
+    # ema_crossover_v1 and iron_condor_v1 more than credit_spread_v1 (the
+    # proven highest performer to date) since momentum_v1 is unproven and
+    # covers similar "strong trend" ground to ema_crossover_v1.
+    "ema_crossover_v1": 0.30,   # ₹90,000 at ₹3L capital (was 0.40)
+    "credit_spread_v1": 0.35,   # ₹1,05,000 (was 0.40)
+    "iron_condor_v1":   0.15,   # ₹45,000 (was 0.20)
+    "momentum_v1":      0.20,   # ₹60,000 (new)
 }
 
 # Max open structures per sector (prevents correlated blow-ups)
@@ -140,6 +146,7 @@ MAX_SECTOR_POSITIONS = 2
 REDIS_TOP_SYMBOLS_KEY = "nfo:top5"                        # EMA crossover: high ATR + strong trend
 REDIS_TOP_SYMBOLS_CREDIT_SPREAD = "nfo:top5:spread"       # Credit spread: low ATR + EMA directional
 REDIS_TOP_SYMBOLS_IRON_CONDOR = "nfo:top5:condor"         # Iron condor: low ATR + EMA flat
+REDIS_TOP_SYMBOLS_MOMENTUM = "nfo:top5:momentum"          # Momentum: high ADX + wide EMA spread (established trend)
 
 REDIS_LOT_SIZE_PREFIX = "nfo:lot:"
 
