@@ -1269,19 +1269,17 @@ class LiveTradingEngine:
         # RVOL filter — require above-average volume (RVOL > 1.3) for momentum entries.
         # Low-volume breakouts have higher false-positive rates and wider bid-ask spreads.
         #
-        # KNOWN GAP (found 2026-07-30, not fixed): this is silently a no-op almost all
-        # session, every day. RVOL's 20-period rolling volume average is computed over
-        # a blended historical+live-tick bar series (see ltp_poller._enrich()), but
-        # WebSocket ticks arrive in MODE_LTP (price only, no volume — see
-        # zerodha_ticker.py), so every live-tick bar carries volume=0. Once ~20 live
-        # bars exist (~100 min into the session), the entire rolling window is
-        # zero-volume and rvol computes to exactly 0.0. Since the check below only
-        # blocks when `_rvol > 0`, a value of exactly 0 always passes — meaning this
-        # filter has provided no real signal for most of every trading day since the
-        # live-tick redesign (2026-07-27). Properly fixing it needs either a real
-        # volume source (MODE_FULL WebSocket subscription instead of MODE_LTP) or a
-        # deliberate non-volume proxy — not attempting either without a decision on
-        # which, since a wrong proxy could be worse than no filter at all.
+        # Fixed 2026-07-30: this was silently a no-op almost all session, every day,
+        # from the live-tick redesign (2026-07-27) until now. RVOL's 20-period rolling
+        # volume average is computed over a blended historical+live-tick bar series
+        # (see ltp_poller._enrich()), but WebSocket ticks arrived in MODE_LTP (price
+        # only, no volume — see zerodha_ticker.py), so every live-tick bar carried
+        # volume=0. Once ~20 live bars existed (~100 min into the session), the entire
+        # rolling window was zero-volume and rvol computed to exactly 0.0 — and since
+        # this check only blocks when `_rvol > 0`, a value of exactly 0 always passed.
+        # ZerodhaTicker now subscribes in MODE_QUOTE (real volume_traded per tick,
+        # accumulated into per-bar volume by update_intraday_bar() in core/utils.py),
+        # so rvol carries a genuine non-zero signal once live bars accumulate.
         _rvol = float(market_data.get("rvol", 0))
         if _rvol > 0 and _rvol < 1.3:
             logger.info(
@@ -1550,11 +1548,15 @@ class LiveTradingEngine:
             )
             return
 
-        # VWAP trend confirmation — VWAP here is computed from 10 days of 5-min candles
-        # (volume-weighted average over ~750 bars), making it a medium-term trend anchor.
-        # Price below this VWAP = 10-day downtrend → oppose BULL_PUT (stock may keep falling).
-        # Price above this VWAP = 10-day uptrend → oppose BEAR_CALL (stock may keep rising).
-        vwap = float(market_data.get("vwap", underlying_price))
+        # VWAP trend confirmation — session_vwap (added 2026-07-30) is a genuine
+        # intraday VWAP built from only today's live-tick bars, matching what the
+        # log messages below actually claim ("intraday bearish/bullish momentum").
+        # Before this, `vwap` (still available, now used only as a fallback) was a
+        # multi-day cumulative figure over ~750 5-min bars — a medium-term anchor,
+        # not the intraday one this check was described as. Falls back to the
+        # multi-day vwap only in the bootstrap edge case (no live bars yet).
+        price_vwap = market_data.get("session_vwap")
+        vwap = float(price_vwap if price_vwap else market_data.get("vwap", underlying_price))
         if vwap > 0:
             _vwap_buffer = 0.005  # 0.5% buffer — ignore tiny VWAP deviations
             if spread_type == "BULL_PUT_SPREAD" and underlying_price < vwap * (1 - _vwap_buffer):

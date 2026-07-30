@@ -7,9 +7,20 @@ the historical indicators (EMA, ATR, VWAP) computed by LTPPoller intact.
 Flow:
   1. fetch_instrument_tokens() — maps NSE symbols to Zerodha instrument_tokens
   2. start(loop) — launches KiteTicker in a daemon thread
-  3. On connection: subscribe to all 40 tokens in MODE_LTP
+  3. On connection: subscribe to all 40 tokens in MODE_QUOTE
   4. On each tick: read existing tick dict from Redis, update 'close', write back
   5. Automatic reconnection handled by KiteTicker (up to MAX_RECONNECT_ATTEMPTS)
+
+MODE_QUOTE vs MODE_LTP (switched 2026-07-30): MODE_LTP ticks carry only
+instrument_token + last_price — no volume. That silently broke the RVOL
+entry filter (see the RVOL comment in live_trading_engine.py
+_process_signal) and left every live-tick bar's volume hardcoded at 0.
+MODE_QUOTE is the same WebSocket connection with one extra flag on
+set_mode() — no separate subscription, plan, or Zerodha permission needed
+— and additionally carries volume_traded (cumulative day volume),
+average_traded_price, and OHLC per tick. MODE_FULL adds market depth (5
+best bid/ask levels) and OI on top of that, which nothing here needs, so
+MODE_QUOTE is the leaner choice for just fixing volume/RVOL.
 """
 import json
 import logging
@@ -134,9 +145,9 @@ class ZerodhaTicker:
     def _on_connect(self, ws, response) -> None:
         tokens = list(self._instrument_tokens.values())
         self._ticker.subscribe(tokens)
-        self._ticker.set_mode(self._ticker.MODE_LTP, tokens)
+        self._ticker.set_mode(self._ticker.MODE_QUOTE, tokens)
         logger.info(
-            f"ZerodhaTicker: WebSocket connected — subscribed {len(tokens)} symbols in LTP mode"
+            f"ZerodhaTicker: WebSocket connected — subscribed {len(tokens)} symbols in QUOTE mode"
         )
 
     def _on_ticks(self, ws, ticks) -> None:
@@ -169,6 +180,9 @@ class ZerodhaTicker:
             ltp = tick.get("last_price", 0)
             if ltp <= 0:
                 continue
+            # Cumulative day volume — present since the MODE_QUOTE switch
+            # (2026-07-30); None for any straggler MODE_LTP-shaped tick.
+            volume_traded = tick.get("volume_traded")
             redis_key = f"tick:{symbol}"
             try:
                 raw = self._redis.get(redis_key)
@@ -183,7 +197,7 @@ class ZerodhaTicker:
                         "close": ltp,
                         "ltp_source": "zerodha_realtime",
                     }
-                update_intraday_bar(data, ltp)
+                update_intraday_bar(data, ltp, volume_traded=volume_traded)
                 self._redis.set(redis_key, json.dumps(data))
             except Exception as e:
                 logger.debug(f"ZerodhaTicker: Redis write failed [{symbol}]: {e}")

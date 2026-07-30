@@ -7,7 +7,12 @@ Runs every 60 s via APScheduler:
      window) — used ONLY as the multi-day baseline for EMA/ATR continuity.
      Today's own bars are always built from live ticks instead (see below),
      never from this call.
-  2. Computes EMA20, EMA50, ATR14, VWAP, ADX14, RVOL, prev_close for each symbol
+  2. Computes EMA20, EMA50, ATR14, VWAP, session_vwap, ADX14, RVOL, prev_close
+     for each symbol. RVOL and session_vwap depend on real per-bar volume,
+     which requires ZerodhaTicker's MODE_QUOTE subscription (see
+     zerodha_ticker.py and update_intraday_bar() in core/utils.py) — before
+     2026-07-30 all live bars had volume=0, silently disabling RVOL and
+     leaving no real session-scoped VWAP.
   3. Writes enriched tick to Redis (tick:SYMBOL)
   4. Scores all 40 symbols FOUR WAYS — one per strategy regime:
        - EMA Crossover pool  (nfo:top5)          : high ATR% + strong EMA trend, NEAR a cross
@@ -390,7 +395,10 @@ class LTPPoller:
                     "high":   bar["high"],
                     "low":    bar["low"],
                     "close":  bar["close"],
-                    "volume": 0,
+                    # Real per-bar volume since the MODE_QUOTE switch (2026-07-30,
+                    # see update_intraday_bar() in core/utils.py) — falls back to 0
+                    # for any bar finalized before that change was deployed.
+                    "volume": bar.get("volume", 0),
                 }
                 for bar in (live_range.get("bars_today") or [])
             ]
@@ -402,7 +410,7 @@ class LTPPoller:
                     "high":   live_range.get("cur_bar_high", ltp),
                     "low":    live_range.get("cur_bar_low", ltp),
                     "close":  ltp,
-                    "volume": 0,
+                    "volume": live_range.get("cur_bar_volume", 0),
                 })
             if not live_rows:
                 # No bars accumulated yet (e.g. moments after market open) —
@@ -416,7 +424,23 @@ class LTPPoller:
                     "close":  ltp,
                     "volume": 0,
                 }]
+            # session_vwap: a genuine intraday VWAP built from ONLY today's live
+            # rows (real volume as of the MODE_QUOTE switch, see above) — kept
+            # separate from the existing multi-day `vwap` below rather than
+            # replacing it, since callers already treat that one as a medium-term
+            # (10-day) trend anchor (see live_trading_engine.py credit-spread
+            # VWAP check). Computed here, before live_rows is merged into the
+            # multi-day df, so it's unambiguous which bars fed it.
+            _sess_typical = pd.Series([(r["high"] + r["low"] + r["close"]) / 3 for r in live_rows])
+            _sess_vol = pd.Series([r["volume"] for r in live_rows]).replace(0, np.nan)
+            _sess_cum_vol = _sess_vol.sum()
+            session_vwap = (
+                float((_sess_typical * _sess_vol).sum() / _sess_cum_vol)
+                if _sess_cum_vol and _sess_cum_vol > 0 else ltp
+            )
             df = pd.concat([df, pd.DataFrame(live_rows)], ignore_index=True)
+        else:
+            session_vwap = ltp
 
         close = df["close"]
         high  = df["high"]
@@ -458,17 +482,11 @@ class LTPPoller:
         _vol_avg20 = volume.rolling(20).mean().iloc[-1]
         rvol = round(float(volume.iloc[-1] / _vol_avg20), 2) if (_vol_avg20 and _vol_avg20 > 0) else 0.0
 
-        # KNOWN GAP (found 2026-07-30, pre-existing, not fixed here): this is a
-        # multi-day cumulative VWAP over the whole `df` (~750 historical bars plus
-        # today's live bars), not a proper SESSION VWAP that resets each day. A real
-        # session VWAP should only weight today's own bars. Strategy code (e.g.
-        # credit_spread's "price below/above VWAP — intraday bearish/bullish
-        # momentum" skip reason) reads this value as if it were today's session
-        # VWAP, which it isn't — the two can diverge meaningfully. Also, today's own
-        # live bars all carry volume=0 (see the RVOL comment in live_trading_engine.py
-        # _process_signal for why), so even a session-scoped version would have no
-        # real volume weight for the current day specifically and would need its own
-        # design decision, not just narrowing the date range.
+        # `vwap` is deliberately a multi-day cumulative figure (~750 historical
+        # bars plus today's live bars) — a medium-term (10-day) trend anchor, see
+        # live_trading_engine.py's credit-spread VWAP check. `session_vwap`
+        # (computed above, today's live rows only) is the genuine intraday
+        # counterpart for callers that actually want "today's session VWAP".
         typical = (high + low + close) / 3
         vol_nonzero = volume.replace(0, np.nan)
         cum_vol = vol_nonzero.sum()
@@ -504,6 +522,7 @@ class LTPPoller:
             "rvol":           rvol,
             "ema_spread_pct": ema_spread_pct,
             "vwap":           round(vwap, 4),
+            "session_vwap":   round(session_vwap, 4),
             "ohlc_bar_key":   ohlc_bar_key,
             "timestamp":      datetime.now().isoformat(),
             "ltp_source":     "zerodha_live_ticks" if has_live_data else "zerodha_historical",

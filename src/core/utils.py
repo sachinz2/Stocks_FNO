@@ -2,6 +2,7 @@ import calendar
 import logging
 import math
 from datetime import date, datetime, timedelta
+from typing import Optional
 import pytz
 
 from src.core.constants import FIVE_MIN_ATR_DAILY_SCALE, FNO_LOT_SIZES, FNO_STRIKE_INTERVALS
@@ -225,11 +226,22 @@ def now_ist() -> datetime:
     return datetime.now(IST)
 
 
-def update_intraday_bar(tick: dict, ltp: float) -> dict:
+def update_intraday_bar(tick: dict, ltp: float, volume_traded: Optional[int] = None) -> dict:
     """
     Build real 5-min OHLC bars for today from live LTP updates, in place on a
     tick dict. Called by ZerodhaTicker (WebSocket) and ZerodhaLTPPoller (REST
     fallback) on every price update.
+
+    volume_traded, when supplied (ZerodhaTicker only, via MODE_QUOTE — see
+    zerodha_ticker.py), is Zerodha's cumulative day volume as of this tick.
+    Converted to a per-tick incremental delta (tracked via the internal
+    "_last_cum_volume" field) and accumulated into cur_bar_volume, so each
+    finalized bar carries its own real traded volume instead of the
+    hardcoded 0 used before 2026-07-30 (see the RVOL comment in
+    live_trading_engine.py _process_signal for why that was silently
+    breaking the RVOL entry filter). ZerodhaLTPPoller's REST fallback has no
+    volume data (kite.ltp() doesn't return it) and always passes None here —
+    those bars simply get 0 volume, same as before.
 
     This is now the ONLY source LTPPoller uses for today's own bars.
     Zerodha's historical_data() API (5-min candles) was observed lagging
@@ -262,8 +274,21 @@ def update_intraday_bar(tick: dict, ltp: float) -> dict:
     now         = now_ist()
     bucket_key  = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0).isoformat()
 
+    # Incremental volume for this tick, derived from Zerodha's cumulative
+    # day-volume figure. Computed before the new-day check below so the
+    # baseline (_last_cum_volume) always reflects the most recent tick.
+    if volume_traded is not None:
+        _last_cum = tick.get("_last_cum_volume")
+        _delta = max(0, volume_traded - _last_cum) if _last_cum is not None else 0
+        tick["_last_cum_volume"] = volume_traded
+    else:
+        _delta = 0
+
     if tick.get("day_range_date") != today_str:
         # New trading day — reset everything, including any carried-over bars.
+        # _last_cum_volume was just set above to this tick's cumulative volume,
+        # i.e. today's baseline — intentionally not counted into cur_bar_volume
+        # since we can't yet tell how much of it belongs to this specific bar.
         tick["day_open"]  = ltp
         tick["day_high"]  = ltp
         tick["day_low"]   = ltp
@@ -274,6 +299,7 @@ def update_intraday_bar(tick: dict, ltp: float) -> dict:
         tick["cur_bar_high"]  = ltp
         tick["cur_bar_low"]   = ltp
         tick["cur_bar_close"] = ltp
+        tick["cur_bar_volume"] = 0
         return tick
 
     tick["day_high"] = max(tick.get("day_high", ltp), ltp)
@@ -284,17 +310,19 @@ def update_intraday_bar(tick: dict, ltp: float) -> dict:
         tick["cur_bar_high"]  = max(tick.get("cur_bar_high", ltp), ltp)
         tick["cur_bar_low"]   = min(tick.get("cur_bar_low", ltp), ltp)
         tick["cur_bar_close"] = ltp
+        tick["cur_bar_volume"] = tick.get("cur_bar_volume", 0) + _delta
         return tick
 
     # Bucket rolled over — finalize the just-completed bar before starting a new one.
     if tick.get("cur_bar_key"):
         bars = tick.get("bars_today") or []
         bars.append({
-            "date":  tick["cur_bar_key"],
-            "open":  tick.get("cur_bar_open", ltp),
-            "high":  tick.get("cur_bar_high", ltp),
-            "low":   tick.get("cur_bar_low", ltp),
-            "close": tick.get("cur_bar_close", ltp),
+            "date":   tick["cur_bar_key"],
+            "open":   tick.get("cur_bar_open", ltp),
+            "high":   tick.get("cur_bar_high", ltp),
+            "low":    tick.get("cur_bar_low", ltp),
+            "close":  tick.get("cur_bar_close", ltp),
+            "volume": tick.get("cur_bar_volume", 0),
         })
         tick["bars_today"] = bars[-100:]  # cap well above the ~75 bars/day expected
 
@@ -303,6 +331,8 @@ def update_intraday_bar(tick: dict, ltp: float) -> dict:
     tick["cur_bar_high"]  = ltp
     tick["cur_bar_low"]   = ltp
     tick["cur_bar_close"] = ltp
+    # This tick's delta belongs to the bar that just started, not the one just finalized.
+    tick["cur_bar_volume"] = _delta
     return tick
 
 
