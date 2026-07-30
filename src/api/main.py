@@ -311,15 +311,16 @@ async def health_check():
     except Exception as e:
         db_status = f"DOWN: {e}"
 
-    # PRIMARY/SECONDARY data-source health — market:trend_stats is published by
-    # LTPPoller every poll cycle (see ltp_poller.py). fallback_symbols > 0 means
-    # historical_data() (PRIMARY) was detected stale for that many symbols and
-    # LTPPoller.py switched them to the live-tick SECONDARY source instead
-    # (see update_intraday_bar() in core/utils.py for why this exists).
+    # Market-data source health — market:trend_stats is published by LTPPoller
+    # every poll cycle (see ltp_poller.py). Today's own bars always come from
+    # live ticks now (Zerodha confirmed historical_data() isn't reliable for the
+    # current session — see ltp_poller.py module docstring); symbols_without_live_data
+    # > 0 means a symbol has no live tick data yet (bootstrap edge case, e.g. the
+    # first few seconds after market open), not a "fallback engaging" situation.
     data_source = {
-        "primary_source_healthy": None,
-        "fallback_symbols":       None,
-        "n_symbols":              None,
+        "all_symbols_live":          None,
+        "symbols_without_live_data": None,
+        "n_symbols":                 None,
     }
 
     try:
@@ -333,9 +334,9 @@ async def health_check():
             trend_raw = await app.state.redis.get("market:trend_stats")
             if trend_raw:
                 trend = json.loads(trend_raw)
-                data_source["primary_source_healthy"] = trend.get("primary_source_healthy")
-                data_source["fallback_symbols"]        = trend.get("fallback_symbols")
-                data_source["n_symbols"]               = trend.get("n_symbols")
+                data_source["all_symbols_live"]          = trend.get("all_symbols_live")
+                data_source["symbols_without_live_data"]  = trend.get("symbols_without_live_data")
+                data_source["n_symbols"]                  = trend.get("n_symbols")
     except Exception as e:
         redis_status = f"DOWN: {e}"
 
@@ -343,8 +344,8 @@ async def health_check():
     source_label = {
         "zerodha_realtime":    "Zerodha WebSocket (real-time)",
         "zerodha_rest":        "Zerodha REST poll (5 s)",
-        "zerodha_historical":  "Zerodha historical OHLC (60 s)",
-        "live_fallback_today": "Live-tick fallback (PRIMARY historical API stale)",
+        "zerodha_historical":  "Zerodha historical OHLC (bootstrap fallback)",
+        "zerodha_live_ticks":  "Zerodha live ticks (real-time bars)",
     }.get(ltp_source, ltp_source)
 
     # Live virtual cash balance (PaperBroker only — this is the actual ledger

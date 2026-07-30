@@ -231,16 +231,18 @@ def update_intraday_bar(tick: dict, ltp: float) -> dict:
     tick dict. Called by ZerodhaTicker (WebSocket) and ZerodhaLTPPoller (REST
     fallback) on every price update.
 
-    This is the SECONDARY price-source. PRIMARY is Zerodha's historical_data()
-    API (5-min candles), used by LTPPoller for EMA/ATR/ADX. historical_data()
-    has been observed lagging same-day (intraday) candles by 5+ hours EVERY
-    trading day (2026-07-17 through 07-24) even with the Historical Data API
-    subscription active and confirmed active on the account — including via a
-    direct, uncached historical_data() call bypassing all our own caching.
-    Confirmed this repeats fresh every calendar day regardless of process
-    uptime (no restart between 07-17 and 07-24), so it's a live characteristic
-    of Zerodha's historical pipeline for the current session, not something a
-    container restart or better caching on our side can fix.
+    This is now the ONLY source LTPPoller uses for today's own bars.
+    Zerodha's historical_data() API (5-min candles) was observed lagging
+    same-day (intraday) candles by 5+ hours EVERY trading day (2026-07-17
+    through 07-24) even with the Historical Data API subscription active and
+    confirmed active on the account — including via a direct, uncached
+    historical_data() call bypassing all our own caching, repeating fresh every
+    calendar day regardless of process uptime. Zerodha support confirmed in
+    writing (2026-07-27) this is fundamental, not a bug: minute candles aren't
+    guaranteed promptly, delays can cascade with no upper bound, and their own
+    recommendation is to generate candles from live ticks for the current
+    session — exactly what this function does. historical_data() is now used
+    only for the prior-day baseline (see ltp_poller.py module docstring).
 
     Maintains:
       - day_open/day_high/day_low: today's full-day range (used directly for
@@ -255,10 +257,6 @@ def update_intraday_bar(tick: dict, ltp: float) -> dict:
         but its real range that day was ~2.8%). A real per-bar series lets
         EMA20 in particular actually track today's intraday path.
       - cur_bar_*: the still-forming (incomplete) current 5-min bar.
-
-    LTPPoller falls back to this only when it detects the historical feed is
-    stale (see PRIMARY_STALE_THRESHOLD_SECONDS in ltp_poller.py) — under
-    normal conditions this data is tracked but unused.
     """
     today_str   = now_ist().date().isoformat()
     now         = now_ist()

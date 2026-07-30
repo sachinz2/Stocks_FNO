@@ -1,9 +1,12 @@
 """
-LTP Poller — fetches 5-min OHLC from Zerodha and computes indicators.
+LTP Poller — computes indicators from Zerodha OHLC, blending baseline history
+with live-tick intraday bars.
 
 Runs every 60 s via APScheduler:
-  1. Polls all 40 F&O symbols via kite.historical_data() (5-min OHLC, 10-day window)
-     — this is the PRIMARY data source.
+  1. Polls all 40 F&O symbols via kite.historical_data() (5-min OHLC, 10-day
+     window) — used ONLY as the multi-day baseline for EMA/ATR continuity.
+     Today's own bars are always built from live ticks instead (see below),
+     never from this call.
   2. Computes EMA20, EMA50, ATR14, VWAP, ADX14, RVOL, prev_close for each symbol
   3. Writes enriched tick to Redis (tick:SYMBOL)
   4. Scores all 40 symbols THREE WAYS — one per strategy regime:
@@ -17,27 +20,29 @@ Runs every 60 s via APScheduler:
      the regime detector's proxy for "NIFTY ATR%" since no index tick is subscribed
   8. Fetches 15-min OHLC for multi-timeframe EMA confirmation (tick15:SYMBOL)
 
-PRIMARY/SECONDARY data source fallback (added 2026-07-18, strengthened 2026-07-26):
-  Zerodha's historical_data() API (PRIMARY, used above) has been observed lagging
-  same-day intraday candles by 5+ hours EVERY trading day from 2026-07-17 through
-  07-24 — confirmed via a direct, uncached call returning candles capped at
-  09:45 IST when queried at 15:16 IST, and confirmed to repeat fresh every
-  calendar day with no container restart in between, so it's not something a
-  restart or our own caching can fix.
-
-  When a symbol's last historical candle is older than PRIMARY_STALE_THRESHOLD_SECONDS,
-  _enrich() falls back to a SECONDARY source: a real, growing series of 5-min OHLC
-  bars built by bucketing live ticks (ZerodhaTicker WebSocket / ZerodhaLTPPoller
-  REST — see update_intraday_bar() in core/utils.py), appended on top of the
-  (still valid) prior-day historical candles. Originally this was a single
-  synthetic "today" blob bar, but that only carries ~9.5%/3.9% weight against
-  ~750 stale historical bars in the EMA20/50 calc — too weak to flip an
-  already-close relationship on a normal trading day (confirmed against live
-  EMA-pool data 2026-07-24: zero EMA crossover entries all week despite the
-  regime gate resuming the strategy almost the full session). A real per-bar
-  series lets EMA20 in particular actually track today's intraday path the way
-  a genuine 20-period EMA should. Under normal conditions the PRIMARY feed is
-  fresh and this fallback never engages.
+Why today's bars never come from historical_data() (2026-07-18 → 2026-07-27):
+  Zerodha's historical_data() API was observed lagging same-day intraday candles
+  by 5+ hours EVERY trading day from 2026-07-17 through 07-24 — confirmed via a
+  direct, uncached call returning candles capped at 09:45 IST when queried at
+  15:16 IST, repeating fresh every calendar day regardless of container uptime.
+  Zerodha support confirmed in writing (2026-07-27) this is fundamental, not a
+  bug: "it is not guaranteed that a minute candle will be available immediately
+  ... delays can occur, and if one write is delayed, subsequent writes may also
+  be delayed... we recommend generating the candles at your end using the live
+  ticks received through Kite Ticker, rather than relying on the Historical Data
+  API for the current trading session." Since the delay has no guaranteed upper
+  bound, a staleness-threshold check (the original 2026-07-18 fix) could still
+  misjudge a historical candle as "fresh enough" on a day the lag happens to be
+  short. So today's bars are now ALWAYS built from live ticks (ZerodhaTicker
+  WebSocket / ZerodhaLTPPoller REST — see update_intraday_bar() in
+  core/utils.py) as real, growing 5-min OHLC bars, blended on top of the
+  (still valid, unaffected) prior-day historical baseline. historical_data()'s
+  role is now exactly what Zerodha says it's for: backtesting-grade baseline,
+  never the current session. (An earlier version of this fix used a single
+  synthetic "today" blob bar instead of a real per-bar series — too weak to
+  move EMA20/50, since one bar only carries ~9.5%/3.9% weight against ~750
+  baseline bars; confirmed via zero EMA crossover entries for two weeks despite
+  the regime gate being open most of each session.)
 """
 import asyncio
 import json
@@ -61,16 +66,8 @@ from src.core.utils import now_ist
 
 logger = logging.getLogger(__name__)
 
-HISTORY_REFRESH_SECONDS      = 300  # reload 5-min OHLC every 5 min
-_HISTORY_15M_REFRESH_SECONDS = 900  # reload 15-min OHLC every 15 min
-# PRIMARY (historical_data) is considered stale beyond this age. Normal worst-case
-# under healthy conditions is ~10 min (5-min refetch cadence + up to one 5-min bar
-# not yet closed) — 20 min gives a comfortable margin so this never false-triggers
-# during ordinary operation, while catching genuine multi-hour degradation fast.
-PRIMARY_STALE_THRESHOLD_SECONDS = 1200
-# Same idea for the 15-min MTF feed — larger normal worst-case (15-min refetch
-# cadence + up to one unclosed 15-min bar), so a longer threshold.
-PRIMARY_STALE_THRESHOLD_15M_SECONDS = 2400
+HISTORY_REFRESH_SECONDS      = 300  # reload 5-min OHLC baseline every 5 min
+_HISTORY_15M_REFRESH_SECONDS = 900  # reload 15-min OHLC baseline every 15 min
 
 # ATR% thresholds that must match strategy parameters
 _LOW_VOL_THRESHOLD = 1.2   # below = low volatility regime
@@ -100,7 +97,7 @@ class LTPPoller:
         self._history_15m_loaded_at: Dict[str, datetime] = {}
         self._no_token_warned: set = set()    # suppress repeat "no token" warnings per symbol
         self._no_history_warned: set = set()  # suppress repeat "not enough history" warnings
-        self._fallback_active: set = set()    # symbols currently on the SECONDARY live-tick source
+        self._no_live_data_warned: set = set()  # suppress repeat "no live tick data yet" warnings
 
     async def poll(self) -> None:
         """Called every 60 s by APScheduler."""
@@ -126,34 +123,28 @@ class LTPPoller:
 
                 ltp = float(df["close"].iloc[-1])
 
-                # Read the SECONDARY live-tick day range (written by ZerodhaTicker /
-                # ZerodhaLTPPoller). Always read it — not just when falling back —
-                # so it survives this poll's full tick overwrite below instead of
-                # resetting to a single tick every 60s.
+                # Live tick-derived day range + intraday bars (written by ZerodhaTicker /
+                # ZerodhaLTPPoller). This is now the ONLY source used for today's own
+                # bars — historical_data() only supplies the prior-day baseline (see
+                # module docstring for why). Read every cycle so it survives this
+                # poll's full tick overwrite below instead of resetting every 60s.
                 day_range = await self._read_day_range(symbol)
 
-                last_bar_date = df["date"].iloc[-1] if "date" in df.columns else None
-                is_fallback = (
-                    last_bar_date is not None
-                    and (now_ist() - last_bar_date).total_seconds() > PRIMARY_STALE_THRESHOLD_SECONDS
-                )
+                if day_range and day_range.get("close"):
+                    ltp = float(day_range["close"])
+                elif symbol not in self._no_live_data_warned:
+                    # Bootstrap edge case only (e.g. the first few seconds after
+                    # market open before any tick has arrived yet) — falls back to
+                    # the historical close so indicators are still defined.
+                    self._no_live_data_warned.add(symbol)
+                    logger.warning(
+                        f"LTPPoller: {symbol} has no live tick data yet — using "
+                        f"historical_data() close as a bootstrap fallback (won't repeat)."
+                    )
+                if day_range and symbol in self._no_live_data_warned:
+                    self._no_live_data_warned.discard(symbol)
 
-                if is_fallback:
-                    if symbol not in self._fallback_active:
-                        self._fallback_active.add(symbol)
-                        age_min = (now_ist() - last_bar_date).total_seconds() / 60
-                        logger.warning(
-                            f"LTPPoller: {symbol} PRIMARY (historical_data) feed stale "
-                            f"(last bar {age_min:.0f} min old) — switching to SECONDARY "
-                            f"live-tick fallback for today's range."
-                        )
-                    if day_range and day_range.get("close"):
-                        ltp = float(day_range["close"])
-                elif symbol in self._fallback_active:
-                    self._fallback_active.discard(symbol)
-                    logger.info(f"LTPPoller: {symbol} PRIMARY feed recovered — back off SECONDARY fallback.")
-
-                tick = self._enrich(symbol, df, ltp, live_range=day_range if is_fallback else None)
+                tick = self._enrich(symbol, df, ltp, live_range=day_range)
                 if day_range:
                     # Carry the live day-range + intraday-bar fields forward across this
                     # overwrite — otherwise bars_today would be wiped every 60s instead
@@ -167,18 +158,11 @@ class LTPPoller:
                 all_ticks.append(tick)
 
                 # 15-min OHLC for multi-timeframe EMA confirmation (MTF feature).
-                # Same PRIMARY staleness check/SECONDARY fallback as the 5-min feed
-                # above, reusing the same live day_range (today's range doesn't
-                # depend on bar granularity).
+                # Same live-ticks-for-today approach as the 5-min feed above, reusing
+                # the same day_range (today's range doesn't depend on bar granularity).
                 df15 = await self._get_history_15m(symbol, loop)
                 if df15 is not None and len(df15) >= 50:
-                    last_bar_15m = df15["date"].iloc[-1] if "date" in df15.columns else None
-                    is_fallback_15m = (
-                        last_bar_15m is not None
-                        and (now_ist() - last_bar_15m).total_seconds() > PRIMARY_STALE_THRESHOLD_15M_SECONDS
-                    )
-                    live_range_15m = day_range if (is_fallback_15m and day_range and day_range.get("close")) else None
-                    tick15 = self._enrich_15m(symbol, df15, live_range=live_range_15m)
+                    tick15 = self._enrich_15m(symbol, df15, live_range=day_range)
                     await self._redis.set(f"tick15:{symbol}", json.dumps(tick15), ex=1800)
 
                 e, s, c = self._score_all(tick)
@@ -213,11 +197,11 @@ class LTPPoller:
             )
             logger.info(f"[Breadth] {_breadth:.1%} advancing ({_adv}/{_tot})")
 
-        if self._fallback_active:
+        if self._no_live_data_warned:
             logger.warning(
-                f"LTPPoller: {len(self._fallback_active)}/{len(self.symbols)} symbols on "
-                f"SECONDARY live-tick fallback (PRIMARY historical API stale): "
-                f"{sorted(self._fallback_active)}"
+                f"LTPPoller: {len(self._no_live_data_warned)}/{len(self.symbols)} symbols "
+                f"still have no live tick data (bootstrap fallback to historical_data() "
+                f"close in effect): {sorted(self._no_live_data_warned)}"
             )
 
         # Market-wide trend stats — regime detector's proxy for "NIFTY ATR%/EMA spread%"
@@ -234,12 +218,12 @@ class LTPPoller:
                 await self._redis.set(
                     "market:trend_stats",
                     json.dumps({
-                        "avg_atr_pct_daily":      _avg_atr_pct_daily,
-                        "avg_ema_spread_pct":     _avg_ema_spread_pct,
-                        "n_symbols":              len(_atrs),
-                        "fallback_symbols":       len(self._fallback_active),
-                        "primary_source_healthy": len(self._fallback_active) == 0,
-                        "timestamp":              datetime.now().isoformat(),
+                        "avg_atr_pct_daily":         _avg_atr_pct_daily,
+                        "avg_ema_spread_pct":        _avg_ema_spread_pct,
+                        "n_symbols":                 len(_atrs),
+                        "symbols_without_live_data": len(self._no_live_data_warned),
+                        "all_symbols_live":          len(self._no_live_data_warned) == 0,
+                        "timestamp":                 datetime.now().isoformat(),
                     }),
                     ex=120,  # 2-min TTL — poll runs every 60 s
                 )
@@ -276,8 +260,9 @@ class LTPPoller:
         Read today's tick (written by ZerodhaTicker / ZerodhaLTPPoller), which
         carries the live day_open/day_high/day_low/day_range_date fields plus
         the real intraday bar series (bars_today, cur_bar_*) maintained by
-        update_intraday_bar() in core/utils.py — the SECONDARY price source.
-        Returns None if no live tick exists yet or it's not from today.
+        update_intraday_bar() in core/utils.py — the only source used for
+        today's own bars (see module docstring). Returns None if no live tick
+        exists yet or it's not from today (bootstrap edge case only).
         """
         try:
             raw = await self._redis.get(f"{REDIS_TICK_PREFIX}{symbol}")
@@ -331,9 +316,11 @@ class LTPPoller:
             # Keep "date" so _enrich can produce ohlc_bar_key for true-bar confirmation
             cols = [c for c in ["date", "open", "high", "low", "close", "volume"] if c in df.columns]
             df = df[cols].dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
-            # Logs the PRIMARY feed's actual last-candle timestamp on every refetch —
-            # this is what surfaced the historical_data() staleness (confirmed
-            # 2026-07-17) that the SECONDARY live-tick fallback below now handles.
+            # Logs historical_data()'s actual last-candle timestamp on every refetch —
+            # this is what originally surfaced the staleness (confirmed 2026-07-17,
+            # later confirmed by Zerodha support as fundamental, not a bug — see
+            # module docstring). Kept for visibility even though today's bars no
+            # longer come from this call at all.
             if not df.empty and "date" in df.columns:
                 logger.info(f"OHLC refresh: {symbol} bars={len(df)} last_bar={df['date'].iloc[-1]}")
             return df
@@ -346,21 +333,18 @@ class LTPPoller:
         """
         Compute EMA20, EMA50, ATR14, ADX14, RVOL, VWAP, prev_close from OHLC.
 
-        live_range, when provided, means PRIMARY (historical_data) was detected
-        stale for `symbol` (see PRIMARY_STALE_THRESHOLD_SECONDS in poll()). The
-        SECONDARY live-tick-derived intraday bar series (bars_today, built by
-        update_intraday_bar() in core/utils.py) is appended on top of the
-        prior-day historical bars (still valid — only the current day lags),
-        plus the still-forming current bar. Any bars historical_data() already
-        has for today are dropped first to avoid double-counting the same
-        price action from two sources. This gives EMA20/50 a real per-bar
-        intraday series instead of one blob "today" bar — a single blob only
-        carries ~9.5%/3.9% weight in the EMA20/50 calc against ~750 stale
-        historical bars, too weak to flip an already-close relationship on a
-        normal trading day (confirmed against live data 2026-07-24).
+        live_range carries today's real, growing 5-min bar series (bars_today,
+        built by update_intraday_bar() in core/utils.py from live ticks) plus
+        the still-forming current bar. It's used whenever available — see
+        module docstring for why today's bars never come from historical_data().
+        Any bars historical_data() happens to have for today are dropped first
+        so the same price action isn't double-counted from two sources. When
+        live_range is None (bootstrap edge case only — e.g. the first few
+        seconds after market open before any tick has arrived), falls back to
+        the raw historical df as-is.
         """
-        is_fallback = live_range is not None
-        if is_fallback:
+        has_live_data = live_range is not None
+        if has_live_data:
             if "date" in df.columns:
                 today_str = now_ist().date().isoformat()
                 df = df[df["date"].apply(lambda d: d.date().isoformat() != today_str)]
@@ -387,9 +371,9 @@ class LTPPoller:
                     "volume": 0,
                 })
             if not live_rows:
-                # No live bars accumulated yet (e.g. moments after market open) —
+                # No bars accumulated yet (e.g. moments after market open) —
                 # fall back to a single blob bar from the day range so indicators
-                # are still defined rather than computed on stale data alone.
+                # are still defined rather than computed on the historical df alone.
                 live_rows = [{
                     "date":   now_ist(),
                     "open":   live_range.get("day_open", ltp),
@@ -451,14 +435,14 @@ class LTPPoller:
 
         # ohlc_bar_key — changes once per 5-min bar; strategies use this for true-bar
         # confirmation so that `signal_confirm_bars=2` means 2 distinct candles, not
-        # 2 engine cycles that may both fall inside the same unfinished bar. In
-        # fallback mode the synthetic row's "date" is now_ist() (changes every poll,
-        # i.e. every 60s) so it's bucketed to the current 5-min window instead —
-        # keeps the "2 distinct candles" semantics intact under the SECONDARY source.
+        # 2 engine cycles that may both fall inside the same unfinished bar. With
+        # live-tick data, the synthetic row's "date" is now_ist() (changes every
+        # poll, i.e. every 60s) so it's bucketed to the current 5-min window
+        # instead — keeps the "2 distinct candles" semantics intact.
         ohlc_bar_key: Optional[str] = None
-        if is_fallback:
+        if has_live_data:
             _bucket = now_ist().replace(minute=(now_ist().minute // 5) * 5, second=0, microsecond=0)
-            ohlc_bar_key = f"fallback:{_bucket.isoformat()}"
+            ohlc_bar_key = f"live:{_bucket.isoformat()}"
         elif "date" in df.columns:
             last_date = df["date"].iloc[-1]
             ohlc_bar_key = str(last_date)
@@ -477,7 +461,7 @@ class LTPPoller:
             "vwap":           round(vwap, 4),
             "ohlc_bar_key":   ohlc_bar_key,
             "timestamp":      datetime.now().isoformat(),
-            "ltp_source":     "live_fallback_today" if is_fallback else "zerodha_historical",
+            "ltp_source":     "zerodha_live_ticks" if has_live_data else "zerodha_historical",
         }
 
     @staticmethod
@@ -571,8 +555,8 @@ class LTPPoller:
             if not records:
                 return None
             df = pd.DataFrame(records)
-            # Keep "date" so poll() can detect PRIMARY staleness the same way it does
-            # for the 5-min feed (see PRIMARY_STALE_THRESHOLD_SECONDS).
+            # Keep "date" so _enrich_15m can drop any of today's bars before
+            # blending in the live-tick series (see module docstring).
             cols = [c for c in ["date", "open", "high", "low", "close"] if c in df.columns]
             return df[cols].dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
         except Exception as e:
@@ -584,17 +568,16 @@ class LTPPoller:
         """
         Compute EMA20 and EMA50 on 15-min candles for multi-timeframe confirmation.
 
-        live_range, when provided, means PRIMARY (historical_data, 15-min) was
-        detected stale for `symbol` — same SECONDARY live-tick fallback as
-        _enrich()'s 5-min path (see that method's docstring), reusing the same
-        bars_today series but resampled into 15-min groups (3 bars each) rather
-        than one blob bar. This feeds a hard gate in live_trading_engine.py
-        (15-min EMA must agree with the 5-min signal), so leaving it as one weak
-        blob bar would keep silently blocking EMA crossover entries even after
-        the 5-min fix.
+        live_range, when provided, carries today's live-tick bar series (same as
+        _enrich()'s 5-min path — see that method's and the module's docstrings
+        for why today's bars always come from live ticks), resampled into
+        15-min groups (3 bars each) rather than the 5-min granularity. This
+        feeds a hard gate in live_trading_engine.py (15-min EMA must agree with
+        the 5-min signal), so it needs the same real per-bar treatment or it
+        would keep blocking EMA crossover entries independently of the 5-min fix.
         """
-        is_fallback = live_range is not None
-        if is_fallback:
+        has_live_data = live_range is not None
+        if has_live_data:
             if "date" in df.columns:
                 today_str = now_ist().date().isoformat()
                 df = df[df["date"].apply(lambda d: d.date().isoformat() != today_str)]
@@ -639,5 +622,5 @@ class LTPPoller:
             "ema20":      round(ema20, 4),
             "ema50":      round(ema50, 4),
             "tf":         "15m",
-            "ltp_source": "live_fallback_today" if is_fallback else "zerodha_historical",
+            "ltp_source": "zerodha_live_ticks" if has_live_data else "zerodha_historical",
         }

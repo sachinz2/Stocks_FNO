@@ -575,28 +575,26 @@ elif page == "System Health":
             else:
                 st.info(f"**{label}**: {value}")
 
-        # PRIMARY/SECONDARY market-data source. Zerodha's historical_data() API
-        # (PRIMARY, used for EMA/ATR/ADX) has been observed lagging same-day
-        # intraday candles by 5+ hours despite the Historical Data API
-        # subscription being active — confirmed repeating fresh every calendar
-        # day regardless of container uptime (2026-07-17 through 07-24).
-        # SECONDARY is a live-tick-derived intraday bar series that LTPPoller
-        # switches individual symbols to automatically when it detects PRIMARY
-        # is stale for them (see update_intraday_bar() in core/utils.py).
+        # Market-data source. Zerodha confirmed (2026-07-27, in writing) that
+        # historical_data() is not designed for the current trading session and
+        # recommended generating candles from live ticks instead — so today's
+        # bars always come from live ticks now (see update_intraday_bar() in
+        # core/utils.py); historical_data() only supplies the prior-day baseline.
+        # This just reports whether every symbol has live tick data flowing yet.
         ds = health.get("data_source") or {}
-        healthy    = ds.get("primary_source_healthy")
-        n_fallback = ds.get("fallback_symbols")
+        all_live   = ds.get("all_symbols_live")
+        n_missing  = ds.get("symbols_without_live_data")
         n_symbols  = ds.get("n_symbols")
-        if healthy is None:
+        if all_live is None:
             st.info("**Market Data Source**: not yet reported (market closed, or LTPPoller hasn't run a cycle yet)")
-        elif healthy:
-            st.success(f"**Market Data Source**: PRIMARY (Zerodha historical API) — healthy, all {n_symbols} symbols current")
+        elif all_live:
+            st.success(f"**Market Data Source**: live ticks flowing for all {n_symbols} tracked symbols")
         else:
             st.warning(
-                f"**Market Data Source**: PRIMARY degraded — {n_fallback}/{n_symbols} symbols "
-                "on SECONDARY live-tick fallback (historical_data() feed is stale for them). "
-                "Strategies keep trading normally off the fallback; this just flags that "
-                "Zerodha's historical candle feed isn't current right now."
+                f"**Market Data Source**: {n_missing}/{n_symbols} symbols have no live tick "
+                "data yet — using historical_data() as a bootstrap fallback for them. "
+                "Normal only in the first few seconds after market open; persisting longer "
+                "than that is worth checking (WebSocket/REST poller connectivity)."
             )
 
     st.markdown("---")
