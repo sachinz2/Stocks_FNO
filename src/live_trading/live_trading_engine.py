@@ -56,6 +56,7 @@ _REDIS_EXITED_TODAY    = "engine:exited_today"
 _REDIS_PROFIT_CLOSED   = "engine:profit_closed_today"
 _REDIS_ORDER_COUNT     = "engine:order_count"
 _REDIS_EMA_STATE       = "engine:ema_crossover_state"
+_REDIS_MOMENTUM_STATE  = "engine:momentum_state"
 
 
 class LiveTradingEngine:
@@ -171,6 +172,7 @@ class LiveTradingEngine:
         self.is_running = True
         await self._restore_state()
         await self._restore_ema_state()
+        await self._restore_momentum_state()
         logger.info(f"Trading engine STARTED — {self.mode.value.upper()} mode")
 
     async def stop(self) -> None:
@@ -188,17 +190,25 @@ class LiveTradingEngine:
 
         # Rebuild per-strategy deployed capital from overnight multi-day positions so
         # the per-strategy budget check (risk layer 5) stays accurate next morning.
+        # Uses max loss (width - net credit), matching add/release at entry/exit in
+        # _process_credit_spread / _process_iron_condor / _check_spread_exits /
+        # _check_condor_exits — not just the long/hedge legs' premium, which
+        # understates real capital at risk (a wide spread's long leg can cost
+        # almost the same regardless of width; real risk scales with width).
         for _sym, _s in self._active_spreads.items():
-            _lp = _s.get("long_premium", 0) * _s.get("lot_size", 0)
-            if _lp > 0:
+            _width = abs(_s.get("short_strike", 0) - _s.get("long_strike", 0))
+            _ml = (_width - _s.get("net_credit", 0)) * _s.get("lot_size", 0)
+            if _ml > 0:
                 self.risk_manager.add_deployed_capital(
-                    _s.get("strategy_name", "credit_spread_v1"), _lp
+                    _s.get("strategy_name", "credit_spread_v1"), _ml
                 )
         for _sym, _c in self._active_condors.items():
-            _lp = (_c.get("put_long_premium", 0) + _c.get("call_long_premium", 0)) * _c.get("lot_size", 0)
-            if _lp > 0:
+            _put_wing  = abs(_c.get("put_short_strike", 0)  - _c.get("put_long_strike", 0))
+            _call_wing = abs(_c.get("call_short_strike", 0) - _c.get("call_long_strike", 0))
+            _ml = (max(_put_wing, _call_wing) - _c.get("net_credit", 0)) * _c.get("lot_size", 0)
+            if _ml > 0:
                 self.risk_manager.add_deployed_capital(
-                    _c.get("strategy_name", "iron_condor_v1"), _lp
+                    _c.get("strategy_name", "iron_condor_v1"), _ml
                 )
 
         # Auto-refresh event calendar every Monday so earnings/RBI dates stay current.
@@ -304,9 +314,10 @@ class LiveTradingEngine:
                 except Exception as exc:
                     logger.error(f"Signal error [{strategy_id}:{symbol}]: {exc}")
 
-        # Persist EMA crossover's per-symbol confirmation progress every cycle so a
-        # restart mid-confirmation doesn't silently reset it back to zero.
+        # Persist EMA crossover's / Momentum's per-symbol confirmation progress every
+        # cycle so a restart mid-confirmation doesn't silently reset it back to zero.
         await self._persist_ema_state()
+        await self._persist_momentum_state()
 
     async def sync_orders(self) -> None:
         try:
@@ -476,6 +487,58 @@ class LiveTradingEngine:
             )
         except Exception as e:
             logger.warning(f"Failed to restore EMA crossover state: {e}")
+
+    def _find_momentum_strategy(self):
+        """Return the loaded MomentumStrategy instance, if any."""
+        for inst in StrategyRegistry.get_active_strategies().values():
+            if inst.__class__.__name__ == "MomentumStrategy":
+                return inst
+        return None
+
+    async def _persist_momentum_state(self) -> None:
+        """
+        Persist Momentum's per-symbol trend-confirmation state every cycle —
+        same rationale as _persist_ema_state() (a restart mid-confirmation
+        would otherwise silently reset it to zero). Momentum's condition is
+        stateless per-cycle (no prev_fast_ema/prev_slow_ema — it doesn't need
+        to detect a sign change, just whether ADX/spread currently qualify),
+        so only the pending-confirmation trackers need saving, not EMA values.
+        """
+        redis = getattr(self, "_redis", None)
+        if not redis:
+            return
+        strategy = self._find_momentum_strategy()
+        if not strategy:
+            return
+        try:
+            await redis.set(_REDIS_MOMENTUM_STATE, json.dumps({
+                "pending_signal":  strategy._pending_signal,
+                "pending_count":   strategy._pending_count,
+                "pending_bar_key": strategy._pending_bar_key,
+            }))
+        except Exception as e:
+            logger.debug(f"Failed to persist Momentum state: {e}")
+
+    async def _restore_momentum_state(self) -> None:
+        redis = getattr(self, "_redis", None)
+        if not redis:
+            return
+        strategy = self._find_momentum_strategy()
+        if not strategy:
+            return
+        try:
+            raw = await redis.get(_REDIS_MOMENTUM_STATE)
+            if not raw:
+                return
+            state = json.loads(raw)
+            strategy._pending_signal  = state.get("pending_signal", {})
+            strategy._pending_count   = state.get("pending_count", {})
+            strategy._pending_bar_key = state.get("pending_bar_key", {})
+            logger.info(
+                f"Restored Momentum state: {len(strategy._pending_signal)} pending confirmation(s)"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to restore Momentum state: {e}")
 
     async def _restore_state(self) -> None:
         redis = getattr(self, "_redis", None)
@@ -1170,7 +1233,7 @@ class LiveTradingEngine:
         option_type = "CE" if signal_str == "BUY" else "PE"
         opposite    = "PE" if option_type == "CE" else "CE"
 
-        await self._close_option_positions(symbol, opposite, market_data)
+        await self._close_option_positions(symbol, opposite, market_data, owner_strategy_name=strategy.name)
         if await self._has_open_option(symbol, option_type):
             return
 
@@ -1286,8 +1349,26 @@ class LiveTradingEngine:
             )
 
     async def _close_option_positions(
-        self, underlying: str, option_type: str, market_data: Dict
+        self, underlying: str, option_type: str, market_data: Dict,
+        owner_strategy_name: Optional[str] = None,
     ) -> None:
+        """
+        Reversal exit: closes an opposite-direction option on `underlying` before
+        a fresh same-underlying entry opens. If owner_strategy_name is given, only
+        closes positions actually opened by THAT strategy (per _single_leg_journals)
+        — a position with no journal entry at all is closed regardless, as a safe
+        fallback for legacy positions predating this check.
+
+        Without this guard, one strategy's fresh opposite-direction signal would
+        silently close ANOTHER strategy's open position on the same underlying,
+        bypassing that strategy's own SL/TP/trailing-stop logic entirely. This
+        was harmless while ema_crossover_v1 was the only strategy using this path
+        (a strategy reversing its own position), but became a real cross-strategy
+        interaction risk once momentum_v1 started sharing it too — e.g. momentum_v1
+        holding a PE that's tracking toward its trailing stop could get force-closed
+        by an unrelated ema_crossover_v1 CE signal on the same stock, crystallizing
+        momentum_v1's P&L at a moment momentum_v1's own exit rules never chose.
+        """
         from src.market_data.option_chain import get_option_quote
         positions = await self._safe_get_positions()
         expiry = get_near_month_expiry()
@@ -1299,6 +1380,10 @@ class LiveTradingEngine:
             qty      = pos.get("quantity", 0)
             if qty <= 0 or not (contract.startswith(underlying) and contract.endswith(option_type)):
                 continue
+            if owner_strategy_name is not None:
+                _owner = self._single_leg_journals.get(contract, {}).get("strategy_name")
+                if _owner is not None and _owner != owner_strategy_name:
+                    continue
             entry_p = float(pos.get("avg_price") or 0)
             _live_p = await get_option_quote(contract, getattr(self, "_kite", None), getattr(self, "_redis", None))
             exit_p = _live_p if (_live_p and _live_p > 0) else (estimate_option_premium(atr, dte) if atr > 0 else entry_p)
@@ -1686,6 +1771,18 @@ class LiveTradingEngine:
             entry_price=net_credit, quantity=lot_size,
             market_data=market_data, iv_rank=iv_rank, vix=vix,
         )
+        # Track deployed capital by actual max loss (width - net credit), not just
+        # the long/hedge leg's premium — found this was previously never called at
+        # entry at all (only reconciled once daily at market open from overnight
+        # positions — see on_market_open), so the per-strategy budget check
+        # (risk_manager.validate_trade layer 5) was silently a no-op for every
+        # same-day credit spread entry. Max loss is also a far more accurate risk
+        # figure than hedge-leg premium: a wide spread's long leg can cost almost
+        # the same regardless of width, while the real capital at risk scales
+        # directly with width.
+        self.risk_manager.add_deployed_capital(
+            strategy.name, (spread_width - net_credit) * lot_size
+        )
         self._active_spreads[symbol] = {
             "spread_type":    spread_type,
             "short_contract": short_contract, "long_contract":  long_contract,
@@ -1875,9 +1972,12 @@ class LiveTradingEngine:
                 - (spread["long_premium"]  - cur_long)
             ) * lot
 
+            # Must match the max-loss figure add_deployed_capital() used at entry
+            # (see _process_credit_spread) — not just the long leg's premium.
+            _spread_width = abs(spread["short_strike"] - spread["long_strike"])
             self.risk_manager.release_deployed_capital(
                 spread.get("strategy_name", "credit_spread_v1"),
-                spread["long_premium"] * lot,
+                (_spread_width - spread["net_credit"]) * lot,
             )
 
             _short_fill = getattr(exit_short, "avg_price", None) or cur_short
@@ -2252,6 +2352,15 @@ class LiveTradingEngine:
             market_data=market_data, iv_rank=iv_rank, vix=vix,
         )
         wing_spread = abs(put_short_strike - put_long_strike)
+        _call_wing  = abs(call_short_strike - call_long_strike)
+        # Track deployed capital by actual max loss, not just the long/hedge legs'
+        # premium — same fix and rationale as _process_credit_spread. Max loss for
+        # an iron condor is bounded by whichever wing is wider (price can't be
+        # simultaneously above the call strikes and below the put strikes, so only
+        # one wing is ever actually breached), minus total net credit collected.
+        self.risk_manager.add_deployed_capital(
+            strategy.name, (max(wing_spread, _call_wing) - net_credit) * lot_size
+        )
         self._active_condors[symbol] = {
             "put_short_contract":  psc,  "put_long_contract":   plc,
             "call_short_contract": csc,  "call_long_contract":  clc,
@@ -2460,9 +2569,13 @@ class LiveTradingEngine:
                 - (c["call_long_premium"]  - cur_cl)
             ) * lot
 
+            # Must match the max-loss figure add_deployed_capital() used at entry
+            # (see _process_iron_condor) — not just the long legs' premium.
+            _put_wing  = abs(c["put_short_strike"]  - c["put_long_strike"])
+            _call_wing = abs(c["call_short_strike"] - c["call_long_strike"])
             self.risk_manager.release_deployed_capital(
                 c.get("strategy_name", "iron_condor_v1"),
-                (c["put_long_premium"] + c["call_long_premium"]) * lot,
+                (max(_put_wing, _call_wing) - c["net_credit"]) * lot,
             )
 
             _ps_fill = getattr(exit_ps, "avg_price", None) or cur_ps
@@ -2669,8 +2782,10 @@ class LiveTradingEngine:
                 _long_x  = _exit_prices.get(_s.get("long_contract", ""),  _s.get("long_premium", 0))
                 _lot     = _s.get("lot_size", 0)
                 _net     = ((_s.get("short_premium", 0) - _short_x) - (_s.get("long_premium", 0) - _long_x)) * _lot
+                _width   = abs(_s.get("short_strike", 0) - _s.get("long_strike", 0))
                 self.risk_manager.release_deployed_capital(
-                    _s.get("strategy_name", "credit_spread_v1"), _s.get("long_premium", 0) * _lot,
+                    _s.get("strategy_name", "credit_spread_v1"),
+                    (_width - _s.get("net_credit", 0)) * _lot,
                 )
                 await self._log_trade_close(
                     journal_id=_s.get("journal_id"),
@@ -2690,9 +2805,11 @@ class LiveTradingEngine:
                     - (_c.get("put_long_premium", 0)   - _pl_x)
                     - (_c.get("call_long_premium", 0)  - _cl_x)
                 ) * _lot_c
+                _put_wing_x  = abs(_c.get("put_short_strike", 0)  - _c.get("put_long_strike", 0))
+                _call_wing_x = abs(_c.get("call_short_strike", 0) - _c.get("call_long_strike", 0))
                 self.risk_manager.release_deployed_capital(
                     _c.get("strategy_name", "iron_condor_v1"),
-                    (_c.get("put_long_premium", 0) + _c.get("call_long_premium", 0)) * _lot_c,
+                    (max(_put_wing_x, _call_wing_x) - _c.get("net_credit", 0)) * _lot_c,
                 )
                 await self._log_trade_close(
                     journal_id=_c.get("journal_id"),
