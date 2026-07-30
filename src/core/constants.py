@@ -170,7 +170,6 @@ SLIPPAGE_PCT = 0.0002    # 0.02% slippage
 # Scheduler job IDs
 JOB_SIGNAL_GENERATION = "signal_generation"
 JOB_ORDER_SYNC = "order_sync"
-JOB_POSITION_SYNC = "position_sync"
 JOB_DAILY_PNL = "daily_pnl_report"
 JOB_MARKET_OPEN = "market_open"
 JOB_MARKET_CLOSE = "market_close"

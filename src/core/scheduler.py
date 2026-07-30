@@ -8,7 +8,6 @@ from src.core.constants import (
     JOB_MARKET_CLOSE,
     JOB_MARKET_OPEN,
     JOB_ORDER_SYNC,
-    JOB_POSITION_SYNC,
     JOB_SIGNAL_GENERATION,
 )
 
@@ -72,16 +71,6 @@ def schedule_trading_jobs(engine) -> None:
         name="Order Sync",
         replace_existing=True,
         misfire_grace_time=15,
-    )
-
-    # Position sync — every 1 minute
-    scheduler.add_job(
-        engine.sync_positions,
-        IntervalTrigger(minutes=1),
-        id=JOB_POSITION_SYNC,
-        name="Position Sync",
-        replace_existing=True,
-        misfire_grace_time=30,
     )
 
     # Market open — 9:15 IST, Mon–Fri

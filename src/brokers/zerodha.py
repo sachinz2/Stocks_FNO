@@ -13,6 +13,14 @@ from src.brokers.base import AbstractBroker
 
 logger = logging.getLogger(__name__)
 
+# Only retry on transient/network-ish failures — anything else (bad params,
+# insufficient margin, invalid order id, auth errors) will just fail the same
+# way 3 times in a row, wasting up to ~7s of retry delay before reporting the
+# real error. Shared by every retry-decorated method below.
+_RETRYABLE_KITE_EXC = (
+    (kite_exc.NetworkException, kite_exc.DataException) if kite_exc else Exception
+)
+
 
 class ZerodhaBroker(AbstractBroker):
     """
@@ -74,9 +82,7 @@ class ZerodhaBroker(AbstractBroker):
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type(
-            (kite_exc.NetworkException, kite_exc.DataException) if kite_exc else Exception
-        ),
+        retry=retry_if_exception_type(_RETRYABLE_KITE_EXC),
     )
     async def place_order(self, symbol: str, side: str, quantity: int, price: float) -> str:
         logger.info(f"Zerodha: {side} {quantity} {symbol} @ {price}")
@@ -101,30 +107,64 @@ class ZerodhaBroker(AbstractBroker):
             logger.error(f"Zerodha: place_order failed: {e}")
             raise
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    # cancel_order/modify_order must never raise — OrderManager.cancel_order()
+    # calls broker.cancel_order() with no try/except around it and checks the
+    # returned bool directly. Previously the @retry decorator sat on the outer
+    # async method while the method's own try/except caught every exception
+    # internally and returned False — so tenacity's wrapper never saw a
+    # failure to retry on, and the decorator was a complete no-op (found
+    # 2026-07-30). Fixed by putting @retry on an inner call that's allowed to
+    # raise (so tenacity can actually retry transient failures), with the
+    # outer method still catching everything after retries are exhausted and
+    # returning bool exactly as before — external behavior is unchanged.
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type(_RETRYABLE_KITE_EXC),
+    )
+    def _cancel_order_call(self, order_id: str) -> None:
+        self.kite.cancel_order(variety=self.kite.VARIETY_REGULAR, order_id=order_id)
+
     async def cancel_order(self, order_id: str) -> bool:
         try:
-            self.kite.cancel_order(variety=self.kite.VARIETY_REGULAR, order_id=order_id)
+            self._cancel_order_call(order_id)
             return True
         except Exception as e:
             logger.error(f"Zerodha: cancel_order failed: {e}")
             return False
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type(_RETRYABLE_KITE_EXC),
+    )
+    def _modify_order_call(self, order_id: str, new_price: float, new_quantity: int) -> None:
+        self.kite.modify_order(
+            variety=self.kite.VARIETY_REGULAR,
+            order_id=order_id,
+            quantity=new_quantity,
+            price=new_price,
+        )
+
     async def modify_order(self, order_id: str, new_price: float, new_quantity: int) -> bool:
         try:
-            self.kite.modify_order(
-                variety=self.kite.VARIETY_REGULAR,
-                order_id=order_id,
-                quantity=new_quantity,
-                price=new_price,
-            )
+            self._modify_order_call(order_id, new_price, new_quantity)
             return True
         except Exception as e:
             logger.error(f"Zerodha: modify_order failed: {e}")
             return False
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    # get_positions/get_orders already re-raise on failure (callers wrap them
+    # in their own try/except — e.g. LiveTradingEngine._safe_get_positions(),
+    # OrderManager.sync_orders()), so retry already worked here — only the
+    # retry scope needed narrowing to match place_order (was retrying on any
+    # exception, including non-transient ones that will just fail identically
+    # 3 times in a row).
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type(_RETRYABLE_KITE_EXC),
+    )
     async def get_positions(self) -> List[Dict[str, Any]]:
         try:
             return self.kite.positions().get("net", [])
@@ -132,7 +172,11 @@ class ZerodhaBroker(AbstractBroker):
             logger.error(f"Zerodha: get_positions failed: {e}")
             raise
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type(_RETRYABLE_KITE_EXC),
+    )
     async def get_orders(self) -> List[Dict[str, Any]]:
         try:
             return self.kite.orders()

@@ -13,10 +13,27 @@ logger = logging.getLogger(__name__)
 
 # Orders that stay OPEN longer than this are stale and should be cancelled
 ORDER_EXPIRY_MINUTES = 5
-# Price adjustment (%) when retrying a stale limit order
+# Price adjustment (%) when retrying a stale limit order — moved toward the
+# market so the retry is more likely to actually fill (BUY: higher, SELL: lower).
 RETRY_PRICE_ADJUSTMENT = 0.015   # 1.5% toward the market
 # Maximum seconds to wait for any single broker API call
 BROKER_TIMEOUT_SEC = 15
+# How many recent ORDER_RECEIVED audit rows to scan when reconstructing a
+# stale order's original placement context (strategy/is_exit_order/etc — see
+# _get_retry_context). The target row is always recent (within ~one retry
+# cycle of when the order was placed), so this is a generous bound, not a
+# tight one — keeps the scan fast regardless of how large audit_logs grows
+# over months of live trading.
+_RETRY_CONTEXT_SCAN_LIMIT = 200
+# Strategies whose entries are multi-leg structures (credit spread / iron
+# condor). Their anchor (first) leg is a SELL and reaches this same
+# is_spread_leg=False code path, but retrying it standalone would place a
+# duplicate leg alongside one the engine has already moved on from (the
+# engine doesn't wait for a fill before placing the next leg / building
+# _active_spreads — see live_trading_engine.py). Retry is intentionally
+# scoped to single-leg strategies (ema_crossover_v1, momentum_v1) and plain
+# exits only; multi-leg entry legs are cancelled-and-left, same as before.
+_MULTI_LEG_STRATEGIES = {"credit_spread_v1", "iron_condor_v1"}
 
 
 class OrderManager:
@@ -68,6 +85,7 @@ class OrderManager:
         iv_rank:       Optional[float] = None,
         vix:           Optional[float] = None,
         capital_at_risk: Optional[float] = None,
+        is_retry:      bool = False,
     ) -> Optional[Order]:
         """
         Main entry point for placing orders.
@@ -80,6 +98,11 @@ class OrderManager:
         vix           : India VIX — market-wide IV gate
         capital_at_risk : Explicit max-loss figure passed straight through to
                         RiskManager.validate_trade() — see its docstring.
+        is_retry      : Internal — set by expire_stale_orders() when
+                        resubmitting a cancelled stale order at an adjusted
+                        price. Recorded in the audit log only, so a retry
+                        that itself goes stale is never retried again (bounds
+                        retries to one attempt per original order).
         """
         # 1. Create PENDING record in DB
         db_order = await self.order_repo.create({
@@ -90,9 +113,16 @@ class OrderManager:
             "order_status": "PENDING",
             "created_at":   datetime.utcnow(),
         })
+        # Recorded so a later stale-order retry can reconstruct the original
+        # placement context (see _get_retry_context) without needing new
+        # columns on the orders table — audit_logs.payload is already a JSON
+        # column that accepts this for free.
         await self._audit("ORDER_RECEIVED", {
             "order_id": db_order.id, "symbol": symbol, "side": side,
             "strategy": strategy_name,
+            "is_exit_order": is_exit_order,
+            "is_spread_leg": is_spread_leg,
+            "is_retry": is_retry,
         })
 
         # 2. Risk validation
@@ -149,16 +179,60 @@ class OrderManager:
 
     # ── Stale order expiry ────────────────────────────────────────────────────
 
+    async def _get_retry_context(self, order_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Reconstruct an order's original placement context from its
+        ORDER_RECEIVED audit entry (see place_order()) — no schema change
+        needed since audit_logs.payload is already JSON. Returns None if no
+        matching entry is found (fails safe: caller treats that as
+        "don't retry", same as before this feature existed).
+        """
+        try:
+            rows = await self.audit_repo.filter(
+                action="ORDER_RECEIVED", order_by="id DESC", limit=_RETRY_CONTEXT_SCAN_LIMIT,
+            )
+            for row in rows:
+                payload = row.payload or {}
+                if payload.get("order_id") == order_id:
+                    return payload
+        except Exception as e:
+            logger.debug(f"Retry context lookup failed for order {order_id}: {e}")
+        return None
+
+    @staticmethod
+    def _adjusted_retry_price(side: str, price: float) -> float:
+        """Move the limit price toward the market so a retry is more likely
+        to actually fill: BUY pays a bit more, SELL accepts a bit less."""
+        if side == "BUY":
+            return round(price * (1 + RETRY_PRICE_ADJUSTMENT), 2)
+        return round(price * (1 - RETRY_PRICE_ADJUSTMENT), 2)
+
     async def expire_stale_orders(self) -> int:
         """
         Cancel any OPEN orders that have been pending for more than
         ORDER_EXPIRY_MINUTES. Called every cycle by the engine.
 
-        Returns the number of orders cancelled.
+        Retries ONCE at an adjusted price (RETRY_PRICE_ADJUSTMENT toward the
+        market) for single-leg orders only (ema_crossover_v1/momentum_v1
+        entries, and any plain exit order) — see _MULTI_LEG_STRATEGIES for
+        why credit_spread_v1/iron_condor_v1's anchor leg is excluded.
+        Everything else is cancelled and left, exactly as before this retry
+        feature existed.
+
+        Also releases any deployed capital that was tentatively added when
+        the now-cancelled order was first submitted (found 2026-07-30: a
+        stale single-leg BUY that never filled was left permanently counted
+        against its strategy's budget until the next day's reset, since
+        nothing released it when the order was cancelled — a retry re-adds
+        its own amount via the normal place_order() path, so this is correct
+        whether or not the order ends up being retried).
+
+        Returns the number of orders cancelled (including any retried).
         """
         cutoff = datetime.utcnow() - timedelta(minutes=ORDER_EXPIRY_MINUTES)
         open_orders = await self.order_repo.filter(order_status="OPEN")
         cancelled = 0
+        retried = 0
 
         for order in open_orders:
             if not order.created_at:
@@ -188,8 +262,44 @@ class OrderManager:
             await self._audit("ORDER_EXPIRED", {"order_id": order.id, "symbol": order.symbol})
             cancelled += 1
 
+            ctx = await self._get_retry_context(order.id)
+
+            # Release deployed capital tentatively added at submission — only
+            # ever applies to the same case place_order() adds it for (BUY,
+            # strategy_name set, not a spread/condor hedge leg). Independent
+            # of whether we go on to retry below.
+            if (
+                ctx and order.price is not None
+                and order.side == "BUY" and ctx.get("strategy") and not ctx.get("is_spread_leg")
+            ):
+                self.risk_manager.release_deployed_capital(
+                    ctx["strategy"], order.quantity * float(order.price)
+                )
+
+            eligible = (
+                ctx is not None
+                and order.price is not None
+                and not ctx.get("is_spread_leg")
+                and not ctx.get("is_retry")
+                and (ctx.get("is_exit_order") or ctx.get("strategy") not in _MULTI_LEG_STRATEGIES)
+            )
+            if eligible:
+                retry_price = self._adjusted_retry_price(order.side, float(order.price))
+                logger.info(
+                    f"Retrying stale order {order.id}: {order.side} {order.quantity} "
+                    f"{order.symbol} @ Rs{order.price} -> Rs{retry_price} (one attempt only)"
+                )
+                await self.place_order(
+                    order.symbol, order.side, order.quantity, retry_price,
+                    is_spread_leg=False,
+                    is_exit_order=bool(ctx.get("is_exit_order")),
+                    strategy_name=ctx.get("strategy"),
+                    is_retry=True,
+                )
+                retried += 1
+
         if cancelled:
-            logger.info(f"Expired {cancelled} stale order(s).")
+            logger.info(f"Expired {cancelled} stale order(s), retried {retried}.")
         return cancelled
 
     # ── Cancel ────────────────────────────────────────────────────────────────

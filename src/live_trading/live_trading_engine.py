@@ -325,12 +325,6 @@ class LiveTradingEngine:
         except Exception as exc:
             logger.error(f"Order sync failed: {exc}")
 
-    async def sync_positions(self) -> None:
-        try:
-            await self.portfolio_manager.sync_positions()
-        except Exception as exc:
-            logger.error(f"Position sync failed: {exc}")
-
     async def send_daily_report(self) -> None:
         expiry = get_near_month_expiry()
         dte    = (expiry - now_ist().replace(tzinfo=None)).days
