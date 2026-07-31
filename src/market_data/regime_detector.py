@@ -233,18 +233,41 @@ class MarketRegimeDetector:
                          VIX > 20?
                         /         \\
                     YES             NO
-                VOLATILE        VIX < 12?
-                              /          \\
-                           YES            NO
-                          LOW_VOL     ATR% >= threshold?
-                                     /             \\
-                                  YES               NO
-                               TRENDING          RANGE_BOUND
-                                            (ATR moderate — whether EMA_spread
-                                             is flat or moderately directional,
-                                             both are "not a strong trend",
-                                             and premium sellers are the
-                                             appropriate regime for either)
+                VOLATILE      ATR% >= threshold?
+                              /                \\
+                           YES                  NO
+                       TRENDING              VIX < 12?
+                                             /          \\
+                                          YES            NO
+                                        LOW_VOL      RANGE_BOUND
+                                    (ATR moderate — whether EMA_spread is flat
+                                     or moderately directional, neither is a
+                                     strong trend, and premium sellers are the
+                                     appropriate regime for either)
+
+        ATR% is checked BEFORE the VIX<12 branch (reordered 2026-07-31 — was
+        VIX<12 first). Rationale: VIX<12 means "index-level option premium is
+        too cheap to be worth SELLING" — a real, correct concern for
+        credit_spread_v1/iron_condor_v1 (which already have their own,
+        unchanged, separate VIX>=12 entry gate — this reorder does not touch
+        that). But the old ordering let a low VIX force LOW_VOL regardless of
+        ATR%, which also excludes ema_crossover_v1/momentum_v1 — strategies
+        that BUY naked long options and have no logical dependency on
+        index-level premium richness; what they need is a genuinely trending
+        stock, which ATR%/EMA-spread already measures directly. Confirmed
+        live 2026-07-31: VIX sat at ~11.8-12.0 essentially all session while
+        several stocks' ATR% was well above the TRENDING threshold (up to
+        ~1.8%) — the old ordering meant ema_crossover_v1/momentum_v1 were
+        paused the entire day for a reason that was never theirs. LOW_VOL and
+        RANGE_BOUND allow the exact same two strategies
+        (REGIME_STRATEGY_MAP), so this reorder changes zero behavior for the
+        premium-selling regimes in any scenario — the only thing that changes
+        is TRENDING becoming reachable on a low-VIX-but-genuinely-trending
+        day. As a side effect, this also closes a gap in the hysteresis
+        added the day before: previously a low VIX alone could still kick an
+        already-TRENDING day out to LOW_VOL even while ATR% stayed well above
+        the (lower) exit threshold, which defeated the point of hysteresis
+        for that path.
 
         The ATR% comparison uses a lower threshold (ATR_TREND_EXIT_THRESHOLD)
         when prev_regime is already "TRENDING" — hysteresis so noise
@@ -252,22 +275,22 @@ class MarketRegimeDetector:
         cycle (see module docstring).
 
         EMA_FLAT_THRESHOLD/ema_spread_pct are accepted for the API/reporting
-        payload (get_regime_report()) but no longer branch here — found
-        2026-07-30 that the "EMA flat" and "EMA not flat" branches both
-        returned RANGE_BOUND, so the comparison was dead code with no
-        observable effect on regime selection. Collapsed rather than left as
-        a misleading no-op; a genuinely distinct outcome for the
-        moderate-ATR/wide-EMA-spread case (if ever wanted) is a separate,
-        deliberate design decision, not a bug fix.
+        payload (get_regime_report()) but don't branch here — found
+        2026-07-30 that an "EMA flat" vs "EMA not flat" split both returned
+        RANGE_BOUND, so the comparison was dead code with no observable
+        effect on regime selection. Collapsed rather than left as a
+        misleading no-op; a genuinely distinct outcome for the moderate-ATR/
+        wide-EMA-spread case (if ever wanted) is a separate, deliberate
+        design decision, not a bug fix.
         """
         if vix > VIX_HIGH_THRESHOLD:
             return "VOLATILE"
-        if vix < VIX_LOW_THRESHOLD:
-            return "LOW_VOL"
         atr_threshold = ATR_TREND_EXIT_THRESHOLD if prev_regime == "TRENDING" else ATR_TREND_THRESHOLD
         if atr_pct >= atr_threshold:
             return "TRENDING"
-        # ATR is moderate (below the trend threshold) — default to RANGE_BOUND
-        # so iron condors and credit spreads are available where they perform
-        # best, regardless of EMA_spread_pct (see docstring above).
+        # ATR is moderate (below the trend threshold) — quiet market. VIX<12
+        # here still correctly labels it LOW_VOL for reporting, but doesn't
+        # change which strategies are eligible (see rationale above).
+        if vix < VIX_LOW_THRESHOLD:
+            return "LOW_VOL"
         return "RANGE_BOUND"
