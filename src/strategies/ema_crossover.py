@@ -117,11 +117,16 @@ class EMACrossoverStrategy(StrategyBase):
         current_position must contain:
           - avg_price      : entry premium paid
           - peak_premium   : highest premium seen since entry (tracked by engine)
+          - current_ema_fast/current_ema_slow : underlying's current EMA20/50
+                              (optional — only the VOLATILE reversal exit uses them)
+          - is_call        : True for a CE position, False for PE (optional, same)
+          - entry_regime   : regime string at entry time (optional, same)
 
         Exit conditions (in priority order):
           1. Hard stop loss  — premium fell >= stop_loss_pct (default 50%) from entry
           2. Profit target   — premium rose >= target_pct (default 100%, i.e. 2×) from entry
           3. Trailing stop   — premium fell >= trailing_stop_pct (default 25%) from its peak
+          4. EMA reversal    — VOLATILE-entered positions only (see below)
         """
         entry_premium = float(current_position.get("avg_price") or 0)
         if entry_premium <= 0 or current_premium <= 0:
@@ -155,6 +160,33 @@ class EMACrossoverStrategy(StrategyBase):
                     f"current=Rs{current_premium:.2f} (drawdown {trail_drawdown:.1%})"
                 )
                 return "EXIT"
+
+        # 4. EMA reversal — VOLATILE-entered positions only (added 2026-07-31).
+        # These are crash-catching PE entries (see REGIME_STRATEGY_MAP/
+        # live_trading_engine.py._process_signal's VOLATILE gate) opened
+        # specifically because EMA20 crossed below EMA50 during a VIX spike.
+        # A genuine panic can V-reverse fast; waiting for the normal SL/TP/
+        # trailing-stop thresholds (tuned for ordinary trending days) risks
+        # riding the reversal most of the way back. If the same EMA
+        # relationship that justified entry has already flipped, exit
+        # immediately regardless of premium P&L — smaller profit is fine,
+        # getting caught in the reversal is not. Not applied to positions
+        # entered outside VOLATILE — this is intentionally scoped, not a
+        # general new exit rule for every EMA crossover trade.
+        if current_position.get("entry_regime") == "VOLATILE":
+            ema_fast = current_position.get("current_ema_fast")
+            ema_slow = current_position.get("current_ema_slow")
+            is_call  = current_position.get("is_call")
+            if ema_fast is not None and ema_slow is not None and is_call is not None:
+                reversed_ = (ema_fast <= ema_slow) if is_call else (ema_fast >= ema_slow)
+                if reversed_:
+                    logger.info(
+                        f"[{self.name}] VOLATILE reversal exit: EMA20/50 relationship "
+                        f"flipped back (fast={ema_fast:.2f} slow={ema_slow:.2f}, "
+                        f"is_call={is_call}) — exiting regardless of premium P&L "
+                        f"({pnl_pct:+.1%})."
+                    )
+                    return "EXIT"
 
         return "HOLD"
 

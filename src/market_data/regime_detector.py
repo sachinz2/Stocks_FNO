@@ -75,13 +75,26 @@ STRATEGY_MOMENTUM  = "momentum_v1"
 # from TRENDING and VOLATILE where one wing reliably gets blown out.
 # Momentum (added 2026-07-30) only makes sense in TRENDING — its entire thesis
 # is an already-strong, established trend (high ADX), which by definition isn't
-# present in RANGE_BOUND/LOW_VOL, and VOLATILE is a VIX-spike/gap regime rather
-# than a sustained-directional one, so it's excluded there too, same as EMA
-# crossover.
+# present in RANGE_BOUND/LOW_VOL.
+#
+# EMA crossover / Momentum now also run in VOLATILE (added 2026-07-31 — were
+# excluded entirely before). India VIX is a fear/uncertainty gauge, not a
+# directional one — VIX>20 empirically correlates with sharp SELLOFFS, not
+# bull sprints (confirmed: this system's own ~4-week history never saw VIX
+# above 15.03, so a genuine spike has never been observed live here — this is
+# a deliberate risk decision, not something validated against this system's
+# own data yet). live_trading_engine.py._process_signal() restricts entries
+# to PE (bearish) only while VOLATILE is active — no CE/long-call entries —
+# and both strategies get a tightened, VOLATILE-specific reversal exit (see
+# EMACrossoverStrategy.manage_position()'s EMA-reversal check and
+# MomentumStrategy's adx_exit_threshold_volatile) so a position opened to
+# catch a crash gets closed fast if the move V-reverses, rather than riding
+# out the same slower thresholds used in a normal trending market.
 REGIME_STRATEGY_MAP: Dict[str, list] = {
     "TRENDING":    [STRATEGY_EMA, STRATEGY_SPREAD, STRATEGY_MOMENTUM],  # spread aligned with trend = low breach risk
     "RANGE_BOUND": [STRATEGY_CONDOR, STRATEGY_SPREAD],   # both premium sellers thrive in flat market
-    "VOLATILE":    [STRATEGY_SPREAD],                     # high IV = rich premium; condor wings blow
+    "VOLATILE":    [STRATEGY_SPREAD, STRATEGY_EMA, STRATEGY_MOMENTUM],  # high IV = rich premium for spreads;
+                                                                          # EMA/Momentum PE-only, crash-catching
     "LOW_VOL":     [STRATEGY_SPREAD, STRATEGY_CONDOR],   # quiet market = premium seller heaven
 }
 

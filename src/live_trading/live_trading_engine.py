@@ -282,8 +282,9 @@ class LiveTradingEngine:
             await self.strategy_monitor.evaluate_all()
 
         # Regime detection + strategy switching (runs every cycle, lightweight)
+        regime = None
         if self.regime_detector:
-            await self.regime_detector.detect()
+            regime = await self.regime_detector.detect()
             await self.regime_detector.enforce_regime_switching()
 
         # Log correlation / sector concentration warnings (non-blocking)
@@ -310,7 +311,7 @@ class LiveTradingEngine:
             symbols = await self._get_active_symbols(strategy)
             for symbol in symbols:
                 try:
-                    await self._process_signal(strategy, symbol, vix=vix)
+                    await self._process_signal(strategy, symbol, vix=vix, regime=regime)
                 except Exception as exc:
                     logger.error(f"Signal error [{strategy_id}:{symbol}]: {exc}")
 
@@ -1139,6 +1140,15 @@ class LiveTradingEngine:
                         "avg_price": entry_p,
                         "peak_premium": peak,
                         "current_adx": market_data.get("adx14"),
+                        # For the VOLATILE crash-catching reversal exit (see
+                        # EMACrossoverStrategy.manage_position() /
+                        # MomentumStrategy.adx_exit_threshold_volatile) — both
+                        # unused by strategies that don't check them, so this
+                        # is a no-op addition for anything else.
+                        "current_ema_fast": market_data.get("ema20"),
+                        "current_ema_slow": market_data.get("ema50"),
+                        "is_call":          contract.endswith("CE"),
+                        "entry_regime":     owner_info.get("entry_regime"),
                     },
                     current_p,
                 )
@@ -1187,7 +1197,8 @@ class LiveTradingEngine:
                     logger.error(f"EXIT FAILED [{contract}]: order rejected or failed — will retry next cycle")
 
     async def _process_signal(
-        self, strategy, symbol: str, vix: Optional[float] = None
+        self, strategy, symbol: str, vix: Optional[float] = None,
+        regime: Optional[str] = None,
     ) -> None:
         if not strategy.is_active:
             return
@@ -1214,6 +1225,21 @@ class LiveTradingEngine:
             await self._exit_all_options_for(symbol)
             return
         if signal_str not in ("BUY", "SELL"):
+            return
+
+        # VOLATILE (VIX>20) crash-catching gate — added 2026-07-31. VIX is a
+        # fear/uncertainty gauge, not a directional one: a spike overwhelmingly
+        # correlates with sharp selloffs, not bull sprints, so only the PE
+        # (bearish) side is allowed while VOLATILE is active. CE/long-call
+        # entries stay blocked, same as before this regime was added to
+        # REGIME_STRATEGY_MAP. See EMACrossoverStrategy.manage_position()'s
+        # EMA-reversal exit and MomentumStrategy.adx_exit_threshold_volatile
+        # for the matching tightened exit these positions get.
+        if regime == "VOLATILE" and signal_str == "BUY":
+            logger.info(
+                f"[{strategy.name}] {symbol} BUY skipped — VOLATILE regime "
+                "only allows PE (bearish/crash-catching) entries, no long calls."
+            )
             return
 
         if self._max_daily_orders > 0 and self._today_order_count >= self._max_daily_orders:
@@ -1368,6 +1394,12 @@ class LiveTradingEngine:
                     "underlying":    symbol,
                     "strategy_name": strategy.name,
                     "date":          now_ist().date().isoformat(),
+                    # Regime at entry (not current regime at exit time) — the
+                    # VOLATILE-specific tightened exit logic in manage_position()
+                    # keys off this, so a crash-catching entry keeps its faster
+                    # reversal exit for its whole life even if VIX later calms
+                    # down mid-day.
+                    "entry_regime":  regime,
                 }
                 if self._ltp_poller:
                     self._ltp_poller.register_option_contracts([contract])

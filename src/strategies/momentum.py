@@ -45,6 +45,12 @@ class MomentumStrategy(StrategyBase):
         self.target_pct        = self.parameters.get("target_pct", 1.50)
         self.trailing_stop_pct = self.parameters.get("trailing_stop_pct", 0.30)
         self.adx_exit_threshold = self.parameters.get("adx_exit_threshold", 22)
+        # Tighter ADX-exhaustion threshold for positions entered during
+        # VOLATILE (VIX>20) — added 2026-07-31, see manage_position(). A
+        # crash-catching entry should bail on trend-decay faster than a normal
+        # trending-day entry; 22 lets a lot of decay happen first, appropriate
+        # for a steady trend but too slow for a panic that can V-reverse fast.
+        self.adx_exit_threshold_volatile = self.parameters.get("adx_exit_threshold_volatile", 30)
 
         # Signal confirmation: the ADX/EMA-spread condition must hold for this
         # many distinct 5-min bars before firing — same debouncing principle as
@@ -63,7 +69,8 @@ class MomentumStrategy(StrategyBase):
 
         logger.info(
             f"Initialized Momentum '{self.name}' ({self.fast_period}/{self.slow_period}) | "
-            f"ADX entry>={self.adx_entry_threshold} exit<{self.adx_exit_threshold} | "
+            f"ADX entry>={self.adx_entry_threshold} exit<{self.adx_exit_threshold} "
+            f"(<{self.adx_exit_threshold_volatile} if VOLATILE-entered) | "
             f"min_EMA_spread={self.min_ema_spread_pct}% | "
             f"SL={self.stop_loss_pct:.0%} TP={self.target_pct:.0%} Trail={self.trailing_stop_pct:.0%} "
             f"ConfirmBars={self.signal_confirm_bars}"
@@ -180,11 +187,22 @@ class MomentumStrategy(StrategyBase):
                 )
                 return "EXIT"
 
+        # VOLATILE-entered positions (see REGIME_STRATEGY_MAP /
+        # live_trading_engine.py._process_signal's VOLATILE gate, added
+        # 2026-07-31) use a tighter threshold — a crash-catching entry should
+        # bail on trend-decay faster than a normal trending-day entry, since a
+        # genuine panic can V-reverse fast. Smaller profit is acceptable;
+        # riding the reversal is not.
+        adx_exit = (
+            self.adx_exit_threshold_volatile
+            if current_position.get("entry_regime") == "VOLATILE"
+            else self.adx_exit_threshold
+        )
         current_adx = current_position.get("current_adx")
-        if current_adx is not None and float(current_adx) < self.adx_exit_threshold:
+        if current_adx is not None and float(current_adx) < adx_exit:
             logger.info(
                 f"[{self.name}] Trend exhausted: ADX={float(current_adx):.1f} "
-                f"< {self.adx_exit_threshold} — exiting regardless of premium P&L."
+                f"< {adx_exit} — exiting regardless of premium P&L."
             )
             return "EXIT"
 
