@@ -3,13 +3,53 @@ Admin API — reset trading data and control email alerts.
 These endpoints mutate live state; use with care.
 """
 import logging
-from fastapi import APIRouter, HTTPException, Request, status
+import os
+import signal
+import time
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
 from sqlalchemy import text
 
 from src.database.connection import AsyncSessionLocal
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["Admin"])
+
+
+def _terminate_process_for_restart() -> None:
+    """Runs in Starlette's background-task threadpool — the brief sleep here
+    just gives the HTTP response time to actually reach the client before
+    this process exits; it does not block the event loop."""
+    time.sleep(0.5)
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
+@router.post("/restart-api")
+async def restart_api(background_tasks: BackgroundTasks):
+    """
+    Gracefully restart the API process.
+
+    Sends SIGTERM to this process shortly after responding — uvicorn's normal
+    shutdown handler then runs the lifespan teardown (engine.stop(),
+    scheduler.shutdown(), ticker.stop()), and Docker's `restart:
+    unless-stopped` policy on the api service brings the container straight
+    back up. Equivalent to `docker compose restart api` from the server, just
+    triggerable from the dashboard without SSH access.
+
+    All engine state is Redis-persisted and restored on the way back up (see
+    LiveTradingEngine._restore_state()) — this is the exact same restart
+    procedure already used routinely throughout development, just invoked
+    from inside the process instead of from outside it.
+    """
+    logger.warning(
+        "API restart requested via admin endpoint — process will exit "
+        "shortly for Docker to restart it."
+    )
+    background_tasks.add_task(_terminate_process_for_restart)
+    return {
+        "status": "restarting",
+        "message": "API is restarting now — should be back in ~10-15 seconds.",
+    }
+
 
 # Tables wiped by /reset (reference data is preserved)
 _TRADING_TABLES = [

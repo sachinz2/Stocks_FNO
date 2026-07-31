@@ -54,6 +54,13 @@ class ZerodhaTicker:
         self._redis = None   # sync redis client (in background thread)
         self._retry_lock = threading.Lock()
         self._retry_in_progress = False
+        # Set by _on_connect / _on_ticks (background thread) — read by the
+        # staleness watchdog in api/main.py's self-heal job (asyncio thread).
+        # Single reference swaps of an immutable datetime, same cross-thread
+        # access pattern already used for self._ticker/self._redis elsewhere
+        # in this class — no extra locking needed.
+        self._connected_at = None
+        self._last_tick_at = None
 
     def fetch_instrument_tokens(self) -> int:
         """
@@ -100,6 +107,31 @@ class ZerodhaTicker:
             except Exception:
                 pass
 
+    def seconds_since_last_tick(self) -> Optional[float]:
+        """
+        Seconds since the last real (market-hours) tick was processed, or
+        since the most recent successful connect if no tick has arrived yet.
+        None if this ticker has never connected at all.
+
+        Used by the staleness watchdog (api/main.py's self-heal job) to catch
+        a connection that LOOKS fine — "WebSocket connected" logged, no
+        error/disconnect callback ever fires — but has silently stopped
+        delivering ticks. Confirmed live 2026-07-31: after a 403 → token
+        refresh → reconnect cycle, a new connection attempt logged
+        "connecting to Zerodha WebSocket..." and then nothing for 2+ hours —
+        no on_connect, no on_error, no on_disconnect — leaving all 41 symbols
+        on the historical-data bootstrap fallback all morning with nothing in
+        the system able to detect or recover from it automatically. Only a
+        full process restart (fresh KiteTicker, fresh reactor thread) fixed
+        it; this watchdog gives the same recovery without needing a human to
+        notice and SSH in.
+        """
+        from src.core.utils import now_ist
+        reference = self._last_tick_at or self._connected_at
+        if reference is None:
+            return None
+        return (now_ist() - reference).total_seconds()
+
     # ------------------------------------------------------------------
     # Internal — runs inside the background thread
     # ------------------------------------------------------------------
@@ -143,6 +175,8 @@ class ZerodhaTicker:
             logger.error(f"ZerodhaTicker: unexpected error in background thread: {e}")
 
     def _on_connect(self, ws, response) -> None:
+        from src.core.utils import now_ist
+        self._connected_at = now_ist()
         tokens = list(self._instrument_tokens.values())
         self._ticker.subscribe(tokens)
         self._ticker.set_mode(self._ticker.MODE_QUOTE, tokens)
@@ -169,9 +203,10 @@ class ZerodhaTicker:
         """
         if not self._redis or not ticks:
             return
-        from src.core.utils import is_market_open, update_intraday_bar
+        from src.core.utils import is_market_open, now_ist, update_intraday_bar
         if not is_market_open():
             return
+        self._last_tick_at = now_ist()
         for tick in ticks:
             token = tick.get("instrument_token")
             symbol = self._token_symbol.get(token)

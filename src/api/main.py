@@ -286,6 +286,12 @@ async def lifespan(app: FastAPI):
     #      newer token (normal daily 08:30 auth) -> refresh it in place with
     #      set_access_token(). Every holder shares this same object, so this
     #      alone keeps them all current — no re-wiring needed for this case.
+    # Ticks must be totally silent for this long, during market hours, before
+    # the watchdog below forces a reconnect. Matches this job's own 180s
+    # cadence — worst case detection is ~2 cycles (~6 min), still far better
+    # than the 2+ hours of silent staleness confirmed live 2026-07-31.
+    TICK_STALE_THRESHOLD_SECONDS = 180
+
     async def _kite_self_heal():
         raw = await redis_client.get("zerodha:access_token")
         if not raw:
@@ -334,6 +340,30 @@ async def lifespan(app: FastAPI):
             app.state.kite.set_access_token(token)
             app.state.last_kite_token = token
             logger.info("Kite access token rotated — refreshed in place on the shared client.")
+
+        # ── Tick-staleness watchdog ──────────────────────────────────────────
+        # A WebSocket connection can look healthy (connected, no error/disconnect
+        # callback ever fires) while silently no longer delivering ticks — the
+        # provisioning checks above (kite None / token rotated) don't catch this
+        # since kite itself is fine; only the ticker's own data flow is stuck.
+        # Confirmed live 2026-07-31: after a 403 -> token-refresh -> reconnect
+        # cycle, a new connection attempt logged "connecting..." and then
+        # nothing — no on_connect, no error — for 2+ hours, leaving all 41
+        # symbols on the historical-data bootstrap fallback all morning with
+        # no automatic recovery. Only a full process restart fixed it. This
+        # force-reconnects in place instead of waiting for a human to notice.
+        ticker = app.state.zerodha_ticker
+        if ticker is not None:
+            from src.core.utils import is_market_open
+            if is_market_open():
+                stale_for = ticker.seconds_since_last_tick()
+                if stale_for is not None and stale_for > TICK_STALE_THRESHOLD_SECONDS:
+                    logger.critical(
+                        f"ZerodhaTicker: no ticks for {stale_for:.0f}s during market hours "
+                        "— forcing a reconnect."
+                    )
+                    ticker.stop()
+                    ticker.start()
 
     scheduler.add_job(
         _kite_self_heal,

@@ -596,6 +596,11 @@ elif page == "System Health":
                 "Normal only in the first few seconds after market open; persisting longer "
                 "than that is worth checking (WebSocket/REST poller connectivity)."
             )
+            st.caption(
+                "The API self-heals a stuck WebSocket automatically within a few minutes "
+                "(see the tick-staleness watchdog). If this keeps persisting, you can force "
+                "a restart from Admin → Restart API."
+            )
 
     st.markdown("---")
 
@@ -701,6 +706,42 @@ elif page == "Admin":
                 st.rerun()
     else:
         st.success("Kill switch is inactive — trading is not blocked.")
+
+    st.markdown("---")
+
+    # ── Restart API ──────────────────────────────────────────────────────────
+    st.subheader("Restart API")
+    st.markdown("""
+Gracefully restarts the API process — equivalent to `docker compose restart api`
+on the server, without needing SSH access. Useful when market data looks stuck
+(e.g. System Health shows symbols with no live tick data for an extended period)
+and the automatic tick-staleness watchdog hasn't recovered it on its own.
+
+All engine state (open positions, spreads, condors, today's order count) is
+Redis-persisted and restored automatically — this is the same restart procedure
+used routinely to deploy code changes. Takes about 10-15 seconds.
+""")
+
+    if "confirm_restart_api" not in st.session_state:
+        st.session_state["confirm_restart_api"] = False
+
+    if not st.session_state["confirm_restart_api"]:
+        if st.button("Restart API", type="secondary"):
+            st.session_state["confirm_restart_api"] = True
+            st.rerun()
+    else:
+        st.warning("Restart the API now? Live market data and signal processing will pause for ~10-15 seconds.")
+        col1, col2 = st.columns(2)
+        if col1.button("YES — Restart Now", type="primary"):
+            result = post("admin/restart-api")
+            st.session_state["confirm_restart_api"] = False
+            if result:
+                st.success(result.get("message", "Restarting..."))
+                st.info("Refresh this page in about 15 seconds.")
+            st.rerun()
+        if col2.button("Cancel", key="cancel_restart_api"):
+            st.session_state["confirm_restart_api"] = False
+            st.rerun()
 
     st.markdown("---")
 
