@@ -243,6 +243,16 @@ elif page == "Positions":
             df = pd.DataFrame(standalone)
             df["total_pnl"] = df["unrealized_pnl"].fillna(0) + df["realized_pnl"].fillna(0)
             df["capital"] = (df["quantity"].abs() * df["avg_price"]).round(2)
+
+            # market_price == 0 means "no live quote available yet" (e.g. Zerodha
+            # not currently quoting this specific contract) -- NOT "worth zero".
+            # Blank it out (and the pnl fields that depend on it) so na_rep="—"
+            # below shows "unknown" instead of a misleading hard 0.00.
+            no_quote = df["market_price"].fillna(0) == 0
+            df.loc[no_quote, "market_price"]   = None
+            df.loc[no_quote, "unrealized_pnl"] = None
+            df.loc[no_quote, "total_pnl"]      = None
+
             show = [c for c in ["symbol", "quantity", "avg_price", "market_price", "unrealized_pnl", "realized_pnl", "total_pnl", "capital"] if c in df.columns]
             df = df[show]
             df.columns = [c.replace("_", " ").title() for c in show]
@@ -250,11 +260,20 @@ elif page == "Positions":
             def highlight_pnl(row):
                 styles = [""] * len(row)
                 for i, col in enumerate(row.index):
-                    if "Pnl" in col:
+                    if "Pnl" in col and pd.notna(row[col]):
                         styles[i] = f"color: {'green' if row[col] > 0 else 'red' if row[col] < 0 else 'gray'}"
                 return styles
 
-            st.dataframe(df.style.apply(highlight_pnl, axis=1), use_container_width=True, hide_index=True)
+            # Same raw-float display issue as the Orders & Trades / Analytics
+            # tables -- DB Numeric/float columns render as e.g. "46.590000"
+            # without an explicit format.
+            _num_fmt = {c: "{:,.2f}" for c in
+                        ["Avg Price", "Market Price", "Unrealized Pnl", "Realized Pnl", "Total Pnl", "Capital"]
+                        if c in df.columns}
+            st.dataframe(
+                df.style.format(_num_fmt, na_rep="—").apply(highlight_pnl, axis=1),
+                use_container_width=True, hide_index=True,
+            )
 
         st.markdown("---")
         total_unrealized = sum(p.get("unrealized_pnl", 0) for p in positions)
