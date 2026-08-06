@@ -287,6 +287,13 @@ elif page == "Orders & Trades":
         t_df = t_df.sort_values("exit_time", ascending=False)[t_show]
         t_df.columns = [c.replace("_", " ").title() for c in t_show]
 
+        # Coerce to numeric first (None -> NaN) so a column that's ever
+        # entirely null doesn't come through as object dtype, which
+        # .style.format() can't apply a numeric spec to (TypeError on None).
+        for _c in ["Entry Price", "Exit Price", "Quantity", "Pnl", "Hold Days"]:
+            if _c in t_df.columns:
+                t_df[_c] = pd.to_numeric(t_df[_c], errors="coerce")
+
         def _highlight_pnl(row):
             styles = [""] * len(row)
             for i, col in enumerate(row.index):
@@ -294,7 +301,18 @@ elif page == "Orders & Trades":
                     styles[i] = f"color: {'green' if row[col] > 0 else 'red' if row[col] < 0 else 'gray'}"
             return styles
 
-        st.dataframe(t_df.style.apply(_highlight_pnl, axis=1), use_container_width=True, hide_index=True)
+        # Values come straight from the DB as raw floats (Numeric(18,4)
+        # columns) -- without an explicit format, Styler renders full float
+        # precision (e.g. "8.250000") instead of clean currency figures.
+        _num_fmt = {c: "{:,.2f}" for c in ["Entry Price", "Exit Price", "Pnl"] if c in t_df.columns}
+        if "Quantity" in t_df.columns:
+            _num_fmt["Quantity"] = "{:,.0f}"
+        if "Hold Days" in t_df.columns:
+            _num_fmt["Hold Days"] = "{:,.0f}"
+        st.dataframe(
+            t_df.style.format(_num_fmt, na_rep="—").apply(_highlight_pnl, axis=1),
+            use_container_width=True, hide_index=True,
+        )
 
         total_pnl = sum(t.get("pnl") or 0 for t in closed_trades)
         wins = sum(1 for t in closed_trades if (t.get("pnl") or 0) > 0)
@@ -582,7 +600,32 @@ elif page == "Analytics":
         ] if c in df_t.columns]
         df_t = df_t[show_cols]
         df_t.columns = [c.replace("_", " ").title() for c in show_cols]
-        st.dataframe(df_t, use_container_width=True, hide_index=True)
+
+        # Coerce to numeric first (None -> NaN) so columns that are entirely
+        # null (e.g. iv_rank before ~30 days of history has accumulated)
+        # don't come through as object dtype, which .style.format() can't
+        # apply a numeric spec to (TypeError on None).
+        for _c in ["Entry Price", "Exit Price", "Pnl", "Iv Rank", "Vix At Entry", "Hold Days"]:
+            if _c in df_t.columns:
+                df_t[_c] = pd.to_numeric(df_t[_c], errors="coerce")
+
+        def _highlight_pnl(row):
+            styles = [""] * len(row)
+            for i, col in enumerate(row.index):
+                if "Pnl" in col:
+                    styles[i] = f"color: {'green' if row[col] > 0 else 'red' if row[col] < 0 else 'gray'}"
+            return styles
+
+        # Same raw-float display issue as Orders & Trades' trade table --
+        # DB Numeric(18,4)/float columns render as e.g. "8.250000" without
+        # an explicit format.
+        _num_fmt = {c: "{:,.2f}" for c in ["Entry Price", "Exit Price", "Pnl", "Iv Rank", "Vix At Entry"] if c in df_t.columns}
+        if "Hold Days" in df_t.columns:
+            _num_fmt["Hold Days"] = "{:,.0f}"
+        st.dataframe(
+            df_t.style.format(_num_fmt, na_rep="—").apply(_highlight_pnl, axis=1),
+            use_container_width=True, hide_index=True,
+        )
 
 
 elif page == "System Health":
