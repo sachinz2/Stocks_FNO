@@ -37,8 +37,9 @@ Usage:
 import asyncio
 import json
 import logging
-from datetime import datetime
 from typing import Dict, Optional
+
+from src.core.utils import now_ist
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +125,13 @@ class MarketRegimeDetector:
             "vix":               vix,
             "market_atr_pct":    atr_pct,
             "market_ema_spread": ema_spread_pct,
-            "timestamp":         datetime.utcnow().isoformat(),
+            # IST-naive (was datetime.utcnow() until 2026-08-06) — the
+            # dashboard's Strategies page displays this labelled "IST"
+            # (app.py: f"...as of {regime_ts} IST") with no conversion, so it
+            # was showing a time 5.5h behind actual IST. Same bug class as
+            # orders.created_at/audit_logs.timestamp, just in a different
+            # module that grep missed the first pass.
+            "timestamp":         now_ist().replace(tzinfo=None).isoformat(),
         }
         await self._redis.set(REDIS_REGIME_KEY, json.dumps(payload))
         logger.info(
