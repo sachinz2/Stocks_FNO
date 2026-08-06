@@ -248,6 +248,42 @@ async def reset_iv_history(request: Request):
     }
 
 
+@router.post("/positions/{contract}/close")
+async def close_single_leg_position(contract: str, reason: str, request: Request):
+    """
+    Manually force-close an open single-leg position (ema_crossover_v1 /
+    momentum_v1) outside the normal per-cycle exit-rule evaluation.
+
+    Added 2026-08-06 to correct positions entered on an invalid contract
+    symbol (e.g. a strike that doesn't actually exist on the exchange, from
+    the FNO_STRIKE_INTERVALS bug fixed the same day) — such a position can
+    never receive a real Zerodha quote or fire a normal exit condition
+    against real data, so it needs an explicit, deliberate close rather than
+    waiting on the strategy's own exit rules. Uses the same real-quote-first,
+    ATR-estimate-fallback pricing as every other exit path (LiveTradingEngine
+    .close_single_leg_position()) -- not a raw DB edit, since PaperBroker's
+    position ledger and balance live in the running process's memory, not
+    the database.
+
+    contract: the exact option tradingsymbol, e.g. "TITAN26AUG4975CE"
+    reason:   free-text reason, recorded in trade_journal.exit_reason
+    """
+    engine = getattr(request.app.state, "trading_engine", None)
+    if not engine:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Trading engine not initialised."
+        )
+    closed = await engine.close_single_leg_position(contract, reason)
+    if not closed:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No open single-leg position found for {contract}"
+        )
+    logger.warning(f"Position {contract} manually closed via admin API. Reason: {reason}")
+    return {"status": "ok", "contract": contract, "reason": reason}
+
+
 async def _clear_iv_history_keys(redis) -> int:
     """Delete all iv_history:{symbol} keys. Returns count of keys deleted."""
     from src.core.constants import FNO_SYMBOLS

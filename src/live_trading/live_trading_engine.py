@@ -1160,41 +1160,94 @@ class LiveTradingEngine:
                     )
 
             if exit_reason:
-                logger.info(f"EXIT [{contract}]: {exit_reason}")
-                db_order = await self.order_manager.place_order(
-                    contract, "SELL", abs(qty), current_p, is_exit_order=True
-                )
-                if db_order and db_order.order_status not in ("REJECTED_BY_RISK", "FAILED"):
-                    self._peak_premiums.pop(contract, None)
-                    _fill_p = getattr(db_order, "avg_price", None) or current_p
-                    _slip   = abs(_fill_p - current_p)
-                    pnl = (_fill_p - entry_p) * abs(qty)
+                await self._execute_single_leg_exit(contract, qty, entry_p, current_p, exit_reason)
 
-                    # Write exit to trade_journal so PnL appears in analytics + dashboard
-                    info = self._single_leg_journals.pop(contract, None)
-                    if info:
-                        md = await self._get_market_data(info["underlying"])
-                        await self._log_trade_close(
-                            journal_id=info["journal_id"],
-                            exit_price=_fill_p,
-                            pnl=pnl,
-                            exit_reason=exit_reason,
-                            market_data=md,
-                            total_slippage_pts=round(_slip, 4) if _slip > 0 else None,
-                        )
-                        self.risk_manager.release_deployed_capital(
-                            info.get("strategy_name", "ema_crossover_v1"), entry_p * abs(qty),
-                        )
-                        await self._persist_state()
+    async def _execute_single_leg_exit(
+        self, contract: str, qty: int, entry_p: float, current_p: float, exit_reason: str,
+    ) -> bool:
+        """
+        Shared exit-execution logic for a single-leg position: places the
+        SELL order, journals the close, releases deployed capital, and
+        notifies. Factored out of _check_open_option_exits() so
+        close_single_leg_position() (manual/admin close) can reuse the exact
+        same path instead of a raw DB edit — PaperBroker's position ledger
+        and balance live in the running process's memory, not the DB, so a
+        SQL-only "fix" wouldn't actually close the position from the
+        engine's point of view. Returns True if the exit succeeded.
+        """
+        logger.info(f"EXIT [{contract}]: {exit_reason}")
+        db_order = await self.order_manager.place_order(
+            contract, "SELL", abs(qty), current_p, is_exit_order=True
+        )
+        if not (db_order and db_order.order_status not in ("REJECTED_BY_RISK", "FAILED")):
+            logger.error(f"EXIT FAILED [{contract}]: order rejected or failed — will retry next cycle")
+            return False
 
-                    await self._notify(
-                        f"POSITION CLOSED\nContract: {contract}\n"
-                        f"Reason: {exit_reason}\n"
-                        f"Entry: Rs{entry_p:.2f} -> Exit: Rs{current_p:.2f}\n"
-                        f"Est. PnL: Rs{pnl:,.2f}"
-                    )
-                else:
-                    logger.error(f"EXIT FAILED [{contract}]: order rejected or failed — will retry next cycle")
+        self._peak_premiums.pop(contract, None)
+        _fill_p = getattr(db_order, "avg_price", None) or current_p
+        _slip   = abs(_fill_p - current_p)
+        pnl = (_fill_p - entry_p) * abs(qty)
+
+        # Write exit to trade_journal so PnL appears in analytics + dashboard
+        info = self._single_leg_journals.pop(contract, None)
+        if info:
+            md = await self._get_market_data(info["underlying"])
+            await self._log_trade_close(
+                journal_id=info["journal_id"],
+                exit_price=_fill_p,
+                pnl=pnl,
+                exit_reason=exit_reason,
+                market_data=md,
+                total_slippage_pts=round(_slip, 4) if _slip > 0 else None,
+            )
+            self.risk_manager.release_deployed_capital(
+                info.get("strategy_name", "ema_crossover_v1"), entry_p * abs(qty),
+            )
+            await self._persist_state()
+
+        await self._notify(
+            f"POSITION CLOSED\nContract: {contract}\n"
+            f"Reason: {exit_reason}\n"
+            f"Entry: Rs{entry_p:.2f} -> Exit: Rs{current_p:.2f}\n"
+            f"Est. PnL: Rs{pnl:,.2f}"
+        )
+        return True
+
+    async def close_single_leg_position(self, contract: str, reason: str) -> bool:
+        """
+        Manually force-close an open single-leg position outside the normal
+        per-cycle exit-rule evaluation — e.g. to correct a position that
+        references an invalid contract symbol (wrong strike interval, etc.)
+        and can therefore never receive a real quote or fire a normal exit
+        condition against real data. Uses the same real-quote-first,
+        ATR-estimate-fallback pricing as every other exit path. Returns True
+        if a matching open position was found and closed.
+        """
+        info = self._single_leg_journals.get(contract)
+        if not info:
+            return False
+        positions = await self._safe_get_positions()
+        pos = next((p for p in positions if p.get("symbol") == contract), None)
+        if not pos:
+            return False
+        qty     = pos.get("quantity", 0)
+        entry_p = float(pos.get("avg_price") or 0)
+
+        market_data = await self._get_market_data(info["underlying"]) or {}
+        atr = float(market_data.get("atr14", 0))
+        expiry = get_near_month_expiry()
+        dte = (expiry - now_ist().replace(tzinfo=None)).days
+
+        from src.market_data.option_chain import get_option_quote
+        _live_p = await get_option_quote(contract, getattr(self, "_kite", None), getattr(self, "_redis", None))
+        if _live_p and _live_p > 0:
+            current_p = _live_p
+        elif atr > 0:
+            current_p = estimate_option_premium(atr, dte)
+        else:
+            current_p = entry_p
+
+        return await self._execute_single_leg_exit(contract, qty, entry_p, current_p, reason)
 
     async def _process_signal(
         self, strategy, symbol: str, vix: Optional[float] = None,
