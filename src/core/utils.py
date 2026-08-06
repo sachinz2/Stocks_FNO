@@ -98,10 +98,22 @@ def get_lot_size(symbol: str) -> int:
     return FNO_LOT_SIZES.get(symbol, 1)
 
 
-def get_atm_strike(price: float, symbol: str) -> int:
-    """Round the underlying price to the nearest valid strike for this symbol."""
+def get_atm_strike(price: float, symbol: str) -> float:
+    """
+    Round the underlying price to the nearest valid strike for this symbol.
+
+    Some symbols (e.g. ITC, WIPRO, ONGC, POWERGRID, TATASTEEL) have a
+    fractional NSE strike interval (2.5) whose grid includes genuine
+    half-strikes (167.5, 247.5, ...). This used to force int(), which
+    truncated those to a non-existent whole-number strike (e.g. 247 instead
+    of the real 247.5) -- the same "computed a phantom contract" bug as the
+    wrong-interval issue this fixes alongside, just triggered differently.
+    Returns int when the result is a whole number (the common case), float
+    otherwise -- build_option_symbol() formats either correctly.
+    """
     interval = FNO_STRIKE_INTERVALS.get(symbol, 50)
-    return int(round(price / interval) * interval)
+    strike = round(price / interval) * interval
+    return int(strike) if strike == int(strike) else strike
 
 
 def _last_expiry_weekday(year: int, month: int) -> datetime:
@@ -160,18 +172,22 @@ def get_entry_expiry(min_dte: int) -> datetime:
     return expiry
 
 
-def build_option_symbol(symbol: str, strike: int, option_type: str, expiry: datetime = None) -> str:
+def build_option_symbol(symbol: str, strike: float, option_type: str, expiry: datetime = None) -> str:
     """
     Build the NSE/Zerodha tradingsymbol for a stock option.
     Format: SYMBOL + YY + MON + STRIKE + TYPE
-    Example: HDFCBANK25JUL800CE
+    Example: HDFCBANK25JUL800CE, or TATASTEEL26AUG167.5CE for a symbol whose
+    real strike interval is fractional (2.5) and lands on a half-strike --
+    confirmed against Zerodha's own tradingsymbol convention, which keeps
+    the ".5" rather than rounding/truncating it away.
     option_type must be 'CE' or 'PE'.
     """
     if expiry is None:
         expiry = get_near_month_expiry()
     yy = expiry.strftime("%y")
     mon = _MONTH_ABBR[expiry.month]
-    return f"{symbol}{yy}{mon}{strike}{option_type}"
+    strike_str = str(int(strike)) if float(strike) == int(strike) else str(float(strike))
+    return f"{symbol}{yy}{mon}{strike_str}{option_type}"
 
 
 def estimate_option_premium(

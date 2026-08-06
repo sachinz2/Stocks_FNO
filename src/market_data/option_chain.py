@@ -263,8 +263,8 @@ def find_delta_strike(
     option_type: str,
     dte: int,
     sigma: float,
-    strike_interval: int = 50,
-) -> int:
+    strike_interval: float = 50,
+) -> float:
     """
     Find the strike K whose Black-Scholes delta is closest to target_delta.
     target_delta: positive for CE (e.g. 0.20), negative for PE (e.g. -0.20)
@@ -272,6 +272,12 @@ def find_delta_strike(
     Linear scan over 33 candidate strikes (2 ITM to 30 OTM from ATM) — cheap enough
     at this size that a binary search isn't worth the complexity.
     Returns the nearest valid strike (rounded to strike_interval).
+
+    strike_interval may be fractional (2.5, for symbols like ITC/WIPRO/ONGC/
+    POWERGRID/TATASTEEL whose real NSE grid includes half-strikes) -- the
+    result is NOT forced to int here (that used to silently truncate a real
+    half-strike like 247.5 into a non-existent 247); build_option_symbol()
+    formats the final value correctly either way.
     """
     T = max(dte, 1) / 365.0
     atm = round(underlying_price / strike_interval) * strike_interval
@@ -299,16 +305,16 @@ def find_delta_strike(
     # at or inside the current price (that would be an immediate breach).
     if option_type == "PE":
         # Put short strike must be strictly below the underlying
-        ceiling = int(round(underlying_price / strike_interval) * strike_interval) - strike_interval
+        ceiling = round(underlying_price / strike_interval) * strike_interval - strike_interval
         if best_strike > ceiling:
             best_strike = ceiling
     else:
         # Call short strike must be strictly above the underlying
-        floor_ = int(round(underlying_price / strike_interval) * strike_interval) + strike_interval
+        floor_ = round(underlying_price / strike_interval) * strike_interval + strike_interval
         if best_strike < floor_:
             best_strike = floor_
 
-    return int(best_strike)
+    return int(best_strike) if best_strike == int(best_strike) else best_strike
 
 
 async def get_entry_prices_for_spread(

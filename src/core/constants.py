@@ -7,8 +7,13 @@ SQUARE_OFF_HOUR = 15
 SQUARE_OFF_MINUTE = 20  # Auto square-off 10 mins before close
 
 # NSE F&O option-eligible stocks (40 most liquid)
-# Lot sizes and strike intervals are ALSO hardcoded here as fallback;
-# the primary source is Redis (refreshed daily from kite.instruments("NFO")).
+# Lot sizes and strike intervals are hardcoded here. NOTE: despite what this
+# comment used to claim, there is no live daily refresh from
+# kite.instruments("NFO") anywhere in this codebase (grepped and confirmed
+# 2026-08-06) -- this hardcoded table is the ONLY source of truth. Verify at
+# nseindia.com/market-data/fo-equity-securities (or against a fresh
+# kite.instruments("NFO") pull) periodically, since NSE revises these when a
+# stock's price moves into a different band.
 FNO_SYMBOLS = [
     # Tier 1 — highest liquidity
     "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK",
@@ -26,8 +31,8 @@ FNO_SYMBOLS = [
     "COALINDIA",
 ]
 
-# Hardcoded lot sizes — fallback when Redis cache is empty.
-# Refreshed daily from kite.instruments("NFO") after auth.
+# Hardcoded lot sizes. As with FNO_STRIKE_INTERVALS above, there is no live
+# refresh mechanism -- this table is the sole source of truth.
 # Verify at nseindia.com/market-data/fo-equity-securities if issues arise.
 FNO_LOT_SIZES = {
     "RELIANCE":    250,   "TCS":         150,   "INFY":        300,
@@ -46,22 +51,33 @@ FNO_LOT_SIZES = {
     "TATASTEEL":  5500,   "COALINDIA":  4200,
 }
 
-# Gap between consecutive strikes on NSE for each symbol
+# Gap between consecutive strikes on NSE for each symbol.
+#
+# Fixed 2026-08-06: audited every symbol here against a live
+# kite.instruments("NFO") pull (nearest expiry, most-populated strike chain)
+# after discovering TITAN's entry here (25) doesn't match the real exchange
+# value (50) -- confirmed live: the strategy had built and traded
+# "TITAN26AUG4975CE", a strike that doesn't exist on Zerodha (real strikes
+# are ...4900, 4950, 5000, 5050...). Since get_option_quote() can only find a
+# contract that actually exists, this silently forced every single-leg trade
+# on an affected symbol to run on the synthetic ATR-estimate fallback for its
+# entire life (entry AND every exit check) instead of ever touching a real
+# quote -- 27 of the 39 symbols below had a wrong value, not just TITAN.
 FNO_STRIKE_INTERVALS = {
-    "RELIANCE":    50,   "TCS":        100,   "INFY":        20,
-    "HDFCBANK":    20,   "ICICIBANK":   20,   "SBIN":        10,
-    "BAJFINANCE": 100,   "KOTAKBANK":   20,   "AXISBANK":    10,
-    "LT":          50,   "HINDUNILVR":  20,   "ITC":          5,
-    "WIPRO":        5,   "HCLTECH":     20,   "MARUTI":     100,
-    "SUNPHARMA":   20,   "M&M":          50,  "BHARTIARTL":  10,
-    "ADANIPORTS":  10,   "ASIANPAINT":  50,   "TITAN":       25,
+    "RELIANCE":    10,   "TCS":         20,   "INFY":        15,
+    "HDFCBANK":    10,   "ICICIBANK":   10,   "SBIN":        10,
+    "BAJFINANCE":  10,   "KOTAKBANK":    5,   "AXISBANK":    20,
+    "LT":          50,   "HINDUNILVR":  20,   "ITC":        2.5,
+    "WIPRO":      2.5,   "HCLTECH":     10,   "MARUTI":     100,
+    "SUNPHARMA":   20,   "M&M":          50,  "BHARTIARTL":  20,
+    "ADANIPORTS":  20,   "ASIANPAINT":  20,   "TITAN":       50,
     "BAJAJ-AUTO": 100,   "EICHERMOT":  100,   "INDUSINDBK":  10,
-    "DRREDDY":     50,   "CIPLA":       10,   "DIVISLAB":    50,
-    "JSWSTEEL":    10,   "HINDALCO":     5,   "GRASIM":      25,
-    "TATACONSUM":  10,   "APOLLOHOSP":  50,   "NESTLEIND":  100,
-    "TECHM":       10,   "BPCL":         5,   "ONGC":         5,
-    "NTPC":         5,   "POWERGRID":    5,   "ULTRACEMCO":  50,
-    "TATASTEEL":    5,   "COALINDIA":    5,
+    "DRREDDY":     10,   "CIPLA":       10,   "DIVISLAB":   100,
+    "JSWSTEEL":    20,   "HINDALCO":    20,   "GRASIM":      20,
+    "TATACONSUM":  10,   "APOLLOHOSP": 100,   "NESTLEIND":   10,
+    "TECHM":       16,   "BPCL":         5,   "ONGC":       2.5,
+    "NTPC":         5,   "POWERGRID":  2.5,   "ULTRACEMCO":  40,
+    "TATASTEEL":  2.5,   "COALINDIA":    5,
 }
 
 # How many stocks to trade at a time per strategy regime
