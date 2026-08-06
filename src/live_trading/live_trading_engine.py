@@ -1206,6 +1206,27 @@ class LiveTradingEngine:
         if not market_data:
             return
 
+        # Skip entirely while this symbol is still on the historical-data
+        # bootstrap fallback (ltp_source == "zerodha_historical" — see
+        # ltp_poller._enrich()) rather than genuine live ticks. Added
+        # 2026-08-06: confirmed live that on 2026-08-03 this fallback lasted
+        # from market open (09:15) through ~09:33 (18 min — longer than
+        # _ENTRY_WARMUP_MINUTES=15), during which every symbol's "EMA" was
+        # frozen on the prior trading day's closing price. Calling
+        # generate_signal() during that window doesn't just risk a bad entry
+        # (already blocked by the warmup for most of it) -- for stateful
+        # strategies (EMACrossoverStrategy/MomentumStrategy track
+        # prev_fast_ema/prev_slow_ema and pending-confirmation bar counts
+        # across cycles) it silently seeds that state from frozen, non-moving
+        # data. A real crossover was verified via Zerodha's own historical
+        # data to have happened at 09:25:00 that morning on MARUTI/NESTLEIND
+        # (both in ema_crossover_v1's pool) and was never detected -- this
+        # closes that gap by not touching strategy state at all until data
+        # is genuinely live, so the first real comparison is against a true
+        # previous value instead of a stale frozen one.
+        if market_data.get("ltp_source") == "zerodha_historical":
+            return
+
         signal = strategy.generate_signal(market_data)
         if not signal or signal == SignalType.HOLD:
             return
