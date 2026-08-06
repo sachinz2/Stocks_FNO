@@ -20,6 +20,7 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 
+from src.core.utils import now_ist
 from src.strategies.base import StrategyRegistry
 
 logger = logging.getLogger(__name__)
@@ -32,10 +33,27 @@ MIN_TRADES_REQUIRED = 30    # don't evaluate with fewer trades — 10 is statist
 
 # Expected per-strategy max drawdown (₹) — operator-configurable at startup.
 # These are conservative defaults; override via constructor.
+#
+# Fixed 2026-08-06: these keys were "ema_crossover"/"credit_spread"/
+# "iron_condor" -- the actual strategy instance IDs used everywhere else in
+# the system (StrategyRegistry, STRATEGY_CAPITAL_ALLOCATION,
+# REGIME_STRATEGY_MAP) are "ema_crossover_v1"/"credit_spread_v1"/
+# "iron_condor_v1"/"momentum_v1". Since StrategyMonitor is instantiated with
+# no override (api/main.py: StrategyMonitor(trade_journal_repo)), every
+# exp_dd lookup used strategy_id (e.g. "credit_spread_v1") against this dict,
+# which never matched -- exp_dd was always 0, and Check 2 (rolling drawdown)
+# is gated on `exp_dd > 0`, so the drawdown-based auto-pause has never
+# actually fired for any strategy since this file was written. Only Check 1
+# (profit factor) was ever live.
 DEFAULT_EXPECTED_DRAWDOWN: Dict[str, float] = {
-    "ema_crossover":  15_000.0,
-    "credit_spread":  10_000.0,
-    "iron_condor":     8_000.0,
+    "ema_crossover_v1": 15_000.0,
+    "credit_spread_v1": 10_000.0,
+    "iron_condor_v1":    8_000.0,
+    # momentum_v1 (added 2026-07-30) never had a default at all -- 20% capital
+    # allocation vs ema_crossover_v1's 30%, scaled proportionally from its
+    # 15,000 default (~10,000), rounded up slightly since it's a newer,
+    # less-tested strategy. Operator-tunable like the rest.
+    "momentum_v1":       12_000.0,
 }
 
 
@@ -157,7 +175,10 @@ class StrategyMonitor:
         if instance.is_active:
             StrategyRegistry.pause_strategy(strategy_id, reason=reason)
             self._pause_reasons[strategy_id] = reason
-            self._paused_at[strategy_id] = datetime.now(timezone.utc).isoformat()
+            # IST-naive, matching the rest of the system's convention (not
+            # currently displayed on the dashboard, but kept consistent —
+            # same bug class fixed elsewhere today).
+            self._paused_at[strategy_id] = now_ist().replace(tzinfo=None).isoformat()
             logger.error(
                 f"AUTO-KILL: Strategy '{strategy_id}' paused. Reason: {reason}"
             )
