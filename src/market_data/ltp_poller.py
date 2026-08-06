@@ -210,10 +210,16 @@ class LTPPoller:
             except Exception as exc:
                 logger.error(f"LTP poll failed for {symbol}: {exc}")
 
-        # Market breadth — advancing/declining ratio across all polled symbols
+        # Market breadth — advancing/declining ratio across all polled symbols.
+        # Uses day_prev_close (real previous-trading-day close), NOT the
+        # bar-to-bar `prev_close` -- see _enrich()'s day_prev_close comment
+        # for why the old bar-to-bar version made this swing wildly within
+        # single trading sessions despite being described as day-level
+        # sentiment everywhere it's consumed (credit_spread_v1/iron_condor_v1
+        # breadth gates in live_trading_engine.py).
         if all_ticks:
-            _adv = sum(1 for t in all_ticks if t.get("close", 0) > t.get("prev_close", 0))
-            _dec = sum(1 for t in all_ticks if t.get("close", 0) < t.get("prev_close", 0))
+            _adv = sum(1 for t in all_ticks if t.get("close", 0) > t.get("day_prev_close", 0))
+            _dec = sum(1 for t in all_ticks if t.get("close", 0) < t.get("day_prev_close", 0))
             _tot = _adv + _dec
             _breadth = round(_adv / _tot, 4) if _tot > 0 else 0.5
             await self._redis.set(
@@ -382,6 +388,27 @@ class LTPPoller:
         seconds after market open before any tick has arrived), falls back to
         the raw historical df as-is.
         """
+        # Real previous-TRADING-DAY close, for market breadth (see refresh()
+        # below) -- captured from the historical baseline with today's rows
+        # excluded, before today's live rows get merged in. Distinct from
+        # `prev_close` further down, which is bar-to-bar (previous 5-min
+        # candle) and stays that way for its existing indicator-continuity
+        # use -- this is specifically for "is this stock up or down TODAY",
+        # which needs yesterday's actual close, not 5 minutes ago.
+        #
+        # Fixed 2026-08-06: market breadth was computed from bar-to-bar
+        # prev_close, not day-over-day -- despite being described everywhere
+        # ("broad market advancing/declining") as day-level sentiment.
+        # Confirmed live: breadth swung 18.4% -> 68.4% -> 35.9% within ~20
+        # minutes on 2026-08-06, which is implausible for genuine "% of
+        # stocks up on the day" but exactly what 5-min-bar noise looks like.
+        if "date" in df.columns:
+            _today_str_dpc = now_ist().date().isoformat()
+            _hist_only = df[df["date"].apply(lambda d: d.date().isoformat() != _today_str_dpc)]
+            day_prev_close = float(_hist_only["close"].iloc[-1]) if len(_hist_only) > 0 else ltp
+        else:
+            day_prev_close = ltp
+
         has_live_data = live_range is not None
         if has_live_data:
             if "date" in df.columns:
@@ -476,11 +503,26 @@ class LTPPoller:
         _di_m  = 100.0 * _dmm_w / _tr_w.replace(0, np.nan)
         _dx    = 100.0 * (_di_p - _di_m).abs() / (_di_p + _di_m).replace(0, np.nan)
         _adx_raw = _dx.ewm(alpha=_alpha, adjust=False).mean().iloc[-1]
-        adx14  = round(float(_adx_raw), 2) if not np.isnan(float(_adx_raw)) else 0.0
+        # adx_valid distinguishes "insufficient history for a real ADX yet"
+        # (NaN -- e.g. before 14 bars of high/low history exist) from a
+        # genuinely-computed low value. Both used to collapse to the same
+        # sentinel (adx14=0.0), and every ADX gate in live_trading_engine.py
+        # checked `if adx > 0` before applying its threshold -- so a missing
+        # value silently passed every ADX-gated entry check instead of being
+        # treated as "can't confirm, don't enter." Fixed 2026-08-06 alongside
+        # the identical RVOL issue below.
+        _adx_valid = not np.isnan(float(_adx_raw))
+        adx14  = round(float(_adx_raw), 2) if _adx_valid else 0.0
 
-        # RVOL — current bar volume relative to 20-period average
+        # RVOL — current bar volume relative to 20-period average.
+        # rvol_valid: same "insufficient data vs genuinely computed" split as
+        # adx_valid above -- _vol_avg20 is NaN until 20 real-volume bars
+        # exist (roughly the first ~100 minutes of every session), during
+        # which the RVOL entry gate was silently disabled rather than
+        # blocking (see live_trading_engine.py's momentum RVOL check).
         _vol_avg20 = volume.rolling(20).mean().iloc[-1]
-        rvol = round(float(volume.iloc[-1] / _vol_avg20), 2) if (_vol_avg20 and _vol_avg20 > 0) else 0.0
+        _rvol_valid = bool(_vol_avg20 and _vol_avg20 > 0)
+        rvol = round(float(volume.iloc[-1] / _vol_avg20), 2) if _rvol_valid else 0.0
 
         # `vwap` is deliberately a multi-day cumulative figure (~750 historical
         # bars plus today's live bars) — a medium-term (10-day) trend anchor, see
@@ -514,12 +556,15 @@ class LTPPoller:
             "symbol":         symbol,
             "close":          ltp,
             "prev_close":     prev_close,
+            "day_prev_close": round(day_prev_close, 4),
             "ema20":          round(ema20, 4),
             "ema50":          round(ema50, 4),
             "atr14":          round(atr14, 4),
             "atr_pct":        atr_pct,
             "adx14":          adx14,
+            "adx_valid":      _adx_valid,
             "rvol":           rvol,
+            "rvol_valid":     _rvol_valid,
             "ema_spread_pct": ema_spread_pct,
             "vwap":           round(vwap, 4),
             "session_vwap":   round(session_vwap, 4),

@@ -1420,8 +1420,21 @@ class LiveTradingEngine:
         # ZerodhaTicker now subscribes in MODE_QUOTE (real volume_traded per tick,
         # accumulated into per-bar volume by update_intraday_bar() in core/utils.py),
         # so rvol carries a genuine non-zero signal once live bars accumulate.
+        # Fixed 2026-08-06: `if _rvol > 0` treated "insufficient data to
+        # compute a real 20-period average yet" (rvol_valid=False, e.g. the
+        # first ~100 min of every session) the SAME as "confirmed above
+        # threshold" -- both silently passed. A volume-confirmation filter
+        # that can't confirm volume shouldn't wave the entry through; it
+        # should block until it can, like every other unconfirmed-data case.
         _rvol = float(market_data.get("rvol", 0))
-        if _rvol > 0 and _rvol < 1.3:
+        _rvol_valid = bool(market_data.get("rvol_valid", False))
+        if not _rvol_valid:
+            logger.info(
+                f"[{strategy.name}] {symbol} skipped — RVOL not yet computable "
+                "(insufficient volume history; cannot confirm breakout strength)"
+            )
+            return
+        if _rvol < 1.3:
             logger.info(
                 f"[{strategy.name}] {symbol} skipped — RVOL={_rvol:.2f} < 1.3 "
                 "(below-average volume; weak breakout confirmation)"
@@ -1430,8 +1443,16 @@ class LiveTradingEngine:
 
         # ADX filter — require strong trend (ADX > 25) for EMA crossover momentum plays.
         # A crossover in a low-ADX environment is likely noise rather than a trend change.
+        # Fixed 2026-08-06: same fail-open-on-missing-data issue as RVOL above.
         _adx_ema = float(market_data.get("adx14", 0))
-        if _adx_ema > 0 and _adx_ema < 25:
+        _adx_ema_valid = bool(market_data.get("adx_valid", False))
+        if not _adx_ema_valid:
+            logger.info(
+                f"[{strategy.name}] {symbol} skipped — ADX not yet computable "
+                "(insufficient history; cannot confirm trend strength)"
+            )
+            return
+        if _adx_ema < 25:
             logger.info(
                 f"[{strategy.name}] {symbol} skipped — ADX={_adx_ema:.1f} < 25 "
                 "(trend not strong enough for momentum entry)"
@@ -1797,20 +1818,29 @@ class LiveTradingEngine:
         # ADX filter — credit spreads need a moderate directional trend (ADX 15–30).
         # ADX < 15: no trend, stock is ranging → condor territory not spread territory.
         # ADX > 30: trend too strong → risk of blowthrough on short strike.
+        # Fixed 2026-08-06: `if _adx_cs > 0` treated "can't confirm ADX yet"
+        # (insufficient history) as "assume we're in the safe [15,30] zone" --
+        # block instead, consistent with every other unconfirmed-data case.
         _adx_cs = float(market_data.get("adx14", 0))
-        if _adx_cs > 0:
-            if _adx_cs < 15:
-                logger.info(
-                    f"[CreditSpread] {symbol} skipped — ADX={_adx_cs:.1f} < 15 "
-                    "(no trend; condor regime)"
-                )
-                return
-            if _adx_cs > 30:
-                logger.info(
-                    f"[CreditSpread] {symbol} skipped — ADX={_adx_cs:.1f} > 30 "
-                    "(trend too strong; blowthrough risk)"
-                )
-                return
+        _adx_cs_valid = bool(market_data.get("adx_valid", False))
+        if not _adx_cs_valid:
+            logger.info(
+                f"[CreditSpread] {symbol} skipped — ADX not yet computable "
+                "(insufficient history; cannot confirm trend is in the safe zone)"
+            )
+            return
+        if _adx_cs < 15:
+            logger.info(
+                f"[CreditSpread] {symbol} skipped — ADX={_adx_cs:.1f} < 15 "
+                "(no trend; condor regime)"
+            )
+            return
+        if _adx_cs > 30:
+            logger.info(
+                f"[CreditSpread] {symbol} skipped — ADX={_adx_cs:.1f} > 30 "
+                "(trend too strong; blowthrough risk)"
+            )
+            return
 
         # Event/earnings calendar filter — block entries within 5 trading days.
         # Earnings and RBI events cause IV crush and gap risk that destroys spread edge.
@@ -2419,8 +2449,18 @@ class LiveTradingEngine:
 
         # ADX filter — iron condors require low trend strength (ADX < 20).
         # ADX ≥ 20 indicates a developing trend that could breach either wing.
+        # Fixed 2026-08-06: `if _adx_ic > 0` treated "can't confirm ADX yet"
+        # as "assume the market is calm enough" -- block instead, consistent
+        # with every other unconfirmed-data case.
         _adx_ic = float(market_data.get("adx14", 0))
-        if _adx_ic > 0 and _adx_ic >= 20:
+        _adx_ic_valid = bool(market_data.get("adx_valid", False))
+        if not _adx_ic_valid:
+            logger.info(
+                f"[IronCondor] {symbol} skipped — ADX not yet computable "
+                "(insufficient history; cannot confirm market is range-bound)"
+            )
+            return
+        if _adx_ic >= 20:
             logger.info(
                 f"[IronCondor] {symbol} skipped — ADX={_adx_ic:.1f} >= 20 "
                 "(market trending; range-bound thesis invalid)"
