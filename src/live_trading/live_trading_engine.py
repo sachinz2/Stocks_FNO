@@ -644,11 +644,11 @@ class LiveTradingEngine:
             logger.error(f"Failed to restore engine state: {e}")
 
         # In paper mode, PaperBroker._positions is in-memory and lost on restart.
-        # Reconstruct it from the restored spread/condor state so that:
+        # Reconstruct it from the restored spread/condor/single-leg state so that:
         #   a) _safe_get_positions() returns correct data for risk manager
         #   b) _reconcile_broker_positions() sees broker positions matching engine state
         if hasattr(self.broker, "_positions"):
-            self._rebuild_paper_broker_positions()
+            await self._rebuild_paper_broker_positions()
             await self._reconcile_paper_broker_balance()
 
         # After Redis restore, cross-check broker positions for orphans
@@ -701,14 +701,27 @@ class LiveTradingEngine:
         except Exception as e:
             logger.error(f"Failed to reconcile PaperBroker balance after restart: {e}")
 
-    def _rebuild_paper_broker_positions(self) -> None:
+    async def _rebuild_paper_broker_positions(self) -> None:
         """
-        Reconstruct PaperBroker._positions from restored spread/condor state.
+        Reconstruct PaperBroker._positions from restored spread/condor/
+        single-leg state.
 
         PaperBroker keeps positions in an in-memory dict that is lost on container
         restart. Without this rebuild, _safe_get_positions() returns empty after
         restart, causing the risk manager to think there are 0 open positions and
         potentially allowing duplicate entries for the same underlying.
+
+        Fixed 2026-08-06: this only ever rebuilt spread/condor legs, never
+        single-leg positions from _single_leg_journals (ema_crossover_v1/
+        momentum_v1) -- the identical "forgot the single-leg case" bug found
+        and fixed the same day in the /positions dashboard endpoint, except
+        here it has real functional consequences rather than cosmetic ones:
+        _check_open_option_exits() iterates broker.get_positions() to decide
+        what to evaluate for exit, so any single-leg position open across a
+        restart silently stopped receiving stop-loss/target/DTE exit checks
+        entirely (confirmed live: today's two open momentum_v1 positions
+        had zero exit evaluation for the ~50 minutes between the first
+        post-entry restart and this fix landing).
         """
         broker = self.broker
         broker._positions.clear()
@@ -737,6 +750,30 @@ class LiveTradingEngine:
                         "symbol": contract, "quantity": qty, "avg_price": float(price)
                     }
 
+        single_leg_count = 0
+        if self._single_leg_journals:
+            from src.database.connection import AsyncSessionLocal
+            from src.database.models.trade_journal import TradeJournal
+            from src.database.repositories.base import BaseRepository
+            journal_repo = BaseRepository(TradeJournal, AsyncSessionLocal)
+            for contract, info in self._single_leg_journals.items():
+                if not contract:
+                    continue
+                journal = await journal_repo.get_by_id(info["journal_id"])
+                if journal is None or journal.entry_price is None:
+                    logger.error(
+                        f"Rebuild: single-leg journal for {contract} (id={info.get('journal_id')}) "
+                        "not found in trade_journal — cannot restore its broker position; "
+                        "it will be invisible to exit checks until manually corrected."
+                    )
+                    continue
+                broker._positions[contract] = {
+                    "symbol": contract,
+                    "quantity": journal.quantity or 0,
+                    "avg_price": float(journal.entry_price),
+                }
+                single_leg_count += 1
+
         # Rebuild margin_blocked for restored short legs too — this bypasses
         # place_order() entirely, so PaperBroker's own margin bookkeeping
         # (see SHORT_MARGIN_MULTIPLE_OF_PREMIUM in paper_broker.py) never runs
@@ -757,7 +794,7 @@ class LiveTradingEngine:
             logger.info(
                 f"Rebuilt PaperBroker positions after restart: "
                 f"{len(self._active_spreads)} spread(s) + {len(self._active_condors)} condor(s) "
-                f"→ {total} contract legs"
+                f"+ {single_leg_count} single-leg(s) → {total} contract legs"
             )
 
     async def _reconcile_broker_positions(self) -> None:
