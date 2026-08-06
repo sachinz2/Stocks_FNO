@@ -246,32 +246,36 @@ elif page == "Positions":
 
             # market_price == 0 means "no live quote available yet" (e.g. Zerodha
             # not currently quoting this specific contract) -- NOT "worth zero".
-            # Blank it out (and the pnl fields that depend on it) so na_rep="—"
-            # below shows "unknown" instead of a misleading hard 0.00.
+            # Blank it out (and the pnl fields that depend on it) to NaN so it
+            # renders as "—" below instead of a misleading hard 0.00.
             no_quote = df["market_price"].fillna(0) == 0
-            df.loc[no_quote, "market_price"]   = None
-            df.loc[no_quote, "unrealized_pnl"] = None
-            df.loc[no_quote, "total_pnl"]      = None
+            df.loc[no_quote, ["market_price", "unrealized_pnl", "total_pnl"]] = float("nan")
 
             show = [c for c in ["symbol", "quantity", "avg_price", "market_price", "unrealized_pnl", "realized_pnl", "total_pnl", "capital"] if c in df.columns]
-            df = df[show]
-            df.columns = [c.replace("_", " ").title() for c in show]
+            numeric_df = df[show].copy()
+            numeric_df.columns = [c.replace("_", " ").title() for c in show]
 
             def highlight_pnl(row):
                 styles = [""] * len(row)
                 for i, col in enumerate(row.index):
-                    if "Pnl" in col and pd.notna(row[col]):
-                        styles[i] = f"color: {'green' if row[col] > 0 else 'red' if row[col] < 0 else 'gray'}"
+                    if "Pnl" in col:
+                        val = numeric_df.loc[row.name, col]
+                        if pd.notna(val):
+                            styles[i] = f"color: {'green' if val > 0 else 'red' if val < 0 else 'gray'}"
                 return styles
 
-            # Same raw-float display issue as the Orders & Trades / Analytics
-            # tables -- DB Numeric/float columns render as e.g. "46.590000"
-            # without an explicit format.
-            _num_fmt = {c: "{:,.2f}" for c in
-                        ["Avg Price", "Market Price", "Unrealized Pnl", "Realized Pnl", "Total Pnl", "Capital"]
-                        if c in df.columns}
+            # Format to display strings ourselves rather than relying on
+            # Styler's na_rep -- Streamlit's dataframe widget doesn't reliably
+            # honor it for NaN cells (renders literal "None" instead). Same
+            # raw-float display issue as Orders & Trades / Analytics tables
+            # otherwise (e.g. "46.590000" without an explicit format).
+            display_df = numeric_df.copy()
+            for c in ["Avg Price", "Market Price", "Unrealized Pnl", "Realized Pnl", "Total Pnl", "Capital"]:
+                if c in display_df.columns:
+                    display_df[c] = display_df[c].map(lambda v: f"{v:,.2f}" if pd.notna(v) else "—")
+
             st.dataframe(
-                df.style.format(_num_fmt, na_rep="—").apply(highlight_pnl, axis=1),
+                display_df.style.apply(highlight_pnl, axis=1),
                 use_container_width=True, hide_index=True,
             )
 
