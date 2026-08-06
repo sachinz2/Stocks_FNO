@@ -103,7 +103,8 @@ if page == "Home":
     capital_deployed = sum(abs(p.get("quantity", 0)) * p.get("avg_price", 0) for p in positions)
     capital_pct = (capital_deployed / INITIAL_CAPITAL) * 100 if capital_deployed else 0
 
-    today_str = date.today().isoformat()
+    from src.core.utils import now_ist
+    today_str = now_ist().date().isoformat()
     orders_today = [o for o in orders if (o.get("created_at") or "").startswith(today_str)]
     open_orders = [o for o in orders if o.get("status") in ("PENDING", "OPEN")]
 
@@ -267,6 +268,45 @@ elif page == "Positions":
 elif page == "Orders & Trades":
     st.title("Order Management")
 
+    # ── Closed Trades (P&L) ──────────────────────────────────────────────────
+    # Added 2026-08-06 — this page previously only showed raw individual orders
+    # (one row per BUY/SELL leg, no P&L), which is the entry/exit pair a
+    # "trade" actually is. Per-trade P&L already existed via analytics/trades
+    # (used on the Analytics page) but wasn't surfaced here, on the one page
+    # named for trades — added it here too using the same data.
+    st.subheader("Closed Trades (P&L)")
+    closed_trades = fetch("analytics/trades") or []
+    if not closed_trades:
+        st.info("No closed trades yet.")
+    else:
+        t_df = pd.DataFrame(closed_trades)
+        t_show = [c for c in [
+            "exit_time", "strategy", "underlying", "structure_type",
+            "entry_price", "exit_price", "quantity", "pnl", "hold_days", "exit_reason",
+        ] if c in t_df.columns]
+        t_df = t_df.sort_values("exit_time", ascending=False)[t_show]
+        t_df.columns = [c.replace("_", " ").title() for c in t_show]
+
+        def _highlight_pnl(row):
+            styles = [""] * len(row)
+            for i, col in enumerate(row.index):
+                if "Pnl" in col:
+                    styles[i] = f"color: {'green' if row[col] > 0 else 'red' if row[col] < 0 else 'gray'}"
+            return styles
+
+        st.dataframe(t_df.style.apply(_highlight_pnl, axis=1), use_container_width=True, hide_index=True)
+
+        total_pnl = sum(t.get("pnl") or 0 for t in closed_trades)
+        wins = sum(1 for t in closed_trades if (t.get("pnl") or 0) > 0)
+        tc1, tc2, tc3 = st.columns(3)
+        tc1.metric("Closed Trades", str(len(closed_trades)))
+        tc2.metric("Win Rate", f"{wins / len(closed_trades) * 100:.1f}%")
+        tc3.metric("Total PnL", fmt_inr(total_pnl))
+
+    st.markdown("---")
+
+    # ── All Orders (raw) ─────────────────────────────────────────────────────
+    st.subheader("All Orders (raw)")
     orders = fetch("orders") or []
 
     if not orders:
@@ -647,8 +687,9 @@ elif page == "System Health":
         )
         st.markdown(log_html, unsafe_allow_html=True)
 
+    from src.core.utils import now_ist
     st.caption(
-        f"Fetched at {datetime.now().strftime('%H:%M:%S')} IST  ·  "
+        f"Fetched at {now_ist().strftime('%H:%M:%S')} IST  ·  "
         "ERROR = red  ·  WARNING = orange  ·  DEBUG = gray"
     )
 

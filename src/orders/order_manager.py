@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional
 
 from src.brokers.base import AbstractBroker
+from src.core.utils import now_ist
 from src.risk.risk_manager import RiskManager
 from src.database.repositories.base import BaseRepository
 from src.database.models.order import Order
@@ -66,7 +67,11 @@ class OrderManager:
                 "service_name": "OrderManager",
                 "action":       action,
                 "payload":      payload,
-                "timestamp":    datetime.utcnow(),
+                # IST-naive, matching trade_journal (see now_ist() usage
+                # throughout live_trading_engine.py) — was datetime.utcnow()
+                # until 2026-08-06, which made every order/audit timestamp
+                # display 5.5h behind the actual IST time on the dashboard.
+                "timestamp":    now_ist().replace(tzinfo=None),
             })
         except Exception as e:
             logger.warning(f"Audit log skipped ({action}): {e}")
@@ -111,7 +116,7 @@ class OrderManager:
             "quantity":     quantity,
             "price":        price,
             "order_status": "PENDING",
-            "created_at":   datetime.utcnow(),
+            "created_at":   now_ist().replace(tzinfo=None),
         })
         # Recorded so a later stale-order retry can reconstruct the original
         # placement context (see _get_retry_context) without needing new
@@ -229,7 +234,7 @@ class OrderManager:
 
         Returns the number of orders cancelled (including any retried).
         """
-        cutoff = datetime.utcnow() - timedelta(minutes=ORDER_EXPIRY_MINUTES)
+        cutoff = now_ist().replace(tzinfo=None) - timedelta(minutes=ORDER_EXPIRY_MINUTES)
         open_orders = await self.order_repo.filter(order_status="OPEN")
         cancelled = 0
         retried = 0
@@ -237,7 +242,7 @@ class OrderManager:
         for order in open_orders:
             if not order.created_at:
                 continue
-            # Normalise: strip tzinfo if present (DB stores UTC naive)
+            # Normalise: strip tzinfo if present (DB stores IST naive)
             created = order.created_at.replace(tzinfo=None) if order.created_at.tzinfo else order.created_at
             if created > cutoff:
                 continue  # not stale yet
@@ -257,7 +262,7 @@ class OrderManager:
 
             await self.order_repo.update(order, {
                 "order_status": "EXPIRED",
-                "updated_at":   datetime.utcnow(),
+                "updated_at":   now_ist().replace(tzinfo=None),
             })
             await self._audit("ORDER_EXPIRED", {"order_id": order.id, "symbol": order.symbol})
             cancelled += 1
