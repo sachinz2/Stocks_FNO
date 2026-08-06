@@ -2066,8 +2066,16 @@ class LiveTradingEngine:
                 continue
 
             lot = spread["lot_size"]
-            exit_short = await self.order_manager.place_order(spread["short_contract"], "BUY",  lot, cur_short, is_spread_leg=True)
-            exit_long  = await self.order_manager.place_order(spread["long_contract"],  "SELL", lot, cur_long,  is_spread_leg=True)
+            # is_exit_order=True is required here, not just is_spread_leg=True --
+            # risk_manager.validate_trade() only bypasses the kill switch/circuit
+            # breaker for is_exit_order (layer 0); is_spread_leg alone still hits
+            # that check (intentional for entry hedge legs, wrong for a genuine
+            # exit). Without this, a tripped kill switch or daily-loss circuit
+            # breaker would block the system from closing an existing credit
+            # spread via its normal exit path -- exactly when it most needs to
+            # (found 2026-08-06).
+            exit_short = await self.order_manager.place_order(spread["short_contract"], "BUY",  lot, cur_short, is_spread_leg=True, is_exit_order=True)
+            exit_long  = await self.order_manager.place_order(spread["long_contract"],  "SELL", lot, cur_long,  is_spread_leg=True, is_exit_order=True)
 
             _bad = {"REJECTED", "REJECTED_BY_RISK", "CANCELLED", "FAILED"}
             if exit_short is None or exit_long is None or \
@@ -2662,10 +2670,16 @@ class LiveTradingEngine:
                 continue
 
             lot = c["lot_size"]
-            exit_ps = await self.order_manager.place_order(c["put_short_contract"],  "BUY",  lot, cur_ps, is_spread_leg=True)
-            exit_pl = await self.order_manager.place_order(c["put_long_contract"],   "SELL", lot, cur_pl, is_spread_leg=True)
-            exit_cs = await self.order_manager.place_order(c["call_short_contract"], "BUY",  lot, cur_cs, is_spread_leg=True)
-            exit_cl = await self.order_manager.place_order(c["call_long_contract"],  "SELL", lot, cur_cl, is_spread_leg=True)
+            # is_exit_order=True required -- same fix and rationale as
+            # _check_spread_exits (found 2026-08-06): is_spread_leg alone still
+            # hits the kill-switch/circuit-breaker check in
+            # risk_manager.validate_trade(), which would block closing an
+            # existing iron condor exactly when a tripped kill switch makes
+            # that most urgent.
+            exit_ps = await self.order_manager.place_order(c["put_short_contract"],  "BUY",  lot, cur_ps, is_spread_leg=True, is_exit_order=True)
+            exit_pl = await self.order_manager.place_order(c["put_long_contract"],   "SELL", lot, cur_pl, is_spread_leg=True, is_exit_order=True)
+            exit_cs = await self.order_manager.place_order(c["call_short_contract"], "BUY",  lot, cur_cs, is_spread_leg=True, is_exit_order=True)
+            exit_cl = await self.order_manager.place_order(c["call_long_contract"],  "SELL", lot, cur_cl, is_spread_leg=True, is_exit_order=True)
 
             _bad = {"REJECTED", "REJECTED_BY_RISK", "CANCELLED", "FAILED"}
             if any(
