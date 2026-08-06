@@ -1,7 +1,9 @@
 from fastapi import APIRouter, HTTPException, Request, status
 from src.database.connection import AsyncSessionLocal
 from src.database.models.position import Position
+from src.database.models.trade_journal import TradeJournal
 from src.database.repositories.base import BaseRepository
+import asyncio
 import logging
 
 logger = logging.getLogger(__name__)
@@ -97,6 +99,23 @@ async def _positions_from_engine(engine, kite, redis) -> list:
             (cond.get("call_short_contract", ""), -lot, cond.get("call_short_premium", 0.0)),
             (cond.get("call_long_contract",  ""),  lot, cond.get("call_long_premium",  0.0)),
         ]
+
+    # Single-leg positions (ema_crossover_v1, momentum_v1) live in
+    # engine._single_leg_journals, not _active_spreads/_active_condors — this
+    # loop was missing entirely, so single-leg BUYs never appeared here even
+    # though they were correctly persisted to trade_journal. The journal only
+    # stores journal_id/strategy/regime (not price/qty), so look those up from
+    # trade_journal directly, keyed by the journal_id already on hand.
+    single_leg_items = [(c, info) for c, info in engine._single_leg_journals.items() if c]
+    if single_leg_items:
+        journal_repo = BaseRepository(TradeJournal, AsyncSessionLocal)
+        journals = await asyncio.gather(*[
+            journal_repo.get_by_id(info["journal_id"]) for _, info in single_leg_items
+        ])
+        for (contract, _info), journal in zip(single_leg_items, journals):
+            if journal is None or journal.entry_price is None:
+                continue
+            all_legs.append((contract, journal.quantity or 0, float(journal.entry_price)))
 
     contracts = [c for c, _, _ in all_legs if c]
     prices    = await _fetch_market_prices(contracts, kite, redis)
