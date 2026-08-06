@@ -1371,8 +1371,26 @@ class LiveTradingEngine:
         atr      = float(market_data.get("atr14", underlying_price * 0.01))
         iv_rank  = await self._get_iv_rank(symbol, underlying_price, atr, dte)
         strike   = get_atm_strike(underlying_price, symbol)
-        option_p = estimate_option_premium(atr, dte)
         contract = build_option_symbol(symbol, strike, option_type, expiry)
+
+        # Fixed 2026-08-06: this unconditionally used the crude ATR-heuristic
+        # estimate at entry, while every exit path (_check_open_option_exits,
+        # _close_option_positions, _exit_all_options_for) already tries a real
+        # Zerodha quote first and only falls back to the same estimate — an
+        # asymmetry that made recorded P&L largely reflect "how far off was
+        # the entry guess from the real market price" rather than genuine
+        # price movement of the same instrument. Confirmed live 2026-08-03
+        # through 08-05: momentum_v1 showed repeated +190%-283% "wins" that
+        # closed within ~1 minute of entry (a real option premium tripling in
+        # 60s isn't plausible) alongside -30%-50% "losses" over longer holds
+        # — both artifacts of the estimate-vs-real gap, not real trading
+        # outcomes. credit_spread_v1/iron_condor_v1 entries never had this
+        # bug (get_entry_prices_for_spread() already tries a real quote
+        # first) — this brings single-leg entries in line with that same,
+        # already-correct pattern.
+        from src.market_data.option_chain import get_option_quote
+        _real_p = await get_option_quote(contract, getattr(self, "_kite", None), getattr(self, "_redis", None))
+        option_p = _real_p if (_real_p and _real_p > 0) else estimate_option_premium(atr, dte)
 
         order = await self.order_manager.place_order(
             contract, "BUY", lot_size, option_p,
