@@ -1221,7 +1221,16 @@ class LiveTradingEngine:
             return False
 
         self._peak_premiums.pop(contract, None)
-        _fill_p = getattr(db_order, "avg_price", None) or current_p
+        # Fixed 2026-08-06: was getattr(db_order, "avg_price", ...) -- the
+        # Order model's real column is fill_price (see database/models/
+        # order.py); "avg_price" doesn't exist on it at all, so this always
+        # silently fell back to current_p (the pre-slippage quoted price)
+        # instead of the real PaperBroker fill. Confirmed live: POWERGRID's
+        # exit today recorded pnl=+190 (from the quote) while the real fill
+        # (with slippage + fees on both legs) worked out to roughly -770 --
+        # every single-leg trade_journal.pnl this system has ever recorded
+        # was blind to execution slippage entirely, not just this one.
+        _fill_p = getattr(db_order, "fill_price", None) or current_p
         _slip   = abs(_fill_p - current_p)
         pnl = (_fill_p - entry_p) * abs(qty)
 
@@ -1511,10 +1520,16 @@ class LiveTradingEngine:
         if order and order.order_status == "OPEN":
             self._today_order_count += 1
             self._peak_premiums[contract] = option_p
+            # Fixed 2026-08-06: was entry_price=option_p (the pre-slippage
+            # quoted price) -- record the real PaperBroker fill instead, same
+            # fix as the exit-side fill_price bug above, so entry_price
+            # reflects what was actually paid rather than what was quoted a
+            # moment before the simulated bid-ask slippage was applied.
+            _entry_fill = getattr(order, "fill_price", None) or option_p
             journal_id = await self._log_trade_open(
                 strategy=strategy.name, underlying=symbol,
                 structure_type="SINGLE_LEG", contracts=[contract],
-                entry_price=option_p, quantity=lot_size,
+                entry_price=_entry_fill, quantity=lot_size,
                 market_data=market_data, iv_rank=iv_rank, vix=vix,
             )
             if journal_id:
@@ -2190,8 +2205,14 @@ class LiveTradingEngine:
                 (_spread_width - spread["net_credit"]) * lot,
             )
 
-            _short_fill = getattr(exit_short, "avg_price", None) or cur_short
-            _long_fill  = getattr(exit_long,  "avg_price", None) or cur_long
+            # Fixed 2026-08-06: was "avg_price" (doesn't exist on the Order
+            # model -- see database/models/order.py, the real column is
+            # fill_price), so _slippage was always silently 0 here. net_pnl
+            # above is deliberately quote-based, not fill-based, so this
+            # fix only corrects the total_slippage_pts diagnostic field
+            # below, not the recorded pnl itself.
+            _short_fill = getattr(exit_short, "fill_price", None) or cur_short
+            _long_fill  = getattr(exit_long,  "fill_price", None) or cur_long
             _slippage   = abs(_short_fill - cur_short) + abs(_long_fill - cur_long)
             await self._log_trade_close(
                 journal_id=spread.get("journal_id"),
@@ -2798,10 +2819,14 @@ class LiveTradingEngine:
                 (max(_put_wing, _call_wing) - c["net_credit"]) * lot,
             )
 
-            _ps_fill = getattr(exit_ps, "avg_price", None) or cur_ps
-            _pl_fill = getattr(exit_pl, "avg_price", None) or cur_pl
-            _cs_fill = getattr(exit_cs, "avg_price", None) or cur_cs
-            _cl_fill = getattr(exit_cl, "avg_price", None) or cur_cl
+            # Fixed 2026-08-06: same "avg_price" -> "fill_price" fix as the
+            # credit spread exit above -- net_pnl is deliberately quote-based
+            # here too, so this only corrects the total_slippage_pts
+            # diagnostic (previously always silently 0).
+            _ps_fill = getattr(exit_ps, "fill_price", None) or cur_ps
+            _pl_fill = getattr(exit_pl, "fill_price", None) or cur_pl
+            _cs_fill = getattr(exit_cs, "fill_price", None) or cur_cs
+            _cl_fill = getattr(exit_cl, "fill_price", None) or cur_cl
             _slippage = (abs(_ps_fill - cur_ps) + abs(_pl_fill - cur_pl)
                          + abs(_cs_fill - cur_cs) + abs(_cl_fill - cur_cl))
             await self._log_trade_close(
