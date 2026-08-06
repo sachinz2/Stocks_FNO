@@ -17,8 +17,8 @@ one trade with doubled exposure. This class surfaces:
 
 Usage:
     analyzer = PortfolioAnalyzer()
-    report = await analyzer.get_report(positions)   # positions from broker
-    flags  = report["correlation_flags"]            # list of warning strings
+    report = analyzer.get_report(positions)   # positions from broker -- get_report is sync, no await
+    flags  = report["correlation_flags"]      # list of warning strings
 """
 
 import logging
@@ -78,8 +78,19 @@ SYMBOL_BETAS: Dict[str, float] = {
 # Notional threshold (₹) above which a single sector is considered over-concentrated
 SECTOR_NOTIONAL_LIMIT = 60_000.0   # ₹60k per sector = 20% of ₹3L capital
 
-# Portfolio-level beta threshold
-PORTFOLIO_BETA_LIMIT = 5.0   # sum of |beta × notional| / total_notional
+# Portfolio-level beta threshold.
+#
+# Fixed 2026-08-06: was 5.0. portfolio_beta is a notional-weighted AVERAGE of
+# SYMBOL_BETAS (weighted_beta / total_notional), which by definition can never
+# exceed the single highest beta in the portfolio -- the max value anywhere
+# in SYMBOL_BETAS is ~1.40 (TATAMOTORS, which isn't even in this system's
+# tradeable universe; the highest beta actually in FNO_SECTORS is ~1.35).
+# A weighted average of values that top out around 1.35-1.40 can mathematically
+# never reach 5.0, so high_beta_alert could never fire regardless of how
+# concentrated the portfolio got. The module's own docstring already states
+# the intended definition ("Beta > 1.2 -> high-beta"); the threshold constant
+# just never matched it.
+PORTFOLIO_BETA_LIMIT = 1.2   # matches "Beta > 1.2 -> high-beta" in the module docstring
 
 # Known highly-correlated pairs (Pearson r historically > 0.85)
 HIGH_CORRELATION_PAIRS = [
