@@ -2931,6 +2931,23 @@ class LiveTradingEngine:
             await self._persist_state()
 
     async def _exit_all_options_for(self, underlying: str) -> None:
+        """
+        Closes every open single-leg position on `underlying`. Reachable via
+        _process_signal() when a strategy's generate_signal() returns
+        SignalType.EXIT -- currently dead code in practice: none of the 4
+        active strategies' generate_signal() methods return "EXIT" (only
+        their manage_position() methods do, which route through the
+        already-correct _check_open_option_exits() path instead). Kept
+        correct anyway since SignalType.EXIT is part of the formal signal
+        contract (src/core/enums.py) -- a future strategy using it from
+        generate_signal() would otherwise silently inherit two bugs found
+        2026-08-07: pnl computed from the pre-slippage quote/estimate
+        instead of the real fill (same class as three other exit paths
+        fixed earlier that day), AND no trade_journal write at all, which
+        is worse -- a position closed this way would show as permanently
+        open (exit_time/exit_price/pnl all NULL) forever, not just
+        mispriced.
+        """
         from src.market_data.option_chain import get_option_quote
         positions = await self._safe_get_positions()
         expiry = get_near_month_expiry()
@@ -2949,8 +2966,25 @@ class LiveTradingEngine:
                 exit_p = estimate_option_premium(atr, dte)
             else:
                 exit_p = entry_p
-            await self.order_manager.place_order(contract, "SELL", abs(pos["quantity"]), exit_p, is_exit_order=True)
+            _ex_order = await self.order_manager.place_order(
+                contract, "SELL", abs(pos["quantity"]), exit_p, is_exit_order=True,
+            )
             self._peak_premiums.pop(contract, None)
+            _ex_fill_p = getattr(_ex_order, "fill_price", None) or exit_p
+
+            _jrnl_info = self._single_leg_journals.pop(contract, None)
+            if _jrnl_info:
+                _pnl = round((_ex_fill_p - entry_p) * abs(pos["quantity"]), 2)
+                await self._log_trade_close(
+                    journal_id=_jrnl_info.get("journal_id"),
+                    exit_price=_ex_fill_p,
+                    pnl=_pnl,
+                    exit_reason=f"{_jrnl_info.get('strategy_name', 'unknown')} EXIT signal",
+                    market_data=md,
+                )
+                self.risk_manager.release_deployed_capital(
+                    _jrnl_info.get("strategy_name", "ema_crossover_v1"), entry_p * abs(pos["quantity"]),
+                )
         if underlying in self._active_spreads:
             del self._active_spreads[underlying]
         if underlying in self._active_condors:

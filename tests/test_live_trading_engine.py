@@ -467,3 +467,82 @@ async def test_square_off_falls_back_to_estimate_when_fill_unavailable():
     journal_id, exit_price, pnl, exit_reason = fake._closed_journals[0]
     # Falls back to the ATR estimate (a positive, computed value), not None/0
     assert exit_price is not None and exit_price > 0
+
+
+# ── _exit_all_options_for (2026-08-07) ───────────────────────────────────────
+#
+# Currently dead code in practice (no active strategy's generate_signal()
+# returns SignalType.EXIT -- only manage_position() does, handled elsewhere),
+# but SignalType.EXIT is part of the formal signal contract, so a future
+# strategy could reach this path. It was missing trade_journal logging
+# entirely (a closed position would show as permanently open forever) and
+# used the pre-slippage quote/estimate instead of the real fill.
+
+class _FakeExitAllOrder:
+    def __init__(self, fill_price):
+        self.fill_price = fill_price
+
+
+class _FakeExitAllOrderManager:
+    def __init__(self, fill_price):
+        self.fill_price = fill_price
+        self.calls = []
+
+    async def place_order(self, contract, side, qty, price, is_exit_order=False):
+        self.calls.append((contract, side, qty, price, is_exit_order))
+        return _FakeExitAllOrder(self.fill_price)
+
+
+class _FakeExitAllEngine:
+    def __init__(self, fill_price):
+        self.order_manager = _FakeExitAllOrderManager(fill_price)
+        self.risk_manager = _FakeRiskManager()
+        self._peak_premiums = {"CIPLA26AUG1250CE": 30.0}
+        self._single_leg_journals = {
+            "CIPLA26AUG1250CE": {"journal_id": 300, "strategy_name": "ema_crossover_v1"},
+        }
+        self._active_spreads = {}
+        self._active_condors = {}
+        self._exited_today = set()
+        self._closed_journals = []
+        self._kite = None
+        self._redis = None
+
+    async def _safe_get_positions(self):
+        return [{"symbol": "CIPLA26AUG1250CE", "quantity": 650, "avg_price": 22.00}]
+
+    async def _get_market_data(self, symbol):
+        return {"atr14": 3.0}
+
+    async def _log_trade_close(self, journal_id, exit_price, pnl, exit_reason, market_data=None, total_slippage_pts=None):
+        self._closed_journals.append((journal_id, exit_price, pnl, exit_reason))
+
+    async def _persist_state(self):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_exit_all_options_for_writes_trade_journal_with_real_fill():
+    real_exit_fill = 25.50
+
+    fake = _FakeExitAllEngine(fill_price=real_exit_fill)
+    await LiveTradingEngine._exit_all_options_for(fake, "CIPLA")
+
+    assert "CIPLA26AUG1250CE" not in fake._single_leg_journals, "journal entry must be popped on close"
+    assert len(fake._closed_journals) == 1, "must write to trade_journal, not leave it permanently open"
+
+    journal_id, exit_price, pnl, exit_reason = fake._closed_journals[0]
+    entry_p, qty = 22.00, 650
+    assert exit_price == real_exit_fill
+    assert abs(pnl - (real_exit_fill - entry_p) * qty) < 0.01
+    assert "CIPLA" in fake._exited_today
+
+
+@pytest.mark.asyncio
+async def test_exit_all_options_for_falls_back_when_fill_unavailable():
+    fake = _FakeExitAllEngine(fill_price=None)
+    await LiveTradingEngine._exit_all_options_for(fake, "CIPLA")
+
+    assert len(fake._closed_journals) == 1
+    journal_id, exit_price, pnl, exit_reason = fake._closed_journals[0]
+    assert exit_price is not None and exit_price > 0
