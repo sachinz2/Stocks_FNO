@@ -151,12 +151,44 @@ class OrderManager:
                 self.broker.place_order(symbol, side, quantity, price),
                 timeout=BROKER_TIMEOUT_SEC,
             )
-            # Must capture the return — BaseRepository.update() returns a new merged
-            # SQLAlchemy object; the original db_order is detached and NOT updated in place.
-            db_order = await self.order_repo.update(db_order, {
+            updates: Dict[str, Any] = {
                 "broker_order_id": broker_order_id,
                 "order_status":    "OPEN",
-            })
+            }
+            # Fixed 2026-08-07: PaperBroker fills synchronously inside the
+            # broker.place_order() call above (fill_price is already known
+            # this instant) -- but that return value is just a bare order
+            # ID; fill_price was previously only ever populated later, by
+            # sync_orders()'s separate periodic reconciliation. Every caller
+            # that reads db_order.fill_price immediately after place_order()
+            # returns (see live_trading_engine.py's single-leg/spread/condor
+            # exit and single-leg entry code, "fixed 2026-08-06") was
+            # therefore always reading it before sync_orders() had a chance
+            # to run -- making that fix a no-op in practice. Confirmed live
+            # 2026-08-07: TATACONSUM's real fills (BUY 19.98, SELL 17.46,
+            # both logged correctly by PaperBroker) still got recorded in
+            # trade_journal as the pre-slippage quotes (19.40, 18.00).
+            # Reconciling once, immediately, right here closes that gap --
+            # for PaperBroker (instant fill) this always finds it; for a
+            # real broker with a genuinely still-pending order, get_orders()
+            # correctly returns no fill yet and this is a no-op, same as the
+            # existing behavior sync_orders() still handles for that case.
+            try:
+                broker_orders = await asyncio.wait_for(
+                    self.broker.get_orders(), timeout=BROKER_TIMEOUT_SEC
+                )
+                b_order = next(
+                    (o for o in broker_orders if str(o.get("order_id", "")) == str(broker_order_id)),
+                    None,
+                )
+                if b_order:
+                    updates.update(self._extract_fill_updates(b_order, price, None))
+            except Exception as e:
+                logger.debug(f"Immediate fill reconciliation failed (sync_orders will retry): {e}")
+
+            # Must capture the return — BaseRepository.update() returns a new merged
+            # SQLAlchemy object; the original db_order is detached and NOT updated in place.
+            db_order = await self.order_repo.update(db_order, updates)
             await self._audit("ORDER_ROUTED", {
                 "order_id": db_order.id, "broker_order_id": broker_order_id,
             })
@@ -327,6 +359,30 @@ class OrderManager:
 
     # ── Sync ─────────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _extract_fill_updates(
+        b_order: Dict[str, Any], expected_price: Optional[float], existing_fill_price: Optional[float],
+    ) -> Dict[str, Any]:
+        """
+        Pull fill_price/slippage out of a broker order dict, if present and
+        not already recorded. Shared by place_order()'s immediate
+        post-routing check and sync_orders()'s periodic reconciliation —
+        same extraction logic, just called at two different points in an
+        order's life (see place_order()'s "Fixed 2026-08-07" comment for why
+        both are needed: PaperBroker fills synchronously, but nothing
+        forwarded that fill_price to the DB until sync_orders() ran later).
+        """
+        if existing_fill_price is not None:
+            return {}
+        b_fill = b_order.get("fill_price") or b_order.get("average_price")
+        if not b_fill:
+            return {}
+        b_fill = float(b_fill)
+        updates: Dict[str, Any] = {"fill_price": b_fill}
+        if expected_price:
+            updates["slippage"] = round(b_fill - expected_price, 4)
+        return updates
+
     async def sync_orders(self) -> None:
         """Reconcile OPEN orders with live broker status, including fill_price and slippage."""
         open_db_orders = await self.order_repo.filter(order_status="OPEN")
@@ -350,14 +406,11 @@ class OrderManager:
                 if new_status != db_order.order_status:
                     updates["order_status"] = new_status
 
-                # Persist fill_price and slippage when the broker provides them.
-                # PaperBroker includes these; ZerodhaBroker can expose average_price.
-                b_fill = b_order.get("fill_price") or b_order.get("average_price")
-                if b_fill and db_order.fill_price is None:
-                    b_fill = float(b_fill)
-                    updates["fill_price"] = b_fill
-                    if db_order.price:
-                        updates["slippage"] = round(b_fill - float(db_order.price), 4)
+                updates.update(self._extract_fill_updates(
+                    b_order,
+                    float(db_order.price) if db_order.price else None,
+                    float(db_order.fill_price) if db_order.fill_price is not None else None,
+                ))
 
                 if updates:
                     await self.order_repo.update(db_order, updates)
