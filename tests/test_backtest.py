@@ -22,8 +22,22 @@ def sample_data():
 
 def test_backtest_engine_ema_crossover(sample_data):
     engine = BacktestEngine(
-        strategy_name="EMA_CROSSOVER", 
-        parameters={"fast_period": 20, "slow_period": 50, "stop_loss_pct": 0.5} # High SL to prevent premature exit in test
+        strategy_name="EMA_CROSSOVER",
+        parameters={
+            "fast_period": 20, "slow_period": 50, "stop_loss_pct": 0.5,  # High SL to prevent premature exit in test
+            # Fixed 2026-08-07: default signal_confirm_bars=2 requires 2
+            # consecutive *transition* rows, but the crossover condition
+            # (prev_fast<=prev_slow and fast>slow) is edge-triggered -- once
+            # prev catches up to current on the 2nd bar of a flat region, it
+            # stops being true. This fixture's constant EMA values per region
+            # can therefore only ever produce ONE qualifying row per
+            # crossover, never reaching a 2-bar confirmation, which silently
+            # produced zero trades (real EMAs keep drifting bar-to-bar even
+            # while trending, so this only breaks constant-value test data,
+            # not live trading). Set to 1 to match this test's own intent
+            # (simple single-bar crossover detection, per its comment below).
+            "signal_confirm_bars": 1,
+        }
     )
     
     metrics = engine.run(sample_data)

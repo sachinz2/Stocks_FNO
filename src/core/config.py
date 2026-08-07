@@ -55,7 +55,18 @@ class Settings(BaseSettings):
     # Logs API
     LOGS_API_TOKEN: str = ""   # set in .env — empty = logs endpoint disabled
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "case_sensitive": True}
+    # extra="ignore": a legacy/unrelated env var in .env (e.g. a leftover
+    # REDIS_URL from an older config generation -- this class only ever
+    # reads REDIS_HOST/PORT/PASSWORD and derives the URL itself via
+    # get_redis_url()) must not crash the entire application at import
+    # time. Found 2026-08-07: pydantic-settings' default extra="forbid"
+    # meant Settings() -- and therefore every module that imports it,
+    # including live_trading_engine.py -- couldn't even be imported in a
+    # dev environment whose .env carried that one stray key.
+    model_config = {
+        "env_file": ".env", "env_file_encoding": "utf-8",
+        "case_sensitive": True, "extra": "ignore",
+    }
 
     def get_database_url(self) -> str:
         if self.DATABASE_URL:

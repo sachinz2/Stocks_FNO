@@ -1,13 +1,23 @@
 name: Falcon CI/CD
 
+# Fixed 2026-08-07: this workflow only ever triggered on a branch called
+# "main" -- this repo's actual branch is "master", so it has never fired
+# once. The tests/ suite it runs existed the whole time but provided zero
+# actual protection as a result (13 of its 30 tests were themselves broken/
+# stale, unnoticed for the same reason: nothing was running them).
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "master" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "master" ]
 
 jobs:
-  lint_and_test:
+  # Split lint from tests: this codebase has likely never actually been
+  # checked by ruff/black (same reason as above -- the job never ran), so
+  # gating tests behind a lint step that might fail for unrelated,
+  # pre-existing formatting reasons would bury the one thing that actually
+  # matters here. Tests run and report independently of lint.
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -20,8 +30,27 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install ruff black mypy pytest
+          pip install pytest pytest-asyncio
           pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: pytest tests/ -v
+
+  lint:
+    runs-on: ubuntu-latest
+    continue-on-error: true  # advisory only until the codebase has been run through this once
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff black
 
       - name: Lint with Ruff
         run: ruff check .
@@ -29,15 +58,15 @@ jobs:
       - name: Check formatting with Black
         run: black --check .
 
-      # - name: Type check with Mypy
-      #   run: mypy src
-
-      - name: Run unit tests
-        run: pytest tests/
-
   build:
-    needs: lint_and_test
+    needs: test
     runs-on: ubuntu-latest
+    # Deliberately left as "main" (not "master") -- build/deploy/rollback
+    # reference infrastructure that doesn't match reality (wrong server
+    # path, no configured DEPLOY_HOST/USER/SSH_KEY/SLACK_WEBHOOK secrets):
+    # this keeps them a safe no-op rather than auto-deploying, which the
+    # careful manual-verification deploy process used throughout this
+    # project was never asked to be replaced by.
     if: github.ref == 'refs/heads/main'
     permissions:
       contents: read

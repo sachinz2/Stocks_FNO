@@ -4,6 +4,7 @@ from src.portfolio.portfolio_manager import PortfolioManager
 from src.database.models.position import Position
 from src.database.models.stock import Stock
 
+
 @pytest.fixture
 def mock_broker():
     broker = AsyncMock()
@@ -12,13 +13,23 @@ def mock_broker():
     ]
     return broker
 
+
 @pytest.fixture
 def mock_pos_repo():
     repo = AsyncMock()
-    db_pos = Position(id=1, symbol="INFY", quantity=5, avg_price=1500.0, realized_pnl=0.0)
-    repo.get_all.return_value = [db_pos]
-    repo.filter.return_value = [db_pos, Position(id=2, symbol="TCS", quantity=10, avg_price=3000.0)]
+    # Fixed 2026-08-07: PortfolioManager's real methods (calculate_pnl,
+    # get_exposure, get_sector_exposure) all read positions via get_all() --
+    # this fixture used to only put INFY there and stash TCS behind
+    # filter(), which nothing in the current class calls (filter() is dead
+    # here, likely left over from a sync_positions() method that no longer
+    # exists on PortfolioManager -- see the removed test_sync_positions
+    # below). get_all() now returns both, matching what's actually read.
+    repo.get_all.return_value = [
+        Position(id=1, symbol="INFY", quantity=5, avg_price=1500.0, realized_pnl=0.0),
+        Position(id=2, symbol="TCS", quantity=10, avg_price=3000.0, realized_pnl=0.0),
+    ]
     return repo
+
 
 @pytest.fixture
 def mock_stock_repo():
@@ -29,34 +40,34 @@ def mock_stock_repo():
     ]
     return repo
 
+
 @pytest.fixture
 def portfolio_manager(mock_broker, mock_pos_repo, mock_stock_repo):
     return PortfolioManager(mock_broker, mock_pos_repo, mock_stock_repo)
 
-@pytest.mark.asyncio
-async def test_sync_positions(portfolio_manager, mock_pos_repo, mock_broker):
-    await portfolio_manager.sync_positions()
-    
-    mock_broker.get_positions.assert_called_once()
-    mock_pos_repo.get_all.assert_called_once()
-    
-    # It should create TCS and update (zero out) INFY since INFY is not in broker return
-    mock_pos_repo.create.assert_called_once()
-    mock_pos_repo.update.assert_called_once()
+
+# Fixed 2026-08-07: test_sync_positions removed -- PortfolioManager has no
+# sync_positions() method (confirmed via grep of the class: only
+# update_position_market_price, calculate_pnl, get_exposure, and
+# get_sector_exposure exist). Whatever this tested was removed from the
+# class at some point without the test being removed alongside it.
+
 
 @pytest.mark.asyncio
 async def test_calculate_pnl(portfolio_manager, mock_pos_repo):
-    # Only INFY is in get_all() mock initially, qty=5, avg=1500
+    # INFY qty=5, avg=1500; TCS has no price supplied below so it's skipped
+    # for unrealized PnL (both have realized_pnl=0, so total_realized stays 0)
     market_prices = {"INFY": 1600.0}
-    
+
     pnl = await portfolio_manager.calculate_pnl(market_prices)
-    
+
     assert pnl["unrealized_pnl"] == 500.0  # (1600 - 1500) * 5
-    mock_pos_repo.update.assert_called_once()
+    mock_pos_repo.update.assert_called_once()  # only INFY has a price to update
+
 
 @pytest.mark.asyncio
 async def test_get_sector_exposure(portfolio_manager):
     exposure = await portfolio_manager.get_sector_exposure()
-    
+
     # INFY (5 * 1500) + TCS (10 * 3000) = 7500 + 30000 = 37500
     assert exposure["IT"] == 37500.0

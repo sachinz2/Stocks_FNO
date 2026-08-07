@@ -25,6 +25,22 @@ def mock_order_repo():
     db_order = Order(id=1, symbol="RELIANCE", side="BUY", quantity=10, price=2000.0, order_status="PENDING", broker_order_id="broker_123")
     repo.create.return_value = db_order
     repo.get_by_id.return_value = db_order
+
+    # Fixed 2026-08-07: update.return_value was never set, so
+    # order_manager.place_order()'s `db_order = await self.order_repo.update(...)`
+    # returned a bare, unconfigured AsyncMock -- silently making any
+    # assertion on the RETURNED object's fields (e.g. result.order_status)
+    # meaningless, since it could never actually equal a real value. This
+    # mirrors BaseRepository.update()'s real contract (a NEW merged object
+    # reflecting the passed-in field updates), same pattern used at the
+    # order_manager level itself ("Must capture the return -- ... returns a
+    # new merged ... object; the original db_order is detached").
+    def _update(obj, updates):
+        for k, v in updates.items():
+            setattr(obj, k, v)
+        return obj
+    repo.update.side_effect = _update
+
     repo.filter.return_value = [db_order]
     return repo
 
@@ -43,12 +59,17 @@ async def test_place_order_success(order_manager, mock_risk_manager, mock_broker
     # 1. DB Create called
     mock_order_repo.create.assert_called_once()
     # 2. Risk check passed
-    mock_risk_manager.validate_trade.assert_called_once_with("RELIANCE", "BUY", 10, 2000.0)
+    mock_risk_manager.validate_trade.assert_called_once_with(
+        "RELIANCE", "BUY", 10, 2000.0,
+        is_spread_leg=False, is_exit_order=False, strategy_name=None,
+        iv_rank=None, vix=None, capital_at_risk=None,
+    )
     # 3. Broker called
     mock_broker.place_order.assert_called_once_with("RELIANCE", "BUY", 10, 2000.0)
     # 4. DB Update called to OPEN
     mock_order_repo.update.assert_called_once()
-    assert result.order_status == "PENDING"  # Initially returned as mock, but update was called
+    assert result.order_status == "OPEN"
+    assert result.broker_order_id == "broker_123"
 
 @pytest.mark.asyncio
 async def test_place_order_risk_rejected(order_manager, mock_risk_manager, mock_broker, mock_order_repo, mock_audit_repo):

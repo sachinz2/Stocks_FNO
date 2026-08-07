@@ -9,7 +9,12 @@ class BacktestMetrics:
     @staticmethod
     def calculate(trades: List[Dict[str, Any]], initial_capital: float) -> Dict[str, float]:
         if not trades:
-            return {"net_profit": 0.0, "win_rate": 0.0, "profit_factor": 0.0, "max_drawdown": 0.0}
+            # Fixed 2026-08-07: missing total_trades here crashed any caller
+            # that unconditionally reads metrics["total_trades"] (found via
+            # a test whose real bug turned out to be upstream -- a strategy
+            # config gap that produced zero trades -- but this empty-branch
+            # dict shape gap was real regardless).
+            return {"net_profit": 0.0, "win_rate": 0.0, "profit_factor": 0.0, "max_drawdown": 0.0, "total_trades": 0}
 
         df = pd.DataFrame(trades)
         wins = df[df['pnl'] > 0]
