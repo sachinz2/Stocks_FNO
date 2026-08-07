@@ -10,6 +10,7 @@ except ImportError:
     kite_exc = None
 
 from src.brokers.base import AbstractBroker
+from src.core.constants import INTRADAY_PRODUCT_STRATEGIES
 
 logger = logging.getLogger(__name__)
 
@@ -71,12 +72,36 @@ class ZerodhaBroker(AbstractBroker):
         """Options (CE/PE suffix) trade on NFO; equity underlyings trade on NSE."""
         return self.kite.EXCHANGE_NFO if symbol.endswith(("CE", "PE")) else self.kite.EXCHANGE_NSE
 
-    def _product_for(self, symbol: str) -> str:
+    def _product_for(
+        self, symbol: str, strategy_name: Optional[str] = None, product_override: Optional[str] = None,
+    ) -> str:
         """
-        Use NRML for all F&O orders so positions can be held overnight.
-        MIS (intraday) gets auto-squared by Zerodha at 15:20 with a penalty —
-        our engine already manages square-off at 15:20 so NRML is correct.
+        NRML for everything by default, so credit_spread_v1/iron_condor_v1
+        (held for days/weeks to collect theta decay) can be held overnight.
+
+        Fixed 2026-08-07: ema_crossover_v1/momentum_v1 are intraday-only by
+        design (single-leg long options, always closed at 15:20 -- see
+        _square_off_all()'s "ALWAYS close (overnight gap risk)") but were
+        ALSO using NRML, meaning that guarantee rested entirely on our own
+        scheduler actually running _square_off_all() that day, with no
+        backstop at the exchange if it didn't (already observed multiple
+        scheduler/watchdog failure modes this session). MIS gives Zerodha's
+        own auto-square-off as a real exchange-level backstop for exactly
+        that risk, at no margin cost -- these two strategies only ever BUY
+        options, and option-buying margin is premium-only regardless of
+        MIS vs NRML (the usual MIS leverage benefit is for futures/short
+        options, unused here).
+
+        product_override wins when given -- the orphan-position auto-close
+        path (engine lost tracking of which strategy owns a position) has
+        no strategy_name to look up, but does have the real product string
+        straight from Zerodha's own position record, which is more
+        reliable than any strategy-based guess anyway.
         """
+        if product_override in (self.kite.PRODUCT_MIS, self.kite.PRODUCT_NRML):
+            return product_override
+        if strategy_name in INTRADAY_PRODUCT_STRATEGIES:
+            return self.kite.PRODUCT_MIS
         return self.kite.PRODUCT_NRML
 
     @retry(
@@ -84,7 +109,11 @@ class ZerodhaBroker(AbstractBroker):
         wait=wait_exponential(multiplier=1, min=1, max=10),
         retry=retry_if_exception_type(_RETRYABLE_KITE_EXC),
     )
-    async def place_order(self, symbol: str, side: str, quantity: int, price: float, is_exit_order: bool = False) -> str:
+    async def place_order(
+        self, symbol: str, side: str, quantity: int, price: float,
+        is_exit_order: bool = False, strategy_name: Optional[str] = None,
+        product_override: Optional[str] = None,
+    ) -> str:
         # Fixed 2026-08-07: exits always used ORDER_TYPE_LIMIT, same as
         # entries -- but every exit path in live_trading_engine.py treats
         # order_status == "OPEN" (broker accepted it) as "position closed"
@@ -112,7 +141,7 @@ class ZerodhaBroker(AbstractBroker):
                     else self.kite.TRANSACTION_TYPE_SELL
                 ),
                 quantity=quantity,
-                product=self._product_for(symbol),
+                product=self._product_for(symbol, strategy_name, product_override),
                 order_type=order_type,
             )
             if not is_exit_order:

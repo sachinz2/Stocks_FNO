@@ -106,8 +106,9 @@ class _FakeOrderManager:
         self.fill_price = fill_price
         self.calls = []
 
-    async def place_order(self, contract, side, qty, price, is_exit_order=False):
-        self.calls.append((contract, side, qty, price, is_exit_order))
+    async def place_order(self, contract, side, qty, price, is_exit_order=False,
+                           strategy_name=None, product_override=None):
+        self.calls.append((contract, side, qty, price, is_exit_order, strategy_name, product_override))
         return _FakeOrder(order_status="OPEN", fill_price=self.fill_price)
 
 
@@ -171,13 +172,16 @@ async def test_close_single_leg_position_places_correct_exit_order():
     assert closed is True
     assert "TITAN26AUG4975CE" not in fake._single_leg_journals, "journal entry should be popped on close"
     assert len(fake.order_manager.calls) == 1
-    contract, side, qty, price, is_exit = fake.order_manager.calls[0]
+    contract, side, qty, price, is_exit, strategy_name, product_override = fake.order_manager.calls[0]
     assert contract == "TITAN26AUG4975CE"
     assert side == "SELL"
     assert qty == 175
     assert is_exit is True
     # price should be the ATR estimate (no live quote available), NOT 0 and NOT entry price
     assert price > 0 and price != 46.59
+    # closing order's product must match the original position's -- peeked from
+    # the journal's strategy_name (momentum_v1, set in _FakeEngine's fixture)
+    assert strategy_name == "momentum_v1"
 
 
 @pytest.mark.asyncio
@@ -399,8 +403,9 @@ class _FakeSquareOffOrderManager:
         self.fill_price = fill_price
         self.calls = []
 
-    async def place_order(self, contract, side, qty, price, is_exit_order=False):
-        self.calls.append((contract, side, qty, price, is_exit_order))
+    async def place_order(self, contract, side, qty, price, is_exit_order=False,
+                           strategy_name=None, product_override=None):
+        self.calls.append((contract, side, qty, price, is_exit_order, strategy_name, product_override))
         return _FakeSquareOffOrder(self.fill_price)
 
 
@@ -488,8 +493,9 @@ class _FakeExitAllOrderManager:
         self.fill_price = fill_price
         self.calls = []
 
-    async def place_order(self, contract, side, qty, price, is_exit_order=False):
-        self.calls.append((contract, side, qty, price, is_exit_order))
+    async def place_order(self, contract, side, qty, price, is_exit_order=False,
+                           strategy_name=None, product_override=None):
+        self.calls.append((contract, side, qty, price, is_exit_order, strategy_name, product_override))
         return _FakeExitAllOrder(self.fill_price)
 
 
@@ -618,3 +624,77 @@ async def test_gtt_backstop_live_mode_success_returns_id_no_notification():
     gtt_id = await LiveTradingEngine._place_gtt_backstop(fake, "SBIN26AUG800PE", 750, 20.0)
     assert gtt_id == 12345
     assert fake._notifications == []
+
+
+# ── Orphan-position auto-close passes product_override (2026-08-07) ─────────
+#
+# strategy_name is fundamentally unavailable for an orphaned position (the
+# engine lost tracking, that's the whole problem) -- so the closing order
+# must instead carry Zerodha's own "product" field straight from the
+# position record, or a MIS position closed with a guessed/defaulted NRML
+# would be rejected by the exchange (product mismatch on a closing order).
+
+class _FakeReconcileBroker:
+    def __init__(self, positions):
+        self._positions = positions
+
+    async def get_positions(self):
+        return self._positions
+
+
+class _FakeReconcileOrderManager:
+    def __init__(self):
+        self.calls = []
+
+    async def place_order(self, contract, side, qty, price, is_exit_order=False,
+                           strategy_name=None, product_override=None):
+        self.calls.append((contract, side, qty, price, is_exit_order, strategy_name, product_override))
+        return None
+
+
+class _FakeReconcileEngine:
+    def __init__(self, positions):
+        self.broker = _FakeReconcileBroker(positions)
+        self.order_manager = _FakeReconcileOrderManager()
+        self._active_spreads = {}
+        self._active_condors = {}
+        self._single_leg_journals = {}
+        self._notifications = []
+        self._kite = None
+        self._redis = None
+
+    async def _notify(self, msg):
+        self._notifications.append(msg)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_orphan_close_passes_broker_product_as_override():
+    orphan = {
+        "symbol": "GHOST26AUG100CE", "quantity": 175,
+        "avg_price": 42.5, "product": "MIS",
+    }
+    fake = _FakeReconcileEngine([orphan])
+
+    await LiveTradingEngine._reconcile_broker_positions(fake)
+
+    assert len(fake.order_manager.calls) == 1
+    contract, side, qty, price, is_exit, strategy_name, product_override = fake.order_manager.calls[0]
+    assert contract == "GHOST26AUG100CE"
+    assert side == "SELL"
+    assert qty == 175
+    assert is_exit is True
+    assert product_override == "MIS", (
+        "orphan close must pass the broker's own product field, not guess from "
+        "a strategy_name that's unavailable for an untracked position"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reconcile_skips_positions_already_tracked():
+    tracked = {"symbol": "TITAN26AUG4975CE", "quantity": 175, "avg_price": 46.59, "product": "NRML"}
+    fake = _FakeReconcileEngine([tracked])
+    fake._single_leg_journals["TITAN26AUG4975CE"] = {"strategy_name": "momentum_v1"}
+
+    await LiveTradingEngine._reconcile_broker_positions(fake)
+
+    assert fake.order_manager.calls == [], "a position the engine already tracks must not be auto-closed"

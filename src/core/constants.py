@@ -171,6 +171,24 @@ STRATEGY_CAPITAL_ALLOCATION = {
     "momentum_v1":      0.20,   # ₹60,000 (new)
 }
 
+# Strategies whose positions are intraday-only by design (single-leg long
+# options, always closed at 15:20 -- see _square_off_all()'s docstring:
+# "ALWAYS close (overnight gap risk)"). credit_spread_v1/iron_condor_v1 are
+# deliberately NOT here -- they're held for days/weeks to collect theta
+# decay, closing them nightly would destroy the strategy's whole edge.
+#
+# Added 2026-08-07: used to select Zerodha's MIS product type for these
+# two specifically (see ZerodhaBroker._product_for()) instead of NRML for
+# everything -- MIS gives a real exchange-level auto-square-off backstop
+# for the exact overnight-gap risk the docstring above calls out, in case
+# our own scheduler fails to run _square_off_all() that day (already
+# observed multiple scheduler/watchdog failure modes this session). No
+# margin-efficiency downside for these two: they only ever BUY options
+# (never write/sell), and option-buying margin is premium-only regardless
+# of MIS vs NRML -- the usual MIS leverage benefit is for futures/short
+# options, which these strategies don't use.
+INTRADAY_PRODUCT_STRATEGIES = {"ema_crossover_v1", "momentum_v1"}
+
 # Max open structures per sector (prevents correlated blow-ups)
 MAX_SECTOR_POSITIONS = 2
 

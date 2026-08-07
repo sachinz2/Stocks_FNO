@@ -857,7 +857,8 @@ class LiveTradingEngine:
             )
             try:
                 await self.order_manager.place_order(
-                    contract, side, abs(qty), exit_p, is_exit_order=True
+                    contract, side, abs(qty), exit_p, is_exit_order=True,
+                    product_override=p.get("product"),
                 )
                 closed_orphans += 1
             except Exception as e:
@@ -1241,8 +1242,13 @@ class LiveTradingEngine:
         engine's point of view. Returns True if the exit succeeded.
         """
         logger.info(f"EXIT [{contract}]: {exit_reason}")
+        # Peeked (not popped) before the order call: a CLOSING order's
+        # product type must match the ORIGINAL position's at Zerodha (see
+        # ZerodhaBroker._product_for()), so this needs the same
+        # strategy_name the entry used, not just entries.
+        _owner_strategy = self._single_leg_journals.get(contract, {}).get("strategy_name")
         db_order = await self.order_manager.place_order(
-            contract, "SELL", abs(qty), current_p, is_exit_order=True
+            contract, "SELL", abs(qty), current_p, is_exit_order=True, strategy_name=_owner_strategy,
         )
         if not (db_order and db_order.order_status not in ("REJECTED_BY_RISK", "FAILED")):
             logger.error(f"EXIT FAILED [{contract}]: order rejected or failed — will retry next cycle")
@@ -1637,22 +1643,35 @@ class LiveTradingEngine:
             qty      = pos.get("quantity", 0)
             if qty <= 0 or not (contract.startswith(underlying) and contract.endswith(option_type)):
                 continue
-            if owner_strategy_name is not None:
-                _owner = self._single_leg_journals.get(contract, {}).get("strategy_name")
-                if _owner is not None and _owner != owner_strategy_name:
-                    continue
+            # Looked up unconditionally now (was only computed inside the
+            # owner_strategy_name filter branch) -- needed either way to
+            # pass the correct strategy_name to place_order(), since a
+            # CLOSING order's product type must match the ORIGINAL
+            # position's at Zerodha (see ZerodhaBroker._product_for()).
+            _owner = self._single_leg_journals.get(contract, {}).get("strategy_name")
+            if owner_strategy_name is not None and _owner is not None and _owner != owner_strategy_name:
+                continue
             entry_p = float(pos.get("avg_price") or 0)
             _live_p = await get_option_quote(contract, getattr(self, "_kite", None), getattr(self, "_redis", None))
             exit_p = _live_p if (_live_p and _live_p > 0) else (estimate_option_premium(atr, dte) if atr > 0 else entry_p)
-            await self.order_manager.place_order(contract, "SELL", abs(qty), exit_p, is_exit_order=True)
+            _rev_order = await self.order_manager.place_order(
+                contract, "SELL", abs(qty), exit_p, is_exit_order=True, strategy_name=_owner,
+            )
             self._peak_premiums.pop(contract, None)
-            logger.info(f"REVERSAL EXIT: SELL {contract} @ Rs{exit_p:.2f}")
+            # Fixed 2026-08-07: sixth instance of the fill_price bug fixed
+            # earlier today (single-leg/spread/condor exits, square-off,
+            # exit_all_options_for) -- pnl was computed from exit_p (the
+            # quote/estimate fed INTO place_order()), and place_order()'s
+            # return value was discarded entirely, never reading the real
+            # PaperBroker fill.
+            _rev_fill_p = getattr(_rev_order, "fill_price", None) or exit_p
+            logger.info(f"REVERSAL EXIT: SELL {contract} @ Rs{_rev_fill_p:.2f}")
             jrnl = self._single_leg_journals.pop(contract, None)
             if jrnl:
-                pnl = (exit_p - entry_p) * abs(qty)
+                pnl = (_rev_fill_p - entry_p) * abs(qty)
                 await self._log_trade_close(
                     journal_id=jrnl.get("journal_id"),
-                    exit_price=exit_p,
+                    exit_price=_rev_fill_p,
                     pnl=pnl,
                     exit_reason=f"Reversal exit ({opposite_type} signal)",
                     market_data=market_data,
@@ -2994,8 +3013,13 @@ class LiveTradingEngine:
                 exit_p = estimate_option_premium(atr, dte)
             else:
                 exit_p = entry_p
+            # Peeked (not popped) before the order call: a CLOSING order's
+            # product type must match the ORIGINAL position's at Zerodha
+            # (see ZerodhaBroker._product_for()).
+            _ex_owner_strategy = self._single_leg_journals.get(contract, {}).get("strategy_name")
             _ex_order = await self.order_manager.place_order(
-                contract, "SELL", abs(pos["quantity"]), exit_p, is_exit_order=True,
+                contract, "SELL", abs(pos["quantity"]), exit_p,
+                is_exit_order=True, strategy_name=_ex_owner_strategy,
             )
             self._peak_premiums.pop(contract, None)
             _ex_fill_p = getattr(_ex_order, "fill_price", None) or exit_p
@@ -3084,7 +3108,16 @@ class LiveTradingEngine:
                         if atr > 0:
                             exit_p = estimate_option_premium(atr, max(dte, 1))
 
-            _sq_order = await self.order_manager.place_order(contract, side, abs(qty), exit_p, is_exit_order=True)
+            # Peeked (not popped) before the order call: a CLOSING order's
+            # product type must match the ORIGINAL position's at Zerodha
+            # (see ZerodhaBroker._product_for()). Empty for spread/condor
+            # legs on expiry day (not in _single_leg_journals -- that dict
+            # is EMA/momentum-only), which correctly resolves to the
+            # default NRML they were actually entered under.
+            _sq_owner_strategy = self._single_leg_journals.get(contract, {}).get("strategy_name")
+            _sq_order = await self.order_manager.place_order(
+                contract, side, abs(qty), exit_p, is_exit_order=True, strategy_name=_sq_owner_strategy,
+            )
             self._peak_premiums.pop(contract, None)
             # Fixed 2026-08-07: same fill_price bug as _execute_single_leg_exit
             # / credit-spread / iron-condor exits (fixed earlier today) --

@@ -91,6 +91,7 @@ class OrderManager:
         vix:           Optional[float] = None,
         capital_at_risk: Optional[float] = None,
         is_retry:      bool = False,
+        product_override: Optional[str] = None,
     ) -> Optional[Order]:
         """
         Main entry point for placing orders.
@@ -98,7 +99,8 @@ class OrderManager:
 
         is_spread_leg : True for legs 2-4 of multi-leg structures (skips entry-only checks)
         is_exit_order : True when closing an existing position (skips entry-only risk checks)
-        strategy_name : Passed to RiskManager for capital allocation check
+        strategy_name : Passed to RiskManager for capital allocation check, and
+                        to ZerodhaBroker for MIS vs NRML product selection
         iv_rank       : Per-symbol IV rank — gates spread/condor entries
         vix           : India VIX — market-wide IV gate
         capital_at_risk : Explicit max-loss figure passed straight through to
@@ -108,6 +110,10 @@ class OrderManager:
                         price. Recorded in the audit log only, so a retry
                         that itself goes stale is never retried again (bounds
                         retries to one attempt per original order).
+        product_override : For closing an ORPHANED position where
+                        strategy_name can't be recovered — pass the real
+                        product string straight from the broker's own
+                        position record instead. See ZerodhaBroker._product_for().
         """
         # 1. Create PENDING record in DB
         db_order = await self.order_repo.create({
@@ -148,7 +154,11 @@ class OrderManager:
         # 3. Route to broker
         try:
             broker_order_id = await asyncio.wait_for(
-                self.broker.place_order(symbol, side, quantity, price, is_exit_order=is_exit_order),
+                self.broker.place_order(
+                    symbol, side, quantity, price,
+                    is_exit_order=is_exit_order, strategy_name=strategy_name,
+                    product_override=product_override,
+                ),
                 timeout=BROKER_TIMEOUT_SEC,
             )
             updates: Dict[str, Any] = {

@@ -110,7 +110,11 @@ class PaperBroker(AbstractBroker):
             return price * 0.06
         return price * 0.03
 
-    async def place_order(self, symbol: str, side: str, quantity: int, price: float, is_exit_order: bool = False) -> str:
+    async def place_order(
+        self, symbol: str, side: str, quantity: int, price: float,
+        is_exit_order: bool = False, strategy_name: Optional[str] = None,
+        product_override: Optional[str] = None,
+    ) -> str:
         """
         Simulates order execution with realistic bid-ask slippage, occasional
         rejection, and enhanced slippage for illiquid/cheap options.
@@ -120,11 +124,14 @@ class PaperBroker(AbstractBroker):
           2. Bid-ask slippage  — BUY at ask, SELL at bid
           3. Extra slippage    — additional random drift for illiquid options
 
-        is_exit_order: accepted for interface parity with ZerodhaBroker
-        (which uses it to route exits through a MARKET order instead of
-        LIMIT — see its place_order() for why). Not used here: PaperBroker
-        always fills synchronously regardless of order type, so there's no
-        "sits unfilled" state this needs to guard against in paper mode.
+        is_exit_order, strategy_name, product_override: accepted for
+        interface parity with ZerodhaBroker (which uses is_exit_order to
+        route exits through a MARKET order, and strategy_name/
+        product_override to select MIS vs NRML -- see its
+        place_order()/_product_for() for why). None of these are used
+        here: PaperBroker always fills synchronously regardless of order
+        type or product, so there's no "sits unfilled" state or
+        exchange-level product-type distinction to model in paper mode.
         """
         order_id  = str(uuid.uuid4())
         timestamp = datetime.utcnow()
