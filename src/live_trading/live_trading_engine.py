@@ -1802,15 +1802,27 @@ class LiveTradingEngine:
             )
             return
 
-        # OI/PCR sentiment check — confirm spread direction with market positioning
+        # OI/PCR sentiment — logged for visibility, not gated. Fixed 2026-08-07:
+        # consolidated redundant direction-confirmation gates -- VWAP, PCR, and
+        # market breadth were 3 independent checks all re-asking "does the
+        # broader market agree with this spread's direction", each required to
+        # pass on top of the strategy's own EMA-based signal and the ADX
+        # trend-strength gate. Requiring all three external confirmations to
+        # independently agree shrank the joint pass rate multiplicatively even
+        # on genuinely good setups (found live: zero credit_spread_v1/
+        # iron_condor_v1 trades in 2.5+ weeks despite the base signal and ADX
+        # gate being satisfied repeatedly). VWAP remains the sole blocking
+        # direction-confirmation below -- most directly tied to this specific
+        # stock's actual intraday price action, vs. PCR/breadth which are
+        # broader-market proxies. oi_data itself is still fetched -- also used
+        # by the crowded-strike check further down.
         redis = getattr(self, "_redis", None)
         oi_data = await get_oi_data(symbol, redis) if redis else None
         if oi_data and not pcr_allows_spread(oi_data.get("pcr"), spread_type):
-            logger.info(
-                f"[CreditSpread] {symbol} skipped — PCR={oi_data['pcr']:.2f} "
-                f"opposes {spread_type}"
+            logger.debug(
+                f"[CreditSpread] {symbol} PCR={oi_data['pcr']:.2f} opposes {spread_type} "
+                "(logged only, no longer blocking -- see 2026-08-07 gate consolidation)"
             )
-            return
 
         # VWAP trend confirmation — session_vwap (added 2026-07-30) is a genuine
         # intraday VWAP built from only today's live-tick bars, matching what the
@@ -1836,9 +1848,9 @@ class LiveTradingEngine:
                 )
                 return
 
-        # Market breadth filter — align spread direction with broad market sentiment.
-        # breadth > 0.65: market advancing → skip BEAR_CALL (would contradict trend)
-        # breadth < 0.35: market declining → skip BULL_PUT (would contradict trend)
+        # Market breadth — logged for visibility, not gated (2026-08-07 gate
+        # consolidation, see PCR comment above). breadth > 0.65: market
+        # advancing; breadth < 0.35: market declining.
         _breadth_cs = None
         _redis_cs   = getattr(self, "_redis", None)
         if _redis_cs:
@@ -1850,17 +1862,15 @@ class LiveTradingEngine:
                 pass
         if _breadth_cs is not None:
             if spread_type == "BEAR_CALL_SPREAD" and _breadth_cs > 0.65:
-                logger.info(
-                    f"[CreditSpread] {symbol} BEAR_CALL skipped — "
-                    f"market breadth {_breadth_cs:.1%} > 65% (broad market advancing)"
+                logger.debug(
+                    f"[CreditSpread] {symbol} BEAR_CALL: market breadth {_breadth_cs:.1%} > 65% "
+                    "(broad market advancing, logged only, no longer blocking)"
                 )
-                return
             if spread_type == "BULL_PUT_SPREAD" and _breadth_cs < 0.35:
-                logger.info(
-                    f"[CreditSpread] {symbol} BULL_PUT skipped — "
-                    f"market breadth {_breadth_cs:.1%} < 35% (broad market declining)"
+                logger.debug(
+                    f"[CreditSpread] {symbol} BULL_PUT: market breadth {_breadth_cs:.1%} < 35% "
+                    "(broad market declining, logged only, no longer blocking)"
                 )
-                return
 
         # ADX filter — credit spreads need a moderate directional trend (ADX 15–30).
         # ADX < 15: no trend, stock is ranging → condor territory not spread territory.
@@ -1949,11 +1959,15 @@ class LiveTradingEngine:
         net_credit = round(short_p - long_p, 2)
         total_credit = net_credit * lot_size
 
-        # HV/IV ratio filter — only sell premium when implied vol exceeds realized vol by ≥10%.
-        # _atr_sigma (ATR-based HV proxy) represents realized/historical volatility.
-        # sigma is now live ATM IV used for strike selection; _atr_sigma is the HV baseline here.
-        # If the market isn't pricing options richer than what stocks actually move,
-        # the edge of premium selling disappears.
+        # HV/IV ratio — logged for visibility, not gated. Fixed 2026-08-07: this
+        # was a THIRD independent "is premium rich enough to sell" check on top
+        # of VIX>=12 (market-wide) and IV Rank>=0.30 (stock-specific vs its own
+        # history) -- all three asking essentially the same question from
+        # different angles. Three multiplicative richness gates shrank the
+        # joint pass rate without adding much information beyond what VIX + IV
+        # Rank already capture; see the 2026-08-07 gate-consolidation note on
+        # the PCR check above for the fuller rationale and the live evidence
+        # (zero credit_spread_v1 trades in 2.5+ weeks).
         if short_p > 0 and _atr_sigma > 0:
             from src.market_data.option_chain import implied_vol as _iv_fn
             _T = max(dte, 1) / 365.0
@@ -1961,15 +1975,16 @@ class LiveTradingEngine:
             if _market_iv is not None and _market_iv > 0:
                 _iv_hv_ratio = _market_iv / _atr_sigma
                 if _iv_hv_ratio < 1.1:
-                    logger.info(
-                        f"[CreditSpread] {symbol} skipped — IV/HV={_iv_hv_ratio:.2f} < 1.10: "
-                        f"market IV ({_market_iv:.1%}) not rich enough vs realized HV ({_atr_sigma:.1%})"
+                    logger.debug(
+                        f"[CreditSpread] {symbol} IV/HV={_iv_hv_ratio:.2f} < 1.10: "
+                        f"market IV ({_market_iv:.1%}) not rich enough vs realized HV ({_atr_sigma:.1%}) "
+                        "(logged only, no longer blocking)"
                     )
-                    return
-                logger.debug(
-                    f"[CreditSpread] {symbol} IV/HV={_iv_hv_ratio:.2f} "
-                    f"(IV={_market_iv:.1%} / HV={_atr_sigma:.1%}) — premium selling edge confirmed"
-                )
+                else:
+                    logger.debug(
+                        f"[CreditSpread] {symbol} IV/HV={_iv_hv_ratio:.2f} "
+                        f"(IV={_market_iv:.1%} / HV={_atr_sigma:.1%}) — premium selling edge confirmed"
+                    )
 
         # Fee viability check — 2 entry + 2 exit orders × ₹20 brokerage = ₹80 minimum fees.
         # Require at least ₹350 net credit so fees (₹80–120 round trip) don't eat the trade.
@@ -2463,7 +2478,17 @@ class LiveTradingEngine:
             )
             return
 
-        # OI/PCR neutrality check — iron condors need a non-directional market
+        # OI/PCR neutrality check — iron condors need a non-directional market.
+        # Fixed 2026-08-07: consolidated redundant neutrality-confirmation gates
+        # -- PCR neutral and market breadth neutral were 2 independent checks
+        # both re-asking "is the broader market non-directional", on top of the
+        # strategy's own low_vol_threshold+flat_EMA signal and the ADX<20 gate.
+        # Kept PCR (stock-specific options positioning for THIS underlying) as
+        # the sole blocking confirmation -- more directly relevant to whether
+        # this specific stock stays inside its wings than a market-wide average.
+        # Market breadth is now logged only, below. See the matching
+        # credit_spread_v1 gate-consolidation note for the fuller rationale and
+        # live evidence (zero iron_condor_v1 trades in 3+ weeks).
         from src.market_data.nse_oi import get_oi_data, is_strike_crowded
         redis = getattr(self, "_redis", None)
         oi_data = await get_oi_data(symbol, redis) if redis else None
@@ -2475,9 +2500,7 @@ class LiveTradingEngine:
             )
             return
 
-        # Market breadth filter — iron condors need a neutral market.
-        # When breadth is extreme (very bullish or very bearish), range-bound
-        # structures are at risk from a one-sided move.
+        # Market breadth — logged for visibility, not gated (see PCR comment above).
         _breadth_ic = None
         _redis_ic2  = getattr(self, "_redis", None)
         if _redis_ic2:
@@ -2488,11 +2511,10 @@ class LiveTradingEngine:
             except Exception:
                 pass
         if _breadth_ic is not None and (_breadth_ic < 0.35 or _breadth_ic > 0.65):
-            logger.info(
-                f"[IronCondor] {symbol} skipped — market breadth {_breadth_ic:.1%} "
-                "outside neutral zone 35–65% (market too directional for condor)"
+            logger.debug(
+                f"[IronCondor] {symbol} market breadth {_breadth_ic:.1%} outside neutral "
+                "zone 35-65% (logged only, no longer blocking)"
             )
-            return
 
         # ADX filter — iron condors require low trend strength (ADX < 20).
         # ADX ≥ 20 indicates a developing trend that could breach either wing.
