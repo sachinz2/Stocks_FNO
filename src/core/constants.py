@@ -31,24 +31,41 @@ FNO_SYMBOLS = [
     "COALINDIA",
 ]
 
-# Hardcoded lot sizes. As with FNO_STRIKE_INTERVALS above, there is no live
-# refresh mechanism -- this table is the sole source of truth.
+# Hardcoded lot sizes -- fallback ONLY. Unlike FNO_STRIKE_INTERVALS above
+# (confirmed no live refresh exists anywhere), _get_lot_size() in
+# live_trading_engine.py DOES check Redis first (REDIS_LOT_SIZE_PREFIX,
+# populated daily by scripts/zerodha_auto_auth.py's "Lot sizes cached for
+# 41 F&O symbols" step right after the 08:30 token refresh) and only falls
+# back to this table if that key is missing.
+#
+# Fixed 2026-08-07: audited every symbol here against a live
+# kite.instruments("NFO") pull, same methodology as the strike-interval
+# audit -- 36 of 39 symbols were wrong (some by a wide margin: KOTAKBANK
+# 400 vs real 2000, NESTLEIND 40 vs real 500). Under normal operation this
+# was masked by the Redis cache above, so it wasn't corrupting live trades
+# -- but on any day the daily auth job fails or is delayed (already
+# observed this week, e.g. the 2026-08-07 dead-WebSocket-reactor incident),
+# the system would silently fall back to this table and submit wildly
+# wrong order quantities right at the moment things are already going
+# wrong -- for a real broker, a near-certain exchange rejection (order
+# quantity must be an exact multiple of the real lot size); in paper mode,
+# a silently mispriced position with no rejection to catch it.
 # Verify at nseindia.com/market-data/fo-equity-securities if issues arise.
 FNO_LOT_SIZES = {
-    "RELIANCE":    250,   "TCS":         150,   "INFY":        300,
-    "HDFCBANK":    550,   "ICICIBANK":   700,   "SBIN":       1500,
-    "BAJFINANCE":  125,   "KOTAKBANK":   400,   "AXISBANK":   1200,
-    "LT":          150,   "HINDUNILVR":  300,   "ITC":        3200,
-    "WIPRO":      1500,   "HCLTECH":     700,   "MARUTI":       25,
-    "SUNPHARMA":   700,   "M&M":         700,   "BHARTIARTL":  500,
-    "ADANIPORTS": 1250,   "ASIANPAINT":  200,   "TITAN":       375,
-    "BAJAJ-AUTO":   75,   "EICHERMOT":    50,   "INDUSINDBK":  500,
-    "DRREDDY":     125,   "CIPLA":       650,   "DIVISLAB":    200,
-    "JSWSTEEL":   1350,   "HINDALCO":   2150,   "GRASIM":      375,
-    "TATACONSUM":  900,   "APOLLOHOSP":  125,   "NESTLEIND":    40,
-    "TECHM":       600,   "BPCL":       1800,   "ONGC":       1950,
-    "NTPC":       3750,   "POWERGRID":  4700,   "ULTRACEMCO":  100,
-    "TATASTEEL":  5500,   "COALINDIA":  4200,
+    "RELIANCE":    500,   "TCS":         225,   "INFY":        400,
+    "HDFCBANK":    650,   "ICICIBANK":   700,   "SBIN":        750,
+    "BAJFINANCE":  750,   "KOTAKBANK":  2000,   "AXISBANK":    625,
+    "LT":          175,   "HINDUNILVR":  300,   "ITC":        1725,
+    "WIPRO":      3000,   "HCLTECH":     400,   "MARUTI":       50,
+    "SUNPHARMA":   350,   "M&M":         200,   "BHARTIARTL":  475,
+    "ADANIPORTS":  475,   "ASIANPAINT":  250,   "TITAN":       175,
+    "BAJAJ-AUTO":   75,   "EICHERMOT":   100,   "INDUSINDBK":  700,
+    "DRREDDY":     625,   "CIPLA":       425,   "DIVISLAB":    100,
+    "JSWSTEEL":    675,   "HINDALCO":    700,   "GRASIM":      250,
+    "TATACONSUM":  550,   "APOLLOHOSP":  125,   "NESTLEIND":   500,
+    "TECHM":       600,   "BPCL":       1975,   "ONGC":       2250,
+    "NTPC":       1500,   "POWERGRID":  1900,   "ULTRACEMCO":   50,
+    "TATASTEEL":  2750,   "COALINDIA":  1350,
 }
 
 # Gap between consecutive strikes on NSE for each symbol.

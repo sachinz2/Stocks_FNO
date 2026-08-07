@@ -67,3 +67,44 @@ def test_all_strike_intervals_are_positive_and_known_symbols():
     # silently misprice every strike for that symbol.
     for symbol, interval in FNO_STRIKE_INTERVALS.items():
         assert interval > 0, f"{symbol} has a non-positive strike interval: {interval}"
+
+
+# ── Lot sizes ────────────────────────────────────────────────────────────────
+#
+# 2026-08-07: FNO_LOT_SIZES is a fallback only -- _get_lot_size() in
+# live_trading_engine.py checks Redis first (populated daily by the 08:30
+# auth job from live Zerodha data) and only falls back to this table if
+# that's missing. Audited against a live kite.instruments("NFO") pull, same
+# methodology as the strike-interval audit: 36 of 39 symbols were wrong,
+# some by a wide margin (KOTAKBANK 400 vs real 2000). Not corrupting live
+# trades under normal operation (the Redis cache masks it), but on any day
+# the daily auth job fails/is delayed -- already observed this week -- the
+# system would silently fall back to this table and submit order
+# quantities that aren't valid multiples of the real exchange lot size.
+#
+# A live-data audit can't be a pure offline unit test (needs network
+# access to Zerodha) -- these are sanity guards for the table's shape, not
+# a substitute for periodically re-running scratchpad/audit_lot_sizes.py
+# against a fresh kite.instruments("NFO") pull (NSE revises lot sizes
+# periodically based on price bands, the same way it revises strike
+# intervals).
+
+from src.core.constants import FNO_LOT_SIZES, FNO_SYMBOLS
+
+
+def test_all_lot_sizes_are_positive_and_cover_every_traded_symbol():
+    assert set(FNO_LOT_SIZES.keys()) == set(FNO_SYMBOLS), (
+        "FNO_LOT_SIZES must have an entry for every symbol the engine actually trades, no more, no less"
+    )
+    for symbol, lot in FNO_LOT_SIZES.items():
+        assert lot > 0, f"{symbol} has a non-positive lot size: {lot}"
+
+
+def test_lot_sizes_are_plausible_nse_values():
+    # NSE lot sizes are set so that lot_size * underlying_price lands in a
+    # roughly consistent notional band (regulatory contract-value target) --
+    # a value that's off by an order of magnitude (a common transcription
+    # error, e.g. dropping/adding a digit) would fail this even without
+    # knowing the exact correct number.
+    for symbol, lot in FNO_LOT_SIZES.items():
+        assert 10 <= lot <= 10_000, f"{symbol} lot size {lot} is outside a plausible NSE range"
