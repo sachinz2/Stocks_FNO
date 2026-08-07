@@ -65,45 +65,88 @@ class EMACrossoverStrategy(StrategyBase):
         prev_fast = self.prev_fast_ema.get(symbol)
         prev_slow = self.prev_slow_ema.get(symbol)
 
-        if prev_fast is not None and prev_slow is not None:
-            if prev_fast <= prev_slow and fast_ema > slow_ema:
-                raw = "BUY"
-            elif prev_fast >= prev_slow and fast_ema < slow_ema:
-                raw = "SELL"
-            else:
-                raw = None
+        # Fixed 2026-08-07: found live that this strategy had fired ZERO
+        # confirmed trades in its ENTIRE history despite genuine EMA20/50
+        # crossovers happening ~once/day/symbol (verified via kite.historical_data()
+        # replay + a regime-timeline cross-reference: 91 crossovers across just 8
+        # sampled symbols occurred while the strategy was active and held for
+        # well over the 2-bar confirmation window, yet none confirmed).
+        #
+        # Root cause: prev_fast_ema/prev_slow_ema were overwritten on EVERY call
+        # (see below), so "prev_fast <= prev_slow and fast_ema > slow_ema" (the
+        # crossover test) could only ever be True on the single cycle the sign
+        # actually flips. The very next cycle, prev_fast already reflected the
+        # POST-cross state, so the same test evaluated False, which hit the
+        # "no crossover this bar -- clear pending" branch and wiped
+        # _pending_count back to 0 before a second confirming bar could ever
+        # accumulate. With signal_confirm_bars=2, confirmation was mathematically
+        # impossible -- it needed the transition-moment condition true on two
+        # separate cycles, but that condition can only be true on one.
+        #
+        # Fix: separate "is this a FRESH cross" (compare prev vs current
+        # relationship, only used to START a pending count) from "is the
+        # crossed relationship still holding" (compare current relationship
+        # against the pending direction, used to CONTINUE counting on each new
+        # bar). momentum_v1 never had this bug -- its condition is state-based
+        # (ADX/spread right now), not transition-based, so it doesn't
+        # self-erase the moment after the first confirming cycle.
+        current_dir = None
+        if fast_ema > slow_ema:
+            current_dir = "BUY"
+        elif fast_ema < slow_ema:
+            current_dir = "SELL"
 
-            if raw is not None:
-                if raw != self._pending_signal.get(symbol):
-                    # New crossover direction — start fresh
-                    self._pending_signal[symbol] = raw
-                    self._pending_count[symbol] = 1
-                    self._pending_bar_key[symbol] = bar_key
-                elif bar_key is None or bar_key != self._pending_bar_key.get(symbol):
-                    # Same direction AND we're on a new 5-min bar (or bar_key unavailable)
-                    self._pending_count[symbol] = self._pending_count.get(symbol, 0) + 1
-                    self._pending_bar_key[symbol] = bar_key
-                # else: same bar as last cycle — don't double-count
-
-                if self._pending_count.get(symbol, 0) >= self.signal_confirm_bars:
-                    logger.info(
-                        f"[{self.name}] {symbol} {raw} confirmed after "
-                        f"{self._pending_count[symbol]} bars — firing."
-                    )
-                    signal = raw
-                    self._pending_signal.pop(symbol, None)
-                    self._pending_count.pop(symbol, None)
-                    self._pending_bar_key.pop(symbol, None)
-                else:
-                    logger.debug(
-                        f"[{self.name}] {symbol} {raw} crossover pending "
-                        f"({self._pending_count.get(symbol, 0)}/{self.signal_confirm_bars} bars)"
-                    )
+        if current_dir is None:
+            # Exactly equal (rare) — nothing to track.
+            self._pending_signal.pop(symbol, None)
+            self._pending_count.pop(symbol, None)
+            self._pending_bar_key.pop(symbol, None)
+        elif current_dir == self._pending_signal.get(symbol):
+            # Still in the same pending direction as last time we saw it —
+            # keep counting distinct confirming bars.
+            if bar_key is None or bar_key != self._pending_bar_key.get(symbol):
+                self._pending_count[symbol] = self._pending_count.get(symbol, 0) + 1
+                self._pending_bar_key[symbol] = bar_key
+            # else: same bar as last cycle — don't double-count
+        else:
+            # Direction differs from whatever was pending (or nothing was
+            # pending) — only start a fresh pending count if this is a
+            # genuine crossover, i.e. the PREVIOUS relationship was the
+            # opposite of the current one. Guards against starting a count
+            # on the first-ever data point (prev unknown) or on a symbol
+            # that's simply always been on one side (never actually crossed).
+            prev_dir = None
+            if prev_fast is not None and prev_slow is not None:
+                if prev_fast > prev_slow:
+                    prev_dir = "BUY"
+                elif prev_fast < prev_slow:
+                    prev_dir = "SELL"
+            if prev_dir is not None and prev_dir != current_dir:
+                self._pending_signal[symbol] = current_dir
+                self._pending_count[symbol] = 1
+                self._pending_bar_key[symbol] = bar_key
             else:
-                # No crossover this bar — clear pending
                 self._pending_signal.pop(symbol, None)
                 self._pending_count.pop(symbol, None)
                 self._pending_bar_key.pop(symbol, None)
+
+        # Single confirm-and-fire check regardless of which branch above set
+        # up the pending state — needed so signal_confirm_bars=1 fires right
+        # on the fresh-cross bar instead of only being checked one branch up.
+        if current_dir is not None and self._pending_count.get(symbol, 0) >= self.signal_confirm_bars:
+            logger.info(
+                f"[{self.name}] {symbol} {current_dir} confirmed after "
+                f"{self._pending_count[symbol]} bars — firing."
+            )
+            signal = current_dir
+            self._pending_signal.pop(symbol, None)
+            self._pending_count.pop(symbol, None)
+            self._pending_bar_key.pop(symbol, None)
+        elif current_dir is not None and symbol in self._pending_signal:
+            logger.debug(
+                f"[{self.name}] {symbol} {current_dir} crossover pending "
+                f"({self._pending_count.get(symbol, 0)}/{self.signal_confirm_bars} bars)"
+            )
 
         self.prev_fast_ema[symbol] = fast_ema
         self.prev_slow_ema[symbol] = slow_ema
