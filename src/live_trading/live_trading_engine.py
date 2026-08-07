@@ -3022,20 +3022,29 @@ class LiveTradingEngine:
                         if atr > 0:
                             exit_p = estimate_option_premium(atr, max(dte, 1))
 
-            await self.order_manager.place_order(contract, side, abs(qty), exit_p, is_exit_order=True)
+            _sq_order = await self.order_manager.place_order(contract, side, abs(qty), exit_p, is_exit_order=True)
             self._peak_premiums.pop(contract, None)
-            _exit_prices[contract] = exit_p
+            # Fixed 2026-08-07: same fill_price bug as _execute_single_leg_exit
+            # / credit-spread / iron-condor exits (fixed earlier today) --
+            # this fourth exit path also computed pnl from the pre-slippage
+            # quote/estimate (exit_p) and didn't even capture place_order()'s
+            # return value, discarding the real PaperBroker fill entirely.
+            # EOD square-off runs every trading day (single-leg positions
+            # "ALWAYS close" per this method's own docstring), so this was a
+            # frequently-triggered instance of the exact same inaccuracy.
+            _sq_fill_p = getattr(_sq_order, "fill_price", None) or exit_p
+            _exit_prices[contract] = _sq_fill_p
 
             # Write exit to trade journal so EOD/expiry closes appear in PnL analytics
             _jrnl_info = self._single_leg_journals.pop(contract, None)
             if _jrnl_info:
                 _entry_p = float(pos.get("avg_price") or 0)
                 _signed  = 1 if qty > 0 else -1
-                _pnl     = round((exit_p - _entry_p) * abs(qty) * _signed, 2)
+                _pnl     = round((_sq_fill_p - _entry_p) * abs(qty) * _signed, 2)
                 _reason  = "Expiry day force-close" if is_expiry else "EOD square-off"
                 await self._log_trade_close(
                     journal_id=_jrnl_info.get("journal_id"),
-                    exit_price=exit_p,
+                    exit_price=_sq_fill_p,
                     pnl=_pnl,
                     exit_reason=_reason,
                 )

@@ -380,3 +380,90 @@ async def test_single_leg_exit_pnl_falls_back_to_quote_when_fill_unavailable():
     journal_id, exit_price, pnl, exit_reason = fake._closed_journals[0]
     expected_fallback_pnl = (5.05 - 5.29) * 1900
     assert abs(pnl - expected_fallback_pnl) < 0.01
+
+
+# ── EOD square-off pnl uses the real fill price (2026-08-07) ────────────────
+#
+# A fourth instance of the same fill_price bug: _square_off_all() (single-leg
+# positions "ALWAYS close" at EOD per its own docstring, so this runs every
+# trading day) computed pnl from the pre-slippage quote/ATR-estimate and
+# didn't even capture place_order()'s return value.
+
+class _FakeSquareOffOrder:
+    def __init__(self, fill_price):
+        self.fill_price = fill_price
+
+
+class _FakeSquareOffOrderManager:
+    def __init__(self, fill_price):
+        self.fill_price = fill_price
+        self.calls = []
+
+    async def place_order(self, contract, side, qty, price, is_exit_order=False):
+        self.calls.append((contract, side, qty, price, is_exit_order))
+        return _FakeSquareOffOrder(self.fill_price)
+
+
+class _FakeSquareOffEngine:
+    def __init__(self, fill_price):
+        self.order_manager = _FakeSquareOffOrderManager(fill_price)
+        self.risk_manager = _FakeRiskManager()
+        self._peak_premiums = {"TITAN26AUG4950CE": 50.0}
+        self._single_leg_journals = {
+            "TITAN26AUG4950CE": {"journal_id": 200, "strategy_name": "ema_crossover_v1"},
+        }
+        self._active_spreads = {}
+        self._active_condors = {}
+        self._closed_journals = []
+        self._notifications = []
+        self._eod_notified_today = False
+        self._kite = None
+        self._redis = None
+
+    async def _safe_get_positions(self):
+        return [{"symbol": "TITAN26AUG4950CE", "quantity": 175, "avg_price": 46.59}]
+
+    async def _get_market_data(self, symbol):
+        return {"atr14": 5.0}  # feeds the ATR-estimate fallback since kite/redis are None
+
+    def _get_underlying_from_contract(self, contract):
+        return "TITAN"
+
+    async def _log_trade_close(self, journal_id, exit_price, pnl, exit_reason):
+        self._closed_journals.append((journal_id, exit_price, pnl, exit_reason))
+
+    async def _persist_state(self):
+        pass
+
+    async def _notify(self, msg):
+        self._notifications.append(msg)
+
+
+@pytest.mark.asyncio
+async def test_square_off_uses_real_fill_price_not_quote_estimate():
+    real_exit_fill = 44.10  # distinct from whatever the ATR estimate computes
+
+    fake = _FakeSquareOffEngine(fill_price=real_exit_fill)
+    await LiveTradingEngine._square_off_all(fake)
+
+    assert len(fake._closed_journals) == 1
+    journal_id, exit_price, pnl, exit_reason = fake._closed_journals[0]
+
+    entry_p = 46.59
+    qty = 175
+    correct_pnl = (real_exit_fill - entry_p) * qty
+
+    assert exit_price == real_exit_fill
+    assert abs(pnl - correct_pnl) < 0.01
+    assert exit_reason == "EOD square-off"
+
+
+@pytest.mark.asyncio
+async def test_square_off_falls_back_to_estimate_when_fill_unavailable():
+    fake = _FakeSquareOffEngine(fill_price=None)
+    await LiveTradingEngine._square_off_all(fake)
+
+    assert len(fake._closed_journals) == 1
+    journal_id, exit_price, pnl, exit_reason = fake._closed_journals[0]
+    # Falls back to the ATR estimate (a positive, computed value), not None/0
+    assert exit_price is not None and exit_price > 0
