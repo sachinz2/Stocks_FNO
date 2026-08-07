@@ -64,8 +64,9 @@ async def test_place_order_success(order_manager, mock_risk_manager, mock_broker
         is_spread_leg=False, is_exit_order=False, strategy_name=None,
         iv_rank=None, vix=None, capital_at_risk=None,
     )
-    # 3. Broker called
-    mock_broker.place_order.assert_called_once_with("RELIANCE", "BUY", 10, 2000.0)
+    # 3. Broker called (is_exit_order forwarded so ZerodhaBroker can route
+    # exits to a MARKET order -- see its place_order() for why)
+    mock_broker.place_order.assert_called_once_with("RELIANCE", "BUY", 10, 2000.0, is_exit_order=False)
     # 4. DB Update called to OPEN
     mock_order_repo.update.assert_called_once()
     assert result.order_status == "OPEN"

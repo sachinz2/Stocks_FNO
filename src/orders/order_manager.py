@@ -148,7 +148,7 @@ class OrderManager:
         # 3. Route to broker
         try:
             broker_order_id = await asyncio.wait_for(
-                self.broker.place_order(symbol, side, quantity, price),
+                self.broker.place_order(symbol, side, quantity, price, is_exit_order=is_exit_order),
                 timeout=BROKER_TIMEOUT_SEC,
             )
             updates: Dict[str, Any] = {

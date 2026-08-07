@@ -84,10 +84,25 @@ class ZerodhaBroker(AbstractBroker):
         wait=wait_exponential(multiplier=1, min=1, max=10),
         retry=retry_if_exception_type(_RETRYABLE_KITE_EXC),
     )
-    async def place_order(self, symbol: str, side: str, quantity: int, price: float) -> str:
-        logger.info(f"Zerodha: {side} {quantity} {symbol} @ {price}")
+    async def place_order(self, symbol: str, side: str, quantity: int, price: float, is_exit_order: bool = False) -> str:
+        # Fixed 2026-08-07: exits always used ORDER_TYPE_LIMIT, same as
+        # entries -- but every exit path in live_trading_engine.py treats
+        # order_status == "OPEN" (broker accepted it) as "position closed"
+        # (journal popped, capital released, trade_journal written), not
+        # "position confirmed filled". A LIMIT exit order can sit unfilled
+        # or partially filled if the market moves away before it crosses --
+        # especially when its price came from a synthetic ATR estimate
+        # rather than a real quote (a scenario confirmed to happen
+        # repeatedly earlier this session). That would leave a real,
+        # still-open position at the broker with nothing in the system
+        # left watching it (popped from _single_leg_journals, no further
+        # exit checks). MARKET orders guarantee an immediate, certain fill
+        # -- standard practice for stop-loss/risk exits, where getting out
+        # matters more than price. Entries are unaffected, still LIMIT.
+        order_type = self.kite.ORDER_TYPE_MARKET if is_exit_order else self.kite.ORDER_TYPE_LIMIT
+        logger.info(f"Zerodha: {side} {quantity} {symbol} @ {'MARKET' if is_exit_order else price}")
         try:
-            order_id = self.kite.place_order(
+            kwargs = dict(
                 variety=self.kite.VARIETY_REGULAR,
                 exchange=self._exchange_for(symbol),
                 tradingsymbol=symbol,
@@ -98,9 +113,11 @@ class ZerodhaBroker(AbstractBroker):
                 ),
                 quantity=quantity,
                 product=self._product_for(symbol),
-                order_type=self.kite.ORDER_TYPE_LIMIT,
-                price=price,
+                order_type=order_type,
             )
+            if not is_exit_order:
+                kwargs["price"] = price  # MARKET orders execute at best available price, no price param
+            order_id = self.kite.place_order(**kwargs)
             logger.info(f"Zerodha: order placed — id={order_id}")
             return order_id
         except Exception as e:

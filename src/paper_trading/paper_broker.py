@@ -110,7 +110,7 @@ class PaperBroker(AbstractBroker):
             return price * 0.06
         return price * 0.03
 
-    async def place_order(self, symbol: str, side: str, quantity: int, price: float) -> str:
+    async def place_order(self, symbol: str, side: str, quantity: int, price: float, is_exit_order: bool = False) -> str:
         """
         Simulates order execution with realistic bid-ask slippage, occasional
         rejection, and enhanced slippage for illiquid/cheap options.
@@ -119,6 +119,12 @@ class PaperBroker(AbstractBroker):
           1. Rejection check   — random draw against price-tier rejection probability
           2. Bid-ask slippage  — BUY at ask, SELL at bid
           3. Extra slippage    — additional random drift for illiquid options
+
+        is_exit_order: accepted for interface parity with ZerodhaBroker
+        (which uses it to route exits through a MARKET order instead of
+        LIMIT — see its place_order() for why). Not used here: PaperBroker
+        always fills synchronously regardless of order type, so there's no
+        "sits unfilled" state this needs to guard against in paper mode.
         """
         order_id  = str(uuid.uuid4())
         timestamp = datetime.utcnow()
