@@ -970,6 +970,19 @@ class LiveTradingEngine:
             return None
         kite = getattr(self, "_kite", None)
         if not kite:
+            # Fixed 2026-08-07: this LIVE-mode branch previously returned
+            # silently, same as the "not LIVE mode" no-op case above -- but
+            # this one means we're actually in live trading with a short
+            # leg open and NO kite client to place the exchange-level
+            # backstop with. That's a real gap, not an expected/normal
+            # condition, and deserves the same loud alert as the exception
+            # path below.
+            logger.critical(f"[GTT] No kite client available — backstop NOT placed for {contract}.")
+            await self._notify(
+                f"WARNING: GTT backstop NOT placed\nContract: {contract}\n"
+                f"Reason: no kite client available\n"
+                f"This position has NO server-independent exchange-level stop-loss."
+            )
             return None
         trigger_price = round(entry_price * trigger_mult, 2)
         try:
@@ -998,7 +1011,22 @@ class LiveTradingEngine:
             )
             return gtt_id
         except Exception as e:
-            logger.warning(f"[GTT] Failed to place backstop on {contract}: {e}")
+            # Fixed 2026-08-07: this only ever logged a WARNING -- easy to
+            # miss in a log file nobody's actively watching, for a feature
+            # whose entire purpose is "protect the position even if nobody
+            # is watching" (server-independent, exchange-level backstop).
+            # A silent failure here means the operator believes a short
+            # option leg has exchange-level protection when it doesn't,
+            # with no way to find out except by manually checking Zerodha's
+            # GTT dashboard. Now escalates to a real notification, same as
+            # every other genuinely dangerous state (unwind failures etc.).
+            logger.critical(f"[GTT] Failed to place backstop on {contract}: {e}")
+            await self._notify(
+                f"WARNING: GTT backstop FAILED\nContract: {contract}\n"
+                f"Error: {e}\n"
+                f"This position has NO server-independent exchange-level stop-loss. "
+                f"Consider closing manually or monitoring closely."
+            )
             return None
 
     async def _cancel_gtt(self, gtt_id: Optional[int], contract: str = "") -> None:

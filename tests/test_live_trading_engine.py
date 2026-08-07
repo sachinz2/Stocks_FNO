@@ -546,3 +546,75 @@ async def test_exit_all_options_for_falls_back_when_fill_unavailable():
     assert len(fake._closed_journals) == 1
     journal_id, exit_price, pnl, exit_reason = fake._closed_journals[0]
     assert exit_price is not None and exit_price > 0
+
+
+# ── GTT backstop failure alerting (2026-08-07) ───────────────────────────────
+#
+# _place_gtt_backstop() places a server-independent, exchange-level stop-loss
+# on a short option leg -- explicitly documented as protecting the position
+# "even if the server crashes entirely". Gated to TradingMode.LIVE only, so
+# it has never once executed against a real broker in this project's paper-
+# trading history. Both failure paths (no kite client, or the placement
+# itself raising) used to only log a warning -- for a feature whose entire
+# point is "protect the position when nobody's watching", that's the wrong
+# failure mode. Must now notify.
+
+from src.core.enums import TradingMode
+
+
+class _FakeGttEngine:
+    def __init__(self, mode, kite):
+        self.mode = mode
+        self._kite = kite
+        self._notifications = []
+
+    async def _notify(self, msg):
+        self._notifications.append(msg)
+
+
+@pytest.mark.asyncio
+async def test_gtt_backstop_paper_mode_is_a_silent_noop():
+    # Not LIVE mode is the normal, expected case (this whole project's
+    # history so far) -- must NOT alert, that would be constant noise.
+    fake = _FakeGttEngine(mode=TradingMode.PAPER, kite=None)
+    gtt_id = await LiveTradingEngine._place_gtt_backstop(fake, "SBIN26AUG800PE", 750, 20.0)
+    assert gtt_id is None
+    assert fake._notifications == []
+
+
+@pytest.mark.asyncio
+async def test_gtt_backstop_live_mode_no_kite_client_notifies():
+    fake = _FakeGttEngine(mode=TradingMode.LIVE, kite=None)
+    gtt_id = await LiveTradingEngine._place_gtt_backstop(fake, "SBIN26AUG800PE", 750, 20.0)
+    assert gtt_id is None
+    assert len(fake._notifications) == 1
+    assert "GTT backstop" in fake._notifications[0]
+
+
+@pytest.mark.asyncio
+async def test_gtt_backstop_live_mode_placement_failure_notifies():
+    class _FailingKite:
+        def place_gtt(self, **kwargs):
+            raise RuntimeError("simulated Zerodha API error")
+
+    fake = _FakeGttEngine(mode=TradingMode.LIVE, kite=_FailingKite())
+    gtt_id = await LiveTradingEngine._place_gtt_backstop(fake, "SBIN26AUG800PE", 750, 20.0)
+    assert gtt_id is None
+    assert len(fake._notifications) == 1
+    assert "GTT backstop" in fake._notifications[0]
+    assert "simulated Zerodha API error" in fake._notifications[0]
+
+
+@pytest.mark.asyncio
+async def test_gtt_backstop_live_mode_success_returns_id_no_notification():
+    class _SucceedingKite:
+        def place_gtt(self, **kwargs):
+            assert kwargs["trigger_values"] == [50.0]  # 2.5x entry(20.0)
+            assert kwargs["orders"][0]["transaction_type"] == "BUY"
+            assert kwargs["orders"][0]["quantity"] == 750
+            return {"trigger_id": 12345}
+
+    fake = _FakeGttEngine(mode=TradingMode.LIVE, kite=_SucceedingKite())
+    gtt_id = await LiveTradingEngine._place_gtt_backstop(fake, "SBIN26AUG800PE", 750, 20.0)
+    assert gtt_id == 12345
+    assert fake._notifications == []
