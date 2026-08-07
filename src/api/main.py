@@ -358,12 +358,36 @@ async def lifespan(app: FastAPI):
             if is_market_open():
                 stale_for = ticker.seconds_since_last_tick()
                 if stale_for is not None and stale_for > TICK_STALE_THRESHOLD_SECONDS:
+                    # Fixed 2026-08-07: ticker.stop(); ticker.start() looked like
+                    # a reconnect but didn't fix anything -- confirmed live, this
+                    # exact watchdog fired every 3 min for 27+ minutes (07:06 403
+                    # -> 08:30 fresh token -> silent non-connection for 99 min ->
+                    # watchdog loop 10:09-10:36, all 41 symbols stuck on the
+                    # historical-close bootstrap fallback the whole time) without
+                    # ever recovering. KiteTicker runs on Twisted's global
+                    # reactor, which can only be started once per process --
+                    # stop()/start() in place leaves a dead reactor that logs
+                    # "connecting..." but never processes another on_connect/
+                    # on_error again. This docstring's own prior-incident note
+                    # already said "only a full process restart fixed it" --
+                    # this now actually does that instead of repeating the
+                    # in-place reconnect that's already proven not to work.
+                    # Safe because of the "PaperBroker silently lost single-leg
+                    # positions across every restart" fix (2026-08-06): engine
+                    # state (spreads/condors/single-leg journals, balance) now
+                    # correctly rebuilds from Redis on every restart, so this
+                    # exit-and-let-Docker-restart-me pattern is the same one
+                    # already exercised (and verified) manually many times
+                    # today, just triggered automatically instead of requiring
+                    # someone to notice and SSH in. `restart: unless-stopped` on
+                    # the api service in docker-compose.yml brings it back up.
+                    import os
                     logger.critical(
                         f"ZerodhaTicker: no ticks for {stale_for:.0f}s during market hours "
-                        "— forcing a reconnect."
+                        "— in-place reconnect already proven insufficient for this failure "
+                        "mode (dead Twisted reactor); exiting process for a full restart."
                     )
-                    ticker.stop()
-                    ticker.start()
+                    os._exit(1)
 
     scheduler.add_job(
         _kite_self_heal,
