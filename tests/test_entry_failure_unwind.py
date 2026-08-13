@@ -41,7 +41,7 @@ def test_iron_condor_unwinds_already_placed_legs_when_a_later_leg_fails():
     src = inspect.getsource(LiveTradingEngine._process_iron_condor)
 
     assert "Unwinding" in src
-    unwind_block = src[src.index("for (c, s, p, _) in placed"):]
+    unwind_block = src[src.index("for (c, s, p, _l, _o) in placed"):]
     assert "is_exit_order=True" in unwind_block
 
     assert "UNWIND FAILED" in src

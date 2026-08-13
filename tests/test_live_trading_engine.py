@@ -8,10 +8,13 @@ import inspect
 import types
 import asyncio
 from decimal import Decimal
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 import pytest
 
 from src.live_trading.live_trading_engine import LiveTradingEngine
 from src.risk.risk_manager import RiskManager
+from src.core.enums import SignalType
 
 
 # ── Bootstrap-fallback skip (2026-08-06) ────────────────────────────────────
@@ -1131,3 +1134,103 @@ async def test_condor_exit_pnl_uses_real_fill_not_quote():
 
     assert "SBIN" not in fake._active_condors
     assert "SBIN" in fake._profit_closed_today
+
+
+# ── Entry-side counterpart of the same fill-vs-quote bug (2026-08-13) ────────
+#
+# The exit-side fix above (test_spread_exit_pnl_uses_real_fill_not_quote /
+# test_condor_exit_pnl_uses_real_fill_not_quote) only closed half the gap.
+# short_p/long_p and psc/plc/csc/clc's prices in _process_credit_spread /
+# _process_iron_condor are the pre-trade QUOTES fed into place_order() --
+# the returned orders already carry the real fill_price (place_order()
+# reconciles it synchronously, "fixed 2026-08-07"), but entry code never
+# read it before storing short_premium/long_premium (which drive every
+# later SL/profit-target check and the exit pnl calc) or the journal's
+# entry_price. Confirmed live: this is a real, currently-open-position bug,
+# not just historical -- BAJFINANCE (id=157) and TATASTEEL (id=161) both
+# have their live thresholds anchored to quote-based entry premiums.
+# net_credit deliberately stays quote-based (see the fix's comment) since
+# it must match _capital_at_risk's basis for add/release symmetry.
+
+def test_credit_spread_entry_uses_real_fill_not_quote():
+    src = inspect.getsource(LiveTradingEngine._process_credit_spread)
+    assert 'short_fill = float(getattr(short_order, "fill_price", None) or short_p)' in src
+    assert 'long_fill  = float(getattr(long_order,  "fill_price", None) or long_p)' in src
+    assert "entry_price=round(short_fill - long_fill, 2)" in src
+    assert '"short_premium":  short_fill,      "long_premium":   long_fill,' in src
+    # GTT backstop trigger must also be anchored to the real fill.
+    assert "_place_gtt_backstop(short_contract, lot_size, short_fill)" in src
+
+
+# ── Cross-strategy contract-collision guard (2026-08-13) ─────────────────────
+#
+# Confirmed live: ema_crossover_v1 independently bought and sold
+# BAJFINANCE26SEP1190CE while credit_spread_v1 was already holding that
+# exact contract open as a spread's long leg (id=157). Invisible in paper
+# mode (each strategy's fills are simulated independently), but Zerodha
+# nets ONE position per contract per account -- two strategies trading the
+# same underlying's options independently would corrupt real position/
+# margin accounting once live. Guarded both directions: spread/condor entry
+# skips if the underlying already has an open single-leg position, and
+# single-leg entry skips if the underlying already has an active spread/condor.
+
+class _FakeCollisionEngine:
+    def __init__(self, active_spreads=None, active_condors=None, single_leg_journals=None):
+        self._active_spreads = active_spreads or {}
+        self._active_condors = active_condors or {}
+        self._single_leg_journals = single_leg_journals or {}
+        self._exited_today = set()
+        self._max_daily_orders = 0
+        self.order_manager = None  # must never be touched if the guard fires first
+
+
+@pytest.mark.asyncio
+async def test_credit_spread_entry_blocked_by_open_single_leg_on_same_underlying():
+    fake = _FakeCollisionEngine(
+        single_leg_journals={"BAJFINANCE26SEP1190CE": {"underlying": "BAJFINANCE", "strategy_name": "ema_crossover_v1"}},
+    )
+    strategy = SimpleNamespace(name="credit_spread_v1", min_dte=7)
+
+    await LiveTradingEngine._process_credit_spread(
+        fake, strategy, "BAJFINANCE", "BEAR_CALL_SPREAD", {"close": 1200.0}, vix=15.0,
+    )
+
+    assert fake._active_spreads == {}  # never got past the guard to place any order
+
+
+@pytest.mark.asyncio
+async def test_iron_condor_entry_blocked_by_open_single_leg_on_same_underlying():
+    fake = _FakeCollisionEngine(
+        single_leg_journals={"SBIN26SEP600CE": {"underlying": "SBIN", "strategy_name": "momentum_v1"}},
+    )
+    strategy = SimpleNamespace(name="iron_condor_v1", min_dte=7)
+
+    await LiveTradingEngine._process_iron_condor(fake, strategy, "SBIN", {"close": 580.0}, vix=15.0)
+
+    assert fake._active_condors == {}
+
+
+@pytest.mark.asyncio
+async def test_single_leg_entry_blocked_by_active_spread_on_same_underlying():
+    fake = _FakeCollisionEngine(active_spreads={"BAJFINANCE": {"short_contract": "BAJFINANCE26SEP1160CE"}})
+    fake._get_market_data = AsyncMock(return_value={"close": 1200.0, "ltp_source": "live_tick"})
+    fake._notify = AsyncMock()
+    strategy = SimpleNamespace(
+        name="ema_crossover_v1", is_active=True,
+        generate_signal=lambda market_data: SignalType.BUY,
+    )
+
+    await LiveTradingEngine._process_signal(fake, strategy, "BAJFINANCE", vix=15.0, regime="TRENDING")
+
+    assert fake.order_manager is None  # guard fired before any order could be placed
+
+
+def test_iron_condor_entry_uses_real_fill_not_quote():
+    src = inspect.getsource(LiveTradingEngine._process_iron_condor)
+    assert 'placed.append((contract, side, price, is_leg, order))' in src
+    assert '_fills = {c: float(getattr(o, "fill_price", None) or p) for c, _s, p, _l, o in placed}' in src
+    assert "entry_price=round(put_short_fill + call_short_fill - put_long_fill - call_long_fill, 2)" in src
+    assert '"put_short_premium":   put_short_fill,  "put_long_premium":  put_long_fill,' in src
+    assert '"call_short_premium":  call_short_fill, "call_long_premium": call_long_fill,' in src
+    assert "_place_gtt_backstop(psc, lot_size, put_short_fill)" in src
+    assert "_place_gtt_backstop(csc, lot_size, call_short_fill)" in src

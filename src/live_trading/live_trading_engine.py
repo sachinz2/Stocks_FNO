@@ -1339,6 +1339,21 @@ class LiveTradingEngine:
         option_type = "CE" if signal_str == "BUY" else "PE"
         opposite    = "PE" if option_type == "CE" else "CE"
 
+        # Cross-strategy contract-collision guard (added 2026-08-13) — see
+        # the matching note in _process_credit_spread for the live incident
+        # (ema_crossover_v1 traded BAJFINANCE26SEP1190CE while credit_spread_v1
+        # already held it open as a spread leg) this closes. A single-leg
+        # strategy picking a contract independently of an already-open
+        # spread/condor on the same underlying corrupts real position/margin
+        # accounting once live, even though it's invisible in paper mode.
+        if symbol in self._active_spreads or symbol in self._active_condors:
+            logger.info(
+                f"[{strategy.name}] {symbol} skipped — already has an active "
+                "credit_spread/iron_condor structure open (cross-strategy "
+                "contract-collision guard)."
+            )
+            return
+
         await self._close_option_positions(symbol, opposite, market_data, owner_strategy_name=strategy.name)
         if await self._has_open_option(symbol, option_type):
             return
@@ -1628,6 +1643,23 @@ class LiveTradingEngine:
             return
         if symbol in self._active_condors:
             return  # already have a condor on this underlying — conflicting structures
+        # Cross-strategy contract-collision guard (added 2026-08-13): a
+        # single-leg strategy (ema_crossover_v1/momentum_v1) picking a
+        # contract independently of an already-open spread/condor leg on the
+        # same underlying is silently harmless in paper mode (each
+        # strategy's fills are simulated independently) but corrupts real
+        # position/margin accounting once live -- Zerodha nets one position
+        # per contract per account, it has no concept of "strategy-owned"
+        # quantity. Confirmed live: ema_crossover_v1 bought and sold
+        # BAJFINANCE26SEP1190CE on 2026-08-13 while credit_spread_v1 was
+        # already holding that exact contract open as a spread's long leg.
+        if any(v.get("underlying") == symbol for v in self._single_leg_journals.values()):
+            logger.info(
+                f"[CreditSpread] {symbol} skipped — already has an open "
+                "single-leg position on this underlying (cross-strategy "
+                "contract-collision guard)."
+            )
+            return
         if symbol in self._exited_today:
             logger.debug(f"[CreditSpread] {symbol} skipped — already exited today, no re-entry.")
             return
@@ -2011,11 +2043,27 @@ class LiveTradingEngine:
 
         self._today_order_count += 2
 
+        # Fixed 2026-08-13: entry-side counterpart of the exit-side fill-price
+        # fix earlier today (see _check_spread_exits). short_p/long_p are the
+        # pre-trade QUOTES fed into place_order() -- the orders above already
+        # carry the real fill_price (place_order() reconciles it synchronously,
+        # "fixed 2026-08-07"), but it was never read here. Used for both the
+        # journal's entry_price (P&L reporting) and short_premium/long_premium
+        # (which drive every SL/profit-target check and the exit pnl calc in
+        # _check_spread_exits) -- so a stale quote baseline wasn't just a
+        # reporting error, it skewed live exit decisions on open positions.
+        # net_credit stays quote-based below for _capital_at_risk symmetry
+        # (add_deployed_capital at entry / release_deployed_capital at exit
+        # must use the same basis, and that's a pre-trade risk budget, not a
+        # P&L figure).
+        short_fill = float(getattr(short_order, "fill_price", None) or short_p)
+        long_fill  = float(getattr(long_order,  "fill_price", None) or long_p)
+
         journal_id = await self._log_trade_open(
             strategy=strategy.name, underlying=symbol,
             structure_type=spread_type,
             contracts=[short_contract, long_contract],
-            entry_price=net_credit, quantity=lot_size,
+            entry_price=round(short_fill - long_fill, 2), quantity=lot_size,
             market_data=market_data, iv_rank=iv_rank, vix=vix,
         )
         # Track deployed capital by actual max loss (width - net credit), not just
@@ -2035,7 +2083,7 @@ class LiveTradingEngine:
             "short_contract": short_contract, "long_contract":  long_contract,
             "short_strike":   short_strike,   "long_strike":    long_strike,
             "option_type":    opt,
-            "short_premium":  short_p,        "long_premium":   long_p,
+            "short_premium":  short_fill,      "long_premium":   long_fill,
             "net_credit":     net_credit,     "lot_size":       lot_size,
             "journal_id":     journal_id,
             "strategy_name":  strategy.name,
@@ -2049,7 +2097,9 @@ class LiveTradingEngine:
 
         # I: place exchange-level GTT backstop on the short leg (live mode only).
         # If server crashes entirely, this fires at Zerodha when price hits 2.5× entry.
-        _gtt_id = await self._place_gtt_backstop(short_contract, lot_size, short_p)
+        # Uses the real fill (see short_fill above), not the quote, so the
+        # trigger level reflects what was actually paid.
+        _gtt_id = await self._place_gtt_backstop(short_contract, lot_size, short_fill)
         if _gtt_id:
             self._active_spreads[symbol]["gtt_id"] = _gtt_id
 
@@ -2321,6 +2371,15 @@ class LiveTradingEngine:
             return
         if symbol in self._active_spreads:
             return  # don't stack condor on top of existing spread for same underlying
+        # Cross-strategy contract-collision guard — see the matching note in
+        # _process_credit_spread for the live incident this closes.
+        if any(v.get("underlying") == symbol for v in self._single_leg_journals.values()):
+            logger.info(
+                f"[IronCondor] {symbol} skipped — already has an open "
+                "single-leg position on this underlying (cross-strategy "
+                "contract-collision guard)."
+            )
+            return
         if symbol in self._exited_today:
             logger.debug(f"[IronCondor] {symbol} skipped — already exited today, no re-entry.")
             return
@@ -2615,7 +2674,7 @@ class LiveTradingEngine:
                 from src.market_data.option_chain import get_option_quote as _gq
                 _bad_uw = {"REJECTED", "REJECTED_BY_RISK", "CANCELLED", "FAILED"}
                 _failed_unwinds = []
-                for (c, s, p, _) in placed:
+                for (c, s, p, _l, _o) in placed:
                     rev = "BUY" if s == "SELL" else "SELL"
                     _unwind_p = await _gq(c, getattr(self, "_kite", None), getattr(self, "_redis", None)) or p
                     _uw = await self.order_manager.place_order(
@@ -2634,13 +2693,25 @@ class LiveTradingEngine:
                         f"Action required: manually close the listed contracts"
                     )
                 return
-            placed.append((contract, side, price, is_leg))
+            placed.append((contract, side, price, is_leg, order))
 
         self._today_order_count += 4
+
+        # Fixed 2026-08-13: entry-side counterpart of the exit-side fill-price
+        # fix earlier today (see _check_condor_exits) and of the matching
+        # credit-spread entry fix above -- psc/plc/csc/clc prices are
+        # pre-trade QUOTES, not the real fill_price the orders above already
+        # carry. net_credit stays quote-based for _capital_at_risk symmetry
+        # (see _process_credit_spread's note).
+        _fills = {c: float(getattr(o, "fill_price", None) or p) for c, _s, p, _l, o in placed}
+        put_short_fill,  put_long_fill  = _fills[psc], _fills[plc]
+        call_short_fill, call_long_fill = _fills[csc], _fills[clc]
+
         journal_id  = await self._log_trade_open(
             strategy=strategy.name, underlying=symbol,
             structure_type="IRON_CONDOR", contracts=[psc, plc, csc, clc],
-            entry_price=net_credit, quantity=lot_size,
+            entry_price=round(put_short_fill + call_short_fill - put_long_fill - call_long_fill, 2),
+            quantity=lot_size,
             market_data=market_data, iv_rank=iv_rank, vix=vix,
         )
         # Track deployed capital by actual max loss, not just the long/hedge legs'
@@ -2656,8 +2727,8 @@ class LiveTradingEngine:
             "call_short_contract": csc,  "call_long_contract":  clc,
             "put_short_strike":    put_short_strike,  "put_long_strike":   put_long_strike,
             "call_short_strike":   call_short_strike, "call_long_strike":  call_long_strike,
-            "put_short_premium":   put_short_p,  "put_long_premium":  put_long_p,
-            "call_short_premium":  call_short_p, "call_long_premium": call_long_p,
+            "put_short_premium":   put_short_fill,  "put_long_premium":  put_long_fill,
+            "call_short_premium":  call_short_fill, "call_long_premium": call_long_fill,
             "net_credit":          net_credit,   "lot_size":          lot_size,
             "journal_id":          journal_id,
             "strategy_name":       strategy.name,
@@ -2670,9 +2741,9 @@ class LiveTradingEngine:
         if self._ltp_poller:
             self._ltp_poller.register_option_contracts([psc, plc, csc, clc])
 
-        # I: GTT backstops on both short legs (live mode only)
-        _put_gtt  = await self._place_gtt_backstop(psc, lot_size, put_short_p)
-        _call_gtt = await self._place_gtt_backstop(csc, lot_size, call_short_p)
+        # I: GTT backstops on both short legs (live mode only) -- real fills, not quotes.
+        _put_gtt  = await self._place_gtt_backstop(psc, lot_size, put_short_fill)
+        _call_gtt = await self._place_gtt_backstop(csc, lot_size, call_short_fill)
         if _put_gtt:
             self._active_condors[symbol]["put_short_gtt_id"]  = _put_gtt
         if _call_gtt:
