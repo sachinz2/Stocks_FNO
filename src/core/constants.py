@@ -201,6 +201,15 @@ REDIS_TOP_SYMBOLS_MOMENTUM = "nfo:top5:momentum"          # Momentum: high ADX +
 
 REDIS_LOT_SIZE_PREFIX = "nfo:lot:"
 
+# Real per-symbol contract data (expiry -> strike -> {CE/PE: real tradingsymbol}),
+# refreshed daily from kite.instruments("NFO") alongside lot sizes -- see
+# scripts/zerodha_auto_auth.py's fetch_and_cache_real_contracts() and
+# src/market_data/option_chain.py's get_real_contract(). Used to validate/
+# correct our own computed strike + build_option_symbol() string against
+# what's actually listed, instead of trusting our own expiry-date and
+# strike-interval arithmetic never drifts from reality.
+REDIS_CONTRACT_PREFIX = "nfo:contracts:"
+
 # Indicator defaults
 EMA_FAST = 20
 EMA_SLOW = 50

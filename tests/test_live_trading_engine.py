@@ -51,11 +51,15 @@ def test_entry_path_tries_real_quote_before_estimate_fallback():
     assert "get_option_quote(contract" in src
     assert '_real_p if (_real_p and _real_p > 0) else estimate_option_premium' in src
 
-    contract_idx = src.index("contract = build_option_symbol")
+    # Fixed 2026-08-13: contract construction now goes through _resolve_contract()
+    # (validates/corrects the computed strike + symbol against Zerodha's real,
+    # daily-cached instrument list -- see _resolve_contract's docstring) instead
+    # of calling build_option_symbol() directly.
+    contract_idx = src.index("self._resolve_contract(symbol, expiry, strike, option_type)")
     quote_idx = src.index("get_option_quote(contract")
     price_idx = src.index("option_p = _real_p")
     assert contract_idx < quote_idx < price_idx, (
-        "must build contract, then fetch quote, then assign option_p, in that order"
+        "must resolve the real contract, then fetch quote, then assign option_p, in that order"
     )
 
 

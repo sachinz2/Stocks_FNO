@@ -196,6 +196,67 @@ def iv_rank_allows_selling(iv_rank: Optional[float]) -> bool:
     return iv_rank >= 0.30
 
 
+# ── Real contract validation ────────────────────────────────────────────────
+
+async def get_real_contract(
+    symbol: str, expiry: date, strike: float, option_type: str, redis,
+) -> Optional[Tuple[str, float]]:
+    """
+    Look up the REAL Zerodha tradingsymbol for (symbol, expiry, strike,
+    option_type) against the daily-refreshed instrument cache (see
+    scripts/zerodha_auto_auth.py's fetch_and_cache_real_contracts()) — instead
+    of trusting build_option_symbol()'s hand-formatted string and our own
+    computed strike to always match what's actually listed.
+
+    Returns (real_tradingsymbol, real_strike_used) on a cache hit -- real_strike_used
+    equals the input `strike` in the common case (exact match), or the nearest
+    ACTUALLY LISTED strike if the computed one isn't listed for this expiry
+    (e.g. a strike-interval assumption slightly off, or this expiry's strike
+    range doesn't extend as far as the near-month one). Returns None on any
+    cache miss (Redis down, symbol not cached, expiry not in the cached
+    window) -- caller falls back to build_option_symbol()'s formula, exactly
+    today's existing behavior, so this can only make contract selection more
+    correct, never less available.
+    """
+    if redis is None:
+        return None
+    try:
+        from src.core.constants import REDIS_CONTRACT_PREFIX
+        raw = await redis.get(f"{REDIS_CONTRACT_PREFIX}{symbol}")
+        if not raw:
+            return None
+        data = json.loads(raw)
+        expiry_iso = expiry.strftime("%Y-%m-%d") if hasattr(expiry, "strftime") else str(expiry)
+        strikes_for_expiry = data.get(expiry_iso)
+        if not strikes_for_expiry:
+            return None
+
+        def _key(k: float) -> str:
+            return str(int(k)) if float(k) == int(k) else str(float(k))
+
+        entry = strikes_for_expiry.get(_key(strike))
+        if entry and entry.get(option_type):
+            return entry[option_type], strike
+
+        # Exact strike not listed for this expiry -- snap to nearest real one.
+        available = sorted(float(k) for k in strikes_for_expiry.keys())
+        if not available:
+            return None
+        nearest = min(available, key=lambda k: abs(k - strike))
+        entry = strikes_for_expiry.get(_key(nearest))
+        if entry and entry.get(option_type):
+            if nearest != strike:
+                logger.warning(
+                    f"get_real_contract: {symbol} {expiry_iso} {option_type} strike "
+                    f"{strike} not listed -- snapped to nearest real strike {nearest}"
+                )
+            return entry[option_type], nearest
+        return None
+    except Exception as e:
+        logger.debug(f"get_real_contract: cache lookup failed for {symbol}: {e}")
+        return None
+
+
 # ── Real option quotes ────────────────────────────────────────────────────────
 
 async def get_option_quote(contract: str, kite, redis) -> Optional[float]:

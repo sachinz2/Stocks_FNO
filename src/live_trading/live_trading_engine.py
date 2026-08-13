@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.brokers.base import AbstractBroker
 from src.core.config import settings
@@ -1567,7 +1567,7 @@ class LiveTradingEngine:
         atr      = float(market_data.get("atr14", underlying_price * 0.01))
         iv_rank  = await self._get_iv_rank(symbol, underlying_price, atr, dte)
         strike   = get_atm_strike(underlying_price, symbol)
-        contract = build_option_symbol(symbol, strike, option_type, expiry)
+        strike, contract = await self._resolve_contract(symbol, expiry, strike, option_type)
 
         # Fixed 2026-08-06: this unconditionally used the crude ATR-heuristic
         # estimate at entry, while every exit path (_check_open_option_exits,
@@ -1951,8 +1951,11 @@ class LiveTradingEngine:
                 logger.info(f"[CreditSpread] {symbol} skipped — price Rs{underlying_price:.2f} already at/above short call Rs{short_strike}")
                 return
 
-        short_contract = build_option_symbol(symbol, short_strike, opt, expiry)
-        long_contract  = build_option_symbol(symbol, long_strike,  opt, expiry)
+        # Resolve against the real, listed Zerodha contract (validates/corrects
+        # the computed strike, uses the real tradingsymbol string) -- falls
+        # back to build_option_symbol()'s formula, unchanged, on a cache miss.
+        short_strike, short_contract = await self._resolve_contract(symbol, expiry, short_strike, opt)
+        long_strike,  long_contract  = await self._resolve_contract(symbol, expiry, long_strike,  opt)
 
         # Avoid selling at crowded OI strikes (high OI = frequently tested)
         from src.market_data.nse_oi import is_strike_crowded
@@ -1965,7 +1968,7 @@ class LiveTradingEngine:
                 short_strike -= interval
             else:
                 short_strike += interval
-            short_contract = build_option_symbol(symbol, short_strike, opt, expiry)
+            short_strike, short_contract = await self._resolve_contract(symbol, expiry, short_strike, opt)
             # Re-validate spread geometry after OI bump
             if spread_type == "BULL_PUT_SPREAD":
                 if long_strike >= short_strike:
@@ -1973,7 +1976,7 @@ class LiveTradingEngine:
             else:  # BEAR_CALL_SPREAD
                 if long_strike <= short_strike:
                     long_strike = short_strike + 2 * interval
-            long_contract = build_option_symbol(symbol, long_strike, opt, expiry)
+            long_strike, long_contract = await self._resolve_contract(symbol, expiry, long_strike, opt)
 
         short_p, long_p = await get_entry_prices_for_spread(
             symbol, short_contract, long_contract,
@@ -2605,10 +2608,13 @@ class LiveTradingEngine:
             )
             return
 
-        psc = build_option_symbol(symbol, put_short_strike,  "PE", expiry)
-        plc = build_option_symbol(symbol, put_long_strike,   "PE", expiry)
-        csc = build_option_symbol(symbol, call_short_strike, "CE", expiry)
-        clc = build_option_symbol(symbol, call_long_strike,  "CE", expiry)
+        # Resolve against the real, listed Zerodha contract for each leg (see
+        # _resolve_contract's docstring) -- falls back to build_option_symbol()'s
+        # formula, unchanged, on a cache miss.
+        put_short_strike,  psc = await self._resolve_contract(symbol, expiry, put_short_strike,  "PE")
+        put_long_strike,   plc = await self._resolve_contract(symbol, expiry, put_long_strike,   "PE")
+        call_short_strike, csc = await self._resolve_contract(symbol, expiry, call_short_strike, "CE")
+        call_long_strike,  clc = await self._resolve_contract(symbol, expiry, call_long_strike,  "CE")
 
         # Fetch real Kite LTPs for all 4 legs — same as credit spread entry.
         # ATR estimates are CE/PE-blind (put_short_p == call_short_p always), which
@@ -3507,7 +3513,6 @@ class LiveTradingEngine:
         the quote fetch fails for any reason.
         """
         from src.market_data.option_chain import get_option_quote, implied_vol as _iv
-        from src.core.utils import build_option_symbol
 
         kite  = getattr(self, "_kite",  None)
         redis = getattr(self, "_redis", None)
@@ -3517,8 +3522,8 @@ class LiveTradingEngine:
         try:
             atm   = round(underlying_price / interval) * interval
             T     = max(dte, 1) / 365.0
-            ce_c  = build_option_symbol(symbol, atm, "CE", expiry)
-            pe_c  = build_option_symbol(symbol, atm, "PE", expiry)
+            _, ce_c = await self._resolve_contract(symbol, expiry, atm, "CE")
+            _, pe_c = await self._resolve_contract(symbol, expiry, atm, "PE")
             ce_p  = await get_option_quote(ce_c, kite, redis)
             pe_p  = await get_option_quote(pe_c, kite, redis)
 
@@ -3678,6 +3683,35 @@ class LiveTradingEngine:
             except Exception:
                 pass
         return get_lot_size(symbol)
+
+    async def _resolve_contract(
+        self, symbol: str, expiry: datetime, candidate_strike: float, option_type: str,
+    ) -> Tuple[float, str]:
+        """
+        Resolve a candidate strike (from get_atm_strike()/find_delta_strike()'s
+        interval-based arithmetic) to a real, listed Zerodha contract when
+        possible. Validates/corrects against the daily-refreshed real-contract
+        cache (see option_chain.get_real_contract()) -- our own expiry-date
+        rollover and strike-interval formulas have no live cross-check
+        otherwise, the same root-cause shape as the FNO_LOT_SIZES/
+        FNO_STRIKE_INTERVALS tables that WERE found wrong for 36/39 and 27/39
+        symbols earlier this project.
+
+        Returns (strike_to_use, tradingsymbol) -- strike_to_use equals
+        candidate_strike unless the cache had to snap to a different, actually-
+        listed strike, in which case ALL downstream math (width, credit, R/R)
+        must use the returned strike, not the original candidate, to stay
+        consistent with the contract actually being traded.
+
+        Falls back to build_option_symbol()'s formula (today's existing
+        behavior, unchanged) whenever the cache is unavailable -- this can
+        only make contract selection more correct, never less available.
+        """
+        from src.market_data.option_chain import get_real_contract
+        real = await get_real_contract(symbol, expiry, candidate_strike, option_type, getattr(self, "_redis", None))
+        if real:
+            return real[1], real[0]
+        return candidate_strike, build_option_symbol(symbol, candidate_strike, option_type, expiry)
 
     async def _get_active_symbols(self, strategy=None) -> List[str]:
         redis = getattr(self, "_redis", None)

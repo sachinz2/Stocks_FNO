@@ -260,19 +260,24 @@ def store_token(access_token: str):
         json.dump({"access_token": access_token}, f)
 
 
-def fetch_and_cache_lot_sizes(access_token: str) -> int:
-    """
-    Fetch all NFO instruments from Kite and cache lot sizes in Redis.
-    Called once daily after auth so the engine always has fresh lot sizes.
-    Returns number of symbols cached.
-    """
+def fetch_nfo_instruments(access_token: str) -> list:
+    """Fetch the full NFO instrument dump once, shared by every cache-refresh
+    step below so we don't hit the (large, ~5-10 MB) endpoint multiple times."""
     from kiteconnect import KiteConnect
-    from src.core.constants import FNO_SYMBOLS, REDIS_LOT_SIZE_PREFIX
 
     kite = KiteConnect(api_key=settings.ZERODHA_API_KEY)
     kite.set_access_token(access_token)
+    return kite.instruments("NFO")
 
-    instruments = kite.instruments("NFO")
+
+def fetch_and_cache_lot_sizes(instruments: list) -> int:
+    """
+    Cache real lot sizes from the NFO instrument dump in Redis.
+    Called once daily after auth so the engine always has fresh lot sizes.
+    Returns number of symbols cached.
+    """
+    from src.core.constants import FNO_SYMBOLS, REDIS_LOT_SIZE_PREFIX
+
     r = get_redis_client()
     fno_set = set(FNO_SYMBOLS)
     seen: set = set()
@@ -289,6 +294,56 @@ def fetch_and_cache_lot_sizes(access_token: str) -> int:
     return len(seen)
 
 
+def fetch_and_cache_real_contracts(instruments: list) -> int:
+    """
+    Cache the REAL per-symbol option chain (expiry -> strike -> {CE/PE:
+    real tradingsymbol}) from the NFO instrument dump, so the engine can
+    validate/correct its own computed expiry + strike + build_option_symbol()
+    string against what Zerodha actually has listed, instead of trusting our
+    own date-rollover and strike-interval arithmetic to never drift from
+    reality (found live 2026-08-13: no concrete mismatch confirmed yet, but
+    both of those are hand-rolled formulas with no live cross-check, the
+    same root-cause shape as the FNO_LOT_SIZES/FNO_STRIKE_INTERVALS tables
+    that WERE found wrong for 36/39 and 27/39 symbols earlier this project).
+
+    Only the 3 nearest expiries per symbol are kept, both to bound payload
+    size and because nothing in this system ever trades further out than
+    that. Returns number of symbols cached.
+    """
+    import json as _json
+    from src.core.constants import FNO_SYMBOLS, REDIS_CONTRACT_PREFIX
+
+    r = get_redis_client()
+    fno_set = set(FNO_SYMBOLS)
+
+    # symbol -> expiry_iso -> strike_str -> {"CE": tradingsymbol, "PE": tradingsymbol}
+    by_symbol: dict = {}
+    for inst in instruments:
+        name = inst.get("name", "")
+        itype = inst.get("instrument_type", "")
+        if name not in fno_set or itype not in ("CE", "PE"):
+            continue
+        expiry = inst.get("expiry")
+        strike = inst.get("strike")
+        tsym   = inst.get("tradingsymbol")
+        if not (expiry and strike and tsym):
+            continue
+        expiry_iso = expiry.isoformat() if hasattr(expiry, "isoformat") else str(expiry)
+        strike_key = str(int(strike)) if float(strike) == int(strike) else str(float(strike))
+        by_symbol.setdefault(name, {}).setdefault(expiry_iso, {}).setdefault(strike_key, {})[itype] = tsym
+
+    seen = 0
+    for name, expiries in by_symbol.items():
+        # Keep only the 3 nearest expiries (sorted ascending ISO date strings
+        # sort correctly as plain strings).
+        nearest_3 = dict(sorted(expiries.items())[:3])
+        r.set(f"{REDIS_CONTRACT_PREFIX}{name}", _json.dumps(nearest_3), ex=86400 * 2)
+        seen += 1
+
+    logger.info(f"Real contract data cached for {seen} F&O symbols")
+    return seen
+
+
 def run_daily_auth():
     """Entry point called by the scheduler at 8:30 AM IST."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -298,12 +353,15 @@ def run_daily_auth():
         store_token(access_token)
         logger.info("Daily authentication SUCCESSFUL")
 
-        # Refresh lot sizes from live instrument data
+        # Refresh lot sizes + real contract data from a single instrument fetch
         try:
-            count = fetch_and_cache_lot_sizes(access_token)
+            instruments = fetch_nfo_instruments(access_token)
+            count = fetch_and_cache_lot_sizes(instruments)
             logger.info(f"Instrument lot sizes refreshed: {count} symbols")
+            contract_count = fetch_and_cache_real_contracts(instruments)
+            logger.info(f"Real contract data refreshed: {contract_count} symbols")
         except Exception as e:
-            logger.warning(f"Lot size refresh failed (non-fatal, using hardcoded fallback): {e}")
+            logger.warning(f"Instrument data refresh failed (non-fatal, using hardcoded/computed fallback): {e}")
 
         return access_token
     except Exception as e:
