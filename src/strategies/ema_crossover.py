@@ -19,6 +19,10 @@ class EMACrossoverStrategy(StrategyBase):
         self.stop_loss_pct = self.parameters.get("stop_loss_pct", 0.50)
         self.target_pct = self.parameters.get("target_pct", 1.0)
         self.trailing_stop_pct = self.parameters.get("trailing_stop_pct", 0.25)
+        # Once a position has been up at least this much from entry, it must
+        # never be allowed to close as a realized loss -- see manage_position()'s
+        # breakeven-stop check for why trailing_stop_pct alone doesn't guarantee this.
+        self.breakeven_activation_pct = self.parameters.get("breakeven_activation_pct", 0.15)
 
         # Signal confirmation: crossover must persist for this many consecutive cycles
         # before a BUY/SELL fires. Prevents rapid BUY↔SELL alternation when EMAs are close.
@@ -39,6 +43,7 @@ class EMACrossoverStrategy(StrategyBase):
         logger.info(
             f"Initialized EMA Crossover '{self.name}' ({self.fast_period}/{self.slow_period}) | "
             f"SL={self.stop_loss_pct:.0%} TP={self.target_pct:.0%} Trail={self.trailing_stop_pct:.0%} "
+            f"Breakeven activates at +{self.breakeven_activation_pct:.0%} | "
             f"ConfirmBars={self.signal_confirm_bars}"
         )
 
@@ -169,7 +174,9 @@ class EMACrossoverStrategy(StrategyBase):
           1. Hard stop loss  — premium fell >= stop_loss_pct (default 50%) from entry
           2. Profit target   — premium rose >= target_pct (default 100%, i.e. 2×) from entry
           3. Trailing stop   — premium fell >= trailing_stop_pct (default 25%) from its peak
-          4. EMA reversal    — VOLATILE-entered positions only (see below)
+          4. Breakeven stop  — once up >= breakeven_activation_pct (default 15%) from
+                                entry, never allow a close below entry (see below)
+          5. EMA reversal    — VOLATILE-entered positions only (see below)
         """
         entry_premium = float(current_position.get("avg_price") or 0)
         if entry_premium <= 0 or current_premium <= 0:
@@ -204,7 +211,29 @@ class EMACrossoverStrategy(StrategyBase):
                 )
                 return "EXIT"
 
-        # 4. EMA reversal — VOLATILE-entered positions only (added 2026-07-31).
+        # 4. Breakeven stop (added 2026-08-13) -- the trailing stop above is
+        # scoped to the PEAK premium, not to locked-in profit. For a peak
+        # gain below roughly trailing_stop_pct/(1-trailing_stop_pct) (~33%
+        # at the default 25%), trailing_stop_pct off that peak lands BELOW
+        # the entry price -- meaning a position that was genuinely
+        # profitable at some point could still round-trip all the way into
+        # a realized loss before the trailing stop ever fires. Confirmed
+        # live 2026-08-11 on the sibling momentum_v1 strategy (same
+        # structure): ULTRACEMCO peaked at +31.9% and only exited once it
+        # had already fallen below its own entry price, a real loss.
+        # Once a position has been up at least breakeven_activation_pct from
+        # entry, it must never be allowed to close as a realized loss --
+        # exit the moment it falls back to entry, regardless of whether the
+        # trailing stop's own (looser) threshold has been reached yet.
+        if peak >= entry_premium * (1 + self.breakeven_activation_pct) and current_premium <= entry_premium:
+            logger.info(
+                f"[{self.name}] Breakeven stop: was up to Rs{peak:.2f} "
+                f"(entry Rs{entry_premium:.2f}), now back to Rs{current_premium:.2f} -- "
+                "exiting to avoid a profitable trade becoming a loss."
+            )
+            return "EXIT"
+
+        # 5. EMA reversal — VOLATILE-entered positions only (added 2026-07-31).
         # These are crash-catching PE entries (see REGIME_STRATEGY_MAP/
         # live_trading_engine.py._process_signal's VOLATILE gate) opened
         # specifically because EMA20 crossed below EMA50 during a VIX spike.

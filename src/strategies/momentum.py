@@ -44,6 +44,10 @@ class MomentumStrategy(StrategyBase):
         self.stop_loss_pct     = self.parameters.get("stop_loss_pct", 0.50)
         self.target_pct        = self.parameters.get("target_pct", 1.50)
         self.trailing_stop_pct = self.parameters.get("trailing_stop_pct", 0.30)
+        # Once a position has been up at least this much from entry, it must
+        # never be allowed to close as a realized loss -- see manage_position()'s
+        # breakeven-stop check for why trailing_stop_pct alone doesn't guarantee this.
+        self.breakeven_activation_pct = self.parameters.get("breakeven_activation_pct", 0.15)
         self.adx_exit_threshold = self.parameters.get("adx_exit_threshold", 22)
         # Tighter ADX-exhaustion threshold for positions entered during
         # VOLATILE (VIX>20) — added 2026-07-31, see manage_position(). A
@@ -73,6 +77,7 @@ class MomentumStrategy(StrategyBase):
             f"(<{self.adx_exit_threshold_volatile} if VOLATILE-entered) | "
             f"min_EMA_spread={self.min_ema_spread_pct}% | "
             f"SL={self.stop_loss_pct:.0%} TP={self.target_pct:.0%} Trail={self.trailing_stop_pct:.0%} "
+            f"Breakeven activates at +{self.breakeven_activation_pct:.0%} | "
             f"ConfirmBars={self.signal_confirm_bars}"
         )
 
@@ -148,7 +153,9 @@ class MomentumStrategy(StrategyBase):
           1. Hard stop loss     — premium fell >= stop_loss_pct from entry
           2. Profit target      — premium rose >= target_pct from entry
           3. Trailing stop      — premium fell >= trailing_stop_pct from its peak
-          4. Trend exhaustion   — ADX has dropped below adx_exit_threshold, i.e.
+          4. Breakeven stop     — once up >= breakeven_activation_pct from entry,
+                                  never allow a close below entry (see below)
+          5. Trend exhaustion   — ADX has dropped below adx_exit_threshold, i.e.
                                   the established trend that justified entry has
                                   since weakened. Unlike EMA crossover (which
                                   waits for premium-based signals only), this
@@ -186,6 +193,29 @@ class MomentumStrategy(StrategyBase):
                     f"current={current_premium:.2f} ({drawdown_from_peak:.1%} off peak)"
                 )
                 return "EXIT"
+
+        # Breakeven stop (added 2026-08-13) -- trailing_stop_pct above is
+        # scoped to the PEAK premium, not to locked-in profit. For a peak
+        # gain below roughly trailing_stop_pct/(1-trailing_stop_pct) (~43%
+        # at the default 30%), trailing_stop_pct off that peak lands BELOW
+        # the entry price -- meaning a position that was genuinely
+        # profitable at some point could still round-trip all the way into
+        # a realized loss before the trailing stop ever fires. Confirmed
+        # live 2026-08-11: ULTRACEMCO26AUG11920PE peaked at +31.9% (entry
+        # Rs54.04 -> peak Rs71.30) and only exited once it had already
+        # fallen to Rs47.34, a real loss of -Rs335, because the trailing
+        # stop's own 30%-off-peak floor (~Rs49.91) was still below entry.
+        # Once a position has been up at least breakeven_activation_pct
+        # from entry, it must never be allowed to close as a realized loss
+        # -- exit the moment it falls back to entry, regardless of whether
+        # the trailing stop's own (looser) threshold has been reached yet.
+        if peak >= entry_premium * (1 + self.breakeven_activation_pct) and current_premium <= entry_premium:
+            logger.info(
+                f"[{self.name}] Breakeven stop: was up to {peak:.2f} "
+                f"(entry {entry_premium:.2f}), now back to {current_premium:.2f} -- "
+                "exiting to avoid a profitable trade becoming a loss."
+            )
+            return "EXIT"
 
         # VOLATILE-entered positions (see REGIME_STRATEGY_MAP /
         # live_trading_engine.py._process_signal's VOLATILE gate, added

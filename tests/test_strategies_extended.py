@@ -80,6 +80,35 @@ def test_ema_crossover_missing_entry_regime_is_safe_noop():
     assert ema.manage_position(pos, 51.0) == "HOLD"
 
 
+def test_ema_crossover_breakeven_stop_fires_before_trailing_stop_would_have():
+    # Mirrors the momentum_v1 fix -- same structural gap, same fix.
+    # trailing_stop_pct=0.25 here, so the breakeven-crossing drawdown for a
+    # peak of +30% is (100-76.9)/100 = 23.1%, still below the 25% trailing
+    # threshold -- the old code would still be holding at exactly breakeven.
+    ema = EMACrossoverStrategy("ema_test", {})
+    ema.initialize()
+    assert ema.breakeven_activation_pct == 0.15
+
+    entry, peak = 50.0, 65.0  # +30% peak
+    pos = {"avg_price": entry, "peak_premium": peak}
+
+    drawdown_at_breakeven = (peak - entry) / peak
+    assert drawdown_at_breakeven < ema.trailing_stop_pct, (
+        "test invariant: breakeven must be reached before the trailing stop "
+        "would have fired, or this test doesn't actually prove the fix"
+    )
+
+    assert ema.manage_position(pos, entry) == "EXIT"
+
+
+def test_ema_crossover_breakeven_stop_not_active_below_activation_threshold():
+    ema = EMACrossoverStrategy("ema_test", {})
+    ema.initialize()
+    # Peak only +10% above entry -- below the 15% activation floor.
+    pos = {"avg_price": 100.0, "peak_premium": 110.0}
+    assert ema.manage_position(pos, 100.0) == "HOLD"
+
+
 def test_momentum_uses_tighter_adx_exit_threshold_only_when_volatile_entered():
     mom = MomentumStrategy("mom_test", {})
     mom.initialize()
@@ -92,3 +121,57 @@ def test_momentum_uses_tighter_adx_exit_threshold_only_when_volatile_entered():
 
     pos_normal = {"avg_price": 50.0, "peak_premium": 52.0, "current_adx": 25.0, "entry_regime": "TRENDING"}
     assert mom.manage_position(pos_normal, 51.0) == "HOLD"
+
+
+# ── Breakeven stop (2026-08-13) ──────────────────────────────────────────────
+#
+# trailing_stop_pct alone is scoped to the PEAK premium, not to locked-in
+# profit -- for a moderate peak gain, trailing_stop_pct off that peak can
+# land BELOW the entry price, letting a genuinely profitable position
+# round-trip all the way into a realized loss before the trailing stop ever
+# fires. Confirmed live 2026-08-11: ULTRACEMCO26AUG11920PE (momentum_v1)
+# entered at Rs54.04, peaked at Rs71.30 (+31.9%), and only exited once
+# already down to Rs47.34 (-Rs335 loss) because 30% off that peak (~Rs49.91)
+# was still below entry. These tests reproduce those exact numbers.
+
+def test_momentum_breakeven_stop_fires_at_entry_before_trailing_stop_would_have():
+    mom = MomentumStrategy("mom_test", {})
+    mom.initialize()
+    assert mom.breakeven_activation_pct == 0.15
+
+    entry, peak = 54.04, 71.30  # the real ULTRACEMCO fill/peak
+    pos = {"avg_price": entry, "peak_premium": peak}
+
+    # At exactly breakeven, drawdown-from-peak is only ~24.2% -- BELOW the
+    # 30% trailing threshold, so the OLD code would still be holding here.
+    drawdown_at_breakeven = (peak - entry) / peak
+    assert drawdown_at_breakeven < mom.trailing_stop_pct, (
+        "test invariant: breakeven must be reached before the trailing stop "
+        "would have fired, or this test doesn't actually prove the fix"
+    )
+
+    assert mom.manage_position(pos, entry) == "EXIT"
+
+
+def test_momentum_breakeven_stop_not_active_below_activation_threshold():
+    mom = MomentumStrategy("mom_test", {})
+    mom.initialize()
+    # Peak only +10% above entry -- below the 15% activation floor, so a
+    # pullback to entry must NOT trigger the breakeven stop (falls through
+    # to the ordinary trailing-stop/ADX rules instead).
+    pos = {"avg_price": 100.0, "peak_premium": 110.0, "current_adx": 25.0}
+    assert mom.manage_position(pos, 100.0) == "HOLD"
+
+
+def test_momentum_breakeven_stop_does_not_preempt_large_trailing_stop():
+    mom = MomentumStrategy("mom_test", {})
+    mom.initialize()
+    # A large peak (+50%) means the 30%-off-peak trailing floor (Rs105) sits
+    # ABOVE entry (Rs100) -- the ordinary trailing stop protects this case
+    # on its own, exiting well before the position could ever reach a loss.
+    entry, peak = 100.0, 150.0
+    trailing_floor = peak * (1 - mom.trailing_stop_pct)
+    assert trailing_floor > entry, "test invariant: trailing floor must be above entry here"
+
+    pos = {"avg_price": entry, "peak_premium": peak}
+    assert mom.manage_position(pos, trailing_floor) == "EXIT"
