@@ -34,10 +34,12 @@ A lot of severe bugs were found by hand this session. Before trusting real
 money to it, close the loop so the next change can't silently reintroduce
 one of them.
 
-- [ ] Add invariant checks (`scripts/verify_invariants.py`) for the fixes
-      from today specifically — it currently doesn't cover:
-      entry-side fill-vs-quote (credit spread/condor), the cross-strategy
-      contract-collision guard, or the exit-side fill-vs-quote fix.
+- [x] **Done 2026-08-13.** Added 8 invariant checks (`scripts/verify_invariants.py`)
+      covering entry/exit fill-vs-quote pricing, the cross-strategy
+      contract-collision guard, exposure/daily-loss cap wiring, capital-period
+      compounding driving live limits, the Zerodha-sync live-mode gate, stale
+      option-price resolution, and auth self-heal. 21/21 pass against the live
+      server (static + runtime).
 - [ ] Re-run `verify_invariants.py` right before the live-mode flip, not
       just after routine deploys.
 - [ ] Full pass over `_check_spread_exits`/`_check_condor_exits`/
@@ -81,13 +83,15 @@ Current `.env`: `INITIAL_CAPITAL=300000.0`, `MAX_OPEN_POSITIONS=5`,
 
 ## 5. Operational readiness
 
-- [ ] **No MySQL backup strategy currently exists on the server** (checked:
-      no cron jobs, no backup directory). Real trade history and P&L records
-      need a real backup/restore plan before this is real money.
-- [ ] Confirm the notification pipeline (`combo_notifier` → Telegram +
-      email) actually delivers for a real critical alert (kill switch,
-      unwind failure, auth outage) — test end-to-end, not just that
-      `self.notifier.send()` doesn't throw.
+- [x] **Done 2026-08-13.** Daily MySQL backups: `/home/falcon/backup_mysql.sh`
+      via cron at 02:00 UTC (~07:30 IST), 90-day retention, gzip-compressed.
+      Restore-tested end-to-end (dumped, restored into a scratch DB, row
+      counts matched exactly, scratch DB dropped).
+- [x] **Done 2026-08-13.** Notification pipeline tested end-to-end — a real
+      TEST message sent via `ComboNotifier`, confirmed delivered to email
+      (the only channel currently configured; Telegram has no
+      `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` set, so it's a documented no-op,
+      not a silent failure). Decided email-only is sufficient for go-live.
 - [ ] Decide who is "on call" during the first weeks of live trading and
       what the response SLA is for a `CRITICAL` / `MANUAL INTERVENTION
       REQUIRED` alert (several exist in the codebase already, e.g. failed
@@ -110,9 +114,10 @@ Current `.env`: `INITIAL_CAPITAL=300000.0`, `MAX_OPEN_POSITIONS=5`,
 
 ## 7. Go-live mechanics
 
-- [ ] Written rollback plan: if live trading needs to be paused/reverted on
-      day 1, what's the exact sequence (kill switch, `TRADING_MODE=paper`,
-      manual position close)?
+- [x] **Done 2026-08-13.** Written rollback runbook: see
+      [ROLLBACK_RUNBOOK.md](ROLLBACK_RUNBOOK.md) — concrete decision tree and
+      exact commands (pause strategies, close a position, flip out of live
+      mode, full stop), grounded in the real admin endpoints that exist today.
 - [ ] Confirm all currently-open paper positions are cleanly closed (or
       explicitly excluded) before the mode flip — don't want paper and live
       state coexisting in `_active_spreads`/`_active_condors`.
