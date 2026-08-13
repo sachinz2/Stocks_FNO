@@ -175,6 +175,108 @@ def check_expiry_day_journal_logged(repo: Path) -> Result:
     return PASS, name, "Expiry-day journal close logged for both structure types."
 
 
+def check_spread_condor_exit_uses_real_fill(repo: Path) -> Result:
+    name = "Credit-spread/condor EXITS price off the real fill, not the pre-trade quote"
+    src = _read(repo, "src/live_trading/live_trading_engine.py")
+    if 'net_pnl = (\n                (spread["short_premium"] - cur_short)' in src:
+        return FAIL, name, "Found the old quote-based net_pnl calc reintroduced in _check_spread_exits."
+    condor_hits = len(re.findall(r'getattr\(\w+,\s*"fill_price",\s*None\)\s*or\s*cur_\w+', src))
+    if condor_hits < 6:  # 2 spread legs (short/long) + 4 condor legs
+        return FAIL, name, f"Expected 6 fill_price-based exit-price reads total (2 spread + 4 condor legs), found {condor_hits}."
+    return PASS, name, f"Exit pricing reads real fill_price at {condor_hits} leg-exit sites (spread + condor)."
+
+
+def check_spread_condor_entry_uses_real_fill(repo: Path) -> Result:
+    name = "Credit-spread/condor ENTRIES record the real fill, not the pre-trade quote"
+    src = _read(repo, "src/live_trading/live_trading_engine.py")
+    if 'short_fill = float(getattr(short_order, "fill_price", None) or short_p)' not in src:
+        return FAIL, name, "_process_credit_spread no longer reads short_order.fill_price -- short_premium/entry_price would silently revert to the pre-trade quote."
+    if '_fills = {c: float(getattr(o, "fill_price", None) or p) for c, _s, p, _l, o in placed}' not in src:
+        return FAIL, name, "_process_iron_condor no longer builds its per-leg fill map from the placed orders' fill_price."
+    if '"short_premium":  short_fill,' not in src:
+        return FAIL, name, "_active_spreads no longer stores the real fill as short_premium -- live SL/profit-target checks would use the stale quote again."
+    return PASS, name, "Both credit_spread and iron_condor entries store real fill_price-based premiums."
+
+
+def check_cross_strategy_collision_guard(repo: Path) -> Result:
+    name = "Single-leg and spread/condor strategies can't both trade the same underlying at once"
+    src = _read(repo, "src/live_trading/live_trading_engine.py")
+    if "Cross-strategy contract-collision guard" not in src:
+        return FAIL, name, "Guard comment/marker missing -- likely removed."
+    spread_guard = 'any(v.get("underlying") == symbol for v in self._single_leg_journals.values())'
+    reverse_guard = "if symbol in self._active_spreads or symbol in self._active_condors:"
+    if src.count(spread_guard) < 2:  # credit_spread + iron_condor entry
+        return FAIL, name, "Spread/condor entry no longer checks for an existing open single-leg position on the same underlying (both _process_credit_spread and _process_iron_condor need this)."
+    if reverse_guard not in src:
+        return FAIL, name, "Single-leg entry (_process_signal) no longer checks for an existing active spread/condor on the same underlying."
+    return PASS, name, "Guarded both directions: spread/condor vs single-leg."
+
+
+def check_risk_limits_wired_from_settings(repo: Path) -> Result:
+    name = "Exposure/daily-loss caps come from settings (.env), not a disconnected hardcoded literal"
+    rm_src = _read(repo, "src/risk/risk_manager.py")
+    if "max_exposure_per_trade_pct: float = 0.30" not in rm_src:
+        return FAIL, name, "RiskManager.__init__ no longer takes max_exposure_per_trade_pct as a constructor arg -- may have reverted to a hardcoded literal, silently disconnecting settings.MAX_EXPOSURE_PCT again."
+    if "max_daily_loss_pct: float = 0.05" not in rm_src:
+        return FAIL, name, "RiskManager.__init__ no longer takes max_daily_loss_pct as a constructor arg."
+    for path in ("src/api/main.py", "src/api/routers/orders_router.py"):
+        src = _read(repo, path)
+        if "max_exposure_per_trade_pct=settings.MAX_EXPOSURE_PCT" not in src:
+            return FAIL, name, f"{path} no longer passes settings.MAX_EXPOSURE_PCT through to RiskManager."
+        if "max_daily_loss_pct=settings.MAX_DAILY_LOSS_PCT" not in src:
+            return FAIL, name, f"{path} no longer passes settings.MAX_DAILY_LOSS_PCT through to RiskManager."
+    return PASS, name, "Both call sites wire exposure/daily-loss caps from settings."
+
+
+def check_capital_period_compounding_drives_live_limits(repo: Path) -> Result:
+    name = "Expiry-to-expiry capital compounding updates RiskManager's LIVE limits, not just reporting"
+    rm_src = _read(repo, "src/risk/risk_manager.py")
+    if "def set_capital" not in rm_src:
+        return FAIL, name, "RiskManager.set_capital() missing."
+    cp_src = _read(repo, "src/portfolio/capital_periods.py")
+    if "risk_manager.set_capital(float(active.starting_capital))" not in cp_src:
+        return FAIL, name, "rollover_if_needed() no longer calls risk_manager.set_capital() on rollover -- capital periods would go back to reporting-only."
+    if "kwargs={\"risk_manager\": engine.risk_manager}" not in _read(repo, "src/core/scheduler.py"):
+        return FAIL, name, "Daily rollover job no longer passes the live engine's risk_manager through -- set_capital() would never actually be called."
+    return PASS, name, "set_capital() exists, called on rollover, wired to the live risk_manager via the scheduled job."
+
+
+def check_zerodha_sync_gated_to_live_mode(repo: Path) -> Result:
+    name = "Daily Zerodha<->DB sync only runs in TradingMode.LIVE, not whenever a kite client exists"
+    src = _read(repo, "src/api/main.py")
+    if "async def _run_daily_zerodha_sync" not in src:
+        return FAIL, name, "_run_daily_zerodha_sync job missing from main.py."
+    idx = src.index("async def _run_daily_zerodha_sync")
+    job_body = src[idx:idx + 400]
+    if "if mode != TradingMode.LIVE:" not in job_body:
+        return FAIL, name, "Job no longer gates on TradingMode.LIVE -- a real, authenticated kite client is attached even in paper mode (for market data), so without this gate the job would pull the real Zerodha account's orders into the paper-trading DB every morning."
+    return PASS, name, "Job explicitly gated to TradingMode.LIVE."
+
+
+def check_stale_option_price_resolved(repo: Path) -> Result:
+    name = "Option prices trust last_price only if traded today, else fall back to bid/ask"
+    oc_src = _read(repo, "src/market_data/option_chain.py")
+    if "def resolve_reliable_option_price" not in oc_src:
+        return FAIL, name, "resolve_reliable_option_price() missing from option_chain.py."
+    if "last_trade_time.date() == now_ist().date()" not in oc_src and "last_trade_time.date()" not in oc_src:
+        return FAIL, name, "resolve_reliable_option_price() no longer checks last_trade_time against today -- a stale last_price (e.g. weeks old) could be trusted again."
+    poller_src = _read(repo, "src/market_data/zerodha_ltp_poller.py")
+    if "resolve_reliable_option_price" not in poller_src:
+        return FAIL, name, "ZerodhaLTPPoller no longer routes option prices through resolve_reliable_option_price()."
+    return PASS, name, "resolve_reliable_option_price() present and wired into the LTP poller."
+
+
+def check_auth_self_heal_actively_retries(repo: Path) -> Result:
+    name = "Kite auth self-heal actively retries login, not just waits for the 08:30 job"
+    utils_src = _read(repo, "src/core/utils.py")
+    if "def is_auth_retry_window" not in utils_src or "def should_retry_auth" not in utils_src:
+        return FAIL, name, "is_auth_retry_window()/should_retry_auth() missing from core/utils.py."
+    main_src = _read(repo, "src/api/main.py")
+    if "run_daily_auth" not in main_src or "_kite_self_heal" not in main_src:
+        return FAIL, name, "_kite_self_heal no longer references run_daily_auth -- a missed 08:30 job would leave the system with zero live data until the next day again."
+    return PASS, name, "Self-heal has an active-retry path, not just a wait for the next scheduled auth."
+
+
 STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_exit_classification_by_pnl,
     check_capital_allocation_keys,
@@ -185,6 +287,14 @@ STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_kill_switch_has_reset_path,
     check_capital_released_on_ema_exit,
     check_expiry_day_journal_logged,
+    check_spread_condor_exit_uses_real_fill,
+    check_spread_condor_entry_uses_real_fill,
+    check_cross_strategy_collision_guard,
+    check_risk_limits_wired_from_settings,
+    check_capital_period_compounding_drives_live_limits,
+    check_zerodha_sync_gated_to_live_mode,
+    check_stale_option_price_resolved,
+    check_auth_self_heal_actively_retries,
 ]
 
 
