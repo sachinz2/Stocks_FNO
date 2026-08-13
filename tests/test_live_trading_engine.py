@@ -69,6 +69,41 @@ def test_exit_path_quote_pattern_unchanged():
     assert "current_p = _live_p" in src
 
 
+# ── Dead Position-table code removed (2026-08-13) ────────────────────────────
+#
+# update_position_market_price() only ever UPDATED a row matching an already-
+# existing Position DB record -- nothing in the live trading path has ever
+# CREATED one (single-leg entries go through trade_journal, spreads/condors
+# through _active_spreads/_active_condors, neither touches the Position
+# model). Confirmed live: the table's most recent row was last updated
+# 2026-07-24, every row quantity=0. Every call site (a dedicated per-cycle
+# _refresh_all_position_market_prices() plus one inline call in
+# _check_open_option_exits) was therefore doing real work -- a live
+# kite.ltp() API call every single minute in live mode -- to feed a method
+# that silently did nothing. Removed entirely rather than fixed, since the
+# one real consumer of position market prices (dashboard unrealized PnL) was
+# separately fixed to read live engine state instead (see
+# analytics_router.get_pnl_summary).
+
+def test_refresh_all_position_market_prices_removed():
+    assert not hasattr(LiveTradingEngine, "_refresh_all_position_market_prices")
+
+
+def test_run_signal_cycle_no_longer_calls_removed_refresh():
+    src = inspect.getsource(LiveTradingEngine.run_signal_cycle)
+    assert "_refresh_all_position_market_prices" not in src
+
+
+def test_check_open_option_exits_no_longer_calls_dead_portfolio_method():
+    src = inspect.getsource(LiveTradingEngine._check_open_option_exits)
+    assert "update_position_market_price" not in src
+
+
+def test_portfolio_manager_no_longer_has_dead_method():
+    from src.portfolio.portfolio_manager import PortfolioManager
+    assert not hasattr(PortfolioManager, "update_position_market_price")
+
+
 # ── per-position error isolation in _check_open_option_exits (2026-08-13) ───
 #
 # Matches the _square_off_all fix (see test_square_off_one_bad_position_does_

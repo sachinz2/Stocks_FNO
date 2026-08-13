@@ -259,10 +259,6 @@ class LiveTradingEngine:
         positions = await self._safe_get_positions()
         await self._refresh_risk_state(positions)
 
-        # Update market prices for ALL open positions (long AND short legs)
-        # so unrealized PnL reflects reality, not just entry prices.
-        await self._refresh_all_position_market_prices(positions)
-
         # Cancel orders that have been pending > 5 minutes
         await self.order_manager.expire_stale_orders()
 
@@ -1045,90 +1041,6 @@ class LiveTradingEngine:
             # GTT may have already fired (SL hit at exchange level) — not an error
             logger.debug(f"[GTT] Could not cancel #{gtt_id} ({contract}): {e}")
 
-    # ── Market price refresh ──────────────────────────────────────────────────
-
-    async def _refresh_all_position_market_prices(
-        self, positions: List[Dict[str, Any]]
-    ) -> None:
-        """
-        Update market_price and unrealized_pnl for EVERY open position —
-        including short legs of spreads/condors which were previously never updated.
-
-        In live mode: fetches actual LTP from kite.ltp() for all option contracts.
-        In paper mode: estimates premium from ATR, inferring OTM distance from the
-                       entry price relative to the current ATM estimate.
-        """
-        if not positions:
-            return
-
-        expiry = get_near_month_expiry()
-        dte    = max((expiry - now_ist().replace(tzinfo=None)).days, 1)
-
-        # ── Live mode: use actual option LTP from Zerodha ─────────────────────
-        if self._kite:
-            try:
-                import asyncio as _asyncio
-                keys = [f"NFO:{p['symbol']}" for p in positions if p.get("symbol")]
-                if keys:
-                    quotes = await _asyncio.get_running_loop().run_in_executor(
-                        None, self._kite.ltp, keys
-                    )
-                    for pos in positions:
-                        ltp = quotes.get(f"NFO:{pos['symbol']}", {}).get("last_price", 0)
-                        if ltp > 0:
-                            await self.portfolio_manager.update_position_market_price(
-                                pos["symbol"], ltp
-                            )
-                return
-            except Exception as e:
-                logger.debug(f"kite.ltp for open positions failed, falling back to estimate: {e}")
-
-        # ── Paper mode: ATR-based estimate, OTM distance inferred from entry price ──
-        # Build OTM-intervals map from active spread/condor metadata (most accurate)
-        contract_otm: Dict[str, int] = {}
-        for s in self._active_spreads.values():
-            contract_otm[s.get("short_contract", "")] = 1   # short is ~1 interval OTM (~0.20 delta)
-            contract_otm[s.get("long_contract", "")]  = 3   # long is ~3 intervals OTM (~0.10 delta)
-        for c in self._active_condors.values():
-            contract_otm[c.get("put_short_contract",  "")] = 1
-            contract_otm[c.get("put_long_contract",   "")] = 2
-            contract_otm[c.get("call_short_contract", "")] = 1
-            contract_otm[c.get("call_long_contract",  "")] = 2
-
-        for pos in positions:
-            contract = pos.get("symbol", "")
-            qty      = pos.get("quantity", 0)
-            entry_p  = float(pos.get("avg_price") or 0)
-            if qty == 0 or entry_p <= 0:
-                continue
-
-            underlying = self._get_underlying_from_contract(contract)
-            if not underlying:
-                continue
-
-            market_data = await self._get_market_data(underlying)
-            if not market_data:
-                continue
-
-            atr = float(market_data.get("atr14", 0))
-            if atr <= 0:
-                continue
-
-            # Infer OTM distance: compare entry_price vs ATM estimate at entry
-            if contract in contract_otm:
-                otm = contract_otm[contract]
-            else:
-                atm_now = estimate_option_premium(atr, dte, otm_intervals=0)
-                if entry_p < atm_now * 0.55:
-                    otm = 2
-                elif entry_p < atm_now * 0.80:
-                    otm = 1
-                else:
-                    otm = 0
-
-            current_p = estimate_option_premium(atr, dte, otm_intervals=otm)
-            await self.portfolio_manager.update_position_market_price(contract, current_p)
-
     # ── Exit management ───────────────────────────────────────────────────────
 
     async def _check_open_option_exits(
@@ -1183,7 +1095,6 @@ class LiveTradingEngine:
                     current_p = estimate_option_premium(atr, dte)
                 else:
                     current_p = entry_p
-                await self.portfolio_manager.update_position_market_price(contract, current_p)
 
                 peak = self._peak_premiums.get(contract, entry_p)
                 if current_p > peak:

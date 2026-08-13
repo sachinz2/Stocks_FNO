@@ -25,34 +25,6 @@ class PortfolioManager:
         self.position_repo = position_repo
         self.stock_repo = stock_repo
 
-    async def update_position_market_price(
-        self, contract: str, market_price: float
-    ) -> None:
-        """
-        Update market_price and unrealized_pnl for an option contract in the DB.
-        Called by the engine every cycle after estimating the current option premium.
-
-        For long positions (qty > 0):  unrealized = (market_price - avg_price) × qty
-        For short positions (qty < 0): unrealized = (market_price - avg_price) × qty
-                                      (negative qty makes this profit when price falls)
-        """
-        try:
-            all_positions = await self.position_repo.get_all()
-            for pos in all_positions:
-                if pos.symbol != contract or pos.quantity == 0 or pos.deleted_at is not None:
-                    continue
-                avg_price = float(pos.avg_price or 0)
-                qty = pos.quantity
-                unrealized_pnl = (market_price - avg_price) * qty
-                await self.position_repo.update(pos, {
-                    "market_price": market_price,
-                    "unrealized_pnl": unrealized_pnl,
-                    "updated_at": datetime.utcnow(),
-                })
-                break
-        except Exception as e:
-            logger.error(f"Failed to update market price for {contract}: {e}")
-
     async def calculate_pnl(
         self, current_market_prices: Dict[str, float]
     ) -> Dict[str, float]:
