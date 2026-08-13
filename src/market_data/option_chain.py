@@ -257,6 +257,57 @@ async def get_real_contract(
         return None
 
 
+def resolve_reliable_option_price(quote: Dict) -> Optional[float]:
+    """
+    Given one symbol's raw kite.quote() response dict, return a price we can
+    actually trust as the current tradeable value -- or None if nothing
+    reliable is available (caller should fall back to the ATR/Black-Scholes
+    estimate already used everywhere get_option_quote() can return None).
+
+    Zerodha's last_price is the LAST TRADED price -- for an option contract
+    nobody's traded in a while, that can be badly stale while still being
+    returned as if current. Confirmed live 2026-08-13: TITAN26SEP4650PE's
+    last_price was frozen at Rs82 (its last_trade_time was 2026-07-29, two
+    weeks earlier) with zero bids and zero volume that day, while the
+    visible ask side (from Rs34.80) showed the real, current, tradeable
+    value was far lower. Both the dashboard's displayed PnL and
+    credit_spread_v1/iron_condor_v1's own profit-target/stop-loss exit
+    checks read this same price, so a stale one isn't just cosmetic -- it
+    can make a strategy's exit logic completely blind to a position's real
+    current value.
+
+    Trusts last_price directly if the contract genuinely traded TODAY.
+    Otherwise prefers the live order book: bid/ask midpoint if both sides
+    have real (non-zero) depth, whichever single side is present if only
+    one does. Returns None only when there's no reliable signal at all.
+    """
+    from src.core.utils import now_ist
+
+    last_price = quote.get("last_price")
+    last_trade_time = quote.get("last_trade_time")
+    traded_today = False
+    if last_trade_time is not None:
+        try:
+            ltt_date = last_trade_time.date() if hasattr(last_trade_time, "date") else None
+            traded_today = ltt_date == now_ist().date()
+        except Exception:
+            traded_today = False
+
+    if traded_today and last_price and float(last_price) > 0:
+        return float(last_price)
+
+    depth = quote.get("depth") or {}
+    best_bid = next((lvl["price"] for lvl in depth.get("buy", []) if lvl.get("price", 0) > 0), None)
+    best_ask = next((lvl["price"] for lvl in depth.get("sell", []) if lvl.get("price", 0) > 0), None)
+    if best_bid and best_ask:
+        return round((best_bid + best_ask) / 2, 2)
+    if best_bid:
+        return float(best_bid)
+    if best_ask:
+        return float(best_ask)
+    return None
+
+
 # ── Real option quotes ────────────────────────────────────────────────────────
 
 async def get_option_quote(contract: str, kite, redis) -> Optional[float]:

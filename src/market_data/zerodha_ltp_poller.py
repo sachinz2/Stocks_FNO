@@ -155,19 +155,33 @@ class ZerodhaLTPPoller:
                 logger.debug(f"ZerodhaLTPPoller: Redis write failed [{symbol}]: {e}")
 
         # ── Active option contracts — polled every 5 s once a position is open ──
+        # Fixed 2026-08-13: was kite.ltp() (last-traded-price only, no way to
+        # tell if that trade was seconds or weeks ago). Confirmed live:
+        # TITAN26SEP4650PE's last_price sat frozen at Rs82 (last actually
+        # traded 2026-07-29, two weeks earlier) while the real, current,
+        # tradeable price -- visible only in the order book -- was far
+        # lower. This feeds both the dashboard's displayed PnL AND
+        # credit_spread_v1/iron_condor_v1's own profit-target/stop-loss exit
+        # checks, so a stale price here isn't cosmetic -- it can make a
+        # strategy's exit logic blind to a position's real value. kite.quote()
+        # returns last_trade_time + order book depth so staleness can
+        # actually be detected; only used for the small, bounded set of
+        # currently-open positions (not all 40+ underlyings above), so the
+        # heavier call is not a rate-limit concern.
         if self._option_instruments:
             try:
+                from src.market_data.option_chain import resolve_reliable_option_price
                 opt_quotes = await loop.run_in_executor(
-                    None, self._kite.ltp, list(self._option_instruments)
+                    None, self._kite.quote, list(self._option_instruments)
                 )
                 for nfo_key, data in opt_quotes.items():
-                    ltp = data.get("last_price", 0)
-                    if ltp <= 0:
+                    price = resolve_reliable_option_price(data)
+                    if not price or price <= 0:
                         continue
                     contract = nfo_key.removeprefix(_NFO_PREFIX)
                     await self._redis.set(
                         f"{REDIS_OPTLTP_PREFIX}{contract}",
-                        str(ltp),
+                        str(price),
                         ex=15,   # 15-second TTL — auto-expire stale data
                     )
                     updated += 1
