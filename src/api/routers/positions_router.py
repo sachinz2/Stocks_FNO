@@ -78,26 +78,35 @@ async def _positions_from_engine(engine, kite, redis) -> list:
       BUY  leg (qty > 0): profit when current price rises above entry
     """
     # Collect every contract in one pass so we can batch the Zerodha LTP fetch
-    all_legs: list = []  # (contract, signed_qty, entry_price)
+    all_legs: list = []  # (contract, signed_qty, entry_price, group_id, structure_type)
 
+    # Fixed 2026-08-13: group_id/structure_type let the dashboard group legs
+    # by the SAME structure the engine actually tracks them under, instead of
+    # a same-underlying + has-short-and-long heuristic. That heuristic could
+    # misattribute an unrelated standalone single-leg position (ema_crossover_v1/
+    # momentum_v1) into a credit_spread_v1/iron_condor_v1 structure's group
+    # whenever both happen to be open on the same underlying at once --
+    # entirely plausible since both trade from the same 41-symbol F&O universe.
     for sym, spread in engine._active_spreads.items():
         lot = spread.get("lot_size", 0)
         if not lot:
             continue
+        group_id = f"spread:{sym}"
         all_legs += [
-            (spread.get("short_contract", ""), -lot, spread.get("short_premium", 0.0)),
-            (spread.get("long_contract",  ""),  lot, spread.get("long_premium",  0.0)),
+            (spread.get("short_contract", ""), -lot, spread.get("short_premium", 0.0), group_id, "credit_spread"),
+            (spread.get("long_contract",  ""),  lot, spread.get("long_premium",  0.0), group_id, "credit_spread"),
         ]
 
     for sym, cond in engine._active_condors.items():
         lot = cond.get("lot_size", 0)
         if not lot:
             continue
+        group_id = f"condor:{sym}"
         all_legs += [
-            (cond.get("put_short_contract",  ""), -lot, cond.get("put_short_premium",  0.0)),
-            (cond.get("put_long_contract",   ""),  lot, cond.get("put_long_premium",   0.0)),
-            (cond.get("call_short_contract", ""), -lot, cond.get("call_short_premium", 0.0)),
-            (cond.get("call_long_contract",  ""),  lot, cond.get("call_long_premium",  0.0)),
+            (cond.get("put_short_contract",  ""), -lot, cond.get("put_short_premium",  0.0), group_id, "iron_condor"),
+            (cond.get("put_long_contract",   ""),  lot, cond.get("put_long_premium",   0.0), group_id, "iron_condor"),
+            (cond.get("call_short_contract", ""), -lot, cond.get("call_short_premium", 0.0), group_id, "iron_condor"),
+            (cond.get("call_long_contract",  ""),  lot, cond.get("call_long_premium",  0.0), group_id, "iron_condor"),
         ]
 
     # Single-leg positions (ema_crossover_v1, momentum_v1) live in
@@ -106,6 +115,7 @@ async def _positions_from_engine(engine, kite, redis) -> list:
     # though they were correctly persisted to trade_journal. The journal only
     # stores journal_id/strategy/regime (not price/qty), so look those up from
     # trade_journal directly, keyed by the journal_id already on hand.
+    # group_id=None -- standalone, never merged with any spread/condor group.
     single_leg_items = [(c, info) for c, info in engine._single_leg_journals.items() if c]
     if single_leg_items:
         journal_repo = BaseRepository(TradeJournal, AsyncSessionLocal)
@@ -115,13 +125,13 @@ async def _positions_from_engine(engine, kite, redis) -> list:
         for (contract, _info), journal in zip(single_leg_items, journals):
             if journal is None or journal.entry_price is None:
                 continue
-            all_legs.append((contract, journal.quantity or 0, float(journal.entry_price)))
+            all_legs.append((contract, journal.quantity or 0, float(journal.entry_price), None, "single_leg"))
 
-    contracts = [c for c, _, _ in all_legs if c]
+    contracts = [c for c, _, _, _, _ in all_legs if c]
     prices    = await _fetch_market_prices(contracts, kite, redis)
 
     rows = []
-    for contract, qty, entry in all_legs:
+    for contract, qty, entry, group_id, structure_type in all_legs:
         if not contract:
             continue
         entry  = round(float(entry), 2)
@@ -134,6 +144,8 @@ async def _positions_from_engine(engine, kite, redis) -> list:
             "market_price":   mkt,
             "unrealized_pnl": unreal,
             "realized_pnl":   0.0,
+            "group_id":       group_id,
+            "structure_type": structure_type,
         })
     return rows
 
@@ -166,6 +178,8 @@ async def get_positions(request: Request):
                 "market_price":   float(p.market_price)   if p.market_price   else 0,
                 "unrealized_pnl": float(p.unrealized_pnl) if p.unrealized_pnl else 0,
                 "realized_pnl":   float(p.realized_pnl)   if p.realized_pnl   else 0,
+                "group_id":       None,
+                "structure_type": None,
             }
             for p in positions
             if p.deleted_at is None and p.quantity != 0

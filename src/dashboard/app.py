@@ -172,14 +172,18 @@ elif page == "Positions":
     if not positions:
         st.info("No open positions.")
     else:
-        # Try to identify multi-leg groups from position contracts
-        # A contract is a spread/condor leg if there is another contract with the same underlying
-        # and opposite qty sign (short + long pair)
-        # A contract like RELIANCE25JUN2850CE → underlying = RELIANCE. Uses the same
-        # FNO_SYMBOLS list the engine actually trades — a separate hand-maintained copy
-        # used to live here and had drifted (missing BHARTIARTL/APOLLOHOSP, and included
-        # several symbols — TATAMOTORS, ADANIENT, BAJAJFINSV, etc. — that aren't in the
-        # live-traded universe), which silently broke multi-leg grouping for those symbols.
+        # Group by the backend's own group_id (added 2026-08-13) -- the engine
+        # already knows exactly which legs belong to which _active_spreads/
+        # _active_condors structure, so use that directly instead of guessing
+        # from same-underlying + has-short-and-long-leg. That heuristic could
+        # misattribute an unrelated standalone single-leg position
+        # (ema_crossover_v1/momentum_v1) into a credit_spread_v1/
+        # iron_condor_v1 structure's group whenever both happened to be open
+        # on the same underlying at once -- entirely plausible since both
+        # trade from the same 41-symbol F&O universe, and would silently
+        # distort "Net structure PnL" by folding in an unrelated position's
+        # PnL. group_id is None for single-leg / fallback-path positions,
+        # which always go to standalone, never merged into a group.
         _UND_BY_LEN = sorted(FNO_SYMBOLS, key=len, reverse=True)
 
         def _extract_underlying(contract: str) -> str:
@@ -188,22 +192,19 @@ elif page == "Positions":
                     return u
             return contract[:10]
 
-        by_underlying: dict = {}
-        for p in positions:
-            sym = p.get("symbol", "")
-            underlying = _extract_underlying(sym)
-            by_underlying.setdefault(underlying, []).append(p)
-
-        # Identify grouped multi-leg structures
-        multi_leg_groups: list = []
+        by_group: dict = {}
         standalone: list = []
-        for underlying, legs in by_underlying.items():
-            has_short = any(l.get("quantity", 0) < 0 for l in legs)
-            has_long = any(l.get("quantity", 0) > 0 for l in legs)
-            if has_short and has_long and len(legs) >= 2:
-                multi_leg_groups.append((underlying, legs))
+        for p in positions:
+            gid = p.get("group_id")
+            if gid:
+                by_group.setdefault(gid, []).append(p)
             else:
-                standalone.extend(legs)
+                standalone.append(p)
+
+        multi_leg_groups = [
+            (_extract_underlying(legs[0].get("symbol", "")), legs)
+            for legs in by_group.values()
+        ]
 
         if multi_leg_groups:
             st.subheader("Multi-Leg Structures (Spreads / Condors)")

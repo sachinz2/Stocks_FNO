@@ -495,7 +495,7 @@ async def run_robustness_check(
 
 
 @router.get("/pnl-summary")
-async def get_pnl_summary():
+async def get_pnl_summary(request: Request):
     """
     Combined PnL summary for the dashboard.
 
@@ -503,11 +503,18 @@ async def get_pnl_summary():
     Total PnL  = all closed trade PnL (all time) + open position unrealized PnL
     """
     try:
-        from datetime import date as _date
-        from src.database.models.position import Position
-        from src.database.repositories.base import BaseRepository
+        from src.core.utils import now_ist
 
-        today_str = _date.today().isoformat()
+        # Fixed 2026-08-13: "today" must be the IST calendar date, not the
+        # container's system-local date (UTC -- confirmed via `date -u` on
+        # the API container). NSE trading hours (09:15-15:30 IST = 03:45-
+        # 10:00 UTC) happen to fall on the same UTC calendar day as IST, so
+        # this was masked during market hours, but the two dates diverge for
+        # the entire 00:00-05:29 IST window every day, matching the exact
+        # same "used a naive/wrong timezone" bug class already found and
+        # fixed multiple times elsewhere in this project (order timestamps,
+        # regime timestamps).
+        today_str = now_ist().date().isoformat()
 
         # ── Closed trades ────────────────────────────────────────────────────
         all_closed = await _get_closed_trades()
@@ -521,10 +528,24 @@ async def get_pnl_summary():
         today_realized = round(sum(float(t.pnl or 0) for t in today_closed), 2)
 
         # ── Open positions (unrealized) ──────────────────────────────────────
-        pos_repo = BaseRepository(Position, AsyncSessionLocal)
-        positions = await pos_repo.get_all()
-        open_positions = [p for p in positions if p.deleted_at is None and p.quantity != 0]
-        total_unrealized = round(sum(float(p.unrealized_pnl or 0) for p in open_positions), 2)
+        # Fixed 2026-08-13: was reading the MySQL `positions` table, which
+        # nothing in the live trading path actually keeps current -- its most
+        # recent row was last updated 2026-07-24, and every row has
+        # quantity=0 (see positions_router.py's own "legacy -- engine never
+        # writes here" comment on its fallback path). This meant
+        # total_unrealized/today_unrealized were silently always 0, missing
+        # every currently-open position's real unrealized PnL entirely.
+        # Reuse the exact same live-engine-state helper /positions uses.
+        from src.api.routers.positions_router import _positions_from_engine
+        engine = getattr(request.app.state, "trading_engine", None)
+        if engine is not None:
+            redis = getattr(request.app.state, "redis", None)
+            kite  = getattr(request.app.state, "kite",  None)
+            live_positions = await _positions_from_engine(engine, kite, redis)
+        else:
+            live_positions = []
+        open_positions = [p for p in live_positions if p.get("quantity", 0) != 0]
+        total_unrealized = round(sum(float(p.get("unrealized_pnl") or 0) for p in open_positions), 2)
 
         return {
             "today_realized":   today_realized,

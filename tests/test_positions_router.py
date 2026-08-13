@@ -103,3 +103,75 @@ async def test_positions_from_engine_includes_single_leg_positions(positions_rou
     powergrid = next(r for r in rows if r["symbol"] == "POWERGRID26AUG270PE")
     assert powergrid["quantity"] == 1900
     assert powergrid["avg_price"] == 4.95
+
+
+# ── group_id/structure_type (2026-08-13) ─────────────────────────────────────
+#
+# The dashboard used to group legs by "same underlying + has both a short and
+# a long leg" -- a heuristic that misattributes a standalone single-leg
+# position into a credit_spread_v1/iron_condor_v1 group whenever both happen
+# to be open on the same underlying (both trade from the same 41-symbol F&O
+# universe, so this is entirely plausible). The engine already knows exactly
+# which legs belong to which structure -- expose that directly instead.
+
+class _FakeMultiStructureEngine:
+    _active_spreads = {
+        "BAJFINANCE": {
+            "short_contract": "BAJFINANCE26SEP1160CE", "long_contract": "BAJFINANCE26SEP1190CE",
+            "short_premium": 18.59, "long_premium": 10.46, "lot_size": 750,
+        },
+    }
+    _active_condors = {
+        "TITAN": {
+            "put_short_contract": "TITAN26SEP4650PE", "put_long_contract": "TITAN26SEP4400PE",
+            "call_short_contract": "TITAN26SEP5100CE", "call_long_contract": "TITAN26SEP5300CE",
+            "put_short_premium": 82.0, "put_long_premium": 13.0,
+            "call_short_premium": 45.0, "call_long_premium": 8.0,
+            "lot_size": 175,
+        },
+    }
+    # A standalone single-leg BUY on BAJFINANCE -- same underlying as the
+    # active credit spread above. Must NOT be folded into that spread's group.
+    # journal_id=154 reuses _FakeJournalRepo's existing fixture entry.
+    _single_leg_journals = {
+        "BAJFINANCE26SEP1200CE": {"journal_id": 154, "strategy_name": "momentum_v1"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_spread_legs_share_a_group_id(positions_router):
+    positions_router.BaseRepository = _FakeJournalRepo
+    rows = await positions_router._positions_from_engine(_FakeMultiStructureEngine(), kite=None, redis=None)
+
+    short_leg = next(r for r in rows if r["symbol"] == "BAJFINANCE26SEP1160CE")
+    long_leg  = next(r for r in rows if r["symbol"] == "BAJFINANCE26SEP1190CE")
+    assert short_leg["group_id"] == long_leg["group_id"]
+    assert short_leg["group_id"] == "spread:BAJFINANCE"
+    assert short_leg["structure_type"] == "credit_spread"
+
+
+@pytest.mark.asyncio
+async def test_condor_legs_share_a_group_id_distinct_from_spread(positions_router):
+    positions_router.BaseRepository = _FakeJournalRepo
+    rows = await positions_router._positions_from_engine(_FakeMultiStructureEngine(), kite=None, redis=None)
+
+    condor_legs = [r for r in rows if r["structure_type"] == "iron_condor"]
+    assert len(condor_legs) == 4
+    group_ids = {r["group_id"] for r in condor_legs}
+    assert group_ids == {"condor:TITAN"}
+
+
+@pytest.mark.asyncio
+async def test_standalone_single_leg_on_same_underlying_as_spread_is_not_grouped(positions_router):
+    # The regression this was built to catch: BAJFINANCE has BOTH an active
+    # credit spread AND an unrelated standalone single-leg position. The
+    # single-leg position must have group_id=None, never the spread's group_id.
+    positions_router.BaseRepository = _FakeJournalRepo
+    rows = await positions_router._positions_from_engine(_FakeMultiStructureEngine(), kite=None, redis=None)
+
+    standalone = next(r for r in rows if r["symbol"] == "BAJFINANCE26SEP1200CE")
+    assert standalone["group_id"] is None
+    assert standalone["structure_type"] == "single_leg"
+
+    spread_leg = next(r for r in rows if r["symbol"] == "BAJFINANCE26SEP1160CE")
+    assert spread_leg["group_id"] != standalone["group_id"]
