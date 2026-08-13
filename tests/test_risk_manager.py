@@ -23,10 +23,70 @@ def test_validate_trade_max_exposure_violation(risk_manager):
 def test_validate_trade_max_daily_loss_violation(risk_manager):
     # Max loss is 5% of 100k = -5000
     risk_manager.update_state([], -6000.0, 0.0) # We are down 6k today
-    
+
     passed = risk_manager.validate_trade("RELIANCE", "BUY", 10, 100.0)
     assert passed is False
     assert risk_manager.rules["kill_switch_active"] is True
+
+
+# ── max_exposure_per_trade_pct is a real constructor param (2026-08-13) ────
+#
+# This was a hardcoded 0.20 literal inside __init__, completely disconnected
+# from settings.MAX_EXPOSURE_PCT (.env) -- changing the .env value silently
+# did nothing, same class of dead-config gap found elsewhere this session.
+# Now a constructor arg, same pattern as initial_capital already was.
+
+def test_max_exposure_defaults_to_30_pct():
+    rm = RiskManager(initial_capital=100_000.0)
+    assert rm.rules["max_exposure_per_trade_pct"] == 0.30
+    rm.update_state([], 0.0, 0.0)
+    # 25,000 = 25% of 100k -- under the 30% default cap, must pass.
+    assert rm.validate_trade("RELIANCE", "BUY", 25, 1000.0) is True
+    # 35,000 = 35% of 100k -- over the 30% default cap, must fail.
+    assert rm.validate_trade("RELIANCE", "BUY", 35, 1000.0) is False
+
+
+def test_max_exposure_pct_is_configurable():
+    rm = RiskManager(initial_capital=100_000.0, max_exposure_per_trade_pct=0.10)
+    assert rm.rules["max_exposure_per_trade_pct"] == 0.10
+    rm.update_state([], 0.0, 0.0)
+    # 15,000 = 15% of 100k -- over a configured 10% cap, must fail.
+    assert rm.validate_trade("RELIANCE", "BUY", 15, 1000.0) is False
+
+
+def test_main_and_orders_router_wire_exposure_pct_from_settings():
+    import inspect
+    from src.api import main as main_module
+    from src.api.routers import orders_router as orders_router_module
+
+    main_src = inspect.getsource(main_module)
+    assert "max_exposure_per_trade_pct=settings.MAX_EXPOSURE_PCT" in main_src
+
+    orders_src = inspect.getsource(orders_router_module)
+    assert "max_exposure_per_trade_pct=settings.MAX_EXPOSURE_PCT" in orders_src
+    assert "max_daily_loss_pct=settings.MAX_DAILY_LOSS_PCT" in main_src
+    assert "max_daily_loss_pct=settings.MAX_DAILY_LOSS_PCT" in orders_src
+
+
+def test_max_daily_loss_pct_is_configurable():
+    rm = RiskManager(initial_capital=100_000.0, max_daily_loss_pct=0.02)
+    assert rm.rules["max_daily_loss_pct"] == 0.02
+    # Max loss is 2% of 100k = -2000; down 2500 must trip it.
+    rm.update_state([], -2500.0, 0.0)
+    assert rm.validate_trade("RELIANCE", "BUY", 1, 100.0) is False
+    assert rm.rules["kill_switch_active"] is True
+
+
+def test_risk_manager_set_capital_updates_live_limits():
+    rm = RiskManager(initial_capital=100_000.0, max_exposure_per_trade_pct=0.30)
+    rm.update_state([], 0.0, 0.0)
+    # 40,000 = 40% of 100k -- over the 30% cap on the original capital.
+    assert rm.validate_trade("RELIANCE", "BUY", 40, 1000.0) is False
+
+    rm.set_capital(200_000.0)
+    assert rm.initial_capital == 200_000.0
+    # Same 40,000 trade is now only 20% of the new (compounded) capital.
+    assert rm.validate_trade("RELIANCE", "BUY", 40, 1000.0) is True
 
 def test_validate_trade_max_positions_violation(risk_manager):
     # Fixed 2026-08-07: was hardcoded to 5 -- the real configured limit is

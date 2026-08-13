@@ -112,7 +112,31 @@ def schedule_trading_jobs(engine) -> None:
         replace_existing=True,
     )
 
+    # Capital period rollover — 08:00 IST, Mon–Fri (before market open at 09:15
+    # and before the day's first signal cycle), so any expiry that passed
+    # closes out and compounds into the new period's starting_capital before
+    # anything gets sized against it. rollover_if_needed() is idempotent —
+    # a no-op on every day that isn't the day after an expiry.
+    scheduler.add_job(
+        _run_capital_period_rollover,
+        CronTrigger(hour=8, minute=0, day_of_week="mon-fri", timezone="Asia/Kolkata"),
+        id="capital_period_rollover",
+        name="Capital Period Rollover",
+        replace_existing=True,
+        kwargs={"risk_manager": engine.risk_manager},
+    )
+
     logger.info("All trading jobs scheduled.")
+
+
+async def _run_capital_period_rollover(risk_manager) -> None:
+    from src.core.config import settings
+    from src.database.connection import AsyncSessionLocal
+    from src.portfolio.capital_periods import rollover_if_needed
+    try:
+        await rollover_if_needed(AsyncSessionLocal, settings.INITIAL_CAPITAL, risk_manager=risk_manager)
+    except Exception as exc:
+        logger.error(f"[CapitalPeriod] Rollover check failed: {exc}")
 
 
 def schedule_zerodha_auth():

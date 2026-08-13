@@ -10,8 +10,10 @@ from src.database.models.position import Position
 from src.database.models.trade import Trade
 from src.database.models.audit import AuditLog
 from src.database.models.trade_journal import TradeJournal
+from src.database.models.capital_period import CapitalPeriod
 
 __all__ = [
     "Base", "Stock", "Instrument", "OHLCData", "Indicator",
     "Signal", "Order", "Position", "Trade", "AuditLog", "TradeJournal",
+    "CapitalPeriod",
 ]

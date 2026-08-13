@@ -8,14 +8,19 @@ from src.database.repositories.base import BaseRepository
 from src.orders.order_manager import OrderManager
 from src.paper_trading.paper_broker import PaperBroker
 from src.risk.risk_manager import RiskManager
+from src.core.config import settings
 import logging
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/orders", tags=["Orders"])
 
-_paper_broker = PaperBroker(initial_balance=300000.0)
-_risk_manager = RiskManager(initial_capital=300000.0)
+_paper_broker = PaperBroker(initial_balance=settings.INITIAL_CAPITAL)
+_risk_manager = RiskManager(
+    initial_capital=settings.INITIAL_CAPITAL,
+    max_exposure_per_trade_pct=settings.MAX_EXPOSURE_PCT,
+    max_daily_loss_pct=settings.MAX_DAILY_LOSS_PCT,
+)
 
 
 @router.get("")

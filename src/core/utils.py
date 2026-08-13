@@ -172,6 +172,37 @@ def get_entry_expiry(min_dte: int) -> datetime:
     return expiry
 
 
+def get_capital_period_bounds(for_date) -> "tuple[date, date]":
+    """
+    Return (period_start, period_end) for the expiry-to-expiry capital
+    "month" containing for_date, using the same monthly expiry weekday
+    (_last_expiry_weekday) the strategies already use for DTE/rollover.
+
+    period_end is the monthly expiry on or after for_date (a trade closing
+    ON expiry day still belongs to the ending period, not the next one).
+    period_start is the day after the PRIOR month's expiry -- a fresh
+    position entered the day after expiry belongs to the new capital cycle.
+    """
+    d = for_date.date() if isinstance(for_date, datetime) else for_date
+
+    y, m = d.year, d.month
+    period_end = _last_expiry_weekday(y, m).date()
+    if period_end < d:
+        if m == 12:
+            y, m = y + 1, 1
+        else:
+            m += 1
+        period_end = _last_expiry_weekday(y, m).date()
+
+    if m == 1:
+        py, pm = y - 1, 12
+    else:
+        py, pm = y, m - 1
+    period_start = _last_expiry_weekday(py, pm).date() + timedelta(days=1)
+
+    return period_start, period_end
+
+
 def build_option_symbol(symbol: str, strike: float, option_type: str, expiry: datetime = None) -> str:
     """
     Build the NSE/Zerodha tradingsymbol for a stock option.

@@ -458,6 +458,8 @@ elif page == "Risk & PnL":
     positions  = fetch("positions") or []
     orders     = fetch("orders") or []
     pnl_data   = fetch("analytics/pnl-summary") or {}
+    capital_periods = (fetch("analytics/capital-periods") or {}).get("periods", [])
+    active_period = next((p for p in capital_periods if not p.get("closed")), None)
 
     today_pnl       = pnl_data.get("today_pnl", 0)
     today_realized  = pnl_data.get("today_realized", 0)
@@ -465,7 +467,9 @@ elif page == "Risk & PnL":
     total_pnl       = pnl_data.get("total_pnl", 0)
     total_realized  = pnl_data.get("total_realized", 0)
     total_unrealized= pnl_data.get("total_unrealized", 0)
-    capital = INITIAL_CAPITAL
+    # Compounding capital (current expiry-to-expiry period), falls back to
+    # the static .env value before the first period has been bootstrapped.
+    capital = active_period.get("capital_now") if active_period else INITIAL_CAPITAL
     max_loss_limit = capital * MAX_DAILY_LOSS_PCT
 
     # ── Today's PnL ─────────────────────────────────────────────────────────
@@ -488,13 +492,48 @@ elif page == "Risk & PnL":
     c2.metric("Total Realized", fmt_inr(total_realized),
               f"{pnl_data.get('closed_trades_total', 0)} closed trades")
     c3.metric("Unrealized",     fmt_inr(total_unrealized))
-    c4.metric("Capital",        fmt_inr(capital))
+    c4.metric("Capital",        fmt_inr(capital),
+              "current period, compounding" if active_period else "static .env value")
+
+    st.markdown("---")
+
+    # ── Monthly P&L (expiry-to-expiry) ─────────────────────────────────────
+    st.subheader("Monthly P&L (Expiry-to-Expiry)")
+    st.caption(
+        "Each “month” is one NSE F&O expiry cycle, not a calendar month. "
+        "A closed period's ending capital becomes the next period's starting "
+        "capital — profits/losses compound."
+    )
+    if capital_periods:
+        rows = []
+        for p in reversed(capital_periods):
+            row = {
+                "Period":            f"{p['period_start']} → {p['period_end']}",
+                "Starting Capital":  fmt_inr(p["starting_capital"]),
+                "Status":            "Open" if not p["closed"] else "Closed",
+            }
+            if p["closed"]:
+                row["Realized PnL"]  = fmt_inr(p["realized_pnl"])
+                row["Ending Capital"] = fmt_inr(p["ending_capital"])
+            else:
+                row["Realized PnL"]  = fmt_inr(p.get("realized_pnl_so_far", 0)) + " (so far)"
+                row["Ending Capital"] = fmt_inr(p.get("capital_now", p["starting_capital"])) + " (running)"
+            rows.append(row)
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("No capital periods recorded yet.")
 
     st.markdown("---")
     st.subheader("Risk Limits")
 
     open_pos = len([p for p in positions if p.get("quantity", 0) != 0])
     capital_deployed = sum(abs(p.get("quantity", 0)) * p.get("avg_price", 0) for p in positions)
+    capital_left = capital - capital_deployed
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Capital in Use", fmt_inr(capital_deployed))
+    c2.metric("Capital Left",   fmt_inr(capital_left))
+    c3.metric("Utilization",    f"{(capital_deployed / capital * 100):.1f}%" if capital else "0%")
 
     col1, col2 = st.columns(2)
     pos_ratio = min(1.0, open_pos / MAX_OPEN_POSITIONS) if MAX_OPEN_POSITIONS > 0 else 0.0

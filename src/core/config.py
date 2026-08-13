@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     INITIAL_CAPITAL: float = 300000.0
     MAX_OPEN_POSITIONS: int = 5
     MAX_DAILY_LOSS_PCT: float = 0.05
-    MAX_EXPOSURE_PCT: float = 0.20
+    MAX_EXPOSURE_PCT: float = 0.30
     TRADING_MODE: str = "paper"  # paper | live
 
     # Dashboard

@@ -29,13 +29,32 @@ class RiskManager:
     legs 2-4 of multi-leg strategies (the first leg still goes through all checks).
     """
 
-    def __init__(self, initial_capital: float = 300_000.0):
+    def __init__(
+        self, initial_capital: float = 300_000.0,
+        max_exposure_per_trade_pct: float = 0.30,
+        max_daily_loss_pct: float = 0.05,
+    ):
         self.initial_capital = initial_capital
 
         self.rules = {
-            "max_daily_loss_pct":        0.05,
+            # Fixed 2026-08-13: max_daily_loss_pct/max_exposure_per_trade_pct
+            # were hardcoded literals, completely disconnected from
+            # settings.MAX_DAILY_LOSS_PCT/MAX_EXPOSURE_PCT (.env) -- changing
+            # the .env value silently did nothing. Now constructor args, same
+            # pattern as initial_capital already was.
+            #
+            # max_open_positions is DELIBERATELY still hardcoded, not wired
+            # to settings.MAX_OPEN_POSITIONS -- that .env value (5) and this
+            # 25 aren't the same unit: this counts individual legs/orders
+            # (25 accommodates ~6 four-leg iron condors), while
+            # MAX_OPEN_POSITIONS reads like a "max concurrent structures"
+            # figure. Wiring them together as-is would silently cut real
+            # trading capacity roughly 5x -- needs a deliberate decision on
+            # what MAX_OPEN_POSITIONS is actually meant to mean, not a
+            # find-and-replace.
+            "max_daily_loss_pct":        max_daily_loss_pct,
             "max_open_positions":         25,
-            "max_exposure_per_trade_pct": 0.20,
+            "max_exposure_per_trade_pct": max_exposure_per_trade_pct,
             "circuit_breaker_active":     False,
             "kill_switch_active":         False,
         }
@@ -94,6 +113,18 @@ class RiskManager:
         self.rules["kill_switch_active"] = False
         self.kill_switch_reason = None
         self.kill_switch_activated_at = None
+
+    def set_capital(self, new_capital: float) -> None:
+        """
+        Update the capital base used by every %-of-capital risk check
+        (daily-loss limit, per-strategy budget, per-trade exposure cap).
+        Called by the expiry-to-expiry capital-period rollover
+        (src/portfolio/capital_periods.py) so profits/losses compound into
+        next period's limits immediately, not just in reporting.
+        """
+        old_capital = self.initial_capital
+        self.initial_capital = new_capital
+        logger.info(f"RiskManager capital updated: Rs{old_capital:,.2f} -> Rs{new_capital:,.2f}")
 
     def get_kill_switch_status(self) -> Dict[str, Any]:
         return {

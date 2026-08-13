@@ -77,7 +77,11 @@ async def lifespan(app: FastAPI):
     logger.info("Database tables verified / created.")
 
     redis_client = aioredis.from_url(settings.get_redis_url(), decode_responses=True)
-    risk_mgr     = RiskManager(initial_capital=settings.INITIAL_CAPITAL)
+    risk_mgr     = RiskManager(
+        initial_capital=settings.INITIAL_CAPITAL,
+        max_exposure_per_trade_pct=settings.MAX_EXPOSURE_PCT,
+        max_daily_loss_pct=settings.MAX_DAILY_LOSS_PCT,
+    )
 
     order_repo    = BaseRepository(Order,    AsyncSessionLocal)
     audit_repo    = BaseRepository(AuditLog, AsyncSessionLocal)
@@ -222,6 +226,11 @@ async def lifespan(app: FastAPI):
     scheduler = get_scheduler()
     schedule_trading_jobs(engine)
     schedule_zerodha_auth()
+    # Run once at startup too (not just the 08:00 IST daily job) so a fresh
+    # deploy/restart bootstraps the first capital period immediately instead
+    # of waiting for the next scheduled tick.
+    from src.core.scheduler import _run_capital_period_rollover
+    await _run_capital_period_rollover(risk_mgr)
     scheduler.add_job(
         ltp_poller.poll,
         IntervalTrigger(seconds=60),

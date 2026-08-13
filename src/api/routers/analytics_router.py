@@ -563,6 +563,78 @@ async def get_pnl_summary(request: Request):
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+@router.get("/capital-periods")
+async def get_capital_periods(request: Request):
+    """
+    Expiry-to-expiry P&L bifurcation and compounding capital trail.
+
+    Each period is one NSE monthly F&O expiry cycle (see
+    core/utils.get_capital_period_bounds). Closed periods show their final
+    realized_pnl/ending_capital (the "ending_capital" of period N is
+    period N+1's "starting_capital" -- profits/losses compound). The
+    still-open current period additionally shows a live, in-progress
+    realized_pnl-so-far plus the current open positions' unrealized PnL,
+    so the dashboard can show a running total for the month in progress.
+    """
+    try:
+        from sqlalchemy import select
+        from src.database.connection import AsyncSessionLocal
+        from src.database.models.capital_period import CapitalPeriod
+        from src.core.utils import now_ist
+
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(CapitalPeriod).order_by(CapitalPeriod.period_start.asc())
+            )
+            periods = result.scalars().all()
+
+        all_closed = await _get_closed_trades()
+        today = now_ist().date()
+
+        out = []
+        for p in periods:
+            entry = {
+                "period_start":     p.period_start.isoformat(),
+                "period_end":       p.period_end.isoformat(),
+                "starting_capital": float(p.starting_capital),
+                "closed":           bool(p.closed),
+                "realized_pnl":     float(p.realized_pnl) if p.realized_pnl is not None else None,
+                "ending_capital":   float(p.ending_capital) if p.ending_capital is not None else None,
+            }
+            if not p.closed:
+                # Running total for the in-progress period: closed trades
+                # that exited within its bounds so far, plus current open
+                # unrealized PnL (same live-engine-state source /pnl-summary uses).
+                in_progress_realized = sum(
+                    float(t.pnl or 0) for t in all_closed
+                    if t.exit_time and p.period_start <= t.exit_time.date() <= min(p.period_end, today)
+                )
+                entry["realized_pnl_so_far"] = round(in_progress_realized, 2)
+
+                from src.api.routers.positions_router import _positions_from_engine
+                engine = getattr(request.app.state, "trading_engine", None)
+                if engine is not None:
+                    redis = getattr(request.app.state, "redis", None)
+                    kite  = getattr(request.app.state, "kite",  None)
+                    live_positions = await _positions_from_engine(engine, kite, redis)
+                    unrealized = sum(
+                        float(pos.get("unrealized_pnl") or 0)
+                        for pos in live_positions if pos.get("quantity", 0) != 0
+                    )
+                else:
+                    unrealized = 0.0
+                entry["unrealized_pnl"] = round(unrealized, 2)
+                entry["capital_now"] = round(
+                    entry["starting_capital"] + in_progress_realized + unrealized, 2
+                )
+            out.append(entry)
+
+        return {"periods": out}
+    except Exception as e:
+        logger.error(f"Analytics /capital-periods error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
 @router.get("/walk-forward-results")
 async def get_walk_forward_results(
     strategy_name: Optional[str] = Query(None),

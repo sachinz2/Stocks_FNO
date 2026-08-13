@@ -37,7 +37,11 @@ build/
 .coverage
 htmlcov/
 
-# ML models (large files)
-models/
+# ML models (large files) -- anchored to repo root so it doesn't also match
+# src/database/models/ (a bare "models/" pattern matches any directory with
+# that name anywhere in the tree, which silently blocked new SQLAlchemy
+# model files there from ever being tracked -- found 2026-08-13 when
+# capital_period.py didn't show up in `git status`).
+/models/
 *.pkl
 *.joblib

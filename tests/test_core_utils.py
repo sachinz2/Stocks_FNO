@@ -173,3 +173,57 @@ def test_should_retry_auth_true_at_exactly_cooldown_boundary():
     now = datetime(2026, 8, 12, 10, 0, 0)
     last_attempt = now - timedelta(seconds=600)
     assert should_retry_auth(last_attempt, now, cooldown_seconds=600) is True
+
+
+# ── get_capital_period_bounds() -- expiry-to-expiry capital months (2026-08-13) ──
+#
+# Reuses the same monthly-expiry weekday (_last_expiry_weekday) the
+# strategies already use for DTE/rollover, so "month" here means an NSE
+# F&O expiry cycle, not a calendar month. period_start is the day after
+# the PRIOR expiry; period_end is the expiry on/after the given date.
+# Real expiry dates for the months these tests touch (Tuesday-based,
+# NSE's 2025 rationalization): Jun 2026 -> 30, Jul 2026 -> 28,
+# Aug 2026 -> 25, Sep 2026 -> 29, Nov 2026 -> 25, Dec 2026 -> 29,
+# Jan 2027 -> 26.
+
+from datetime import date as _date
+from src.core.utils import get_capital_period_bounds
+
+
+def test_capital_period_bounds_mid_cycle():
+    # 2026-08-13 sits between Jul 28 (prior expiry) and Aug 25 (next).
+    start, end = get_capital_period_bounds(_date(2026, 8, 13))
+    assert start == _date(2026, 7, 29)
+    assert end == _date(2026, 8, 25)
+
+
+def test_capital_period_bounds_on_expiry_day_belongs_to_ending_period():
+    # Expiry day itself still belongs to the period that's ending, not the next one.
+    start, end = get_capital_period_bounds(_date(2026, 8, 25))
+    assert start == _date(2026, 7, 29)
+    assert end == _date(2026, 8, 25)
+
+
+def test_capital_period_bounds_day_after_expiry_starts_new_period():
+    start, end = get_capital_period_bounds(_date(2026, 8, 26))
+    assert start == _date(2026, 8, 26)
+    assert end == _date(2026, 9, 29)
+
+
+def test_capital_period_bounds_before_prior_expiry_in_same_month():
+    # 2026-07-28 is itself an expiry day -- belongs to the period ending that day.
+    start, end = get_capital_period_bounds(_date(2026, 7, 28))
+    assert start == _date(2026, 7, 1)
+    assert end == _date(2026, 7, 28)
+
+
+def test_capital_period_bounds_across_year_boundary():
+    start, end = get_capital_period_bounds(_date(2027, 1, 1))
+    assert start == _date(2026, 12, 30)
+    assert end == _date(2027, 1, 26)
+
+
+def test_capital_period_bounds_accepts_datetime_not_just_date():
+    start, end = get_capital_period_bounds(datetime(2026, 8, 13, 14, 30, 0))
+    assert start == _date(2026, 7, 29)
+    assert end == _date(2026, 8, 25)
