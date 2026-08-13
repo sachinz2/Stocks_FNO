@@ -33,6 +33,7 @@ async def lifespan(app: FastAPI):
     import asyncio
     import redis.asyncio as aioredis
     from apscheduler.triggers.interval import IntervalTrigger
+    from apscheduler.triggers.cron import CronTrigger
 
     from src.core.config import settings
     from src.core.constants import FNO_SYMBOLS
@@ -231,6 +232,23 @@ async def lifespan(app: FastAPI):
     # of waiting for the next scheduled tick.
     from src.core.scheduler import _run_capital_period_rollover
     await _run_capital_period_rollover(risk_mgr)
+
+    # Daily Zerodha <-> DB reconciliation (live mode only) -- 08:45 IST,
+    # after the 08:30 auth job has a fresh token and before 09:15 market
+    # open. Reads app.state.kite live at run time (not the startup snapshot)
+    # since self-heal can rotate it in later in the day.
+    async def _run_daily_zerodha_sync() -> None:
+        from src.live_trading.zerodha_sync import daily_zerodha_sync
+        kite_now = getattr(app.state, "kite", None)
+        await daily_zerodha_sync(kite_now, order_repo)
+
+    scheduler.add_job(
+        _run_daily_zerodha_sync,
+        CronTrigger(hour=8, minute=45, day_of_week="mon-fri", timezone="Asia/Kolkata"),
+        id="daily_zerodha_sync",
+        name="Daily Zerodha Reconciliation",
+        replace_existing=True,
+    )
     scheduler.add_job(
         ltp_poller.poll,
         IntervalTrigger(seconds=60),

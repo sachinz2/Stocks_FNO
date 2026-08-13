@@ -1234,3 +1234,23 @@ def test_iron_condor_entry_uses_real_fill_not_quote():
     assert '"call_short_premium":  call_short_fill, "call_long_premium": call_long_fill,' in src
     assert "_place_gtt_backstop(psc, lot_size, put_short_fill)" in src
     assert "_place_gtt_backstop(csc, lot_size, call_short_fill)" in src
+
+
+# ── EOD report shows real capital, not just PnL (2026-08-13) ────────────────
+#
+# The daily email/Telegram report had no capital figures at all -- just
+# PnL/order counts. initial_capital must reflect the compounding
+# expiry-to-expiry period (RiskManager.set_capital(), not a static .env
+# constant), and in live mode capital_left/capital_in_use must prefer
+# Zerodha's real margins() over the internal deployed-capital estimate.
+
+def test_daily_report_includes_capital_lines_sourced_from_risk_manager_and_zerodha():
+    src = inspect.getsource(LiveTradingEngine.send_daily_report)
+    assert "initial_capital = self.risk_manager.initial_capital" in src
+    assert "capital_in_use  = sum(self.risk_manager.get_deployed_by_strategy().values())" in src
+    assert "capital_left    = initial_capital - capital_in_use" in src
+    assert "if self.mode == TradingMode.LIVE and self._kite:" in src
+    assert "from src.live_trading.zerodha_sync import get_zerodha_capital" in src
+    assert '"Initial Capital: ₹{initial_capital:,.2f}"' in src
+    assert '"Capital in Use:  ₹{capital_in_use:,.2f}"' in src
+    assert '"Capital Left:    ₹{capital_left:,.2f}"' in src

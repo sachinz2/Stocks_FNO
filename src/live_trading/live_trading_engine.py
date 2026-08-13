@@ -352,6 +352,27 @@ class LiveTradingEngine:
         positions      = await self._safe_get_positions()
         open_unrealized = sum(p.get("unrealized_pnl", 0) for p in positions)
 
+        # ── Capital summary (added 2026-08-13) ──────────────────────────────
+        # initial_capital is the current expiry-to-expiry period's compounding
+        # capital (RiskManager.set_capital() keeps this in sync at each
+        # rollover -- see src/portfolio/capital_periods.py), not the static
+        # .env value. In live mode, prefer Zerodha's real available margin
+        # for capital_left over the computed estimate -- it reflects actual
+        # account state (fees, any manual deposits/withdrawals) our own
+        # bookkeeping can't see.
+        initial_capital = self.risk_manager.initial_capital
+        capital_in_use  = sum(self.risk_manager.get_deployed_by_strategy().values())
+        capital_left    = initial_capital - capital_in_use
+        if self.mode == TradingMode.LIVE and self._kite:
+            try:
+                from src.live_trading.zerodha_sync import get_zerodha_capital
+                real_capital = await get_zerodha_capital(self._kite)
+                if real_capital:
+                    capital_left = real_capital["capital_left"]
+                    capital_in_use = real_capital["capital_in_use"]
+            except Exception as e:
+                logger.error(f"EOD: failed to fetch real Zerodha capital, using estimate: {e}")
+
         # ── Overnight positions summary ───────────────────────────────────────
         overnight_spreads = len(self._active_spreads)
         overnight_condors = len(self._active_condors)
@@ -370,6 +391,9 @@ class LiveTradingEngine:
 
         report_lines = [
             f"EOD REPORT — {now_ist().strftime('%d-%b-%Y')} | {self.mode.value.upper()}",
+            f"Initial Capital: ₹{initial_capital:,.2f}",
+            f"Capital in Use:  ₹{capital_in_use:,.2f}",
+            f"Capital Left:    ₹{capital_left:,.2f}",
             f"Orders today:    {self._today_order_count}",
             f"Closed trades:   {closed_count}",
             f"Realized PnL:    ₹{today_realized:,.2f}",
