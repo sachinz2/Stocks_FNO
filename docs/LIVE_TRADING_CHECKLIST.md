@@ -96,9 +96,18 @@ Current `.env`: `INITIAL_CAPITAL=300000.0`, `MAX_OPEN_POSITIONS=5`,
       what the response SLA is for a `CRITICAL` / `MANUAL INTERVENTION
       REQUIRED` alert (several exist in the codebase already, e.g. failed
       spread/condor unwinds).
-- [ ] Server hardening check: root SSH still reachable directly (used
-      throughout this session for deploys) — confirm this is acceptable for
-      a box now handling live trading, or lock it down further.
+- [x] **Done 2026-08-13.** Server hardening: found the original SSH-hardening
+      commands (from initial server setup) had silently no-op'd — sed patterns
+      didn't match the actual config lines, so PasswordAuthentication was
+      still enabled server-wide despite bash history showing an attempt to
+      disable it. Fixed properly this time (verified with `sshd -T` +
+      `sshd -t` before applying, reloaded, then confirmed with a **fresh**
+      connection before considering it done — no lockout). Also: installed
+      + enabled fail2ban (wasn't running at all), tightened `.env` from
+      world-readable (664) to owner-only (600). Root login was already
+      key-only. Note: unattended-upgrades has a pending kernel update
+      needing a reboot to fully apply — not done (would restart all
+      containers/trading), your call on timing.
 - [ ] Log retention: currently rotates out at ~1 month. Confirm that's
       enough for compliance/audit needs once real trades are involved.
 
