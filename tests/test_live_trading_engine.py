@@ -65,6 +65,28 @@ def test_exit_path_quote_pattern_unchanged():
     assert "current_p = _live_p" in src
 
 
+# ── per-position error isolation in _check_open_option_exits (2026-08-13) ───
+#
+# Matches the _square_off_all fix (see test_square_off_one_bad_position_does_
+# not_block_the_rest below) -- an exception evaluating ONE position's exit
+# rules must not prevent every OTHER open position's exit rules (or, since
+# this runs before the entry-signal loop in run_signal_cycle, every entry
+# signal that cycle) from being evaluated. No full behavioral harness exists
+# for this method yet (it needs active_strategies + portfolio_manager +
+# option-quote mocking), so this checks the structural property directly.
+
+def test_check_open_option_exits_wraps_per_position_body_in_try_except():
+    src = inspect.getsource(LiveTradingEngine._check_open_option_exits)
+    loop_idx   = src.index("for pos in positions:")
+    try_idx    = src.index("try:", loop_idx)
+    except_idx = src.index("except Exception", try_idx)
+    exit_call_idx = src.index("await self._execute_single_leg_exit(", try_idx)
+    # The try must start right after entering the loop, and the actual exit
+    # execution (the call most likely to raise, per the 2026-08-12 live
+    # crash) must be inside the try/except span, not after it.
+    assert loop_idx < try_idx < exit_call_idx < except_idx
+
+
 # ── Kill-switch bypass for spread/condor exits (2026-08-06) ─────────────────
 #
 # risk_manager.validate_trade()'s is_exit_order=True bypasses the kill
@@ -531,6 +553,87 @@ async def test_square_off_handles_decimal_fill_price_without_crashing():
 
     assert exit_price == 44.10
     assert abs(pnl - correct_pnl) < 0.01
+
+
+# ── per-position error isolation in _square_off_all (2026-08-13) ────────────
+#
+# The 2026-08-12 live Decimal/float crash didn't just fail to close ONE
+# position -- it aborted the entire square-off loop, since nothing caught
+# the exception before it reached run_signal_cycle's caller. Confirmed with
+# 2 positions: the first raises, the second must still get closed.
+
+class _FakeMultiSquareOffOrderManager:
+    def __init__(self, fill_price, raise_for_contract):
+        self.fill_price = fill_price
+        self.raise_for_contract = raise_for_contract
+        self.calls = []
+
+    async def place_order(self, contract, side, qty, price, is_exit_order=False,
+                           strategy_name=None, product_override=None):
+        self.calls.append(contract)
+        if contract == self.raise_for_contract:
+            raise TypeError("simulated Decimal/float crash for this contract only")
+        return _FakeSquareOffOrder(self.fill_price)
+
+
+class _FakeMultiSquareOffEngine:
+    def __init__(self):
+        self.order_manager = _FakeMultiSquareOffOrderManager(
+            fill_price=44.10, raise_for_contract="TITAN26AUG4950CE",
+        )
+        self.risk_manager = _FakeRiskManager()
+        self._peak_premiums = {"TITAN26AUG4950CE": 50.0, "RELIANCE26AUG1400CE": 20.0}
+        self._single_leg_journals = {
+            "TITAN26AUG4950CE":    {"journal_id": 200, "strategy_name": "ema_crossover_v1"},
+            "RELIANCE26AUG1400CE": {"journal_id": 201, "strategy_name": "momentum_v1"},
+        }
+        self._active_spreads = {}
+        self._active_condors = {}
+        self._closed_journals = []
+        self._notifications = []
+        self._eod_notified_today = False
+        self._kite = None
+        self._redis = None
+
+    async def _safe_get_positions(self):
+        return [
+            {"symbol": "TITAN26AUG4950CE",    "quantity": 175, "avg_price": 46.59},
+            {"symbol": "RELIANCE26AUG1400CE", "quantity": 100, "avg_price": 18.20},
+        ]
+
+    async def _get_market_data(self, symbol):
+        return {"atr14": 5.0}
+
+    def _get_underlying_from_contract(self, contract):
+        return "TITAN" if "TITAN" in contract else "RELIANCE"
+
+    async def _log_trade_close(self, journal_id, exit_price, pnl, exit_reason):
+        self._closed_journals.append((journal_id, exit_price, pnl, exit_reason))
+
+    async def _persist_state(self):
+        pass
+
+    async def _notify(self, msg):
+        self._notifications.append(msg)
+
+
+@pytest.mark.asyncio
+async def test_square_off_one_bad_position_does_not_block_the_rest():
+    fake = _FakeMultiSquareOffEngine()
+
+    await LiveTradingEngine._square_off_all(fake)  # must not raise
+
+    # Both positions must have been attempted...
+    assert fake.order_manager.calls == ["TITAN26AUG4950CE", "RELIANCE26AUG1400CE"]
+    # ...but only the one that didn't crash actually got its journal closed.
+    assert len(fake._closed_journals) == 1
+    journal_id, exit_price, pnl, exit_reason = fake._closed_journals[0]
+    assert journal_id == 201  # RELIANCE, not the crashing TITAN (200)
+    assert exit_price == 44.10
+    # The crashing position's journal entry must survive (not popped) so
+    # it's retried next cycle instead of silently vanishing.
+    assert "TITAN26AUG4950CE" in fake._single_leg_journals
+    assert "RELIANCE26AUG1400CE" not in fake._single_leg_journals
 
 
 # ── _exit_all_options_for (2026-08-07) ───────────────────────────────────────

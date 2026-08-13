@@ -1151,82 +1151,94 @@ class LiveTradingEngine:
 
         for pos in positions:
             contract = pos.get("symbol", "")
-            qty      = pos.get("quantity", 0)
-            entry_p  = float(pos.get("avg_price") or 0)
-            if qty <= 0 or entry_p <= 0 or contract in managed:
-                continue
+            # Fixed 2026-08-13: the whole per-position body is now wrapped in
+            # try/except. Previously, an exception anywhere in here (e.g. the
+            # Decimal/float fill_price TypeError fixed 2026-08-12) propagated
+            # all the way up through run_signal_cycle and aborted the ENTIRE
+            # 1-minute cycle -- not just the exit check for this one contract,
+            # but every remaining position's exit check, and every entry
+            # signal that would have run afterward in the same cycle. One bad
+            # position should delay ITS OWN exit to next cycle, not everyone
+            # else's.
+            try:
+                qty      = pos.get("quantity", 0)
+                entry_p  = float(pos.get("avg_price") or 0)
+                if qty <= 0 or entry_p <= 0 or contract in managed:
+                    continue
 
-            underlying = self._get_underlying_from_contract(contract)
-            if not underlying:
-                continue
+                underlying = self._get_underlying_from_contract(contract)
+                if not underlying:
+                    continue
 
-            market_data = await self._get_market_data(underlying)
-            if not market_data:
-                continue
+                market_data = await self._get_market_data(underlying)
+                if not market_data:
+                    continue
 
-            atr = float(market_data.get("atr14", 0))
-            from src.market_data.option_chain import get_option_quote
-            _live_p = await get_option_quote(contract, getattr(self, "_kite", None), getattr(self, "_redis", None))
-            if _live_p and _live_p > 0:
-                current_p = _live_p
-            elif atr > 0:
-                current_p = estimate_option_premium(atr, dte)
-            else:
-                current_p = entry_p
-            await self.portfolio_manager.update_position_market_price(contract, current_p)
+                atr = float(market_data.get("atr14", 0))
+                from src.market_data.option_chain import get_option_quote
+                _live_p = await get_option_quote(contract, getattr(self, "_kite", None), getattr(self, "_redis", None))
+                if _live_p and _live_p > 0:
+                    current_p = _live_p
+                elif atr > 0:
+                    current_p = estimate_option_premium(atr, dte)
+                else:
+                    current_p = entry_p
+                await self.portfolio_manager.update_position_market_price(contract, current_p)
 
-            peak = self._peak_premiums.get(contract, entry_p)
-            if current_p > peak:
-                self._peak_premiums[contract] = current_p
-                peak = current_p
+                peak = self._peak_premiums.get(contract, entry_p)
+                if current_p > peak:
+                    self._peak_premiums[contract] = current_p
+                    peak = current_p
 
-            exit_reason: Optional[str] = None
-            if dte < 4:
-                exit_reason = f"DTE={dte} — entering illiquid expiry window"
+                exit_reason: Optional[str] = None
+                if dte < 4:
+                    exit_reason = f"DTE={dte} — entering illiquid expiry window"
 
-            # Resolve the strategy that actually OPENED this position (via the
-            # strategy_name recorded in _single_leg_journals at entry) rather
-            # than assuming EMA Crossover — that assumption held only while it
-            # was the sole single-leg strategy. Now that momentum_v1 also opens
-            # single-leg positions, using the wrong strategy's manage_position()
-            # would apply the wrong SL/TP/trailing thresholds to it.
-            owner_info = self._single_leg_journals.get(contract, {})
-            owner_strategy = active_strategies.get(owner_info.get("strategy_name", ""))
-            if owner_strategy is None:
-                # Fallback for a position somehow missing its journal entry —
-                # matches the old EMA-only assumption as a safe default.
-                owner_strategy = next(
-                    (s for s in active_strategies.values()
-                     if s.__class__.__name__ == "EMACrossoverStrategy"), None
-                )
-
-            if exit_reason is None and owner_strategy is not None:
-                result = owner_strategy.manage_position(
-                    {
-                        "avg_price": entry_p,
-                        "peak_premium": peak,
-                        "current_adx": market_data.get("adx14"),
-                        # For the VOLATILE crash-catching reversal exit (see
-                        # EMACrossoverStrategy.manage_position() /
-                        # MomentumStrategy.adx_exit_threshold_volatile) — both
-                        # unused by strategies that don't check them, so this
-                        # is a no-op addition for anything else.
-                        "current_ema_fast": market_data.get("ema20"),
-                        "current_ema_slow": market_data.get("ema50"),
-                        "is_call":          contract.endswith("CE"),
-                        "entry_regime":     owner_info.get("entry_regime"),
-                    },
-                    current_p,
-                )
-                if result == "EXIT":
-                    pnl_pct = (current_p - entry_p) / entry_p * 100
-                    exit_reason = (
-                        f"{owner_strategy.name} entry=Rs{entry_p:.2f} "
-                        f"now=Rs{current_p:.2f} ({pnl_pct:+.1f}%)"
+                # Resolve the strategy that actually OPENED this position (via the
+                # strategy_name recorded in _single_leg_journals at entry) rather
+                # than assuming EMA Crossover — that assumption held only while it
+                # was the sole single-leg strategy. Now that momentum_v1 also opens
+                # single-leg positions, using the wrong strategy's manage_position()
+                # would apply the wrong SL/TP/trailing thresholds to it.
+                owner_info = self._single_leg_journals.get(contract, {})
+                owner_strategy = active_strategies.get(owner_info.get("strategy_name", ""))
+                if owner_strategy is None:
+                    # Fallback for a position somehow missing its journal entry —
+                    # matches the old EMA-only assumption as a safe default.
+                    owner_strategy = next(
+                        (s for s in active_strategies.values()
+                         if s.__class__.__name__ == "EMACrossoverStrategy"), None
                     )
 
-            if exit_reason:
-                await self._execute_single_leg_exit(contract, qty, entry_p, current_p, exit_reason)
+                if exit_reason is None and owner_strategy is not None:
+                    result = owner_strategy.manage_position(
+                        {
+                            "avg_price": entry_p,
+                            "peak_premium": peak,
+                            "current_adx": market_data.get("adx14"),
+                            # For the VOLATILE crash-catching reversal exit (see
+                            # EMACrossoverStrategy.manage_position() /
+                            # MomentumStrategy.adx_exit_threshold_volatile) — both
+                            # unused by strategies that don't check them, so this
+                            # is a no-op addition for anything else.
+                            "current_ema_fast": market_data.get("ema20"),
+                            "current_ema_slow": market_data.get("ema50"),
+                            "is_call":          contract.endswith("CE"),
+                            "entry_regime":     owner_info.get("entry_regime"),
+                        },
+                        current_p,
+                    )
+                    if result == "EXIT":
+                        pnl_pct = (current_p - entry_p) / entry_p * 100
+                        exit_reason = (
+                            f"{owner_strategy.name} entry=Rs{entry_p:.2f} "
+                            f"now=Rs{current_p:.2f} ({pnl_pct:+.1f}%)"
+                        )
+
+                if exit_reason:
+                    await self._execute_single_leg_exit(contract, qty, entry_p, current_p, exit_reason)
+            except Exception as exc:
+                logger.error(f"Exit-check error [{contract}]: {exc} -- will retry next cycle")
 
     async def _execute_single_leg_exit(
         self, contract: str, qty: int, entry_p: float, current_p: float, exit_reason: str,
@@ -3119,80 +3131,92 @@ class LiveTradingEngine:
         _exit_prices: Dict[str, float] = {}   # contract -> exit price, for expiry-day journal below
 
         for pos in positions:
-            qty = pos.get("quantity", 0)
-            if qty == 0:
-                continue
-            contract = pos["symbol"]
+            contract = pos.get("symbol", "")
+            # Fixed 2026-08-13: whole per-position body wrapped in try/except --
+            # same rationale as _check_open_option_exits' matching fix. This is
+            # the exact loop that crashed live on 2026-08-12 (Decimal/float
+            # TypeError, fixed 2026-08-12): one bad position aborted EOD
+            # square-off for every position still left in the loop that cycle,
+            # including this method's own single-leg positions AND, on expiry
+            # day, every other spread/condor about to be force-closed below.
+            # "ALWAYS close" (this method's own docstring) only holds if one
+            # bad position can't take the rest of the loop down with it.
+            try:
+                qty = pos.get("quantity", 0)
+                if qty == 0:
+                    continue
 
-            # On normal days, skip spread/condor legs — they hold overnight
-            if not is_expiry and contract in spread_condor_contracts:
-                continue
+                # On normal days, skip spread/condor legs — they hold overnight
+                if not is_expiry and contract in spread_condor_contracts:
+                    continue
 
-            side    = "SELL" if qty > 0 else "BUY"
-            entry_p = float(pos.get("avg_price") or 0)
-            exit_p  = entry_p
+                side    = "SELL" if qty > 0 else "BUY"
+                entry_p = float(pos.get("avg_price") or 0)
+                exit_p  = entry_p
 
-            # Try live price first
-            live_p = await get_option_quote(contract, kite, redis)
-            if live_p and live_p > 0:
-                exit_p = live_p
-            else:
-                underlying = self._get_underlying_from_contract(contract)
-                if underlying:
-                    md = await self._get_market_data(underlying)
-                    if md:
-                        atr = float(md.get("atr14", 0))
-                        if atr > 0:
-                            exit_p = estimate_option_premium(atr, max(dte, 1))
+                # Try live price first
+                live_p = await get_option_quote(contract, kite, redis)
+                if live_p and live_p > 0:
+                    exit_p = live_p
+                else:
+                    underlying = self._get_underlying_from_contract(contract)
+                    if underlying:
+                        md = await self._get_market_data(underlying)
+                        if md:
+                            atr = float(md.get("atr14", 0))
+                            if atr > 0:
+                                exit_p = estimate_option_premium(atr, max(dte, 1))
 
-            # Peeked (not popped) before the order call: a CLOSING order's
-            # product type must match the ORIGINAL position's at Zerodha
-            # (see ZerodhaBroker._product_for()). Empty for spread/condor
-            # legs on expiry day (not in _single_leg_journals -- that dict
-            # is EMA/momentum-only), which correctly resolves to the
-            # default NRML they were actually entered under.
-            _sq_owner_strategy = self._single_leg_journals.get(contract, {}).get("strategy_name")
-            _sq_order = await self.order_manager.place_order(
-                contract, side, abs(qty), exit_p, is_exit_order=True, strategy_name=_sq_owner_strategy,
-            )
-            self._peak_premiums.pop(contract, None)
-            # Fixed 2026-08-07: same fill_price bug as _execute_single_leg_exit
-            # / credit-spread / iron-condor exits (fixed earlier today) --
-            # this fourth exit path also computed pnl from the pre-slippage
-            # quote/estimate (exit_p) and didn't even capture place_order()'s
-            # return value, discarding the real PaperBroker fill entirely.
-            # EOD square-off runs every trading day (single-leg positions
-            # "ALWAYS close" per this method's own docstring), so this was a
-            # frequently-triggered instance of the exact same inaccuracy.
-            # float() cast: see 2026-08-12 fix note in _execute_single_leg_exit --
-            # this is the exact site that crashed live on 2026-08-12, aborting
-            # EOD square-off mid-loop and leaving every remaining position that
-            # cycle unclosed (single-leg AND spread/condor legs after it).
-            _sq_fill_p = float(getattr(_sq_order, "fill_price", None) or exit_p)
-            _exit_prices[contract] = _sq_fill_p
-
-            # Write exit to trade journal so EOD/expiry closes appear in PnL analytics
-            _jrnl_info = self._single_leg_journals.pop(contract, None)
-            if _jrnl_info:
-                _entry_p = float(pos.get("avg_price") or 0)
-                _signed  = 1 if qty > 0 else -1
-                _pnl     = round((_sq_fill_p - _entry_p) * abs(qty) * _signed, 2)
-                _reason  = "Expiry day force-close" if is_expiry else "EOD square-off"
-                await self._log_trade_close(
-                    journal_id=_jrnl_info.get("journal_id"),
-                    exit_price=_sq_fill_p,
-                    pnl=_pnl,
-                    exit_reason=_reason,
+                # Peeked (not popped) before the order call: a CLOSING order's
+                # product type must match the ORIGINAL position's at Zerodha
+                # (see ZerodhaBroker._product_for()). Empty for spread/condor
+                # legs on expiry day (not in _single_leg_journals -- that dict
+                # is EMA/momentum-only), which correctly resolves to the
+                # default NRML they were actually entered under.
+                _sq_owner_strategy = self._single_leg_journals.get(contract, {}).get("strategy_name")
+                _sq_order = await self.order_manager.place_order(
+                    contract, side, abs(qty), exit_p, is_exit_order=True, strategy_name=_sq_owner_strategy,
                 )
-                self.risk_manager.release_deployed_capital(
-                    _jrnl_info.get("strategy_name", "ema_crossover_v1"),
-                    _entry_p * abs(qty),
-                )
+                self._peak_premiums.pop(contract, None)
+                # Fixed 2026-08-07: same fill_price bug as _execute_single_leg_exit
+                # / credit-spread / iron-condor exits (fixed earlier today) --
+                # this fourth exit path also computed pnl from the pre-slippage
+                # quote/estimate (exit_p) and didn't even capture place_order()'s
+                # return value, discarding the real PaperBroker fill entirely.
+                # EOD square-off runs every trading day (single-leg positions
+                # "ALWAYS close" per this method's own docstring), so this was a
+                # frequently-triggered instance of the exact same inaccuracy.
+                # float() cast: see 2026-08-12 fix note in _execute_single_leg_exit --
+                # this is the exact site that crashed live on 2026-08-12, aborting
+                # EOD square-off mid-loop and leaving every remaining position that
+                # cycle unclosed (single-leg AND spread/condor legs after it).
+                _sq_fill_p = float(getattr(_sq_order, "fill_price", None) or exit_p)
+                _exit_prices[contract] = _sq_fill_p
 
-            if is_expiry:
-                closed_expiry += 1
-            else:
-                closed_ema += 1
+                # Write exit to trade journal so EOD/expiry closes appear in PnL analytics
+                _jrnl_info = self._single_leg_journals.pop(contract, None)
+                if _jrnl_info:
+                    _entry_p = float(pos.get("avg_price") or 0)
+                    _signed  = 1 if qty > 0 else -1
+                    _pnl     = round((_sq_fill_p - _entry_p) * abs(qty) * _signed, 2)
+                    _reason  = "Expiry day force-close" if is_expiry else "EOD square-off"
+                    await self._log_trade_close(
+                        journal_id=_jrnl_info.get("journal_id"),
+                        exit_price=_sq_fill_p,
+                        pnl=_pnl,
+                        exit_reason=_reason,
+                    )
+                    self.risk_manager.release_deployed_capital(
+                        _jrnl_info.get("strategy_name", "ema_crossover_v1"),
+                        _entry_p * abs(qty),
+                    )
+
+                if is_expiry:
+                    closed_expiry += 1
+                else:
+                    closed_ema += 1
+            except Exception as exc:
+                logger.error(f"Square-off error [{contract}]: {exc} -- position may still be open, will retry next cycle")
 
         if is_expiry:
             # Cancel GTT backstops before clearing so exchange-level orders don't
@@ -3207,46 +3231,60 @@ class LiveTradingEngine:
             # Their legs aren't in _single_leg_journals (that dict is EMA-only), so the
             # per-leg loop above can't log them — without this, these trades would keep
             # exit_time/pnl = NULL forever despite being genuinely closed by real orders.
+            # Fixed 2026-08-13: per-structure try/except, same rationale as the main
+            # square-off loop above -- one malformed spread/condor record shouldn't
+            # block the journal close (and capital release) for every other one,
+            # especially on expiry day when getting this right matters most.
             for _s in self._active_spreads.values():
-                _short_x = _exit_prices.get(_s.get("short_contract", ""), _s.get("short_premium", 0))
-                _long_x  = _exit_prices.get(_s.get("long_contract", ""),  _s.get("long_premium", 0))
-                _lot     = _s.get("lot_size", 0)
-                _net     = ((_s.get("short_premium", 0) - _short_x) - (_s.get("long_premium", 0) - _long_x)) * _lot
-                _width   = abs(_s.get("short_strike", 0) - _s.get("long_strike", 0))
-                self.risk_manager.release_deployed_capital(
-                    _s.get("strategy_name", "credit_spread_v1"),
-                    (_width - _s.get("net_credit", 0)) * _lot,
-                )
-                await self._log_trade_close(
-                    journal_id=_s.get("journal_id"),
-                    exit_price=round(_short_x - _long_x, 2),
-                    pnl=round(_net, 2),
-                    exit_reason=f"Expiry day force-close (DTE={dte})",
-                )
+                try:
+                    _short_x = _exit_prices.get(_s.get("short_contract", ""), _s.get("short_premium", 0))
+                    _long_x  = _exit_prices.get(_s.get("long_contract", ""),  _s.get("long_premium", 0))
+                    _lot     = _s.get("lot_size", 0)
+                    _net     = ((_s.get("short_premium", 0) - _short_x) - (_s.get("long_premium", 0) - _long_x)) * _lot
+                    _width   = abs(_s.get("short_strike", 0) - _s.get("long_strike", 0))
+                    self.risk_manager.release_deployed_capital(
+                        _s.get("strategy_name", "credit_spread_v1"),
+                        (_width - _s.get("net_credit", 0)) * _lot,
+                    )
+                    await self._log_trade_close(
+                        journal_id=_s.get("journal_id"),
+                        exit_price=round(_short_x - _long_x, 2),
+                        pnl=round(_net, 2),
+                        exit_reason=f"Expiry day force-close (DTE={dte})",
+                    )
+                except Exception as exc:
+                    logger.error(
+                        f"Expiry force-close journal error [spread {_s.get('short_contract', '?')}]: {exc}"
+                    )
             for _c in self._active_condors.values():
-                _ps_x = _exit_prices.get(_c.get("put_short_contract", ""),  _c.get("put_short_premium", 0))
-                _pl_x = _exit_prices.get(_c.get("put_long_contract", ""),   _c.get("put_long_premium", 0))
-                _cs_x = _exit_prices.get(_c.get("call_short_contract", ""), _c.get("call_short_premium", 0))
-                _cl_x = _exit_prices.get(_c.get("call_long_contract", ""),  _c.get("call_long_premium", 0))
-                _lot_c = _c.get("lot_size", 0)
-                _net_c = (
-                    (_c.get("put_short_premium", 0)  - _ps_x)
-                    + (_c.get("call_short_premium", 0) - _cs_x)
-                    - (_c.get("put_long_premium", 0)   - _pl_x)
-                    - (_c.get("call_long_premium", 0)  - _cl_x)
-                ) * _lot_c
-                _put_wing_x  = abs(_c.get("put_short_strike", 0)  - _c.get("put_long_strike", 0))
-                _call_wing_x = abs(_c.get("call_short_strike", 0) - _c.get("call_long_strike", 0))
-                self.risk_manager.release_deployed_capital(
-                    _c.get("strategy_name", "iron_condor_v1"),
-                    (max(_put_wing_x, _call_wing_x) - _c.get("net_credit", 0)) * _lot_c,
-                )
-                await self._log_trade_close(
-                    journal_id=_c.get("journal_id"),
-                    exit_price=round(_ps_x + _cs_x - _pl_x - _cl_x, 2),
-                    pnl=round(_net_c, 2),
-                    exit_reason=f"Expiry day force-close (DTE={dte})",
-                )
+                try:
+                    _ps_x = _exit_prices.get(_c.get("put_short_contract", ""),  _c.get("put_short_premium", 0))
+                    _pl_x = _exit_prices.get(_c.get("put_long_contract", ""),   _c.get("put_long_premium", 0))
+                    _cs_x = _exit_prices.get(_c.get("call_short_contract", ""), _c.get("call_short_premium", 0))
+                    _cl_x = _exit_prices.get(_c.get("call_long_contract", ""),  _c.get("call_long_premium", 0))
+                    _lot_c = _c.get("lot_size", 0)
+                    _net_c = (
+                        (_c.get("put_short_premium", 0)  - _ps_x)
+                        + (_c.get("call_short_premium", 0) - _cs_x)
+                        - (_c.get("put_long_premium", 0)   - _pl_x)
+                        - (_c.get("call_long_premium", 0)  - _cl_x)
+                    ) * _lot_c
+                    _put_wing_x  = abs(_c.get("put_short_strike", 0)  - _c.get("put_long_strike", 0))
+                    _call_wing_x = abs(_c.get("call_short_strike", 0) - _c.get("call_long_strike", 0))
+                    self.risk_manager.release_deployed_capital(
+                        _c.get("strategy_name", "iron_condor_v1"),
+                        (max(_put_wing_x, _call_wing_x) - _c.get("net_credit", 0)) * _lot_c,
+                    )
+                    await self._log_trade_close(
+                        journal_id=_c.get("journal_id"),
+                        exit_price=round(_ps_x + _cs_x - _pl_x - _cl_x, 2),
+                        pnl=round(_net_c, 2),
+                        exit_reason=f"Expiry day force-close (DTE={dte})",
+                    )
+                except Exception as exc:
+                    logger.error(
+                        f"Expiry force-close journal error [condor {_c.get('put_short_contract', '?')}]: {exc}"
+                    )
 
             # Full expiry-day clear — all positions force-closed
             self._active_spreads.clear()
