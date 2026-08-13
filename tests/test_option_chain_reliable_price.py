@@ -89,3 +89,55 @@ def test_zero_price_levels_in_depth_are_ignored(frozen_today):
         },
     }
     assert resolve_reliable_option_price(q) == 34.80
+
+
+# ── get_option_quote()'s own kite.quote() fallback (2026-08-13) ─────────────
+#
+# Steps 1-2 (optltp:/optq: Redis caches) are already staleness-checked at
+# the source now (ZerodhaLTPPoller writes through resolve_reliable_option_price
+# too -- see test_zerodha_ltp_poller.py). This covers step 3: the rare
+# last-resort direct REST call, hit only when both caches are empty (e.g.
+# a brand new candidate contract, or briefly after a restart).
+
+from src.market_data.option_chain import get_option_quote
+
+
+class _FakeRedisEmpty:
+    async def get(self, key):
+        return None
+
+    async def set(self, key, value, ex=None):
+        pass
+
+
+class _FakeKiteQuote:
+    def __init__(self, response):
+        self.response = response
+        self.quote_calls = []
+        self.ltp_calls = []
+
+    def quote(self, instruments):
+        self.quote_calls.append(list(instruments))
+        return self.response
+
+    def ltp(self, instruments):
+        self.ltp_calls.append(list(instruments))
+        raise AssertionError("get_option_quote's REST fallback must use kite.quote(), not kite.ltp()")
+
+
+@pytest.mark.asyncio
+async def test_get_option_quote_rest_fallback_uses_quote_and_ignores_stale_last_price(frozen_today):
+    stale_time = frozen_today - timedelta(days=15)
+    fake_kite = _FakeKiteQuote({
+        "NFO:TITAN26SEP4650PE": {
+            "last_price": 82.0,
+            "last_trade_time": stale_time,
+            "depth": {"buy": [], "sell": [{"price": 34.80, "quantity": 1750, "orders": 2}]},
+        },
+    })
+
+    price = await get_option_quote("TITAN26SEP4650PE", fake_kite, _FakeRedisEmpty())
+
+    assert fake_kite.quote_calls == [["NFO:TITAN26SEP4650PE"]]
+    assert fake_kite.ltp_calls == []
+    assert price == 34.80

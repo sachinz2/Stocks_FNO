@@ -318,11 +318,21 @@ async def get_option_quote(contract: str, kite, redis) -> Optional[float]:
       1. optltp:{contract}  — written every 5 s by ZerodhaLTPPoller when the
                               contract is registered as an active position. This
                               is the freshest source; TTL = 15 s so stale data
-                              auto-expires if the poller stops.
-      2. optq:{contract}    — 30-second on-demand cache from a previous kite.ltp()
+                              auto-expires if the poller stops. Already staleness-
+                              checked at the source (see resolve_reliable_option_price).
+      2. optq:{contract}    — 30-second on-demand cache from a previous quote
                               call (used before the position was registered, or as
                               a fallback when the live cache has expired).
-      3. kite.ltp() live    — fresh REST call; result stored in optq cache.
+      3. kite.quote() live  — fresh REST call; result stored in optq cache.
+
+    Fixed 2026-08-13: step 3 used kite.ltp() (last-traded-price only, no
+    staleness signal) -- switched to kite.quote() + resolve_reliable_option_price()
+    for the same reason the ZerodhaLTPPoller path was fixed (see that
+    function's docstring): a contract that hasn't actually traded in a
+    while can report a last_price that's badly stale while looking current.
+    This is specifically the fallback for when steps 1-2 are both empty
+    (rare -- active positions are kept warm by the poller), so the extra
+    kite.quote() cost here is not a rate-limit concern.
 
     contract: NSE F&O symbol, e.g. "BPCL26JUL315CE"
     Returns LTP (float) or None.
@@ -347,21 +357,20 @@ async def get_option_quote(contract: str, kite, redis) -> Optional[float]:
     if kite is None:
         return None
 
-    # 3. Fresh kite.ltp() REST call
+    # 3. Fresh kite.quote() REST call
     try:
         import asyncio
         loop = asyncio.get_running_loop()
         nfo_sym = f"NFO:{contract}"
-        data = await loop.run_in_executor(None, lambda: kite.ltp([nfo_sym]))
-        ltp = data.get(nfo_sym, {}).get("last_price")
-        if ltp and float(ltp) > 0:
-            ltp = float(ltp)
+        data = await loop.run_in_executor(None, lambda: kite.quote([nfo_sym]))
+        price = resolve_reliable_option_price(data.get(nfo_sym, {}))
+        if price and price > 0:
             try:
                 if redis is not None:
-                    await redis.set(f"optq:{contract}", str(ltp), ex=30)
+                    await redis.set(f"optq:{contract}", str(price), ex=30)
             except Exception:
                 pass
-            return ltp
+            return price
     except Exception as e:
         logger.debug(f"Option quote fetch failed [{contract}]: {e}")
     return None
