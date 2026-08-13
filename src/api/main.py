@@ -237,7 +237,19 @@ async def lifespan(app: FastAPI):
     # after the 08:30 auth job has a fresh token and before 09:15 market
     # open. Reads app.state.kite live at run time (not the startup snapshot)
     # since self-heal can rotate it in later in the day.
+    #
+    # Fixed 2026-08-13: originally gated on "kite exists", not TradingMode
+    # -- but a real, authenticated kite client is attached regardless of
+    # paper/live mode (see "Always try Zerodha for market data" above, used
+    # for real VIX/option quotes even in paper mode). Without this explicit
+    # mode check, this job would have run during paper trading too and
+    # pulled the REAL Zerodha account's actual orders into this app's
+    # `orders` table -- paper trades never touch the real account, so
+    # there's nothing there to reconcile, and doing so risks corrupting the
+    # paper trade history with unrelated real activity on that account.
     async def _run_daily_zerodha_sync() -> None:
+        if mode != TradingMode.LIVE:
+            return
         from src.live_trading.zerodha_sync import daily_zerodha_sync
         kite_now = getattr(app.state, "kite", None)
         await daily_zerodha_sync(kite_now, order_repo)

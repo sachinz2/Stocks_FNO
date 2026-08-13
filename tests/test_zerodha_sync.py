@@ -174,3 +174,28 @@ async def test_get_zerodha_capital_returns_none_on_broker_error():
 async def test_daily_sync_is_noop_in_paper_mode_no_kite():
     # Must not raise -- paper mode has no real kite client at all.
     await daily_zerodha_sync(None, _FakeRepo())
+
+
+# ── Scheduled job must gate on TradingMode.LIVE, not just "kite exists" (2026-08-13) ──
+#
+# A real, authenticated kite client is attached regardless of paper/live
+# mode -- it's used for real VIX/option quotes even in paper mode (see
+# main.py's "Always try Zerodha for market data if a token exists"). The
+# job was originally gated only on `kite is not None`, which meant it
+# would have run during paper trading too and pulled the REAL Zerodha
+# account's actual orders into this app's `orders` table -- paper trades
+# never touch the real account, so there's nothing there to legitimately
+# reconcile, and doing so risked corrupting the paper trade history this
+# app's own P&L numbers are read from. main.py's lifespan is too heavy
+# (real DB/broker/redis wiring) to invoke directly in a unit test -- this
+# is a static-source regression guard instead, matching this project's
+# convention for other lifespan-embedded scheduled jobs.
+
+def test_daily_zerodha_sync_job_gated_on_live_mode():
+    import inspect
+    from src.api import main as main_module
+    src = inspect.getsource(main_module)
+    idx = src.index("async def _run_daily_zerodha_sync")
+    job_body = src[idx:idx + 400]
+    assert "if mode != TradingMode.LIVE:" in job_body
+    assert "return" in job_body
