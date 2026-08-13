@@ -371,6 +371,43 @@ def is_square_off_time() -> bool:
     return square_off <= now <= market_close
 
 
+def is_auth_retry_window(now: Optional[datetime] = None) -> bool:
+    """
+    True during the window it's worth actively retrying a missed Zerodha
+    daily-auth login (08:25 IST, 5 min before the scheduled slot, through
+    market close) -- used by the kite-provisioning self-heal job's no-token
+    fallback (see src/api/main.py) so a missed 08:30 CronTrigger (e.g. a
+    deploy restarted the process right at that moment, wiping APScheduler's
+    in-memory state before login could complete -- confirmed live
+    2026-08-13) doesn't leave the system with zero live data until
+    tomorrow's scheduled slot. Accepts `now` for testability.
+    """
+    now = now or now_ist()
+    if now.weekday() >= 5:
+        return False
+    if _is_nse_holiday(now.date()):
+        return False
+    window_start = now.replace(hour=8, minute=25, second=0, microsecond=0)
+    window_end   = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    return window_start <= now <= window_end
+
+
+def should_retry_auth(
+    last_attempt: Optional[datetime], now: Optional[datetime] = None, cooldown_seconds: int = 600,
+) -> bool:
+    """
+    True if enough time has passed since the last fresh-login retry attempt
+    (or none has been made yet) to try again. Pure/testable cooldown gate --
+    kept separate from is_auth_retry_window() so the "should we even be
+    trying right now" and "have we tried too recently" questions can be
+    tested independently.
+    """
+    if last_attempt is None:
+        return True
+    now = now or now_ist()
+    return (now - last_attempt).total_seconds() >= cooldown_seconds
+
+
 def format_inr(amount: float) -> str:
     return f"₹{amount:,.2f}"
 

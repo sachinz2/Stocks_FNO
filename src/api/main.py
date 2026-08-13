@@ -267,6 +267,7 @@ async def lifespan(app: FastAPI):
     app.state.kite              = kite_instance
     app.state.instrument_tokens = instrument_tokens
     app.state.last_kite_token   = access_token
+    app.state.last_auth_retry_attempt = None  # see _kite_self_heal's no-token retry path
 
     # ── Self-healing kite provisioning ───────────────────────────────────────
     # kite_instance used to be a one-time startup snapshot: if Redis had no
@@ -291,10 +292,48 @@ async def lifespan(app: FastAPI):
     # cadence — worst case detection is ~2 cycles (~6 min), still far better
     # than the 2+ hours of silent staleness confirmed live 2026-07-31.
     TICK_STALE_THRESHOLD_SECONDS = 180
+    # Cooldown between fresh-login retry attempts when no token exists at all
+    # (see below) -- long enough not to hammer Zerodha's login endpoint /
+    # repeatedly launch a headless browser if credentials or network are
+    # genuinely broken, short enough that a missed 08:30 auth job recovers
+    # within one trading session instead of losing the whole day.
+    AUTH_RETRY_COOLDOWN_SECONDS = 600
 
     async def _kite_self_heal():
         raw = await redis_client.get("zerodha:access_token")
         if not raw:
+            # Fixed 2026-08-13: this used to just return here, silently
+            # giving up every 3 minutes forever. If the scheduled 08:30
+            # daily-auth job never fires -- confirmed live 2026-08-13: a
+            # deploy restarted this process right at 08:30, wiping
+            # APScheduler's in-memory state before the login could complete
+            # -- NOTHING else ever puts a token back in Redis, and this job
+            # would keep silently doing nothing until tomorrow's 08:30 slot.
+            # That's a full trading day with zero live data if it happens on
+            # a day nobody's watching the logs. Actively retry the login
+            # here instead of only waiting for the next scheduled slot.
+            from src.core.utils import now_ist, is_auth_retry_window, should_retry_auth
+            now = now_ist()
+            if not is_auth_retry_window(now):
+                return
+            if not should_retry_auth(app.state.last_auth_retry_attempt, now, AUTH_RETRY_COOLDOWN_SECONDS):
+                return
+            app.state.last_auth_retry_attempt = now
+            logger.warning(
+                "Kite self-heal: no access token in Redis -- the scheduled "
+                "08:30 auth job appears to have been missed. Triggering a "
+                f"fresh login now (retrying at most every {AUTH_RETRY_COOLDOWN_SECONDS}s)."
+            )
+            try:
+                from scripts.zerodha_auto_auth import run_daily_auth
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, run_daily_auth)
+                logger.info(
+                    "Kite self-heal: fresh login succeeded -- provisioning "
+                    "will pick up the new token on the next cycle."
+                )
+            except Exception as e:
+                logger.error(f"Kite self-heal: fresh login attempt failed: {e}")
             return
         token = raw.strip()
 

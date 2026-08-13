@@ -108,3 +108,68 @@ def test_lot_sizes_are_plausible_nse_values():
     # knowing the exact correct number.
     for symbol, lot in FNO_LOT_SIZES.items():
         assert 10 <= lot <= 10_000, f"{symbol} lot size {lot} is outside a plausible NSE range"
+
+
+# ── Auth self-heal retry gating (2026-08-13) ─────────────────────────────────
+#
+# The kite-provisioning self-heal job (src/api/main.py's _kite_self_heal)
+# used to silently give up forever if Redis had no access token at all --
+# confirmed live 2026-08-13: a deploy restarted the API process right at
+# 08:30 IST, wiping APScheduler's in-memory state before the scheduled daily
+# auth login could complete, and nothing else ever re-triggered it. These two
+# pure functions gate the "actively retry the login" fallback: is it even
+# worth trying right now, and have we tried too recently.
+
+from datetime import timedelta
+from src.core.utils import is_auth_retry_window, should_retry_auth
+
+
+def test_auth_retry_window_true_during_trading_hours_weekday():
+    # A Wednesday at 10:00 IST -- comfortably inside 08:25-15:30.
+    dt = datetime(2026, 8, 12, 10, 0, 0)  # 2026-08-12 is a Wednesday
+    assert dt.weekday() == 2
+    assert is_auth_retry_window(dt) is True
+
+
+def test_auth_retry_window_true_at_exactly_0825():
+    dt = datetime(2026, 8, 12, 8, 25, 0)
+    assert is_auth_retry_window(dt) is True
+
+
+def test_auth_retry_window_false_before_0825():
+    dt = datetime(2026, 8, 12, 8, 24, 59)
+    assert is_auth_retry_window(dt) is False
+
+
+def test_auth_retry_window_false_after_market_close():
+    dt = datetime(2026, 8, 12, 15, 30, 1)
+    assert is_auth_retry_window(dt) is False
+
+
+def test_auth_retry_window_false_on_weekend():
+    # 2026-08-15 is a Saturday.
+    dt = datetime(2026, 8, 15, 10, 0, 0)
+    assert dt.weekday() == 5
+    assert is_auth_retry_window(dt) is False
+
+
+def test_should_retry_auth_true_when_never_attempted():
+    assert should_retry_auth(last_attempt=None) is True
+
+
+def test_should_retry_auth_false_within_cooldown():
+    now = datetime(2026, 8, 12, 10, 0, 0)
+    last_attempt = now - timedelta(seconds=200)
+    assert should_retry_auth(last_attempt, now, cooldown_seconds=600) is False
+
+
+def test_should_retry_auth_true_after_cooldown_elapses():
+    now = datetime(2026, 8, 12, 10, 0, 0)
+    last_attempt = now - timedelta(seconds=601)
+    assert should_retry_auth(last_attempt, now, cooldown_seconds=600) is True
+
+
+def test_should_retry_auth_true_at_exactly_cooldown_boundary():
+    now = datetime(2026, 8, 12, 10, 0, 0)
+    last_attempt = now - timedelta(seconds=600)
+    assert should_retry_auth(last_attempt, now, cooldown_seconds=600) is True
