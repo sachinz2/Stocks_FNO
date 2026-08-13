@@ -1264,7 +1264,16 @@ class LiveTradingEngine:
         # (with slippage + fees on both legs) worked out to roughly -770 --
         # every single-leg trade_journal.pnl this system has ever recorded
         # was blind to execution slippage entirely, not just this one.
-        _fill_p = getattr(db_order, "fill_price", None) or current_p
+        # Fixed 2026-08-12: db_order.fill_price is a SQLAlchemy Numeric column
+        # -- comes back as decimal.Decimal, not float. Every arithmetic use
+        # below (and at every other fill_price call site in this file) mixed
+        # it with plain floats, raising an uncaught TypeError that crashed
+        # the entire signal cycle (not just this exit) -- confirmed live:
+        # 5 crashes across 2026-08-10/11/12, each one leaving its trade_journal
+        # row's exit_time/exit_price/pnl permanently NULL because everything
+        # after this line (the journal pop, _log_trade_close, capital release)
+        # never ran, even though the SELL order itself had already filled.
+        _fill_p = float(getattr(db_order, "fill_price", None) or current_p)
         _slip   = abs(_fill_p - current_p)
         pnl = (_fill_p - entry_p) * abs(qty)
 
@@ -1580,7 +1589,9 @@ class LiveTradingEngine:
             # fix as the exit-side fill_price bug above, so entry_price
             # reflects what was actually paid rather than what was quoted a
             # moment before the simulated bid-ask slippage was applied.
-            _entry_fill = getattr(order, "fill_price", None) or option_p
+            # float() cast: db_order.fill_price is Decimal (SQLAlchemy Numeric
+            # column) -- see the 2026-08-12 fix note in _execute_single_leg_exit.
+            _entry_fill = float(getattr(order, "fill_price", None) or option_p)
             journal_id = await self._log_trade_open(
                 strategy=strategy.name, underlying=symbol,
                 structure_type="SINGLE_LEG", contracts=[contract],
@@ -1664,7 +1675,8 @@ class LiveTradingEngine:
             # quote/estimate fed INTO place_order()), and place_order()'s
             # return value was discarded entirely, never reading the real
             # PaperBroker fill.
-            _rev_fill_p = getattr(_rev_order, "fill_price", None) or exit_p
+            # float() cast: see 2026-08-12 fix note in _execute_single_leg_exit.
+            _rev_fill_p = float(getattr(_rev_order, "fill_price", None) or exit_p)
             logger.info(f"REVERSAL EXIT: SELL {contract} @ Rs{_rev_fill_p:.2f}")
             jrnl = self._single_leg_journals.pop(contract, None)
             if jrnl:
@@ -2303,8 +2315,9 @@ class LiveTradingEngine:
             # above is deliberately quote-based, not fill-based, so this
             # fix only corrects the total_slippage_pts diagnostic field
             # below, not the recorded pnl itself.
-            _short_fill = getattr(exit_short, "fill_price", None) or cur_short
-            _long_fill  = getattr(exit_long,  "fill_price", None) or cur_long
+            # float() cast: see 2026-08-12 fix note in _execute_single_leg_exit.
+            _short_fill = float(getattr(exit_short, "fill_price", None) or cur_short)
+            _long_fill  = float(getattr(exit_long,  "fill_price", None) or cur_long)
             _slippage   = abs(_short_fill - cur_short) + abs(_long_fill - cur_long)
             await self._log_trade_close(
                 journal_id=spread.get("journal_id"),
@@ -2932,10 +2945,11 @@ class LiveTradingEngine:
             # credit spread exit above -- net_pnl is deliberately quote-based
             # here too, so this only corrects the total_slippage_pts
             # diagnostic (previously always silently 0).
-            _ps_fill = getattr(exit_ps, "fill_price", None) or cur_ps
-            _pl_fill = getattr(exit_pl, "fill_price", None) or cur_pl
-            _cs_fill = getattr(exit_cs, "fill_price", None) or cur_cs
-            _cl_fill = getattr(exit_cl, "fill_price", None) or cur_cl
+            # float() cast: see 2026-08-12 fix note in _execute_single_leg_exit.
+            _ps_fill = float(getattr(exit_ps, "fill_price", None) or cur_ps)
+            _pl_fill = float(getattr(exit_pl, "fill_price", None) or cur_pl)
+            _cs_fill = float(getattr(exit_cs, "fill_price", None) or cur_cs)
+            _cl_fill = float(getattr(exit_cl, "fill_price", None) or cur_cl)
             _slippage = (abs(_ps_fill - cur_ps) + abs(_pl_fill - cur_pl)
                          + abs(_cs_fill - cur_cs) + abs(_cl_fill - cur_cl))
             await self._log_trade_close(
@@ -3044,7 +3058,8 @@ class LiveTradingEngine:
                 is_exit_order=True, strategy_name=_ex_owner_strategy,
             )
             self._peak_premiums.pop(contract, None)
-            _ex_fill_p = getattr(_ex_order, "fill_price", None) or exit_p
+            # float() cast: see 2026-08-12 fix note in _execute_single_leg_exit.
+            _ex_fill_p = float(getattr(_ex_order, "fill_price", None) or exit_p)
 
             _jrnl_info = self._single_leg_journals.pop(contract, None)
             if _jrnl_info:
@@ -3149,7 +3164,11 @@ class LiveTradingEngine:
             # EOD square-off runs every trading day (single-leg positions
             # "ALWAYS close" per this method's own docstring), so this was a
             # frequently-triggered instance of the exact same inaccuracy.
-            _sq_fill_p = getattr(_sq_order, "fill_price", None) or exit_p
+            # float() cast: see 2026-08-12 fix note in _execute_single_leg_exit --
+            # this is the exact site that crashed live on 2026-08-12, aborting
+            # EOD square-off mid-loop and leaving every remaining position that
+            # cycle unclosed (single-leg AND spread/condor legs after it).
+            _sq_fill_p = float(getattr(_sq_order, "fill_price", None) or exit_p)
             _exit_prices[contract] = _sq_fill_p
 
             # Write exit to trade journal so EOD/expiry closes appear in PnL analytics

@@ -7,6 +7,7 @@ production code, not a reimplementation of it.
 import inspect
 import types
 import asyncio
+from decimal import Decimal
 import pytest
 
 from src.live_trading.live_trading_engine import LiveTradingEngine
@@ -386,6 +387,44 @@ async def test_single_leg_exit_pnl_falls_back_to_quote_when_fill_unavailable():
     assert abs(pnl - expected_fallback_pnl) < 0.01
 
 
+# ── fill_price Decimal/float TypeError crashed the whole signal cycle (2026-08-12) ──
+#
+# db_order.fill_price is a SQLAlchemy Numeric(18,4) column -- reads back as
+# decimal.Decimal, not float (see database/models/order.py). Every fill_price
+# call site mixed it with plain floats in subtraction, which raises an
+# uncaught TypeError. Confirmed live: 5 crashes across 2026-08-10/11/12 (4 in
+# _execute_single_leg_exit, 1 in _square_off_all), each one aborting the
+# ENTIRE run_signal_cycle mid-iteration -- the SELL order had already filled
+# by that point, but everything after the crash (journal close, capital
+# release, and for _square_off_all specifically, every OTHER position still
+# left to close that cycle) never ran. Left 6 trade_journal rows permanently
+# stuck with NULL exit_time/exit_price/pnl. All prior fill_price tests in
+# this file used a plain float, which is why this slipped through -- these
+# use a real Decimal to match what SQLAlchemy actually returns.
+
+@pytest.mark.asyncio
+async def test_single_leg_exit_handles_decimal_fill_price_without_crashing():
+    fake = _FakeEngine(fill_price=Decimal("4.90"))
+    fake._single_leg_journals["POWERGRID26AUG270PE"] = {
+        "journal_id": 155, "underlying": "POWERGRID", "strategy_name": "momentum_v1",
+    }
+
+    async def _get_market_data(symbol):
+        return {}
+    fake._get_market_data = _get_market_data
+
+    closed = await LiveTradingEngine._execute_single_leg_exit(
+        fake, "POWERGRID26AUG270PE", 1900, 5.29, 5.05,
+        "momentum_v1 entry=Rs5.29 now=Rs5.05 (-4.5%)",
+    )
+
+    assert closed is True, "a Decimal fill_price must not crash the exit"
+    assert len(fake._closed_journals) == 1, "trade_journal close must still run after the crash site"
+    _, exit_price, pnl, _ = fake._closed_journals[0]
+    assert abs(pnl - (4.90 - 5.29) * 1900) < 0.01
+    assert exit_price == 4.90
+
+
 # ── EOD square-off pnl uses the real fill price (2026-08-07) ────────────────
 #
 # A fourth instance of the same fill_price bug: _square_off_all() (single-leg
@@ -472,6 +511,26 @@ async def test_square_off_falls_back_to_estimate_when_fill_unavailable():
     journal_id, exit_price, pnl, exit_reason = fake._closed_journals[0]
     # Falls back to the ATR estimate (a positive, computed value), not None/0
     assert exit_price is not None and exit_price > 0
+
+
+@pytest.mark.asyncio
+async def test_square_off_handles_decimal_fill_price_without_crashing():
+    # This is the exact site that crashed live on 2026-08-12 (see the
+    # Decimal/float TypeError note above _execute_single_leg_exit's Decimal
+    # test) -- aborted _square_off_all mid-loop, leaving every remaining
+    # position that cycle unclosed too.
+    fake = _FakeSquareOffEngine(fill_price=Decimal("44.10"))
+    await LiveTradingEngine._square_off_all(fake)
+
+    assert len(fake._closed_journals) == 1, "a Decimal fill_price must not crash square-off"
+    journal_id, exit_price, pnl, exit_reason = fake._closed_journals[0]
+
+    entry_p = 46.59
+    qty = 175
+    correct_pnl = (44.10 - entry_p) * qty
+
+    assert exit_price == 44.10
+    assert abs(pnl - correct_pnl) < 0.01
 
 
 # ── _exit_all_options_for (2026-08-07) ───────────────────────────────────────
