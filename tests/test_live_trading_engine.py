@@ -899,3 +899,235 @@ async def test_reconcile_skips_positions_already_tracked():
     await LiveTradingEngine._reconcile_broker_positions(fake)
 
     assert fake.order_manager.calls == [], "a position the engine already tracks must not be auto-closed"
+
+
+# ── Credit spread / iron condor exits use the real fill, not the quote (2026-08-13) ──
+#
+# net_pnl and exit_price were computed from cur_short/cur_long (the pre-trade
+# QUOTE fed into place_order()) instead of the real fill -- despite the real
+# fill being computed immediately afterward, but only for the slippage
+# diagnostic. Confirmed live: a real TITAN BULL_PUT_SPREAD closed with
+# recorded pnl=Rs7,638.75 (quote-based) vs the real fill-based pnl of
+# Rs7,390.25 -- a Rs248.50 overstatement from slippage the record never
+# reflected. These tests reproduce that exact trade's numbers.
+
+class _FakeSpreadOrder:
+    def __init__(self, fill_price, status="OPEN"):
+        self.fill_price = fill_price
+        self.order_status = status
+
+
+class _FakeSpreadOrderManager:
+    def __init__(self, fills: dict):
+        self._fills = fills  # contract -> fill_price
+        self.calls = []
+
+    async def place_order(self, contract, side, qty, price, is_spread_leg=False, is_exit_order=False):
+        self.calls.append((contract, side, qty, price))
+        return _FakeSpreadOrder(self._fills[contract])
+
+
+class _FakeSpreadRiskManager:
+    def __init__(self):
+        self.released = []
+
+    def release_deployed_capital(self, strategy_name, amount):
+        self.released.append((strategy_name, amount))
+
+
+class _FakeSpreadExitEngine:
+    """Reproduces the real 2026-08-13 TITAN BULL_PUT_SPREAD close: quoted
+    exit prices of 36.35 (short buyback) / 11.00 (long sell), real fills of
+    37.44 / 10.67 after slippage."""
+
+    def __init__(self):
+        self.order_manager = _FakeSpreadOrderManager({
+            "TITAN26SEP4650PE": 37.44,   # short leg real fill (BUY to close)
+            "TITAN26SEP4400PE": 10.67,   # long leg real fill (SELL to close)
+        })
+        self.risk_manager = _FakeSpreadRiskManager()
+        self._active_spreads = {
+            "TITAN": {
+                "short_contract": "TITAN26SEP4650PE", "long_contract": "TITAN26SEP4400PE",
+                "short_premium": 82.0, "long_premium": 13.0, "net_credit": 69.0,
+                "short_strike": 4650, "long_strike": 4400, "option_type": "PE",
+                "spread_type": "BULL_PUT_SPREAD", "lot_size": 175,
+                "entry_vix": 0.0, "gtt_id": None, "strategy_name": "credit_spread_v1",
+            },
+        }
+        self._active_condors = {}
+        self._exited_today = set()
+        self._profit_closed_today = set()
+        self._close_on_first_cycle = set()
+        self._closed_journals = []
+        self._notifications = []
+        self._ltp_poller = None
+        self._kite = None
+        self._redis = None
+
+    async def _get_market_data(self, symbol):
+        # current_price safely above short_strike (4650) so the put-breach
+        # check doesn't fire before the DTE-tiered profit check does.
+        return {"close": 4900.0, "atr14": 20.0}
+
+    async def _get_cached_vix(self):
+        return None
+
+    async def _log_trade_close(self, journal_id, exit_price, pnl, exit_reason, market_data, total_slippage_pts):
+        self._closed_journals.append((journal_id, exit_price, pnl, exit_reason))
+
+    async def _persist_state(self):
+        pass
+
+    async def _notify(self, msg):
+        self._notifications.append(msg)
+
+    async def _cancel_gtt(self, gtt_id, contract=""):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_spread_exit_pnl_uses_real_fill_not_quote():
+    from datetime import timedelta
+    from src.core.utils import now_ist
+
+    fake = _FakeSpreadExitEngine()
+
+    with pytest.MonkeyPatch.context() as mp:
+        # Fixed DTE=11 (matches the real trade's "DTE-tiered profit (DTE=11)"
+        # exit and its 45% tier) and a fixed quote (36.35 / 11.00, matching
+        # the real pre-trade quote logged for this exact close).
+        mp.setattr(
+            "src.live_trading.live_trading_engine.get_near_month_expiry",
+            lambda: now_ist().replace(tzinfo=None) + timedelta(days=11),
+        )
+
+        async def _fake_get_option_quote(contract, kite, redis):
+            return {"TITAN26SEP4650PE": 36.35, "TITAN26SEP4400PE": 11.00}[contract]
+        mp.setattr("src.market_data.option_chain.get_option_quote", _fake_get_option_quote)
+
+        await LiveTradingEngine._check_spread_exits(fake, active_strategies={})
+
+    assert len(fake._closed_journals) == 1
+    journal_id, exit_price, pnl, exit_reason = fake._closed_journals[0]
+
+    # Real fill-based numbers, NOT the quote-based ones (short 36.35/long
+    # 11.00 would give exit_price=25.35, pnl=7638.75 -- the bug).
+    assert exit_price == 26.77
+    assert abs(pnl - 7390.25) < 0.01
+    assert "DTE-tiered profit" in exit_reason
+
+    # TITAN must be fully closed out and routed to the profit bucket.
+    assert "TITAN" not in fake._active_spreads
+    assert "TITAN" in fake._profit_closed_today
+
+
+class _FakeCondorOrder:
+    def __init__(self, fill_price, status="OPEN"):
+        self.fill_price = fill_price
+        self.order_status = status
+
+
+class _FakeCondorOrderManager:
+    def __init__(self, fills: dict):
+        self._fills = fills
+        self.calls = []
+
+    async def place_order(self, contract, side, qty, price, is_spread_leg=False, is_exit_order=False):
+        self.calls.append((contract, side, qty, price))
+        return _FakeCondorOrder(self._fills[contract])
+
+
+class _FakeCondorExitEngine:
+    """Same fill-vs-quote fix, on the 4-leg iron condor exit path."""
+
+    def __init__(self):
+        # Quote-side prices (what the exit DECISION and old buggy pnl used):
+        #   put short 4.5, put long 2.0, call short 15.0, call long 6.0
+        # Real fills (what pnl/exit_price must now use instead):
+        #   put short 4.8, put long 1.9, call short 15.2, call long 5.9
+        self.order_manager = _FakeCondorOrderManager({
+            "SBIN26SEP4400PE": 4.8,
+            "SBIN26SEP4300PE": 1.9,
+            "SBIN26SEP4900CE": 15.2,
+            "SBIN26SEP5000CE": 5.9,
+        })
+        self.risk_manager = _FakeSpreadRiskManager()
+        self._active_spreads = {}
+        self._active_condors = {
+            "SBIN": {
+                "put_short_contract": "SBIN26SEP4400PE", "put_long_contract": "SBIN26SEP4300PE",
+                "call_short_contract": "SBIN26SEP4900CE", "call_long_contract": "SBIN26SEP5000CE",
+                "put_short_premium": 20.0, "put_long_premium": 8.0,
+                "call_short_premium": 18.0, "call_long_premium": 7.0,
+                "put_short_strike": 4400, "put_long_strike": 4300,
+                "call_short_strike": 4900, "call_long_strike": 5000,
+                "net_credit": 23.0, "lot_size": 175,
+                "entry_vix": 0.0, "strategy_name": "iron_condor_v1",
+            },
+        }
+        self._exited_today = set()
+        self._profit_closed_today = set()
+        self._close_on_first_cycle = set()
+        self._closed_journals = []
+        self._notifications = []
+        self._ltp_poller = None
+        self._kite = None
+        self._redis = None
+
+    async def _get_market_data(self, symbol):
+        # Between both short strikes (4400 put / 4900 call) so neither
+        # breach check fires before the profit-target check does.
+        return {"close": 4650.0, "atr14": 20.0}
+
+    async def _get_cached_vix(self):
+        return None
+
+    async def _log_trade_close(self, journal_id, exit_price, pnl, exit_reason, market_data, total_slippage_pts):
+        self._closed_journals.append((journal_id, exit_price, pnl, exit_reason))
+
+    async def _persist_state(self):
+        pass
+
+    async def _notify(self, msg):
+        self._notifications.append(msg)
+
+    async def _cancel_gtt(self, gtt_id, contract=""):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_condor_exit_pnl_uses_real_fill_not_quote():
+    from datetime import timedelta
+    from src.core.utils import now_ist
+
+    fake = _FakeCondorExitEngine()
+
+    with pytest.MonkeyPatch.context() as mp:
+        # DTE=25 -> default profit_pct stays 0.25 (no DTE-tiering involved).
+        mp.setattr(
+            "src.live_trading.live_trading_engine.get_near_month_expiry",
+            lambda: now_ist().replace(tzinfo=None) + timedelta(days=25),
+        )
+
+        _quotes = {
+            "SBIN26SEP4400PE": 4.5, "SBIN26SEP4300PE": 2.0,
+            "SBIN26SEP4900CE": 15.0, "SBIN26SEP5000CE": 6.0,
+        }
+        async def _fake_get_option_quote(contract, kite, redis):
+            return _quotes[contract]
+        mp.setattr("src.market_data.option_chain.get_option_quote", _fake_get_option_quote)
+
+        await LiveTradingEngine._check_condor_exits(fake, active_strategies={})
+
+    assert len(fake._closed_journals) == 1
+    journal_id, exit_price, pnl, exit_reason = fake._closed_journals[0]
+
+    # Fill-based: (20-4.8)+(18-15.2)-(8-1.9)-(7-5.9) = 10.8 * 175 = 1890.0
+    # exit_price = 4.8+15.2-1.9-5.9 = 12.2
+    # Quote-based (the bug) would instead give exit_price=11.5, pnl=2012.5.
+    assert exit_price == 12.2
+    assert abs(pnl - 1890.0) < 0.01
+
+    assert "SBIN" not in fake._active_condors
+    assert "SBIN" in fake._profit_closed_today

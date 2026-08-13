@@ -2222,9 +2222,23 @@ class LiveTradingEngine:
                 )
                 continue
 
+            # Fixed 2026-08-13: net_pnl/exit_price were computed from cur_short/
+            # cur_long -- the pre-trade QUOTE fed into place_order(), not the
+            # real fill -- despite the real fill being computed right below
+            # this, immediately, for the slippage diagnostic only. Same class
+            # of bug as the single-leg/square-off fill_price fixes earlier this
+            # project, just never closed here. Confirmed live 2026-08-13: a
+            # real TITAN BULL_PUT_SPREAD closed with recorded pnl=Rs7,638.75
+            # (quote-based) vs the real fill-based pnl of Rs7,390.25 -- a
+            # Rs248.50 overstatement from slippage the record never reflected.
+            # float() cast: see 2026-08-12 fix note in _execute_single_leg_exit.
+            _short_fill = float(getattr(exit_short, "fill_price", None) or cur_short)
+            _long_fill  = float(getattr(exit_long,  "fill_price", None) or cur_long)
+            _slippage   = abs(_short_fill - cur_short) + abs(_long_fill - cur_long)
+
             net_pnl = (
-                (spread["short_premium"] - cur_short)
-                - (spread["long_premium"]  - cur_long)
+                (spread["short_premium"] - _short_fill)
+                - (spread["long_premium"]  - _long_fill)
             ) * lot
 
             # Must match the max-loss figure add_deployed_capital() used at entry
@@ -2235,19 +2249,9 @@ class LiveTradingEngine:
                 (_spread_width - spread["net_credit"]) * lot,
             )
 
-            # Fixed 2026-08-06: was "avg_price" (doesn't exist on the Order
-            # model -- see database/models/order.py, the real column is
-            # fill_price), so _slippage was always silently 0 here. net_pnl
-            # above is deliberately quote-based, not fill-based, so this
-            # fix only corrects the total_slippage_pts diagnostic field
-            # below, not the recorded pnl itself.
-            # float() cast: see 2026-08-12 fix note in _execute_single_leg_exit.
-            _short_fill = float(getattr(exit_short, "fill_price", None) or cur_short)
-            _long_fill  = float(getattr(exit_long,  "fill_price", None) or cur_long)
-            _slippage   = abs(_short_fill - cur_short) + abs(_long_fill - cur_long)
             await self._log_trade_close(
                 journal_id=spread.get("journal_id"),
-                exit_price=round(cur_short - cur_long, 2),
+                exit_price=round(_short_fill - _long_fill, 2),
                 pnl=net_pnl, exit_reason=exit_reason,
                 market_data=market_data,
                 total_slippage_pts=round(_slippage, 4) if _slippage > 0 else None,
@@ -2259,8 +2263,8 @@ class LiveTradingEngine:
             await self._notify(
                 f"CREDIT SPREAD CLOSED\n"
                 f"Underlying: {underlying}\nReason: {exit_reason}\n"
-                f"Short: sold Rs{spread['short_premium']:.2f}, closed Rs{cur_short:.2f}\n"
-                f"Long:  paid Rs{spread['long_premium']:.2f}, sold Rs{cur_long:.2f}\n"
+                f"Short: sold Rs{spread['short_premium']:.2f}, closed Rs{_short_fill:.2f}\n"
+                f"Long:  paid Rs{spread['long_premium']:.2f}, sold Rs{_long_fill:.2f}\n"
                 f"Net PnL: Rs{net_pnl:,.2f}"
             )
 
@@ -2854,11 +2858,25 @@ class LiveTradingEngine:
                 )
                 continue
 
+            # Fixed 2026-08-13: net_pnl/exit_price were computed from the
+            # pre-trade QUOTEs (cur_ps/cur_pl/cur_cs/cur_cl), not the real
+            # fills -- same bug just fixed in the matching credit-spread exit
+            # above (see its comment for the confirmed live example and
+            # rationale). The real fills were already being computed right
+            # below, immediately, but only for the slippage diagnostic.
+            # float() cast: see 2026-08-12 fix note in _execute_single_leg_exit.
+            _ps_fill = float(getattr(exit_ps, "fill_price", None) or cur_ps)
+            _pl_fill = float(getattr(exit_pl, "fill_price", None) or cur_pl)
+            _cs_fill = float(getattr(exit_cs, "fill_price", None) or cur_cs)
+            _cl_fill = float(getattr(exit_cl, "fill_price", None) or cur_cl)
+            _slippage = (abs(_ps_fill - cur_ps) + abs(_pl_fill - cur_pl)
+                         + abs(_cs_fill - cur_cs) + abs(_cl_fill - cur_cl))
+
             net_pnl = (
-                (c["put_short_premium"]  - cur_ps)
-                + (c["call_short_premium"] - cur_cs)
-                - (c["put_long_premium"]   - cur_pl)
-                - (c["call_long_premium"]  - cur_cl)
+                (c["put_short_premium"]  - _ps_fill)
+                + (c["call_short_premium"] - _cs_fill)
+                - (c["put_long_premium"]   - _pl_fill)
+                - (c["call_long_premium"]  - _cl_fill)
             ) * lot
 
             # Must match the max-loss figure add_deployed_capital() used at entry
@@ -2870,20 +2888,9 @@ class LiveTradingEngine:
                 (max(_put_wing, _call_wing) - c["net_credit"]) * lot,
             )
 
-            # Fixed 2026-08-06: same "avg_price" -> "fill_price" fix as the
-            # credit spread exit above -- net_pnl is deliberately quote-based
-            # here too, so this only corrects the total_slippage_pts
-            # diagnostic (previously always silently 0).
-            # float() cast: see 2026-08-12 fix note in _execute_single_leg_exit.
-            _ps_fill = float(getattr(exit_ps, "fill_price", None) or cur_ps)
-            _pl_fill = float(getattr(exit_pl, "fill_price", None) or cur_pl)
-            _cs_fill = float(getattr(exit_cs, "fill_price", None) or cur_cs)
-            _cl_fill = float(getattr(exit_cl, "fill_price", None) or cur_cl)
-            _slippage = (abs(_ps_fill - cur_ps) + abs(_pl_fill - cur_pl)
-                         + abs(_cs_fill - cur_cs) + abs(_cl_fill - cur_cl))
             await self._log_trade_close(
                 journal_id=c.get("journal_id"),
-                exit_price=round(cur_ps + cur_cs - cur_pl - cur_cl, 2),
+                exit_price=round(_ps_fill + _cs_fill - _pl_fill - _cl_fill, 2),
                 pnl=net_pnl, exit_reason=exit_reason,
                 market_data=market_data,
                 total_slippage_pts=round(_slippage, 4) if _slippage > 0 else None,
@@ -2896,8 +2903,8 @@ class LiveTradingEngine:
             await self._notify(
                 f"IRON CONDOR CLOSED\n"
                 f"Underlying: {underlying}\nReason: {exit_reason}\n"
-                f"Put short:  Rs{c['put_short_premium']:.2f} -> Rs{cur_ps:.2f}\n"
-                f"Call short: Rs{c['call_short_premium']:.2f} -> Rs{cur_cs:.2f}\n"
+                f"Put short:  Rs{c['put_short_premium']:.2f} -> Rs{_ps_fill:.2f}\n"
+                f"Call short: Rs{c['call_short_premium']:.2f} -> Rs{_cs_fill:.2f}\n"
                 f"Net PnL: Rs{net_pnl:,.2f}"
             )
 
