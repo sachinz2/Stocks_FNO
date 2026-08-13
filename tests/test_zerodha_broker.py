@@ -136,3 +136,74 @@ async def test_cancel_order(broker):
     result = await broker.cancel_order("order123")
     assert result is True
     broker.kite.cancel_order.assert_called_once()
+
+
+# ── transaction_type mapping -- selling trades (2026-08-13) ────────────────
+#
+# Every existing test above places BUY orders (or a SELL only incidentally,
+# without ever asserting transaction_type). credit_spread_v1/iron_condor_v1
+# open every position with a SELL (the short leg) -- if this ever mapped to
+# the wrong Zerodha transaction_type, it would silently BUY instead of
+# SELL, taking the exact opposite market exposure of what the strategy
+# intended. Never directly asserted until now.
+
+@pytest.mark.asyncio
+async def test_place_order_sell_maps_to_transaction_type_sell(broker):
+    broker.kite.place_order.return_value = "order789"
+
+    await broker.place_order("TITAN26SEP4650PE", "SELL", 175, 82.0)
+
+    _, kwargs = broker.kite.place_order.call_args
+    assert kwargs["transaction_type"] == broker.kite.TRANSACTION_TYPE_SELL
+
+
+@pytest.mark.asyncio
+async def test_place_order_buy_maps_to_transaction_type_buy(broker):
+    broker.kite.place_order.return_value = "order790"
+
+    await broker.place_order("TITAN26SEP4400PE", "BUY", 175, 13.0)
+
+    _, kwargs = broker.kite.place_order.call_args
+    assert kwargs["transaction_type"] == broker.kite.TRANSACTION_TYPE_BUY
+
+
+# ── exchange selection (2026-08-13) ──────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_place_order_option_symbol_routes_to_nfo(broker):
+    broker.kite.place_order.return_value = "order791"
+
+    await broker.place_order("TITAN26SEP4650PE", "SELL", 175, 82.0)
+
+    _, kwargs = broker.kite.place_order.call_args
+    assert kwargs["exchange"] == broker.kite.EXCHANGE_NFO
+
+
+@pytest.mark.asyncio
+async def test_place_order_equity_symbol_routes_to_nse(broker):
+    # NOTE: deliberately not "RELIANCE" -- it ends in "CE", which
+    # _exchange_for()'s bare symbol.endswith(("CE","PE")) suffix check
+    # would misroute to NFO. That's a real (if currently dormant --
+    # nothing in this codebase calls place_order with a bare equity
+    # symbol; every real caller passes a constructed option contract)
+    # fragility in _exchange_for found while writing this test, flagged
+    # separately rather than fixed here (out of scope, no live code path
+    # exercises it today).
+    broker.kite.place_order.return_value = "order792"
+
+    await broker.place_order("TCS", "BUY", 1, 3800.0)
+
+    _, kwargs = broker.kite.place_order.call_args
+    assert kwargs["exchange"] == broker.kite.EXCHANGE_NSE
+
+
+@pytest.mark.asyncio
+async def test_modify_order(broker):
+    broker.kite.modify_order.return_value = None
+
+    result = await broker.modify_order("order123", new_price=510.0, new_quantity=50)
+
+    assert result is True
+    _, kwargs = broker.kite.modify_order.call_args
+    assert kwargs["price"] == 510.0
+    assert kwargs["quantity"] == 50
