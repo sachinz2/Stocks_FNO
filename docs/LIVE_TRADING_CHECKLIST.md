@@ -17,13 +17,17 @@ contract collisions). The historical *win/loss pattern* is still valid, but
 the exact P&L numbers it was judged on were often wrong — one trade even
 flipped from a recorded profit to a real loss (POWERGRID, +₹380 → −₹2,052).
 
-- [ ] Recompute total realized P&L across every historical trade using real
-      fill prices (same methodology as the credit_spread/iron_condor
-      backfill just done) — confirm the strategy is genuinely net profitable,
-      not just reported as such.
+- [x] **Done 2026-08-13.** Recomputed total realized P&L on corrected data:
+      net profitable, **₹72,120.75 across 22 closed trades**
+      (credit_spread_v1 ₹73,033.00/9 trades, iron_condor_v1 ₹1,163.25/4,
+      ema_crossover_v1 ₹59.25/1, **momentum_v1 −₹2,134.75/8 — 1 win, 7
+      losses**). momentum_v1's poor showing is confirmed on correct
+      numbers, not a fill-price artifact — worth a hard look before go-live.
 - [ ] Run at least 2-3 more weeks of paper trading **on the fully-fixed
-      code** (today's fixes onward) before counting it toward the 45-day
-      gate — the old track record was earned on a different, buggier system.
+      code** (2026-08-13 onward — today's fixes) before counting it toward
+      the 45-day gate — the old track record was earned on a different,
+      buggier system. First trade was 2026-07-03, so only 41 days of real
+      trading activity exist even though paper infra started 2026-06-15.
 - [ ] Compare paper fills vs a spot-check of real quotes for a few trades —
       confirm PaperBroker's slippage model is realistic, not systematically
       generous or harsh vs what Zerodha would actually fill.
@@ -51,14 +55,24 @@ one of them.
 ## 3. Risk & capital configuration — sized for the REAL account, not the default
 
 Current `.env`: `INITIAL_CAPITAL=300000.0`, `MAX_OPEN_POSITIONS=5`,
-`MAX_DAILY_LOSS_PCT=0.05`, `MAX_EXPOSURE_PCT=0.20`.
+`MAX_DAILY_LOSS_PCT=0.05`, `MAX_EXPOSURE_PCT=0.30` (raised from 0.20,
+2026-08-13 — also fixed as dead config, see §2 history: it wasn't wired
+to anything at all before today).
 
-- [ ] Confirm `INITIAL_CAPITAL` matches the actual funded Zerodha account
-      balance at go-live time, not a stale placeholder.
-- [ ] Explicitly decide (don't inherit by default) whether `MAX_DAILY_LOSS_PCT`
-      (5%) and `MAX_EXPOSURE_PCT` (20%) are still the right numbers for real
-      capital — paper-mode risk tolerance and real-money risk tolerance are
-      not obligated to match.
+- [ ] **Blocked on you.** Confirm `INITIAL_CAPITAL` matches the actual funded
+      Zerodha account balance at go-live time, not the ₹300,000 placeholder.
+      Also drives paper trading's position sizing right now (risk_manager +
+      PaperBroker both read it) — changing it will visibly shift paper
+      trading behavior, so do it deliberately, not as a drive-by edit.
+- [x] **Partially done 2026-08-13.** `MAX_EXPOSURE_PCT` explicitly decided
+      → 30% (was silently unenforced 20% before today's fix).
+      `MAX_DAILY_LOSS_PCT` (5%) not yet explicitly re-confirmed for real
+      capital — still just inherited from the paper-mode default.
+- [ ] `MAX_OPEN_POSITIONS` (.env says 5) still doesn't match the actually
+      enforced limit (hardcoded 25, counts individual legs not
+      structures) — found 2026-08-13, deliberately left unwired since the
+      two numbers aren't the same unit. Needs an actual decision on what
+      this should mean, not just a wiring fix.
 - [ ] Confirm `_check_available_margin`'s live-mode path (`kite.margins()`)
       has actually been exercised against the real account at least once
       before go-live, not just unit-tested against a mock.
@@ -113,7 +127,7 @@ Current `.env`: `INITIAL_CAPITAL=300000.0`, `MAX_OPEN_POSITIONS=5`,
 
 ## 6. Testing & CI safety net
 
-- [ ] Full test suite green (currently 209 passing) immediately before flip.
+- [ ] Full test suite green (currently 244 passing) immediately before flip.
 - [ ] `deploy.sh`'s invariant-check step (`verify_invariants.py`) wired into
       the actual deploy path used for the live-mode cutover, not run ad hoc.
 - [ ] Dry run: flip `TRADING_MODE=live` on a throwaway/sandboxed Zerodha
@@ -138,5 +152,6 @@ Current `.env`: `INITIAL_CAPITAL=300000.0`, `MAX_OPEN_POSITIONS=5`,
 
 ---
 
-*Last updated: 2026-08-13, after the credit_spread/iron_condor fill-price
-backfill and the entry-side fix + cross-strategy collision guard.*
+*Last updated: 2026-08-13, after the P&L recompute, capital-period/
+exposure-cap work, MySQL backups, verify_invariants.py extension,
+notification test, rollback runbook, and server hardening.*
