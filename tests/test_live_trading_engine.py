@@ -188,6 +188,8 @@ class _FakeRiskManager:
 class _FakeEngine:
     """Duck-typed stand-in -- only the attributes/methods the target methods
     actually touch."""
+    _real_fill = staticmethod(LiveTradingEngine._real_fill)
+
     def __init__(self, fill_price=None):
         self.order_manager = _FakeOrderManager(fill_price)
         self.risk_manager = _FakeRiskManager()
@@ -513,6 +515,8 @@ class _FakeSquareOffOrderManager:
 
 
 class _FakeSquareOffEngine:
+    _real_fill = staticmethod(LiveTradingEngine._real_fill)
+
     def __init__(self, fill_price):
         self.order_manager = _FakeSquareOffOrderManager(fill_price)
         self.risk_manager = _FakeRiskManager()
@@ -619,6 +623,8 @@ class _FakeMultiSquareOffOrderManager:
 
 
 class _FakeMultiSquareOffEngine:
+    _real_fill = staticmethod(LiveTradingEngine._real_fill)
+
     def __init__(self):
         self.order_manager = _FakeMultiSquareOffOrderManager(
             fill_price=44.10, raise_for_contract="TITAN26AUG4950CE",
@@ -678,6 +684,111 @@ async def test_square_off_one_bad_position_does_not_block_the_rest():
     assert "RELIANCE26AUG1400CE" not in fake._single_leg_journals
 
 
+# ── expiry-day journal-close failure alerts, doesn't leave a phantom
+# active entry (2026-08-13) ──────────────────────────────────────────────
+#
+# By the time the spread/condor journal-close loop runs on expiry day, the
+# REAL broker position is already flat (closed by real orders in the
+# per-position loop above). If _log_trade_close() then fails for one
+# structure, the entry must NOT be left in _active_spreads/_active_condors
+# "for retry" -- that would make future exit-check cycles treat an
+# already-closed structure as still open, risking a real order against a
+# flat position. It must still be cleared, but with a loud CRITICAL alert
+# carrying enough detail to fix the trade_journal row by hand, instead of
+# silently losing it forever with just a log line.
+
+class _FakeExpiryJournalFailOrderManager:
+    def __init__(self, fill_price):
+        self.fill_price = fill_price
+
+    async def place_order(self, contract, side, qty, price, is_exit_order=False,
+                           strategy_name=None, product_override=None):
+        return _FakeSquareOffOrder(self.fill_price)
+
+
+class _FakeExpiryJournalFailEngine:
+    _real_fill = staticmethod(LiveTradingEngine._real_fill)
+
+    def __init__(self):
+        self.order_manager = _FakeExpiryJournalFailOrderManager(fill_price=5.0)
+        self.risk_manager = _FakeRiskManager()
+        self._peak_premiums = {}
+        self._single_leg_journals = {}
+        self._active_spreads = {
+            "GOODSPR": {
+                "journal_id": 300, "short_contract": "GOODSPR26AUG100PE",
+                "long_contract": "GOODSPR26AUG90PE", "short_premium": 10.0,
+                "long_premium": 4.0, "lot_size": 100, "short_strike": 100,
+                "long_strike": 90, "net_credit": 6.0, "strategy_name": "credit_spread_v1",
+            },
+            "BADSPR": {
+                "journal_id": 301, "short_contract": "BADSPR26AUG200PE",
+                "long_contract": "BADSPR26AUG190PE", "short_premium": 8.0,
+                "long_premium": 3.0, "lot_size": 50, "short_strike": 200,
+                "long_strike": 190, "net_credit": 5.0, "strategy_name": "credit_spread_v1",
+            },
+        }
+        self._active_condors = {}
+        self._closed_journals = []
+        self._notifications = []
+        self._eod_notified_today = False
+        self._kite = None
+        self._redis = None
+
+    async def _safe_get_positions(self):
+        return []
+
+    async def _get_market_data(self, symbol):
+        return {"atr14": 5.0}
+
+    def _get_underlying_from_contract(self, contract):
+        return contract[:7]
+
+    async def _log_trade_close(self, journal_id, exit_price, pnl, exit_reason):
+        if journal_id == 301:  # BADSPR
+            raise RuntimeError("simulated DB write failure")
+        self._closed_journals.append((journal_id, exit_price, pnl, exit_reason))
+
+    async def _persist_state(self):
+        pass
+
+    async def _notify(self, msg):
+        self._notifications.append(msg)
+
+    async def _cancel_gtt(self, gtt_id, contract=""):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_expiry_journal_close_failure_alerts_and_still_clears_the_entry():
+    fake = _FakeExpiryJournalFailEngine()
+
+    with pytest.MonkeyPatch.context() as mp:
+        from datetime import timedelta
+        from src.core.utils import now_ist
+        mp.setattr(
+            "src.live_trading.live_trading_engine.get_near_month_expiry",
+            lambda: now_ist().replace(tzinfo=None) + timedelta(days=1),  # DTE=1 -> is_expiry
+        )
+        await LiveTradingEngine._square_off_all(fake)  # must not raise
+
+    # The good spread closed normally.
+    assert len(fake._closed_journals) == 1
+    assert fake._closed_journals[0][0] == 300
+
+    # The bad spread's journal write failed -> a loud, actionable alert, not just a log line.
+    critical_alerts = [m for m in fake._notifications if "CRITICAL" in m]
+    assert len(critical_alerts) == 1
+    assert "journal_id=301" in critical_alerts[0]
+    assert "MANUAL INTERVENTION REQUIRED" in critical_alerts[0]
+    assert "BADSPR" in critical_alerts[0]
+
+    # Both entries are cleared regardless -- the real broker position is
+    # already flat either way, so a "failed" entry must not be left behind
+    # looking like it's still an open, active structure.
+    assert fake._active_spreads == {}
+
+
 # ── _exit_all_options_for (2026-08-07) ───────────────────────────────────────
 #
 # Currently dead code in practice (no active strategy's generate_signal()
@@ -704,6 +815,8 @@ class _FakeExitAllOrderManager:
 
 
 class _FakeExitAllEngine:
+    _real_fill = staticmethod(LiveTradingEngine._real_fill)
+
     def __init__(self, fill_price):
         self.order_manager = _FakeExitAllOrderManager(fill_price)
         self.risk_manager = _FakeRiskManager()
@@ -943,6 +1056,8 @@ class _FakeSpreadExitEngine:
     exit prices of 36.35 (short buyback) / 11.00 (long sell), real fills of
     37.44 / 10.67 after slippage."""
 
+    _real_fill = staticmethod(LiveTradingEngine._real_fill)
+
     def __init__(self):
         self.order_manager = _FakeSpreadOrderManager({
             "TITAN26SEP4650PE": 37.44,   # short leg real fill (BUY to close)
@@ -1043,6 +1158,8 @@ class _FakeCondorOrderManager:
 
 class _FakeCondorExitEngine:
     """Same fill-vs-quote fix, on the 4-leg iron condor exit path."""
+
+    _real_fill = staticmethod(LiveTradingEngine._real_fill)
 
     def __init__(self):
         # Quote-side prices (what the exit DECISION and old buggy pnl used):
@@ -1154,8 +1271,8 @@ async def test_condor_exit_pnl_uses_real_fill_not_quote():
 
 def test_credit_spread_entry_uses_real_fill_not_quote():
     src = inspect.getsource(LiveTradingEngine._process_credit_spread)
-    assert 'short_fill = float(getattr(short_order, "fill_price", None) or short_p)' in src
-    assert 'long_fill  = float(getattr(long_order,  "fill_price", None) or long_p)' in src
+    assert "short_fill = self._real_fill(short_order, short_p)" in src
+    assert "long_fill  = self._real_fill(long_order,  long_p)" in src
     assert "entry_price=round(short_fill - long_fill, 2)" in src
     assert '"short_premium":  short_fill,      "long_premium":   long_fill,' in src
     # GTT backstop trigger must also be anchored to the real fill.
@@ -1173,8 +1290,59 @@ def test_credit_spread_entry_uses_real_fill_not_quote():
 # margin accounting once live. Guarded both directions: spread/condor entry
 # skips if the underlying already has an open single-leg position, and
 # single-leg entry skips if the underlying already has an active spread/condor.
+#
+# Consolidated 2026-08-13 into two small shared methods (were 3 independent
+# inline copies at each entry site -- a future 4th entry path had nothing
+# forcing it to remember the check).
+
+# ── _real_fill() -- shared fill-vs-quote helper (2026-08-13) ────────────────
+#
+# Extracted from ~13 inlined copies of `float(getattr(order, "fill_price",
+# None) or fallback)` scattered across every entry/exit path -- this exact
+# bug class (quote instead of real fill) had already been found and fixed
+# piecemeal at 6+ call sites earlier the same day.
+
+def test_real_fill_prefers_order_fill_price():
+    order = SimpleNamespace(fill_price=37.44)
+    assert LiveTradingEngine._real_fill(order, fallback=36.35) == 37.44
+
+
+def test_real_fill_falls_back_when_no_fill_price():
+    order = SimpleNamespace(fill_price=None)
+    assert LiveTradingEngine._real_fill(order, fallback=36.35) == 36.35
+
+
+def test_real_fill_falls_back_when_order_is_none():
+    assert LiveTradingEngine._real_fill(None, fallback=36.35) == 36.35
+
+
+def test_real_fill_casts_decimal_to_float():
+    order = SimpleNamespace(fill_price=Decimal("4.90"))
+    result = LiveTradingEngine._real_fill(order, fallback=5.05)
+    assert result == 4.90
+    assert isinstance(result, float)
+
+
+def test_has_active_multi_leg_structure():
+    fake = SimpleNamespace(_active_spreads={"TITAN": {}}, _active_condors={"SBIN": {}})
+    assert LiveTradingEngine._has_active_multi_leg_structure(fake, "TITAN") is True
+    assert LiveTradingEngine._has_active_multi_leg_structure(fake, "SBIN") is True
+    assert LiveTradingEngine._has_active_multi_leg_structure(fake, "INFY") is False
+
+
+def test_has_open_single_leg_position():
+    fake = SimpleNamespace(_single_leg_journals={"TITAN26SEP4650PE": {"underlying": "TITAN"}})
+    assert LiveTradingEngine._has_open_single_leg_position(fake, "TITAN") is True
+    assert LiveTradingEngine._has_open_single_leg_position(fake, "SBIN") is False
+
 
 class _FakeCollisionEngine:
+    # Bind the real (small, pure) helper methods rather than reimplementing
+    # them -- the function descriptor protocol binds `self` correctly when
+    # called as fake._has_active_multi_leg_structure(symbol).
+    _has_active_multi_leg_structure = LiveTradingEngine._has_active_multi_leg_structure
+    _has_open_single_leg_position   = LiveTradingEngine._has_open_single_leg_position
+
     def __init__(self, active_spreads=None, active_condors=None, single_leg_journals=None):
         self._active_spreads = active_spreads or {}
         self._active_condors = active_condors or {}
@@ -1228,7 +1396,7 @@ async def test_single_leg_entry_blocked_by_active_spread_on_same_underlying():
 def test_iron_condor_entry_uses_real_fill_not_quote():
     src = inspect.getsource(LiveTradingEngine._process_iron_condor)
     assert 'placed.append((contract, side, price, is_leg, order))' in src
-    assert '_fills = {c: float(getattr(o, "fill_price", None) or p) for c, _s, p, _l, o in placed}' in src
+    assert "_fills = {c: self._real_fill(o, p) for c, _s, p, _l, o in placed}" in src
     assert "entry_price=round(put_short_fill + call_short_fill - put_long_fill - call_long_fill, 2)" in src
     assert '"put_short_premium":   put_short_fill,  "put_long_premium":  put_long_fill,' in src
     assert '"call_short_premium":  call_short_fill, "call_long_premium": call_long_fill,' in src

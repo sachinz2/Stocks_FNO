@@ -54,18 +54,30 @@ def test_max_exposure_pct_is_configurable():
     assert rm.validate_trade("RELIANCE", "BUY", 15, 1000.0) is False
 
 
-def test_main_and_orders_router_wire_exposure_pct_from_settings():
+def test_main_wires_exposure_and_daily_loss_pct_from_settings():
     import inspect
     from src.api import main as main_module
-    from src.api.routers import orders_router as orders_router_module
 
     main_src = inspect.getsource(main_module)
     assert "max_exposure_per_trade_pct=settings.MAX_EXPOSURE_PCT" in main_src
-
-    orders_src = inspect.getsource(orders_router_module)
-    assert "max_exposure_per_trade_pct=settings.MAX_EXPOSURE_PCT" in orders_src
     assert "max_daily_loss_pct=settings.MAX_DAILY_LOSS_PCT" in main_src
-    assert "max_daily_loss_pct=settings.MAX_DAILY_LOSS_PCT" in orders_src
+
+
+def test_orders_router_reuses_the_live_engines_risk_manager_not_its_own():
+    # Fixed 2026-08-13: orders_router.py used to build its own, completely
+    # separate RiskManager/PaperBroker pair -- never wired to capital-period
+    # compounding, and tracking independent exposure/daily-loss state from
+    # whatever the live engine itself enforces. Now it must reuse
+    # request.app.state.trading_engine.order_manager (and therefore its
+    # real risk_manager) instead of constructing its own.
+    import inspect
+    from src.api.routers import orders_router as orders_router_module
+
+    src = inspect.getsource(orders_router_module)
+    assert "RiskManager(" not in src, "orders_router.py must not construct its own RiskManager -- reuse the live engine's."
+    assert "PaperBroker(" not in src, "orders_router.py must not construct its own PaperBroker -- reuse the live engine's."
+    assert "app.state, \"trading_engine\"" in src
+    assert "engine.order_manager" in src
 
 
 def test_max_daily_loss_pct_is_configurable():

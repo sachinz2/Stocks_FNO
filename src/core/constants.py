@@ -220,8 +220,12 @@ ATR_PERIOD = 14
 # Risk defaults
 MAX_DAILY_LOSS_PCT = 0.05
 MAX_OPEN_POSITIONS = 5
-MAX_EXPOSURE_PCT = 0.20
 DEFAULT_CAPITAL = 300_000.0
+# Fixed 2026-08-13: removed a dead MAX_EXPOSURE_PCT = 0.20 that was never
+# imported/read anywhere -- the real, enforced value lives in
+# settings.MAX_EXPOSURE_PCT (core/config.py, currently 0.30) and had
+# silently diverged from this one, which could have misled a future reader
+# into using the wrong figure.
 
 # Backtest cost assumptions
 BROKERAGE_PCT = 0.0003   # 0.03% per leg (Zerodha approx)

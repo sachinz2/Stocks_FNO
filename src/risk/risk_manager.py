@@ -18,12 +18,14 @@ class RiskManager:
 
     Layers (in order):
       1. Kill switch / circuit breaker
-      2. Daily loss limit (5% of capital)
+      2. Daily loss limit (max_daily_loss_pct of capital, default 5% -- see __init__)
       3. IV rank gate — skip spread/condor entries when options are cheap
       4. Sector concentration — max 2 open structures per sector
       5. Per-strategy capital allocation — each strategy has a fixed budget
       6. Open position count — max 25 total (accommodates multi-leg structures)
-      7. Per-leg exposure — BUY legs capped at 20% of capital each
+      7. Per-leg exposure — BUY legs capped at max_exposure_per_trade_pct of
+         capital each, default 30% (see __init__ -- fixed 2026-08-13, this
+         used to be a hardcoded 20% literal disconnected from settings)
 
     is_spread_leg=True bypasses the position-count and sector checks for
     legs 2-4 of multi-leg strategies (the first leg still goes through all checks).

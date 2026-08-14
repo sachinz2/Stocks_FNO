@@ -180,18 +180,24 @@ def check_spread_condor_exit_uses_real_fill(repo: Path) -> Result:
     src = _read(repo, "src/live_trading/live_trading_engine.py")
     if 'net_pnl = (\n                (spread["short_premium"] - cur_short)' in src:
         return FAIL, name, "Found the old quote-based net_pnl calc reintroduced in _check_spread_exits."
-    condor_hits = len(re.findall(r'getattr\(\w+,\s*"fill_price",\s*None\)\s*or\s*cur_\w+', src))
-    if condor_hits < 6:  # 2 spread legs (short/long) + 4 condor legs
-        return FAIL, name, f"Expected 6 fill_price-based exit-price reads total (2 spread + 4 condor legs), found {condor_hits}."
-    return PASS, name, f"Exit pricing reads real fill_price at {condor_hits} leg-exit sites (spread + condor)."
+    # Fixed 2026-08-13: the fill-vs-quote pattern was consolidated from ~13
+    # inlined `float(getattr(order, "fill_price", None) or fallback)` copies
+    # into one shared self._real_fill(order, fallback) helper -- check for
+    # that instead of the old inline pattern.
+    if "def _real_fill(order, fallback: float) -> float:" not in src:
+        return FAIL, name, "_real_fill() shared helper missing."
+    real_fill_hits = len(re.findall(r"self\._real_fill\(\w+,\s*cur_\w+\)", src))
+    if real_fill_hits < 6:  # 2 spread legs (short/long) + 4 condor legs
+        return FAIL, name, f"Expected 6 self._real_fill(...) exit-price reads total (2 spread + 4 condor legs), found {real_fill_hits}."
+    return PASS, name, f"Exit pricing reads real fill_price at {real_fill_hits} leg-exit sites (spread + condor) via the shared helper."
 
 
 def check_spread_condor_entry_uses_real_fill(repo: Path) -> Result:
     name = "Credit-spread/condor ENTRIES record the real fill, not the pre-trade quote"
     src = _read(repo, "src/live_trading/live_trading_engine.py")
-    if 'short_fill = float(getattr(short_order, "fill_price", None) or short_p)' not in src:
+    if "short_fill = self._real_fill(short_order, short_p)" not in src:
         return FAIL, name, "_process_credit_spread no longer reads short_order.fill_price -- short_premium/entry_price would silently revert to the pre-trade quote."
-    if '_fills = {c: float(getattr(o, "fill_price", None) or p) for c, _s, p, _l, o in placed}' not in src:
+    if "_fills = {c: self._real_fill(o, p) for c, _s, p, _l, o in placed}" not in src:
         return FAIL, name, "_process_iron_condor no longer builds its per-leg fill map from the placed orders' fill_price."
     if '"short_premium":  short_fill,' not in src:
         return FAIL, name, "_active_spreads no longer stores the real fill as short_premium -- live SL/profit-target checks would use the stale quote again."
@@ -203,13 +209,18 @@ def check_cross_strategy_collision_guard(repo: Path) -> Result:
     src = _read(repo, "src/live_trading/live_trading_engine.py")
     if "Cross-strategy contract-collision guard" not in src:
         return FAIL, name, "Guard comment/marker missing -- likely removed."
-    spread_guard = 'any(v.get("underlying") == symbol for v in self._single_leg_journals.values())'
-    reverse_guard = "if symbol in self._active_spreads or symbol in self._active_condors:"
-    if src.count(spread_guard) < 2:  # credit_spread + iron_condor entry
+    # Fixed 2026-08-13: consolidated from 3 independent inline copies into
+    # two shared helper methods -- check for those instead of the old
+    # inline patterns, and confirm both entry directions actually call them.
+    if "def _has_active_multi_leg_structure(self, symbol: str) -> bool:" not in src:
+        return FAIL, name, "_has_active_multi_leg_structure() helper missing."
+    if "def _has_open_single_leg_position(self, symbol: str) -> bool:" not in src:
+        return FAIL, name, "_has_open_single_leg_position() helper missing."
+    if src.count("if self._has_open_single_leg_position(symbol):") < 2:  # credit_spread + iron_condor entry
         return FAIL, name, "Spread/condor entry no longer checks for an existing open single-leg position on the same underlying (both _process_credit_spread and _process_iron_condor need this)."
-    if reverse_guard not in src:
+    if "if self._has_active_multi_leg_structure(symbol):" not in src:
         return FAIL, name, "Single-leg entry (_process_signal) no longer checks for an existing active spread/condor on the same underlying."
-    return PASS, name, "Guarded both directions: spread/condor vs single-leg."
+    return PASS, name, "Guarded both directions via shared helpers: spread/condor vs single-leg."
 
 
 def check_risk_limits_wired_from_settings(repo: Path) -> Result:
@@ -219,13 +230,22 @@ def check_risk_limits_wired_from_settings(repo: Path) -> Result:
         return FAIL, name, "RiskManager.__init__ no longer takes max_exposure_per_trade_pct as a constructor arg -- may have reverted to a hardcoded literal, silently disconnecting settings.MAX_EXPOSURE_PCT again."
     if "max_daily_loss_pct: float = 0.05" not in rm_src:
         return FAIL, name, "RiskManager.__init__ no longer takes max_daily_loss_pct as a constructor arg."
-    for path in ("src/api/main.py", "src/api/routers/orders_router.py"):
-        src = _read(repo, path)
-        if "max_exposure_per_trade_pct=settings.MAX_EXPOSURE_PCT" not in src:
-            return FAIL, name, f"{path} no longer passes settings.MAX_EXPOSURE_PCT through to RiskManager."
-        if "max_daily_loss_pct=settings.MAX_DAILY_LOSS_PCT" not in src:
-            return FAIL, name, f"{path} no longer passes settings.MAX_DAILY_LOSS_PCT through to RiskManager."
-    return PASS, name, "Both call sites wire exposure/daily-loss caps from settings."
+    main_src = _read(repo, "src/api/main.py")
+    if "max_exposure_per_trade_pct=settings.MAX_EXPOSURE_PCT" not in main_src:
+        return FAIL, name, "main.py no longer passes settings.MAX_EXPOSURE_PCT through to RiskManager."
+    if "max_daily_loss_pct=settings.MAX_DAILY_LOSS_PCT" not in main_src:
+        return FAIL, name, "main.py no longer passes settings.MAX_DAILY_LOSS_PCT through to RiskManager."
+    # Fixed 2026-08-13: orders_router.py used to build its OWN separate
+    # RiskManager (never wired to capital-period compounding, tracking
+    # independent exposure/daily-loss state from the live engine's) --
+    # now it must reuse the live engine's order_manager/risk_manager
+    # instead of constructing anything of its own.
+    orders_src = _read(repo, "src/api/routers/orders_router.py")
+    if "RiskManager(" in orders_src or "PaperBroker(" in orders_src:
+        return FAIL, name, "orders_router.py constructs its own RiskManager/PaperBroker again -- manual orders would stop sharing the live engine's real risk state."
+    if "engine.order_manager" not in orders_src:
+        return FAIL, name, "orders_router.py no longer reuses request.app.state.trading_engine.order_manager."
+    return PASS, name, "main.py wires exposure/daily-loss caps from settings; orders_router.py reuses the live engine's RiskManager instead of its own."
 
 
 def check_capital_period_compounding_drives_live_limits(repo: Path) -> Result:

@@ -1220,7 +1220,7 @@ class LiveTradingEngine:
         # row's exit_time/exit_price/pnl permanently NULL because everything
         # after this line (the journal pop, _log_trade_close, capital release)
         # never ran, even though the SELL order itself had already filled.
-        _fill_p = float(getattr(db_order, "fill_price", None) or current_p)
+        _fill_p = self._real_fill(db_order, current_p)
         _slip   = abs(_fill_p - current_p)
         pnl = (_fill_p - entry_p) * abs(qty)
 
@@ -1284,6 +1284,51 @@ class LiveTradingEngine:
             current_p = entry_p
 
         return await self._execute_single_leg_exit(contract, qty, entry_p, current_p, reason)
+
+    # ── Cross-strategy contract-collision guard (added 2026-08-13, ─────────
+    # consolidated into shared helpers 2026-08-13) ──────────────────────────
+    #
+    # A single-leg strategy (ema_crossover_v1/momentum_v1) picking a
+    # contract independently of an already-open spread/condor leg on the
+    # same underlying is silently harmless in paper mode (each strategy's
+    # fills are simulated independently) but corrupts real position/margin
+    # accounting once live -- Zerodha nets one position per contract per
+    # account, it has no concept of "strategy-owned" quantity. Confirmed
+    # live: ema_crossover_v1 bought and sold BAJFINANCE26SEP1190CE on
+    # 2026-08-13 while credit_spread_v1 was already holding that exact
+    # contract open as a spread's long leg.
+    #
+    # Used by both entry directions (_process_signal for single-leg vs.
+    # _process_credit_spread/_process_iron_condor for multi-leg) -- kept as
+    # two small shared methods rather than inline checks at each of the 3
+    # entry sites, so a future 4th entry path calling these has the same
+    # guard available instead of needing to remember to reimplement it.
+
+    def _has_active_multi_leg_structure(self, symbol: str) -> bool:
+        return symbol in self._active_spreads or symbol in self._active_condors
+
+    def _has_open_single_leg_position(self, symbol: str) -> bool:
+        return any(v.get("underlying") == symbol for v in self._single_leg_journals.values())
+
+    @staticmethod
+    def _real_fill(order, fallback: float) -> float:
+        """
+        The real broker/PaperBroker fill price if the order carries one,
+        else the pre-trade quote/estimate `fallback`. Always returns
+        float -- order.fill_price is a SQLAlchemy Numeric column (Decimal
+        when populated), and mixing Decimal with float elsewhere in a P&L
+        calc has crashed the live signal cycle before (2026-08-12).
+
+        Shared by every entry/exit site that needs "what did this actually
+        fill at" instead of "what did we expect/quote" -- extracted
+        2026-08-13 from ~13 inlined copies of the same expression, found
+        during a review pass (this exact bug class -- using the quote
+        instead of the real fill -- had already been independently found
+        and fixed piecemeal at 6+ call sites earlier the same day; a
+        single named helper makes the next new entry/exit path use the
+        right one by default instead of by copy-paste).
+        """
+        return float(getattr(order, "fill_price", None) or fallback)
 
     async def _process_signal(
         self, strategy, symbol: str, vix: Optional[float] = None,
@@ -1363,14 +1408,9 @@ class LiveTradingEngine:
         option_type = "CE" if signal_str == "BUY" else "PE"
         opposite    = "PE" if option_type == "CE" else "CE"
 
-        # Cross-strategy contract-collision guard (added 2026-08-13) — see
-        # the matching note in _process_credit_spread for the live incident
-        # (ema_crossover_v1 traded BAJFINANCE26SEP1190CE while credit_spread_v1
-        # already held it open as a spread leg) this closes. A single-leg
-        # strategy picking a contract independently of an already-open
-        # spread/condor on the same underlying corrupts real position/margin
-        # accounting once live, even though it's invisible in paper mode.
-        if symbol in self._active_spreads or symbol in self._active_condors:
+        # Cross-strategy contract-collision guard — see _has_active_multi_leg_structure()'s
+        # docstring for the live incident this closes.
+        if self._has_active_multi_leg_structure(symbol):
             logger.info(
                 f"[{strategy.name}] {symbol} skipped — already has an active "
                 "credit_spread/iron_condor structure open (cross-strategy "
@@ -1553,7 +1593,7 @@ class LiveTradingEngine:
             # moment before the simulated bid-ask slippage was applied.
             # float() cast: db_order.fill_price is Decimal (SQLAlchemy Numeric
             # column) -- see the 2026-08-12 fix note in _execute_single_leg_exit.
-            _entry_fill = float(getattr(order, "fill_price", None) or option_p)
+            _entry_fill = self._real_fill(order, option_p)
             journal_id = await self._log_trade_open(
                 strategy=strategy.name, underlying=symbol,
                 structure_type="SINGLE_LEG", contracts=[contract],
@@ -1638,7 +1678,7 @@ class LiveTradingEngine:
             # return value was discarded entirely, never reading the real
             # PaperBroker fill.
             # float() cast: see 2026-08-12 fix note in _execute_single_leg_exit.
-            _rev_fill_p = float(getattr(_rev_order, "fill_price", None) or exit_p)
+            _rev_fill_p = self._real_fill(_rev_order, exit_p)
             logger.info(f"REVERSAL EXIT: SELL {contract} @ Rs{_rev_fill_p:.2f}")
             jrnl = self._single_leg_journals.pop(contract, None)
             if jrnl:
@@ -1667,17 +1707,9 @@ class LiveTradingEngine:
             return
         if symbol in self._active_condors:
             return  # already have a condor on this underlying — conflicting structures
-        # Cross-strategy contract-collision guard (added 2026-08-13): a
-        # single-leg strategy (ema_crossover_v1/momentum_v1) picking a
-        # contract independently of an already-open spread/condor leg on the
-        # same underlying is silently harmless in paper mode (each
-        # strategy's fills are simulated independently) but corrupts real
-        # position/margin accounting once live -- Zerodha nets one position
-        # per contract per account, it has no concept of "strategy-owned"
-        # quantity. Confirmed live: ema_crossover_v1 bought and sold
-        # BAJFINANCE26SEP1190CE on 2026-08-13 while credit_spread_v1 was
-        # already holding that exact contract open as a spread's long leg.
-        if any(v.get("underlying") == symbol for v in self._single_leg_journals.values()):
+        # Cross-strategy contract-collision guard — see
+        # _has_open_single_leg_position()'s docstring for the live incident this closes.
+        if self._has_open_single_leg_position(symbol):
             logger.info(
                 f"[CreditSpread] {symbol} skipped — already has an open "
                 "single-leg position on this underlying (cross-strategy "
@@ -2080,8 +2112,8 @@ class LiveTradingEngine:
         # (add_deployed_capital at entry / release_deployed_capital at exit
         # must use the same basis, and that's a pre-trade risk budget, not a
         # P&L figure).
-        short_fill = float(getattr(short_order, "fill_price", None) or short_p)
-        long_fill  = float(getattr(long_order,  "fill_price", None) or long_p)
+        short_fill = self._real_fill(short_order, short_p)
+        long_fill  = self._real_fill(long_order,  long_p)
 
         journal_id = await self._log_trade_open(
             strategy=strategy.name, underlying=symbol,
@@ -2306,8 +2338,8 @@ class LiveTradingEngine:
             # (quote-based) vs the real fill-based pnl of Rs7,390.25 -- a
             # Rs248.50 overstatement from slippage the record never reflected.
             # float() cast: see 2026-08-12 fix note in _execute_single_leg_exit.
-            _short_fill = float(getattr(exit_short, "fill_price", None) or cur_short)
-            _long_fill  = float(getattr(exit_long,  "fill_price", None) or cur_long)
+            _short_fill = self._real_fill(exit_short, cur_short)
+            _long_fill  = self._real_fill(exit_long,  cur_long)
             _slippage   = abs(_short_fill - cur_short) + abs(_long_fill - cur_long)
 
             net_pnl = (
@@ -2395,9 +2427,9 @@ class LiveTradingEngine:
             return
         if symbol in self._active_spreads:
             return  # don't stack condor on top of existing spread for same underlying
-        # Cross-strategy contract-collision guard — see the matching note in
-        # _process_credit_spread for the live incident this closes.
-        if any(v.get("underlying") == symbol for v in self._single_leg_journals.values()):
+        # Cross-strategy contract-collision guard — see
+        # _has_open_single_leg_position()'s docstring for the live incident this closes.
+        if self._has_open_single_leg_position(symbol):
             logger.info(
                 f"[IronCondor] {symbol} skipped — already has an open "
                 "single-leg position on this underlying (cross-strategy "
@@ -2727,7 +2759,7 @@ class LiveTradingEngine:
         # pre-trade QUOTES, not the real fill_price the orders above already
         # carry. net_credit stays quote-based for _capital_at_risk symmetry
         # (see _process_credit_spread's note).
-        _fills = {c: float(getattr(o, "fill_price", None) or p) for c, _s, p, _l, o in placed}
+        _fills = {c: self._real_fill(o, p) for c, _s, p, _l, o in placed}
         put_short_fill,  put_long_fill  = _fills[psc], _fills[plc]
         call_short_fill, call_long_fill = _fills[csc], _fills[clc]
 
@@ -2960,10 +2992,10 @@ class LiveTradingEngine:
             # rationale). The real fills were already being computed right
             # below, immediately, but only for the slippage diagnostic.
             # float() cast: see 2026-08-12 fix note in _execute_single_leg_exit.
-            _ps_fill = float(getattr(exit_ps, "fill_price", None) or cur_ps)
-            _pl_fill = float(getattr(exit_pl, "fill_price", None) or cur_pl)
-            _cs_fill = float(getattr(exit_cs, "fill_price", None) or cur_cs)
-            _cl_fill = float(getattr(exit_cl, "fill_price", None) or cur_cl)
+            _ps_fill = self._real_fill(exit_ps, cur_ps)
+            _pl_fill = self._real_fill(exit_pl, cur_pl)
+            _cs_fill = self._real_fill(exit_cs, cur_cs)
+            _cl_fill = self._real_fill(exit_cl, cur_cl)
             _slippage = (abs(_ps_fill - cur_ps) + abs(_pl_fill - cur_pl)
                          + abs(_cs_fill - cur_cs) + abs(_cl_fill - cur_cl))
 
@@ -3090,7 +3122,7 @@ class LiveTradingEngine:
             )
             self._peak_premiums.pop(contract, None)
             # float() cast: see 2026-08-12 fix note in _execute_single_leg_exit.
-            _ex_fill_p = float(getattr(_ex_order, "fill_price", None) or exit_p)
+            _ex_fill_p = self._real_fill(_ex_order, exit_p)
 
             _jrnl_info = self._single_leg_journals.pop(contract, None)
             if _jrnl_info:
@@ -3209,7 +3241,7 @@ class LiveTradingEngine:
                 # this is the exact site that crashed live on 2026-08-12, aborting
                 # EOD square-off mid-loop and leaving every remaining position that
                 # cycle unclosed (single-leg AND spread/condor legs after it).
-                _sq_fill_p = float(getattr(_sq_order, "fill_price", None) or exit_p)
+                _sq_fill_p = self._real_fill(_sq_order, exit_p)
                 _exit_prices[contract] = _sq_fill_p
 
                 # Write exit to trade journal so EOD/expiry closes appear in PnL analytics
@@ -3272,8 +3304,32 @@ class LiveTradingEngine:
                         exit_reason=f"Expiry day force-close (DTE={dte})",
                     )
                 except Exception as exc:
+                    # Fixed 2026-08-13: this was log-only. The real broker
+                    # position is already flat (closed by real orders in the
+                    # per-leg loop above) by the time we get here, so leaving
+                    # this entry in _active_spreads for a "retry" would be
+                    # actively dangerous -- exit-check cycles would keep
+                    # treating a genuinely-closed structure as open and could
+                    # place a real order against it. It still gets cleared
+                    # below like every other structure; only the journal
+                    # write failed, so the trade_journal row's exit_time/
+                    # exit_price/pnl would otherwise stay NULL forever with
+                    # nothing left in the running process to retry against.
+                    # A loud alert with every figure needed to manually
+                    # correct the row (same methodology as this session's
+                    # earlier manual trade_journal corrections) is the safe
+                    # way to not lose this silently.
                     logger.error(
                         f"Expiry force-close journal error [spread {_s.get('short_contract', '?')}]: {exc}"
+                    )
+                    await self._notify(
+                        f"CRITICAL: expiry force-close journal write FAILED\n"
+                        f"Spread: {_s.get('short_contract', '?')} / {_s.get('long_contract', '?')}\n"
+                        f"journal_id={_s.get('journal_id')} error={exc}\n"
+                        f"Broker position is already closed -- only the trade_journal "
+                        f"row is missing its exit. MANUAL INTERVENTION REQUIRED: correct "
+                        f"trade_journal.exit_time/exit_price/pnl for journal_id="
+                        f"{_s.get('journal_id')} by hand."
                     )
             for _c in self._active_condors.values():
                 try:
@@ -3301,8 +3357,22 @@ class LiveTradingEngine:
                         exit_reason=f"Expiry day force-close (DTE={dte})",
                     )
                 except Exception as exc:
+                    # See the matching comment on the spread loop above --
+                    # same rationale: broker position is already flat, so
+                    # this entry still gets cleared below; only the journal
+                    # write is lost without a loud alert to fix it by hand.
                     logger.error(
                         f"Expiry force-close journal error [condor {_c.get('put_short_contract', '?')}]: {exc}"
+                    )
+                    await self._notify(
+                        f"CRITICAL: expiry force-close journal write FAILED\n"
+                        f"Condor: {_c.get('put_short_contract', '?')} / "
+                        f"{_c.get('call_short_contract', '?')}\n"
+                        f"journal_id={_c.get('journal_id')} error={exc}\n"
+                        f"Broker position is already closed -- only the trade_journal "
+                        f"row is missing its exit. MANUAL INTERVENTION REQUIRED: correct "
+                        f"trade_journal.exit_time/exit_price/pnl for journal_id="
+                        f"{_c.get('journal_id')} by hand."
                     )
 
             # Full expiry-day clear — all positions force-closed

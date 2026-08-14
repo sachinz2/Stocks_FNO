@@ -74,7 +74,7 @@ async def test_inserts_broker_order_with_no_matching_db_record():
 
     result = await sync_orders_from_zerodha(kite, repo)
 
-    assert result == {"checked": 1, "inserted": 1, "corrected": 0}
+    assert result == {"checked": 1, "inserted": 1, "corrected": 0, "failed": 0}
     assert len(repo.rows) == 1
     row = repo.rows[0]
     assert row.broker_order_id == "BR-1"
@@ -102,7 +102,7 @@ async def test_corrects_fill_price_mismatch_zerodha_wins():
 
     result = await sync_orders_from_zerodha(kite, repo)
 
-    assert result == {"checked": 1, "inserted": 0, "corrected": 1}
+    assert result == {"checked": 1, "inserted": 0, "corrected": 1, "failed": 0}
     assert existing.fill_price == 2.40
 
 
@@ -122,7 +122,7 @@ async def test_no_op_when_db_already_matches_zerodha():
     }])
 
     result = await sync_orders_from_zerodha(kite, repo)
-    assert result == {"checked": 1, "inserted": 0, "corrected": 0}
+    assert result == {"checked": 1, "inserted": 0, "corrected": 0, "failed": 0}
 
 
 @pytest.mark.asyncio
@@ -137,7 +137,7 @@ async def test_ignores_orders_not_from_today():
     }])
 
     result = await sync_orders_from_zerodha(kite, repo)
-    assert result == {"checked": 0, "inserted": 0, "corrected": 0}
+    assert result == {"checked": 0, "inserted": 0, "corrected": 0, "failed": 0}
     assert repo.rows == []
 
 
@@ -199,3 +199,93 @@ def test_daily_zerodha_sync_job_gated_on_live_mode():
     job_body = src[idx:idx + 400]
     assert "if mode != TradingMode.LIVE:" in job_body
     assert "return" in job_body
+
+
+# ── kite.orders()/kite.margins() must not block the event loop (2026-08-13) ──
+#
+# Every other KiteConnect call site in this codebase wraps the blocking
+# REST call in run_in_executor. These two were missed when the file was
+# new -- confirmed here by using a kite fake whose orders()/margins()
+# assert they're NOT running on the main thread (run_in_executor moves
+# them to a worker thread; a direct synchronous call would run on the
+# event loop's own thread instead).
+
+class _FakeThreadCheckingKite:
+    def __init__(self, orders=None, margins=None):
+        self._orders = orders or []
+        self._margins = margins
+        import threading
+        self._main_thread = threading.current_thread()
+        self.orders_called_off_main_thread = None
+        self.margins_called_off_main_thread = None
+
+    def orders(self):
+        import threading
+        self.orders_called_off_main_thread = threading.current_thread() is not self._main_thread
+        return self._orders
+
+    def margins(self):
+        import threading
+        self.margins_called_off_main_thread = threading.current_thread() is not self._main_thread
+        return self._margins
+
+
+@pytest.mark.asyncio
+async def test_sync_orders_calls_kite_orders_via_executor_not_blocking():
+    repo = _FakeRepo()
+    kite = _FakeThreadCheckingKite(orders=[])
+    await sync_orders_from_zerodha(kite, repo)
+    assert kite.orders_called_off_main_thread is True
+
+
+@pytest.mark.asyncio
+async def test_get_zerodha_capital_calls_kite_margins_via_executor_not_blocking():
+    kite = _FakeThreadCheckingKite(margins={
+        "equity": {"available": {"live_balance": 1000.0}, "utilised": {"debits": 0}},
+    })
+    await get_zerodha_capital(kite)
+    assert kite.margins_called_off_main_thread is True
+
+
+# ── per-order error isolation (2026-08-13) ──────────────────────────────────
+#
+# One order's DB failure used to abort reconciliation of every order after
+# it in that day's list, with no indication of what was skipped -- the
+# same bug class this same day's other loops (square-off, expiry
+# force-close) were explicitly guarded against, missed here since this
+# file was new.
+
+class _FailOnceRepo(_FakeRepo):
+    def __init__(self, fail_for_broker_id):
+        super().__init__()
+        self._fail_for = fail_for_broker_id
+
+    async def create(self, data):
+        if data.get("broker_order_id") == self._fail_for:
+            raise RuntimeError("simulated DB write failure")
+        return await super().create(data)
+
+
+@pytest.mark.asyncio
+async def test_one_bad_order_does_not_block_reconciling_the_rest():
+    repo = _FailOnceRepo(fail_for_broker_id="BR-BAD")
+    kite = _FakeKite(orders=[
+        {
+            "order_id": "BR-BAD", "order_timestamp": _today_ts(),
+            "status": "COMPLETE", "tradingsymbol": "SBIN26AUG800CE",
+            "transaction_type": "BUY", "quantity": 500,
+            "price": 10.0, "average_price": 10.5,
+        },
+        {
+            "order_id": "BR-GOOD", "order_timestamp": _today_ts(),
+            "status": "COMPLETE", "tradingsymbol": "TCS26AUG3800CE",
+            "transaction_type": "BUY", "quantity": 225,
+            "price": 48.0, "average_price": 48.41,
+        },
+    ])
+
+    result = await sync_orders_from_zerodha(kite, repo)
+
+    assert result == {"checked": 2, "inserted": 1, "corrected": 0, "failed": 1}
+    assert len(repo.rows) == 1
+    assert repo.rows[0].broker_order_id == "BR-GOOD"

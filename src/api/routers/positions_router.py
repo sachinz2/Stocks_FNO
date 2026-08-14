@@ -5,10 +5,25 @@ from src.database.models.trade_journal import TradeJournal
 from src.database.repositories.base import BaseRepository
 import asyncio
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/positions", tags=["Positions"])
+
+# Fixed 2026-08-13: /positions, /analytics/pnl-summary, and
+# /analytics/capital-periods each independently called
+# _positions_from_engine() (which walks engine state and fetches live
+# market prices) on every dashboard render -- the dashboard fetches all
+# three in the same page load, every 60s auto-refresh, so this was doing
+# the identical work 3x per render. A short TTL is enough to collapse
+# those into one real fetch while staying well under the refresh interval
+# (so it never serves meaningfully stale data). Keyed by id(engine) --
+# there's only ever one real engine per running process, so this is
+# effectively a single global cache in production, but keying it avoids
+# cross-contamination between different engine instances passed in tests.
+_POSITIONS_CACHE_TTL_SECONDS = 3.0
+_positions_cache: dict = {}  # id(engine) -> (fetched_at, result)
 
 
 async def _fetch_market_prices(contracts: list, kite, redis) -> dict:
@@ -66,7 +81,7 @@ async def _fetch_market_prices(contracts: list, kite, redis) -> dict:
     return prices
 
 
-async def _positions_from_engine(engine, kite, redis) -> list:
+async def _positions_from_engine_uncached(engine, kite, redis) -> list:
     """
     Build per-contract position rows from the engine's active spreads and condors.
 
@@ -148,6 +163,18 @@ async def _positions_from_engine(engine, kite, redis) -> list:
             "structure_type": structure_type,
         })
     return rows
+
+
+async def _positions_from_engine(engine, kite, redis) -> list:
+    """Cached wrapper -- see _POSITIONS_CACHE_TTL_SECONDS above for why."""
+    now = time.monotonic()
+    key = id(engine)
+    cached = _positions_cache.get(key)
+    if cached is not None and (now - cached[0]) < _POSITIONS_CACHE_TTL_SECONDS:
+        return cached[1]
+    result = await _positions_from_engine_uncached(engine, kite, redis)
+    _positions_cache[key] = (now, result)
+    return result
 
 
 @router.get("")

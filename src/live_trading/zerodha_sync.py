@@ -19,6 +19,7 @@ scheduled job wiring in api/main.py), gated to when a real `kite` client
 exists (i.e. live mode; paper mode has nothing at the broker to sync
 against).
 """
+import asyncio
 import logging
 from typing import Any, Dict, Optional
 
@@ -41,7 +42,13 @@ def _map_status(broker_status: str) -> str:
 async def sync_orders_from_zerodha(kite, order_repo) -> Dict[str, int]:
     """Reconcile TODAY's orders between Zerodha and our `orders` table."""
     today = now_ist().date()
-    broker_orders = kite.orders()
+    # kite.orders() is a blocking KiteConnect REST call -- run off the
+    # event loop like every other kite.* call site in this codebase (e.g.
+    # live_trading_engine.py's self._kite.margins), so the daily sync
+    # doesn't stall order placement/WebSocket processing on the shared
+    # asyncio event loop for the duration of the request. Fixed 2026-08-13.
+    loop = asyncio.get_running_loop()
+    broker_orders = await loop.run_in_executor(None, kite.orders)
 
     today_orders = []
     for o in broker_orders:
@@ -49,61 +56,72 @@ async def sync_orders_from_zerodha(kite, order_repo) -> Dict[str, int]:
         if ts is not None and hasattr(ts, "date") and ts.date() == today:
             today_orders.append(o)
 
-    inserted, corrected, checked = 0, 0, 0
+    inserted, corrected, checked, failed = 0, 0, 0, 0
     for b in today_orders:
         broker_id = str(b.get("order_id", "") or "")
         if not broker_id:
             continue
         checked += 1
 
-        status     = _map_status(b.get("status", ""))
-        fill_price = b.get("average_price") or None
-        side       = b.get("transaction_type", "")
-        symbol     = b.get("tradingsymbol", "")
-        quantity   = int(b.get("quantity", 0) or 0)
-        price      = b.get("price") or fill_price
+        # Fixed 2026-08-13: one order's DB error (transient deadlock,
+        # unexpected field) used to abort reconciliation of every order
+        # after it in today's list, with no indication of what was
+        # skipped -- the exact bug class the same day's other loops
+        # (square-off, expiry force-close) were explicitly guarded
+        # against, missed here since this file was new.
+        try:
+            status     = _map_status(b.get("status", ""))
+            fill_price = b.get("average_price") or None
+            side       = b.get("transaction_type", "")
+            symbol     = b.get("tradingsymbol", "")
+            quantity   = int(b.get("quantity", 0) or 0)
+            price      = b.get("price") or fill_price
 
-        matches = await order_repo.filter(broker_order_id=broker_id)
-        existing = matches[0] if matches else None
+            matches = await order_repo.filter(broker_order_id=broker_id)
+            existing = matches[0] if matches else None
 
-        if existing is None:
-            await order_repo.create({
-                "broker_order_id": broker_id,
-                "symbol": symbol, "side": side, "quantity": quantity,
-                "price": price, "fill_price": fill_price,
-                "order_status": status,
-            })
-            inserted += 1
-            logger.warning(
-                f"[ZerodhaSync] Broker order {broker_id} ({side} {quantity} {symbol}) "
-                "has NO matching DB record -- inserted. Investigate how this was placed "
-                "outside the normal order-placement path."
-            )
-            continue
+            if existing is None:
+                await order_repo.create({
+                    "broker_order_id": broker_id,
+                    "symbol": symbol, "side": side, "quantity": quantity,
+                    "price": price, "fill_price": fill_price,
+                    "order_status": status,
+                })
+                inserted += 1
+                logger.warning(
+                    f"[ZerodhaSync] Broker order {broker_id} ({side} {quantity} {symbol}) "
+                    "has NO matching DB record -- inserted. Investigate how this was placed "
+                    "outside the normal order-placement path."
+                )
+                continue
 
-        updates: Dict[str, Any] = {}
-        if fill_price is not None:
-            existing_fill = float(existing.fill_price) if existing.fill_price is not None else None
-            if existing_fill is None or abs(existing_fill - float(fill_price)) > 0.01:
-                updates["fill_price"] = float(fill_price)
-        if status and status != existing.order_status:
-            updates["order_status"] = status
+            updates: Dict[str, Any] = {}
+            if fill_price is not None:
+                existing_fill = float(existing.fill_price) if existing.fill_price is not None else None
+                if existing_fill is None or abs(existing_fill - float(fill_price)) > 0.01:
+                    updates["fill_price"] = float(fill_price)
+            if status and status != existing.order_status:
+                updates["order_status"] = status
 
-        if updates:
-            await order_repo.update(existing, updates)
-            corrected += 1
-            logger.warning(
-                f"[ZerodhaSync] Corrected order {existing.id} (broker {broker_id}) "
-                f"from Zerodha's real record: {updates}"
-            )
+            if updates:
+                await order_repo.update(existing, updates)
+                corrected += 1
+                logger.warning(
+                    f"[ZerodhaSync] Corrected order {existing.id} (broker {broker_id}) "
+                    f"from Zerodha's real record: {updates}"
+                )
+        except Exception as exc:
+            failed += 1
+            logger.error(f"[ZerodhaSync] Failed to reconcile broker order {broker_id}: {exc}")
 
-    return {"checked": checked, "inserted": inserted, "corrected": corrected}
+    return {"checked": checked, "inserted": inserted, "corrected": corrected, "failed": failed}
 
 
 async def get_zerodha_capital(kite) -> Optional[Dict[str, float]]:
     """Real available cash / used margin from Zerodha (live mode)."""
     try:
-        margins = kite.margins()
+        loop = asyncio.get_running_loop()
+        margins = await loop.run_in_executor(None, kite.margins)
         equity = margins.get("equity", {})
         available = equity.get("available", {})
         capital_left = float(available.get("live_balance", available.get("cash", equity.get("net", 0))))

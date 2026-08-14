@@ -94,9 +94,20 @@ async def rollover_if_needed(session_factory, default_capital: float, risk_manag
     compounding any overdue period(s) first (loops in case the job didn't
     run for more than one expiry cycle, e.g. after extended downtime).
 
-    If risk_manager is passed and a rollover actually happened, the new
-    period's starting_capital is immediately applied to risk_manager's
-    live capital-based limits (exposure %, daily-loss %, capital-at-risk).
+    If risk_manager is passed, the active period's starting_capital is
+    (re-)applied to risk_manager's live capital-based limits (exposure %,
+    daily-loss %, capital-at-risk) on every call, not just when a rollover
+    happens this call. Fixed 2026-08-13: this used to only sync on an
+    actual rollover -- but risk_manager is a fresh instance on every
+    process restart (constructed with the static settings.INITIAL_CAPITAL),
+    and this function also runs once at every startup (see api/main.py).
+    Gating the sync on "did a rollover just happen" meant any ordinary
+    restart mid-period (deploy, crash, self-heal) silently reverted live
+    risk limits back to the static config value until the next real
+    rollover -- defeating the whole point of compounding except in the
+    narrow window right after an expiry. set_capital() is idempotent
+    (setting to the value it already has is a no-op in effect), so calling
+    it unconditionally here is safe.
     """
     today = today or now_ist().date()
 
@@ -113,11 +124,12 @@ async def rollover_if_needed(session_factory, default_capital: float, risk_manag
         active = await _create_period(session_factory, next_start, next_end, float(closed.ending_capital))
         rolled = True
 
-    if rolled and risk_manager is not None:
+    if risk_manager is not None:
         risk_manager.set_capital(float(active.starting_capital))
-        logger.info(
-            f"[CapitalPeriod] risk_manager capital updated to Rs{float(active.starting_capital):,.2f} "
-            f"for the new period {active.period_start} -> {active.period_end}"
-        )
+        if rolled:
+            logger.info(
+                f"[CapitalPeriod] risk_manager capital updated to Rs{float(active.starting_capital):,.2f} "
+                f"for the new period {active.period_start} -> {active.period_end}"
+            )
 
     return active
