@@ -150,8 +150,72 @@ to anything at all before today).
 - [ ] Post-flip: watch the first live session in real time rather than
       trusting it to run unattended on day 1.
 
+## 8. From the external architecture review (2026-08-14)
+
+An outside review flagged 27 points. Most were either already fixed earlier
+in this project's history, or duplicate items already above. This section
+covers only what's genuinely NEW and was independently verified against the
+actual current code (not taken on the reviewer's word) before being added.
+
+- [x] **Done 2026-08-14.** `.env` was git-tracked since the repo's first
+      commit, on a now-confirmed-**public** GitHub repo. Verified every
+      historical version — only ever held placeholder values, so no real
+      credential rotation needed. Untracked via `git rm --cached` on both
+      local and server; verified the server's real `.env` (genuine Zerodha/
+      email/DB secrets) was byte-for-byte unchanged throughout (checksum
+      compared before/after). No longer one `git add -A` away from leaking.
+- [x] **Done 2026-08-14.** 36 compiled `__pycache__` files were also
+      git-tracked despite `.gitignore` already listing them (same root
+      cause as `.env` — added after the fact, doesn't retroactively
+      untrack). Untracked; local files unaffected.
+- [ ] **Verified real, not yet fixed.** Contract/lot-size resolution is
+      fail-open, not fail-closed: `FNO_LOT_SIZES.get(symbol, 1)` silently
+      returns lot size **1** for an unrecognized symbol instead of blocking
+      the trade, and `_resolve_contract()`'s own docstring confirms it
+      "falls back to build_option_symbol()'s formula... whenever the cache
+      is unavailable" rather than refusing to trade. For real capital, "no
+      valid contract metadata → reject the trade" is safer than "use a
+      computed guess." Worth an explicit decision on which failure modes
+      should become fail-closed (option quote unavailable, contract
+      metadata unavailable, broker reconciliation unavailable) vs. which
+      are genuinely fine to fail-open (dashboard/notifications/optional
+      ranking) — the reviewer's fail-open/fail-closed framework is sound,
+      but auditing every call site is a real project, not a quick patch.
+- [ ] **Partially verified.** Sampled ~7 bare `except Exception: pass`
+      blocks in `live_trading_engine.py` — most are correctly scoped to
+      informational-only signals (market breadth, matching the "logged for
+      visibility, not gated" comments already there). Found one real gap:
+      a condor's regime-shift-triggered early exit check silently no-ops
+      on a Redis/parse error, meaning that one protective check can go
+      dark without any log — bounded impact since SL/profit-target/DTE
+      checks still run independently for the same position, but worth a
+      log line at minimum.
+- [ ] **Not yet investigated.** Backtester realism: `qty=1`, no brokerage/
+      slippage/spread modeled, and doesn't appear to share execution logic
+      with paper/live (single-leg OHLC signal → price → exit, not real
+      option-chain/multi-leg simulation). If true, backtest P&L numbers
+      aren't representative of what paper/live would actually produce.
+      Haven't opened `src/backtesting/` this session to confirm firsthand.
+- [ ] **Not yet investigated.** Multi-leg execution atomicity beyond what
+      exists: today's unwind-on-failure logic handles "leg 2 fails to
+      place," but not "process crashes between leg 1 filling and leg 2
+      being attempted" — a real gap per the reviewer's Test 2 (restart with
+      a naked short at the broker that nothing detects). The Zerodha daily
+      sync built today (`zerodha_sync.py`) reconciles orders, not
+      positions, so it wouldn't catch this specific case.
+- [ ] **Not yet investigated.** Reserved-capital / TOCTOU risk manager
+      race: two strategies' risk checks could both pass against the same
+      available capital before either order fills. Asyncio's single-
+      threaded event loop narrows (doesn't eliminate) this vs. a truly
+      parallel system — worth understanding exactly which `await` points
+      make this reachable before deciding it needs a reservation mechanism.
+- [x] **Confirmed correctly separated, no action needed.** ML prediction
+      paths are not wired into live signal generation anywhere in
+      `src/live_trading/` or `src/strategies/` — matches the reviewer's own
+      "keep it that way" recommendation, not a flagged problem.
+
 ---
 
-*Last updated: 2026-08-13, after the P&L recompute, capital-period/
-exposure-cap work, MySQL backups, verify_invariants.py extension,
-notification test, rollback runbook, and server hardening.*
+*Last updated: 2026-08-14, after the credit-spread/iron-condor code
+review fixes, the external architecture review follow-up, and the
+.env/__pycache__ git-tracking fixes.*
