@@ -44,6 +44,20 @@ class MomentumStrategy(StrategyBase):
         self.stop_loss_pct     = self.parameters.get("stop_loss_pct", 0.50)
         self.target_pct        = self.parameters.get("target_pct", 1.50)
         self.trailing_stop_pct = self.parameters.get("trailing_stop_pct", 0.30)
+        # Weakening-trend stop (added 2026-08-14) -- closes the dead zone
+        # between adx_exit_threshold and adx_entry_threshold. Once ADX drops
+        # below adx_entry_threshold, the trend is no longer strong enough to
+        # reconfirm this position's own entry condition, but it can still sit
+        # above adx_exit_threshold indefinitely (ADX is a smoothed, lagging
+        # indicator that doesn't reflect a fresh reversal quickly). Confirmed
+        # live 2026-08-14: TATASTEEL26AUG180PE entered at ADX=52.2, stopped
+        # reconfirming after ADX fell under 35 by ~11:10, but never dropped
+        # below the 22 trend-exhaustion threshold before exit -- so the only
+        # stop that ever fired was the full 50% hard stop, 2h17m and a much
+        # larger loss later. Once the trend is no longer fresh (ADX below
+        # entry threshold), this tighter stop applies instead of waiting for
+        # the full hard-stop drawdown.
+        self.weakening_stop_loss_pct = self.parameters.get("weakening_stop_loss_pct", 0.25)
         # Once a position has been up at least this much from entry, it must
         # never be allowed to close as a realized loss -- see manage_position()'s
         # breakeven-stop check for why trailing_stop_pct alone doesn't guarantee this.
@@ -76,7 +90,8 @@ class MomentumStrategy(StrategyBase):
             f"ADX entry>={self.adx_entry_threshold} exit<{self.adx_exit_threshold} "
             f"(<{self.adx_exit_threshold_volatile} if VOLATILE-entered) | "
             f"min_EMA_spread={self.min_ema_spread_pct}% | "
-            f"SL={self.stop_loss_pct:.0%} TP={self.target_pct:.0%} Trail={self.trailing_stop_pct:.0%} "
+            f"SL={self.stop_loss_pct:.0%} WeakeningSL={self.weakening_stop_loss_pct:.0%} "
+            f"TP={self.target_pct:.0%} Trail={self.trailing_stop_pct:.0%} "
             f"Breakeven activates at +{self.breakeven_activation_pct:.0%} | "
             f"ConfirmBars={self.signal_confirm_bars}"
         )
@@ -151,11 +166,19 @@ class MomentumStrategy(StrategyBase):
 
         Exit conditions (in priority order):
           1. Hard stop loss     — premium fell >= stop_loss_pct from entry
-          2. Profit target      — premium rose >= target_pct from entry
-          3. Trailing stop      — premium fell >= trailing_stop_pct from its peak
-          4. Breakeven stop     — once up >= breakeven_activation_pct from entry,
+          2. Weakening-trend stop — premium fell >= weakening_stop_loss_pct
+                                  from entry AND ADX has already dropped below
+                                  adx_entry_threshold (the trend no longer
+                                  reconfirms this position's own entry
+                                  condition). Tighter than the hard stop,
+                                  since a trend that's stopped reconfirming
+                                  itself shouldn't get the full drawdown
+                                  before being cut loose — see initialize().
+          3. Profit target      — premium rose >= target_pct from entry
+          4. Trailing stop      — premium fell >= trailing_stop_pct from its peak
+          5. Breakeven stop     — once up >= breakeven_activation_pct from entry,
                                   never allow a close below entry (see below)
-          5. Trend exhaustion   — ADX has dropped below adx_exit_threshold, i.e.
+          6. Trend exhaustion   — ADX has dropped below adx_exit_threshold, i.e.
                                   the established trend that justified entry has
                                   since weakened. Unlike EMA crossover (which
                                   waits for premium-based signals only), this
@@ -169,11 +192,25 @@ class MomentumStrategy(StrategyBase):
             return "HOLD"
 
         pnl_pct = (current_premium - entry_premium) / entry_premium
+        current_adx = current_position.get("current_adx")
 
         if pnl_pct <= -self.stop_loss_pct:
             logger.info(
                 f"[{self.name}] Stop loss hit: entry={entry_premium:.2f} "
                 f"current={current_premium:.2f} ({pnl_pct:.1%})"
+            )
+            return "EXIT"
+
+        if (
+            current_adx is not None
+            and float(current_adx) < self.adx_entry_threshold
+            and pnl_pct <= -self.weakening_stop_loss_pct
+        ):
+            logger.info(
+                f"[{self.name}] Weakening-trend stop: ADX={float(current_adx):.1f} "
+                f"< entry threshold {self.adx_entry_threshold} and premium down "
+                f"{pnl_pct:.1%} (>= {self.weakening_stop_loss_pct:.0%}) -- exiting "
+                "before the full hard stop since the trend no longer reconfirms."
             )
             return "EXIT"
 
@@ -228,7 +265,6 @@ class MomentumStrategy(StrategyBase):
             if current_position.get("entry_regime") == "VOLATILE"
             else self.adx_exit_threshold
         )
-        current_adx = current_position.get("current_adx")
         if current_adx is not None and float(current_adx) < adx_exit:
             logger.info(
                 f"[{self.name}] Trend exhausted: ADX={float(current_adx):.1f} "

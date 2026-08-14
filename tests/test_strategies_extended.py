@@ -175,3 +175,58 @@ def test_momentum_breakeven_stop_does_not_preempt_large_trailing_stop():
 
     pos = {"avg_price": entry, "peak_premium": peak}
     assert mom.manage_position(pos, trailing_floor) == "EXIT"
+
+
+# ── Weakening-trend stop (2026-08-14) ────────────────────────────────────────
+#
+# Closes the dead zone between adx_exit_threshold (22) and adx_entry_threshold
+# (35): once ADX drops below the entry threshold, the trend no longer
+# reconfirms this position's own entry condition, but ADX (a smoothed,
+# lagging indicator) can still sit above the exhaustion threshold
+# indefinitely even as price moves against the position. Confirmed live
+# 2026-08-14: TATASTEEL26AUG180PE entered at ADX=52.2, stopped reconfirming
+# once ADX fell under 35 (~11:10), but never dropped below 22 before exit --
+# so only the full 50% hard stop ever fired, 2h17m and a much larger loss
+# later than necessary.
+
+def test_momentum_weakening_stop_fires_once_trend_no_longer_reconfirms():
+    mom = MomentumStrategy("mom_test", {})
+    mom.initialize()
+    assert mom.weakening_stop_loss_pct == 0.25
+
+    # ADX=30 is below the 35 entry threshold (no longer reconfirming) but
+    # above the 22 exhaustion threshold -- the TATASTEEL dead zone. A 25%+
+    # loss here must now exit instead of riding to the full 50% hard stop.
+    pos = {"avg_price": 100.0, "peak_premium": 100.0, "current_adx": 30.0}
+    assert mom.manage_position(pos, 74.0) == "EXIT"  # -26%
+
+
+def test_momentum_weakening_stop_not_active_while_trend_still_confirms():
+    mom = MomentumStrategy("mom_test", {})
+    mom.initialize()
+    # ADX=40 is still above the 35 entry threshold -- the trend is still
+    # fresh enough to reconfirm, so only the full hard stop (50%) should
+    # apply, not the tighter weakening stop.
+    pos = {"avg_price": 100.0, "peak_premium": 100.0, "current_adx": 40.0}
+    assert mom.manage_position(pos, 74.0) == "HOLD"  # -26%, above hard stop
+
+
+def test_momentum_weakening_stop_not_active_below_its_own_threshold():
+    mom = MomentumStrategy("mom_test", {})
+    mom.initialize()
+    # ADX already below entry threshold, but the loss (-10%) hasn't reached
+    # weakening_stop_loss_pct (25%) yet.
+    pos = {"avg_price": 100.0, "peak_premium": 100.0, "current_adx": 25.0}
+    assert mom.manage_position(pos, 90.0) == "HOLD"
+
+
+def test_momentum_weakening_stop_reproduces_tatasteel_dead_zone_2026_08_14():
+    mom = MomentumStrategy("mom_test", {})
+    mom.initialize()
+    # The actual live entry price -- ADX had fallen under 35 well before the
+    # position was down 25%, so the new stop should exit around Rs2.685
+    # (-25%) instead of riding all the way to Rs1.78 (-50.3%) like it did live.
+    entry = 3.58
+    weakening_exit_price = entry * (1 - mom.weakening_stop_loss_pct)
+    pos = {"avg_price": entry, "peak_premium": entry, "current_adx": 28.0}
+    assert mom.manage_position(pos, weakening_exit_price) == "EXIT"
