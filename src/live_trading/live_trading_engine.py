@@ -24,7 +24,6 @@ from src.core.utils import (
     estimate_option_premium,
     get_atm_strike,
     get_entry_expiry,
-    get_lot_size,
     get_near_month_expiry,
     is_market_open,
     is_square_off_time,
@@ -1554,10 +1553,24 @@ class LiveTradingEngine:
                 pass  # MTF data unavailable — proceed without filter
 
         lot_size = await self._get_lot_size(symbol)
+        if not lot_size:
+            logger.warning(
+                f"[{strategy.name}] {symbol} skipped — no verified real lot size available "
+                "(Redis cache miss and this is a live trading decision, not falling back to "
+                "the static table). Fail-closed: won't trade this symbol until it's resolvable."
+            )
+            return
         atr      = float(market_data.get("atr14", underlying_price * 0.01))
         iv_rank  = await self._get_iv_rank(symbol, underlying_price, atr, dte)
         strike   = get_atm_strike(underlying_price, symbol)
-        strike, contract = await self._resolve_contract(symbol, expiry, strike, option_type)
+        resolved = await self._resolve_contract(symbol, expiry, strike, option_type)
+        if resolved is None:
+            logger.warning(
+                f"[{strategy.name}] {symbol} skipped — no verified real contract available "
+                "for the computed strike (fail-closed, not trading a guessed symbol)."
+            )
+            return
+        strike, contract = resolved
 
         # Fixed 2026-08-06: this unconditionally used the crude ATR-heuristic
         # estimate at entry, while every exit path (_check_open_option_exits,
@@ -1805,6 +1818,12 @@ class LiveTradingEngine:
                 return
 
         lot_size   = await self._get_lot_size(symbol)
+        if not lot_size:
+            logger.warning(
+                f"[CreditSpread] {symbol} skipped — no verified real lot size available "
+                "(fail-closed, not falling back to the static table for a live trading decision)."
+            )
+            return
         atr        = float(market_data.get("atr14", underlying_price * 0.01))
         iv_rank    = await self._get_iv_rank(symbol, underlying_price, atr, dte)
         _atr_sigma = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, underlying_price)
@@ -1951,10 +1970,19 @@ class LiveTradingEngine:
                 return
 
         # Resolve against the real, listed Zerodha contract (validates/corrects
-        # the computed strike, uses the real tradingsymbol string) -- falls
-        # back to build_option_symbol()'s formula, unchanged, on a cache miss.
-        short_strike, short_contract = await self._resolve_contract(symbol, expiry, short_strike, opt)
-        long_strike,  long_contract  = await self._resolve_contract(symbol, expiry, long_strike,  opt)
+        # the computed strike, uses the real tradingsymbol string). Fail-closed
+        # (2026-08-14): None means the cache couldn't verify this contract --
+        # skip the entry rather than trade a computed guess.
+        resolved = await self._resolve_contract(symbol, expiry, short_strike, opt)
+        if resolved is None:
+            logger.warning(f"[CreditSpread] {symbol} skipped — no verified real contract for short strike {short_strike}.")
+            return
+        short_strike, short_contract = resolved
+        resolved = await self._resolve_contract(symbol, expiry, long_strike, opt)
+        if resolved is None:
+            logger.warning(f"[CreditSpread] {symbol} skipped — no verified real contract for long strike {long_strike}.")
+            return
+        long_strike, long_contract = resolved
 
         # Avoid selling at crowded OI strikes (high OI = frequently tested)
         from src.market_data.nse_oi import is_strike_crowded
@@ -1967,7 +1995,11 @@ class LiveTradingEngine:
                 short_strike -= interval
             else:
                 short_strike += interval
-            short_strike, short_contract = await self._resolve_contract(symbol, expiry, short_strike, opt)
+            resolved = await self._resolve_contract(symbol, expiry, short_strike, opt)
+            if resolved is None:
+                logger.warning(f"[CreditSpread] {symbol} skipped — no verified real contract for OI-bumped short strike {short_strike}.")
+                return
+            short_strike, short_contract = resolved
             # Re-validate spread geometry after OI bump
             if spread_type == "BULL_PUT_SPREAD":
                 if long_strike >= short_strike:
@@ -1975,7 +2007,11 @@ class LiveTradingEngine:
             else:  # BEAR_CALL_SPREAD
                 if long_strike <= short_strike:
                     long_strike = short_strike + 2 * interval
-            long_strike, long_contract = await self._resolve_contract(symbol, expiry, long_strike, opt)
+            resolved = await self._resolve_contract(symbol, expiry, long_strike, opt)
+            if resolved is None:
+                logger.warning(f"[CreditSpread] {symbol} skipped — no verified real contract for re-validated long strike {long_strike}.")
+                return
+            long_strike, long_contract = resolved
 
         short_p, long_p = await get_entry_prices_for_spread(
             symbol, short_contract, long_contract,
@@ -2516,6 +2552,12 @@ class LiveTradingEngine:
                 return
 
         lot_size   = await self._get_lot_size(symbol)
+        if not lot_size:
+            logger.warning(
+                f"[IronCondor] {symbol} skipped — no verified real lot size available "
+                "(fail-closed, not falling back to the static table for a live trading decision)."
+            )
+            return
         atr        = float(market_data.get("atr14", underlying_price * 0.01))
         iv_rank    = await self._get_iv_rank(symbol, underlying_price, atr, dte)
         _atr_sigma = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, underlying_price)
@@ -2639,12 +2681,24 @@ class LiveTradingEngine:
             return
 
         # Resolve against the real, listed Zerodha contract for each leg (see
-        # _resolve_contract's docstring) -- falls back to build_option_symbol()'s
-        # formula, unchanged, on a cache miss.
-        put_short_strike,  psc = await self._resolve_contract(symbol, expiry, put_short_strike,  "PE")
-        put_long_strike,   plc = await self._resolve_contract(symbol, expiry, put_long_strike,   "PE")
-        call_short_strike, csc = await self._resolve_contract(symbol, expiry, call_short_strike, "CE")
-        call_long_strike,  clc = await self._resolve_contract(symbol, expiry, call_long_strike,  "CE")
+        # _resolve_contract's docstring). Fail-closed (2026-08-14): None means
+        # the cache couldn't verify this leg -- skip the whole structure rather
+        # than trade a computed guess for any one leg.
+        _leg_specs = [
+            ("put_short", put_short_strike, "PE"), ("put_long", put_long_strike, "PE"),
+            ("call_short", call_short_strike, "CE"), ("call_long", call_long_strike, "CE"),
+        ]
+        _resolved_legs = {}
+        for _leg_name, _leg_strike, _leg_opt in _leg_specs:
+            _r = await self._resolve_contract(symbol, expiry, _leg_strike, _leg_opt)
+            if _r is None:
+                logger.warning(f"[IronCondor] {symbol} skipped — no verified real contract for {_leg_name} strike {_leg_strike}.")
+                return
+            _resolved_legs[_leg_name] = _r
+        put_short_strike,  psc = _resolved_legs["put_short"]
+        put_long_strike,   plc = _resolved_legs["put_long"]
+        call_short_strike, csc = _resolved_legs["call_short"]
+        call_long_strike,  clc = _resolved_legs["call_long"]
 
         # Fetch real Kite LTPs for all 4 legs — same as credit spread entry.
         # ATR estimates are CE/PE-blind (put_short_p == call_short_p always), which
@@ -3756,7 +3810,23 @@ class LiveTradingEngine:
             logger.error(f"Redis read [{symbol}]: {exc}")
             return None
 
-    async def _get_lot_size(self, symbol: str) -> int:
+    async def _get_lot_size(self, symbol: str) -> Optional[int]:
+        """
+        Real lot size from Redis (populated daily by zerodha_auto_auth.py's
+        "Lot sizes cached for 41 F&O symbols" step, right after the 08:30
+        token refresh) -- or None if that's not available.
+
+        Fixed 2026-08-14: used to fall back to the static FNO_LOT_SIZES
+        table on any cache miss. That table's own comment already
+        documents the exact danger this caused: 36/39 symbols were once
+        found wrong there (KOTAKBANK 400 vs real 2000), masked under normal
+        operation by this same Redis cache -- but on any day the daily
+        auth job fails or is delayed, the system would silently submit
+        wildly wrong order quantities right as things are already going
+        wrong. Fail-closed instead: no verified real lot size, no trade.
+        Callers must treat None as "skip this entry," not substitute the
+        static table themselves.
+        """
         redis = getattr(self, "_redis", None)
         if redis:
             try:
@@ -3765,16 +3835,16 @@ class LiveTradingEngine:
                     return int(val)
             except Exception:
                 pass
-        return get_lot_size(symbol)
+        return None
 
     async def _resolve_contract(
         self, symbol: str, expiry: datetime, candidate_strike: float, option_type: str,
-    ) -> Tuple[float, str]:
+    ) -> Optional[Tuple[float, str]]:
         """
         Resolve a candidate strike (from get_atm_strike()/find_delta_strike()'s
-        interval-based arithmetic) to a real, listed Zerodha contract when
-        possible. Validates/corrects against the daily-refreshed real-contract
-        cache (see option_chain.get_real_contract()) -- our own expiry-date
+        interval-based arithmetic) to a real, listed Zerodha contract.
+        Validates/corrects against the daily-refreshed real-contract cache
+        (see option_chain.get_real_contract()) -- our own expiry-date
         rollover and strike-interval formulas have no live cross-check
         otherwise, the same root-cause shape as the FNO_LOT_SIZES/
         FNO_STRIKE_INTERVALS tables that WERE found wrong for 36/39 and 27/39
@@ -3786,15 +3856,23 @@ class LiveTradingEngine:
         must use the returned strike, not the original candidate, to stay
         consistent with the contract actually being traded.
 
-        Falls back to build_option_symbol()'s formula (today's existing
-        behavior, unchanged) whenever the cache is unavailable -- this can
-        only make contract selection more correct, never less available.
+        Fixed 2026-08-14: used to fall back to build_option_symbol()'s
+        purely computed formula whenever the real-contract cache was
+        unavailable -- fail-OPEN, silently trading a guessed symbol/strike
+        that might not even be listed. For a live order this is exactly
+        backwards: "no valid contract metadata" should block the trade,
+        not substitute a guess for it (this project has already found the
+        computed formula wrong for 27/39 symbols once). Returns None when
+        the cache can't verify the contract -- every entry-path caller
+        must skip the entry on None, not fall back to a computed symbol
+        itself. Exit paths are unaffected: they never call this, they
+        reuse the contract string already recorded at entry.
         """
         from src.market_data.option_chain import get_real_contract
         real = await get_real_contract(symbol, expiry, candidate_strike, option_type, getattr(self, "_redis", None))
         if real:
             return real[1], real[0]
-        return candidate_strike, build_option_symbol(symbol, candidate_strike, option_type, expiry)
+        return None
 
     async def _get_active_symbols(self, strategy=None) -> List[str]:
         redis = getattr(self, "_redis", None)

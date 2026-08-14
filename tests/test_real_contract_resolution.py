@@ -13,8 +13,15 @@ get_real_contract() validates/corrects a computed (symbol, expiry, strike,
 option_type) against a daily-refreshed real-instrument cache (see
 scripts/zerodha_auto_auth.py's fetch_and_cache_real_contracts()), returning
 the REAL tradingsymbol -- snapping to the nearest actually-listed strike if
-the computed one isn't listed for that expiry. Falls back to None (caller
-uses build_option_symbol()'s formula, unchanged) on any cache miss.
+the computed one isn't listed for that expiry. Returns None on a cache miss.
+
+Fixed 2026-08-14: LiveTradingEngine._resolve_contract() (the caller) used
+to fall back to build_option_symbol()'s computed formula whenever
+get_real_contract() returned None -- fail-OPEN, silently trading a guessed
+symbol/strike that might not even be listed (the exact bug class already
+found wrong for 27/39 symbols once). Now fail-closed: _resolve_contract()
+itself returns None on a cache miss, and every entry-path caller skips the
+trade rather than substituting a computed guess.
 """
 import json
 import pytest
@@ -147,16 +154,16 @@ async def test_resolve_contract_uses_real_match_when_available():
 
 
 @pytest.mark.asyncio
-async def test_resolve_contract_falls_back_to_formula_on_cache_miss():
+async def test_resolve_contract_fails_closed_on_cache_miss():
     fake = _FakeResolveEngine(redis=None)
 
-    strike, contract = await LiveTradingEngine._resolve_contract(
+    result = await LiveTradingEngine._resolve_contract(
         fake, "BAJFINANCE", date(2026, 9, 29), 1160, "CE",
     )
 
-    # Falls back to build_option_symbol()'s formula unchanged.
-    assert strike == 1160
-    assert contract == "BAJFINANCE26SEP1160CE"  # formula and real data agree here
+    # Fail-closed (2026-08-14): no verified real contract -> None, not a
+    # silent fallback to the computed build_option_symbol() guess.
+    assert result is None
 
 
 @pytest.mark.asyncio
@@ -173,3 +180,115 @@ async def test_resolve_contract_snapped_strike_flows_through_to_caller():
 
     assert strike == 1160
     assert contract == "BAJFINANCE26SEP1160CE"
+
+
+# ── _get_lot_size() fail-closed (2026-08-14) ────────────────────────────────
+#
+# Used to fall back to the static FNO_LOT_SIZES table on any Redis cache
+# miss -- that table's own comment already documents the exact danger this
+# caused live: 36/39 symbols were once found wrong there, masked under
+# normal operation by the Redis cache, but on any day the daily auth job
+# fails or is delayed, this would silently submit wildly wrong order
+# quantities. Now returns None on a cache miss; callers must skip the entry.
+
+import inspect
+from src.core.constants import REDIS_LOT_SIZE_PREFIX
+
+
+class _FakeLotSizeEngine:
+    def __init__(self, redis):
+        self._redis = redis
+
+
+@pytest.mark.asyncio
+async def test_get_lot_size_returns_real_cached_value():
+    redis = _FakeRedis({f"{REDIS_LOT_SIZE_PREFIX}RELIANCE": "500"})
+    fake = _FakeLotSizeEngine(redis)
+    assert await LiveTradingEngine._get_lot_size(fake, "RELIANCE") == 500
+
+
+@pytest.mark.asyncio
+async def test_get_lot_size_fails_closed_on_cache_miss():
+    fake = _FakeLotSizeEngine(redis=_FakeRedis({}))
+    assert await LiveTradingEngine._get_lot_size(fake, "RELIANCE") is None
+
+
+@pytest.mark.asyncio
+async def test_get_lot_size_fails_closed_when_redis_unavailable():
+    fake = _FakeLotSizeEngine(redis=None)
+    assert await LiveTradingEngine._get_lot_size(fake, "RELIANCE") is None
+
+
+@pytest.mark.asyncio
+async def test_get_lot_size_fails_closed_on_redis_error():
+    class _BrokenRedis:
+        async def get(self, key):
+            raise RuntimeError("connection lost")
+    fake = _FakeLotSizeEngine(redis=_BrokenRedis())
+    assert await LiveTradingEngine._get_lot_size(fake, "RELIANCE") is None
+
+
+# ── Entry-path callers must skip on lot-size/contract fail-closed (2026-08-14) ──
+#
+# _process_signal/_process_credit_spread/_process_iron_condor all have deep
+# precondition chains (IV rank/VIX/ADX/PCR/DTE/strike-selection checks)
+# before reaching lot-size/contract resolution -- driving the full method
+# end-to-end for this would need an extremely large mock (same rationale
+# test_entry_failure_unwind.py documents for the sibling unwind-on-failure
+# checks). Source-level regression guards instead.
+
+def test_process_signal_skips_entry_when_lot_size_unavailable():
+    src = inspect.getsource(LiveTradingEngine._process_signal)
+    idx = src.index("lot_size = await self._get_lot_size(symbol)")
+    guard = src[idx:idx + 500]
+    assert "if not lot_size:" in guard
+    assert "return" in guard
+
+
+def test_process_signal_skips_entry_when_contract_unresolved():
+    src = inspect.getsource(LiveTradingEngine._process_signal)
+    idx = src.index("resolved = await self._resolve_contract(symbol, expiry, strike, option_type)")
+    guard = src[idx:idx + 500]
+    assert "if resolved is None:" in guard
+    assert "return" in guard
+
+
+def test_process_credit_spread_skips_entry_when_lot_size_unavailable():
+    src = inspect.getsource(LiveTradingEngine._process_credit_spread)
+    idx = src.index("lot_size   = await self._get_lot_size(symbol)")
+    guard = src[idx:idx + 500]
+    assert "if not lot_size:" in guard
+    assert "return" in guard
+
+
+def test_process_credit_spread_skips_entry_when_any_leg_unresolved():
+    src = inspect.getsource(LiveTradingEngine._process_credit_spread)
+    # All 4 resolve_contract call sites (initial short/long, OI-bump short/long)
+    # must each be followed by a None-check within a short span.
+    idx = 0
+    found = 0
+    while True:
+        idx = src.find("await self._resolve_contract(symbol, expiry,", idx)
+        if idx == -1:
+            break
+        guard = src[idx:idx + 250]
+        assert "if resolved is None:" in guard, f"missing fail-closed guard near offset {idx}"
+        found += 1
+        idx += 1
+    assert found == 4, f"expected 4 resolve_contract call sites, found {found}"
+
+
+def test_process_iron_condor_skips_entry_when_lot_size_unavailable():
+    src = inspect.getsource(LiveTradingEngine._process_iron_condor)
+    idx = src.index("lot_size   = await self._get_lot_size(symbol)")
+    guard = src[idx:idx + 500]
+    assert "if not lot_size:" in guard
+    assert "return" in guard
+
+
+def test_process_iron_condor_skips_entry_when_any_leg_unresolved():
+    src = inspect.getsource(LiveTradingEngine._process_iron_condor)
+    idx = src.index('_resolved_legs = {}')
+    guard = src[idx:idx + 500]
+    assert "if _r is None:" in guard
+    assert "return" in guard

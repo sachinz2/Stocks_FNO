@@ -273,6 +273,28 @@ def check_zerodha_sync_gated_to_live_mode(repo: Path) -> Result:
     return PASS, name, "Job explicitly gated to TradingMode.LIVE."
 
 
+def check_lot_size_and_contract_resolution_fail_closed(repo: Path) -> Result:
+    name = "Missing lot-size/contract metadata blocks the trade, doesn't fall back to a computed guess"
+    src = _read(repo, "src/live_trading/live_trading_engine.py")
+    if "async def _get_lot_size(self, symbol: str) -> Optional[int]:" not in src:
+        return FAIL, name, "_get_lot_size() no longer returns Optional[int] -- may have reverted to always returning an int (silently falling back to the static FNO_LOT_SIZES table on a cache miss)."
+    lot_idx = src.index("async def _get_lot_size")
+    lot_body = src[lot_idx:lot_idx + 1200]
+    if "return get_lot_size(symbol)" in lot_body:
+        return FAIL, name, "_get_lot_size() still falls back to the static table -- that table's own comment documents 36/39 symbols once found wrong there, masked only by this same cache."
+    if "-> Optional[Tuple[float, str]]:" not in src or "async def _resolve_contract(" not in src:
+        return FAIL, name, "_resolve_contract() no longer returns Optional[...] -- may have reverted to always returning a (possibly computed-guess) contract."
+    resolve_idx = src.index("async def _resolve_contract(")
+    resolve_body = src[resolve_idx:resolve_idx + 1800]
+    if "return candidate_strike, build_option_symbol(symbol, candidate_strike, option_type, expiry)" in resolve_body:
+        return FAIL, name, "_resolve_contract() still falls back to the computed build_option_symbol() guess on a cache miss."
+    if "if not lot_size:" not in src:
+        return FAIL, name, "No entry-path caller checks _get_lot_size()'s result for None before using it."
+    if src.count("if resolved is None:") + src.count("if _r is None:") < 3:
+        return FAIL, name, "Not all 3 entry paths (single-leg, credit-spread, iron-condor) check _resolve_contract()'s result for None."
+    return PASS, name, "_get_lot_size()/_resolve_contract() fail closed on missing metadata; entry paths check and skip rather than trade a guess."
+
+
 def check_stale_option_price_resolved(repo: Path) -> Result:
     name = "Option prices trust last_price only if traded today, else fall back to bid/ask"
     oc_src = _read(repo, "src/market_data/option_chain.py")
@@ -313,6 +335,7 @@ STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_risk_limits_wired_from_settings,
     check_capital_period_compounding_drives_live_limits,
     check_zerodha_sync_gated_to_live_mode,
+    check_lot_size_and_contract_resolution_fail_closed,
     check_stale_option_price_resolved,
     check_auth_self_heal_actively_retries,
 ]
