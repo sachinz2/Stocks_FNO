@@ -3659,8 +3659,28 @@ class LiveTradingEngine:
         try:
             atm   = round(underlying_price / interval) * interval
             T     = max(dte, 1) / 365.0
-            _, ce_c = await self._resolve_contract(symbol, expiry, atm, "CE")
-            _, pe_c = await self._resolve_contract(symbol, expiry, atm, "PE")
+            # Fixed 2026-08-14: this unpacked _resolve_contract()'s result
+            # directly, the one pair of call sites in the file that was
+            # missed when _resolve_contract() was made fail-closed (returns
+            # None on a cache miss instead of a computed guess). The
+            # resulting TypeError was already harmless -- caught by this
+            # function's own broad except below, falling back to atr_sigma
+            # -- but only at DEBUG level with a generic "cannot unpack"
+            # message, masking the real cause (same cache-miss condition
+            # every other call site logs at WARNING) behind what looked
+            # like an ordinary quote-fetch failure. This is a volatility
+            # ESTIMATE refinement, not a final trade decision, so it stays
+            # fail-open to atr_sigma on purpose -- just loudly now.
+            ce_resolved = await self._resolve_contract(symbol, expiry, atm, "CE")
+            pe_resolved = await self._resolve_contract(symbol, expiry, atm, "PE")
+            if ce_resolved is None or pe_resolved is None:
+                logger.warning(
+                    f"[LiveIV] {symbol}: no verified real contract for the ATM strike -- "
+                    "falling back to ATR sigma for delta-based strike selection."
+                )
+                return atr_sigma
+            _, ce_c = ce_resolved
+            _, pe_c = pe_resolved
             ce_p  = await get_option_quote(ce_c, kite, redis)
             pe_p  = await get_option_quote(pe_c, kite, redis)
 

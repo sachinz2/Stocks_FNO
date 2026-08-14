@@ -292,3 +292,49 @@ def test_process_iron_condor_skips_entry_when_any_leg_unresolved():
     guard = src[idx:idx + 500]
     assert "if _r is None:" in guard
     assert "return" in guard
+
+
+# ── _get_live_sigma() -- the 4th _resolve_contract call site (2026-08-14) ──
+#
+# Found in a follow-up review: this call site (used by both credit-spread
+# and iron-condor entries to refine delta-based strike selection with live
+# ATM IV) was the one pair of _resolve_contract() call sites in the file
+# NOT updated when _resolve_contract() was made fail-closed. It didn't
+# crash -- the resulting TypeError from unpacking None was already caught
+# by this function's own broad except, falling back to atr_sigma -- but
+# only at DEBUG level with a generic "cannot unpack" message, masking the
+# real cause. This is a volatility ESTIMATE refinement, not a final trade
+# decision, so it stays fail-OPEN to atr_sigma on purpose -- just loudly now.
+
+class _FakeLiveSigmaEngine:
+    def __init__(self, kite, resolve_result):
+        self._kite = kite
+        self._redis = None
+        self._resolve_result = resolve_result
+
+    async def _resolve_contract(self, symbol, expiry, strike, option_type):
+        return self._resolve_result
+
+
+@pytest.mark.asyncio
+async def test_get_live_sigma_falls_back_cleanly_when_contract_unresolved(caplog):
+    import logging
+    fake = _FakeLiveSigmaEngine(kite=object(), resolve_result=None)
+
+    with caplog.at_level(logging.WARNING):
+        sigma = await LiveTradingEngine._get_live_sigma(
+            fake, "BAJFINANCE", 1160.0, 25, 10, date(2026, 9, 29), atr_sigma=0.22,
+        )
+
+    assert sigma == 0.22
+    assert any("no verified real contract" in r.message for r in caplog.records), \
+        "must warn loudly, not silently fall through to the generic debug-level exception handler"
+
+
+@pytest.mark.asyncio
+async def test_get_live_sigma_returns_atr_sigma_when_kite_unavailable():
+    fake = _FakeLiveSigmaEngine(kite=None, resolve_result=None)
+    sigma = await LiveTradingEngine._get_live_sigma(
+        fake, "BAJFINANCE", 1160.0, 25, 10, date(2026, 9, 29), atr_sigma=0.18,
+    )
+    assert sigma == 0.18

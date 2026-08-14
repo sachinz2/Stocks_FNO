@@ -220,7 +220,15 @@ def check_cross_strategy_collision_guard(repo: Path) -> Result:
         return FAIL, name, "Spread/condor entry no longer checks for an existing open single-leg position on the same underlying (both _process_credit_spread and _process_iron_condor need this)."
     if "if self._has_active_multi_leg_structure(symbol):" not in src:
         return FAIL, name, "Single-leg entry (_process_signal) no longer checks for an existing active spread/condor on the same underlying."
-    return PASS, name, "Guarded both directions via shared helpers: spread/condor vs single-leg."
+    # Fixed 2026-08-14: the guard above only covered the engine's own
+    # automated entry paths -- a manual order placed via orders_router.py
+    # called OrderManager.place_order() directly, bypassing it entirely.
+    orders_src = _read(repo, "src/api/routers/orders_router.py")
+    if "_has_active_multi_leg_structure(underlying)" not in orders_src:
+        return FAIL, name, "orders_router.py's place_order() no longer checks _has_active_multi_leg_structure() before placing a manual order -- manual orders can again collide with an active spread/condor on the same underlying."
+    if "_get_underlying_from_contract(order_request.symbol)" not in orders_src:
+        return FAIL, name, "orders_router.py's place_order() no longer resolves the underlying from the manual order's contract symbol before the collision check."
+    return PASS, name, "Guarded both directions via shared helpers: spread/condor vs single-leg, plus manual orders through orders_router.py."
 
 
 def check_risk_limits_wired_from_settings(repo: Path) -> Result:
@@ -292,7 +300,30 @@ def check_lot_size_and_contract_resolution_fail_closed(repo: Path) -> Result:
         return FAIL, name, "No entry-path caller checks _get_lot_size()'s result for None before using it."
     if src.count("if resolved is None:") + src.count("if _r is None:") < 3:
         return FAIL, name, "Not all 3 entry paths (single-leg, credit-spread, iron-condor) check _resolve_contract()'s result for None."
-    return PASS, name, "_get_lot_size()/_resolve_contract() fail closed on missing metadata; entry paths check and skip rather than trade a guess."
+    # Fixed 2026-08-14: the checks above only count how many guard patterns
+    # EXIST, not whether every _resolve_contract() call site actually has
+    # one -- that let _get_live_sigma()'s two call sites (used by both
+    # credit-spread and iron-condor entries for delta-based strike
+    # selection) go unguarded for a full review cycle, silently degrading
+    # to ATR sigma instead of the loud warning every other site gets.
+    # Explicitly walk every call site this time.
+    unguarded = []
+    idx = 0
+    while True:
+        idx = src.find("await self._resolve_contract(", idx)
+        if idx == -1:
+            break
+        # A guard is anywhere in the ~200 chars before this call (the "if
+        # ... is None" check for the PRIOR leg) or ~250 after (this leg's
+        # own check, or the loop-based iron-condor pattern's "if _r is
+        # None" a few lines below the call inside its for-loop).
+        window = src[max(0, idx - 250):idx + 350]
+        if "is None" not in window:
+            unguarded.append(idx)
+        idx += 1
+    if unguarded:
+        return FAIL, name, f"Found {len(unguarded)} _resolve_contract() call site(s) with no None-check nearby (offsets {unguarded}) -- a cache miss there would either crash or silently degrade instead of failing closed/loud."
+    return PASS, name, "_get_lot_size()/_resolve_contract() fail closed on missing metadata; every call site checked and handles None."
 
 
 def check_stale_option_price_resolved(repo: Path) -> Result:

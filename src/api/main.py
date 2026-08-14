@@ -307,6 +307,7 @@ async def lifespan(app: FastAPI):
     app.state.instrument_tokens = instrument_tokens
     app.state.last_kite_token   = access_token
     app.state.last_auth_retry_attempt = None  # see _kite_self_heal's no-token retry path
+    app.state.last_instrument_cache_retry_attempt = None  # see _kite_self_heal's cache-refresh retry path
 
     # ── Self-healing kite provisioning ───────────────────────────────────────
     # kite_instance used to be a one-time startup snapshot: if Redis had no
@@ -418,6 +419,43 @@ async def lifespan(app: FastAPI):
             app.state.kite.set_access_token(token)
             app.state.last_kite_token = token
             logger.info("Kite access token rotated — refreshed in place on the shared client.")
+
+        # ── Instrument-cache self-heal ─────────────────────────────────────────
+        # Fixed 2026-08-14: the token-missing retry path above only catches a
+        # FAILED LOGIN. run_daily_auth() stores the token BEFORE attempting the
+        # separate lot-size/real-contract cache refresh (see
+        # zerodha_auto_auth.py) -- so a login that succeeds followed by an
+        # instrument-fetch failure (network blip, Zerodha rate-limit, timeout
+        # on the ~5-10MB instrument dump) leaves a valid token in Redis with
+        # empty caches, and the check above never fires since `raw` is
+        # present. Since LiveTradingEngine._get_lot_size()/_resolve_contract()
+        # now fail closed on a cache miss (no more computed-guess fallback),
+        # this used to be merely degraded and is now a full "zero new entries
+        # all day" outage with nothing watching for it. Same active-retry
+        # pattern as the no-token case above, separate cooldown so the two
+        # don't interfere with each other.
+        from scripts.zerodha_auto_auth import instrument_caches_healthy
+        if not instrument_caches_healthy():
+            from src.core.utils import now_ist, is_auth_retry_window, should_retry_auth
+            now = now_ist()
+            if is_auth_retry_window(now) and should_retry_auth(
+                app.state.last_instrument_cache_retry_attempt, now, AUTH_RETRY_COOLDOWN_SECONDS,
+            ):
+                app.state.last_instrument_cache_retry_attempt = now
+                logger.warning(
+                    "Kite self-heal: lot-size/real-contract caches are empty despite "
+                    "a valid token -- the daily instrument refresh appears to have "
+                    "failed independently of login. New entries are fail-closed-"
+                    f"blocked until this succeeds. Retrying now (at most every "
+                    f"{AUTH_RETRY_COOLDOWN_SECONDS}s)."
+                )
+                try:
+                    from scripts.zerodha_auto_auth import refresh_instrument_caches
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, refresh_instrument_caches, token)
+                    logger.info("Kite self-heal: instrument cache refresh succeeded.")
+                except Exception as e:
+                    logger.error(f"Kite self-heal: instrument cache refresh attempt failed: {e}")
 
         # ── Tick-staleness watchdog ──────────────────────────────────────────
         # A WebSocket connection can look healthy (connected, no error/disconnect

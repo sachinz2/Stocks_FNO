@@ -95,6 +95,30 @@ async def place_order(
 ):
     """Place a new order — requires JWT auth."""
     try:
+        engine = getattr(http_request.app.state, "trading_engine", None)
+        if engine is not None:
+            # Cross-strategy contract-collision guard — see
+            # LiveTradingEngine._has_active_multi_leg_structure()'s docstring
+            # for the live incident this closes (a strategy independently
+            # trading an underlying that another strategy already holds open
+            # as a spread/condor leg). Fixed 2026-08-14: this guard was only
+            # wired into the engine's own automated entry paths
+            # (_process_signal/_process_credit_spread/_process_iron_condor);
+            # a manual order placed through this router bypassed it entirely,
+            # since it calls OrderManager.place_order() directly. Manual
+            # orders are single-leg like _process_signal's entries, so this
+            # mirrors that call site's guard exactly.
+            underlying = engine._get_underlying_from_contract(order_request.symbol)
+            if underlying and engine._has_active_multi_leg_structure(underlying):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"{underlying} already has an active credit_spread/iron_condor "
+                        "structure open — manual order blocked to avoid a cross-strategy "
+                        "contract collision."
+                    ),
+                )
+
         om = _get_order_manager(http_request)
         db_order = await om.place_order(
             order_request.symbol, order_request.side, order_request.quantity, order_request.price,

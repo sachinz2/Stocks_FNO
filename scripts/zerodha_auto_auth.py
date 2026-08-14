@@ -344,6 +344,48 @@ def fetch_and_cache_real_contracts(instruments: list) -> int:
     return seen
 
 
+def instrument_caches_healthy() -> bool:
+    """
+    Cheap spot-check for whether the lot-size/real-contract Redis caches are
+    actually populated -- checks one canonical symbol (RELIANCE, always in
+    FNO_SYMBOLS) as a proxy rather than all 41, since fetch_and_cache_lot_sizes/
+    fetch_and_cache_real_contracts populate every symbol from the same single
+    instrument-dump pass (either all succeed together or none do, barring a
+    genuinely symbol-specific listing gap).
+
+    Fixed 2026-08-14: LiveTradingEngine._get_lot_size()/_resolve_contract()
+    now fail closed (return None, block the trade) on a cache miss instead
+    of falling back to a computed guess -- so unlike before, a missing cache
+    isn't "non-fatal" anymore, it's "zero new entries all day." Used by
+    api/main.py's kite self-heal to detect and actively retry this specific
+    failure mode, the same way it already does for a missing auth token.
+    """
+    from src.core.constants import REDIS_LOT_SIZE_PREFIX
+    try:
+        r = get_redis_client()
+        return r.get(f"{REDIS_LOT_SIZE_PREFIX}RELIANCE") is not None
+    except Exception:
+        return False
+
+
+def refresh_instrument_caches(access_token: str) -> tuple:
+    """
+    Fetch the NFO instrument dump once and refresh both the lot-size and
+    real-contract Redis caches from it. Extracted from run_daily_auth() so
+    self-heal can retry just this step without re-running the full login
+    when the token is already valid but this step alone failed (network
+    blip, Zerodha rate-limit, timeout on the ~5-10MB instrument dump --
+    confirmed live 2026-08-07 and 2026-08-13 as real, independent failure
+    modes from the login itself). Returns (lot_count, contract_count).
+    """
+    instruments = fetch_nfo_instruments(access_token)
+    count = fetch_and_cache_lot_sizes(instruments)
+    logger.info(f"Instrument lot sizes refreshed: {count} symbols")
+    contract_count = fetch_and_cache_real_contracts(instruments)
+    logger.info(f"Real contract data refreshed: {contract_count} symbols")
+    return count, contract_count
+
+
 def run_daily_auth():
     """Entry point called by the scheduler at 8:30 AM IST."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -353,15 +395,20 @@ def run_daily_auth():
         store_token(access_token)
         logger.info("Daily authentication SUCCESSFUL")
 
-        # Refresh lot sizes + real contract data from a single instrument fetch
+        # Fixed 2026-08-14: this used to be logged as "non-fatal, using
+        # hardcoded/computed fallback" -- that fallback no longer exists
+        # (see instrument_caches_healthy()'s docstring), so a failure here
+        # is not actually non-fatal: it silently blocks every new entry for
+        # the rest of the day with nothing else watching for it, unless
+        # api/main.py's self-heal catches it via instrument_caches_healthy().
         try:
-            instruments = fetch_nfo_instruments(access_token)
-            count = fetch_and_cache_lot_sizes(instruments)
-            logger.info(f"Instrument lot sizes refreshed: {count} symbols")
-            contract_count = fetch_and_cache_real_contracts(instruments)
-            logger.info(f"Real contract data refreshed: {contract_count} symbols")
+            refresh_instrument_caches(access_token)
         except Exception as e:
-            logger.warning(f"Instrument data refresh failed (non-fatal, using hardcoded/computed fallback): {e}")
+            logger.warning(
+                f"Instrument cache refresh failed: {e} -- new entries will "
+                "fail closed (blocked) until this is retried successfully, "
+                "by self-heal or tomorrow's scheduled run."
+            )
 
         return access_token
     except Exception as e:
