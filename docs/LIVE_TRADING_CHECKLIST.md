@@ -59,7 +59,12 @@ Current `.env`: `INITIAL_CAPITAL=300000.0`, `MAX_OPEN_POSITIONS=5`,
       default.
 - [ ] Confirm `_check_available_margin`'s live-mode path (`kite.margins()`)
       has actually been exercised against the real account at least once
-      before go-live, not just unit-tested against a mock.
+      before go-live, not just unit-tested against a mock. Code-level gap
+      already fixed (2026-08-14, external review): this used to fail OPEN
+      ("Allowing trade") on a `kite.margins()` API error — both call sites
+      are entry paths only, never an exit, so it now fails CLOSED and blocks
+      the entry instead. What's left here is the real-account exercise
+      itself, not a code change.
 - [ ] Decide what happens when the kill switch fires for real: who gets
       paged, what's the manual re-enable process, has it ever been triggered
       end-to-end (not just unit-tested)?
@@ -77,7 +82,15 @@ Current `.env`: `INITIAL_CAPITAL=300000.0`, `MAX_OPEN_POSITIONS=5`,
       volume (paper mode has no real rate limit to violate).
 - [ ] GTT backstops (`_place_gtt_backstop`) — confirm at least one has been
       placed and verified visible in the real Zerodha GTT order book, not
-      just logged as "placed" by the app.
+      just logged as "placed" by the app, AND that the actual trigger/order
+      parameters (`order_type=MARKET`, `product=NRML`, `price=0`) behave as
+      expected when a real GTT fires — `kite.place_gtt()` returning a
+      trigger ID is not sufficient verification on its own. Source comment
+      corrected 2026-08-14 (external review): was overclaiming "server-
+      independent emergency stop" — now documented as an exchange-side
+      backstop layered on top of the normal exit rules, not a substitute
+      guarantee of the exact exit price. The verification itself still
+      requires a real Zerodha session and hasn't been done.
 
 ## A4. Operational readiness
 
@@ -87,15 +100,10 @@ Current `.env`: `INITIAL_CAPITAL=300000.0`, `MAX_OPEN_POSITIONS=5`,
       spread/condor unwinds, failed expiry-day journal writes).
 - [ ] Log retention: currently rotates out at ~1 month. Confirm that's
       enough for compliance/audit needs once real trades are involved.
-- [ ] The one confirmed fail-open gap found in the external review: a
-      condor's regime-shift-triggered early exit check silently no-ops on a
-      Redis/JSON-parse error with no log line. Bounded impact (SL/profit-
-      target/DTE checks still run independently for the same position), but
-      a quick fix — add a log line so a silent miss is at least visible.
 
 ## A5. Testing & CI safety net
 
-- [ ] Full test suite green (currently 273 passing) immediately before flip.
+- [ ] Full test suite green (currently 302 passing) immediately before flip.
 - [ ] `deploy.sh`'s invariant-check step (`verify_invariants.py`, currently
       18 static + 4 runtime checks) wired into the actual deploy path used
       for the live-mode cutover, not run ad hoc.
@@ -248,8 +256,35 @@ Kept short — see git log / individual commit messages for full detail.
   server) before shipping (2026-08-14)
 - **ML confirmed correctly separated** from live signal generation — no
   action needed (2026-08-14)
+- **5 code-level gaps from an external pre-live review fixed** (2026-08-14,
+  verified against actual code before fixing, not taken on faith):
+  - `_safe_get_positions()` used to conflate "broker call failed" with
+    "broker confirmed zero positions" (both returned `[]`). Now tracks a
+    separate `_broker_position_state_known` flag; `run_signal_cycle()`
+    blocks all new entries for the cycle when it's `False`, without
+    changing exit behavior.
+  - `_check_available_margin()`'s live-mode path used to fail OPEN
+    ("Allowing trade") on a `kite.margins()` API error. Both call sites are
+    entry paths only (never an exit), so it now fails CLOSED instead.
+  - Found while fixing the above: the paper-mode branch of the same
+    function read `getattr(settings, "initial_capital", 300_000)` —
+    lowercase, which never matched the real case-sensitive
+    `INITIAL_CAPITAL` — so it silently used the hardcoded 300,000 fallback
+    regardless of the actually configured value. Now reads the real setting.
+  - `_get_market_data()`'s timestamp validation let a malformed/unparseable
+    timestamp through unchanged instead of rejecting it, skipped the
+    staleness check entirely on a missing timestamp, and never rejected a
+    future timestamp. All four cases (missing/malformed/future/stale) now
+    return `None`.
+  - The condor regime-shift exit check's silent no-op on a Redis/JSON error
+    (the one confirmed fail-open gap called out in the external review, was
+    tracked in A4) now logs a warning instead.
+  - GTT backstop docstring corrected from the overclaiming "server-
+    independent emergency stop" to "exchange-side emergency backstop" — the
+    real-account trigger/order-parameter verification itself (A3) is still
+    open, this was a documentation-accuracy fix, not a substitute for it.
+  - 13 new tests added (`tests/test_prelive_external_review_2026_08_14.py`).
 
 ---
 
-*Last updated: 2026-08-14, after the fail-closed lot-size/contract
-resolution fix.*
+*Last updated: 2026-08-14, after the external-review pre-live fixes above.*

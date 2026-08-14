@@ -350,6 +350,20 @@ def check_auth_self_heal_actively_retries(repo: Path) -> Result:
     return PASS, name, "Self-heal has an active-retry path, not just a wait for the next scheduled auth."
 
 
+def check_margin_and_broker_position_failures_fail_closed(repo: Path) -> Result:
+    name = "Margin API failure and broker-position-fetch failure block new entries, don't fail open"
+    src = _read(repo, "src/live_trading/live_trading_engine.py")
+    if "Blocking entry (fail-closed)" not in src:
+        return FAIL, name, "_check_available_margin()'s live-mode API-error path no longer fails closed -- a kite.margins() error could once again silently allow an entry with unverified margin."
+    if "return False" not in src[src.index("Blocking entry (fail-closed)"):src.index("Blocking entry (fail-closed)") + 100]:
+        return FAIL, name, "_check_available_margin()'s fail-closed log line is no longer immediately followed by `return False`."
+    if "_broker_position_state_known" not in src:
+        return FAIL, name, "_broker_position_state_known flag missing -- _safe_get_positions() no longer distinguishes a broker API failure from a confirmed-zero position list."
+    if "if not self._broker_position_state_known:" not in src:
+        return FAIL, name, "run_signal_cycle() no longer checks _broker_position_state_known before the entry loop -- a broker fetch failure would silently be treated as zero positions again."
+    return PASS, name, "Margin API errors and broker-position-fetch failures both block new entries instead of assuming a safe default."
+
+
 STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_exit_classification_by_pnl,
     check_capital_allocation_keys,
@@ -369,6 +383,7 @@ STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_lot_size_and_contract_resolution_fail_closed,
     check_stale_option_price_resolved,
     check_auth_self_heal_actively_retries,
+    check_margin_and_broker_position_failures_fail_closed,
 ]
 
 

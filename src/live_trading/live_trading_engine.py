@@ -117,6 +117,15 @@ class LiveTradingEngine:
         # Holds references to fire-and-forget background tasks so the GC cannot
         # collect them before they complete (asyncio discards unreferenced tasks).
         self._background_tasks: set = set()
+        # Fixed 2026-08-14 (external review): "broker call failed" and "broker
+        # says zero positions" must never be treated the same. _safe_get_positions()
+        # sets this False whenever the underlying broker.get_positions() call
+        # raises, True whenever it succeeds (even with an empty result -- that's
+        # a legitimate zero). run_signal_cycle() checks this immediately before
+        # the entry-signal loop and skips ALL new entries for the cycle if the
+        # broker's real position state is unknown, rather than silently treating
+        # a fetch failure as "nothing open, safe to enter more."
+        self._broker_position_state_known: bool = True
 
         logger.info(f"LiveTradingEngine initialised — mode: {self.mode.value.upper()}")
 
@@ -300,6 +309,22 @@ class LiveTradingEngine:
                 f"Market open warm-up: {self._ENTRY_WARMUP_MINUTES - int(minutes_since_open)} min "
                 f"remaining before entries are allowed."
             )
+            return
+
+        # Fixed 2026-08-14 (external review): if the most recent
+        # _safe_get_positions() call (right above, before exits) failed, the
+        # broker's real position/margin exposure is unknown -- opening a NEW
+        # position on top of an unknown existing book is exactly the
+        # "assume zero and trade anyway" risk this flag exists to block.
+        # Exits above already ran (closing/protecting existing positions is
+        # not gated the same way), just new entries this cycle.
+        if not self._broker_position_state_known:
+            logger.warning(
+                "Broker position state unknown (last get_positions() call "
+                "failed) — skipping all new entries this cycle."
+            )
+            await self._persist_ema_state()
+            await self._persist_momentum_state()
             return
 
         for strategy_id, strategy in active_strategies.items():
@@ -980,8 +1005,16 @@ class LiveTradingEngine:
         I: Place a Zerodha GTT buy-back order on a short leg.
 
         Fires automatically at the exchange if the option price rises to
-        trigger_mult × entry_price. Acts as a server-independent emergency stop
-        — protects the position even if the server crashes entirely.
+        trigger_mult × entry_price. Acts as an exchange-side emergency
+        backstop that still fires even if this server crashes entirely --
+        NOT a guarantee the short leg exits at exactly this price (external
+        review, 2026-08-14: the "server-independent emergency stop" wording
+        overclaimed; a GTT is additional protection layered on top of the
+        normal exit rules, not a substitute for them). The exact real-money
+        trigger/fill behavior of the order_type=MARKET/product=NRML/price=0
+        parameters below still needs to be verified against a live GTT that
+        has actually fired in the real Zerodha account -- see
+        docs/LIVE_TRADING_CHECKLIST.md A3.
 
         Only active in LIVE mode (paper broker has no GTT support).
         Returns the GTT trigger_id or None.
@@ -2988,8 +3021,15 @@ class LiveTradingEngine:
                                         f"Regime shift: {_regime} post-entry — "
                                         "condor range assumption broken, exiting"
                                     )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        # Fixed 2026-08-14 (external review, checklist A4): this used
+                        # to silently no-op on any Redis/JSON error -- a real fail-open
+                        # gap for this specific exit check. Bounded impact (SL/profit-
+                        # target/DTE/delta checks above and below still run
+                        # independently for the same position), but a miss here was
+                        # previously invisible. Log it so it's at least visible; other
+                        # exit rules for this condor continue to run either way.
+                        logger.warning(f"Regime-shift exit check failed for condor on {underlying}: {exc}")
 
             # Delta-based exit — if either short leg delta exceeds 0.40, that wing is in danger.
             if exit_reason is None and atr > 0 and current_price > 0:
@@ -3562,14 +3602,22 @@ class LiveTradingEngine:
     async def _check_available_margin(self, required: float) -> bool:
         """
         Verify enough margin exists before placing a multi-leg structure.
+        Both call sites (_process_credit_spread / _process_iron_condor) are
+        ENTRY paths only -- this is never called on an exit, so failing
+        closed here can never block a position from being closed.
 
         Paper mode: simulates margin by computing total locked margin across all
         active spreads/condors (max-loss per structure = spread_width × lot_size)
         and subtracting from initial_capital. Prevents paper account from opening
         unlimited structures beyond what real margin would allow.
 
-        Live mode: queries kite.margins() — fails-open on API error so a transient
-        Zerodha glitch never blocks a legitimate exit.
+        Live mode: queries kite.margins() — fails CLOSED on API error. Margin is
+        one of the few things the broker is the sole authoritative source for;
+        assuming "enough margin" on an API failure risks a real rejected/partial
+        order at the exchange. Fixed 2026-08-14 (external review): this used to
+        fail OPEN ("Allowing trade") on any margins() exception -- but the
+        original justification ("never blocks a legitimate exit") doesn't apply
+        to either actual call site, both of which are entries, not exits.
         """
         if self.mode == TradingMode.LIVE and self._kite:
             try:
@@ -3584,11 +3632,16 @@ class LiveTradingEngine:
                     return False
                 return True
             except Exception as e:
-                logger.error(f"Margin check API call failed: {e}. Allowing trade (fail-open).")
-                return True
+                logger.error(f"Margin check API call failed: {e}. Blocking entry (fail-closed).")
+                return False
 
         # ── Paper mode: simulate margin from active structures ────────────────
-        capital = float(getattr(settings, "initial_capital", 300_000))
+        # Fixed 2026-08-14 (external review): "initial_capital" (lowercase) was
+        # never a real attribute on Settings -- case_sensitive=True in
+        # src/core/config.py means only "INITIAL_CAPITAL" exists, so this
+        # getattr() silently missed every time and always fell back to the
+        # hardcoded 300_000 default regardless of the actual configured value.
+        capital = float(getattr(settings, "INITIAL_CAPITAL", 300_000))
         locked = 0.0
         for s in self._active_spreads.values():
             wing = abs(s.get("short_strike", 0) - s.get("long_strike", 0))
@@ -3787,9 +3840,19 @@ class LiveTradingEngine:
 
     async def _safe_get_positions(self) -> List[Dict[str, Any]]:
         try:
-            return await self.broker.get_positions()
+            positions = await self.broker.get_positions()
+            self._broker_position_state_known = True
+            return positions
         except Exception as exc:
             logger.error(f"Failed to fetch positions: {exc}")
+            # Fixed 2026-08-14 (external review): do NOT let callers conflate
+            # this with "broker confirmed zero positions" -- see the flag's
+            # docstring in __init__. The empty list below is still returned
+            # (existing exit/risk-state callers already tolerate it and a
+            # broader change to their behavior is out of scope here), but
+            # run_signal_cycle() checks this flag separately to block new
+            # entries specifically.
+            self._broker_position_state_known = False
             return []
 
     # Market data is considered stale if older than this many seconds.
@@ -3805,26 +3868,39 @@ class LiveTradingEngine:
             if not raw:
                 return None
             data = json.loads(raw)
-            # Stale data circuit breaker: reject data older than 90 seconds
+            # Stale data circuit breaker: reject data older than 90 seconds.
+            # Fixed 2026-08-14 (external review): missing/malformed/unparseable/
+            # future timestamps used to either skip the check entirely (missing)
+            # or get caught and silently let the data through anyway (malformed)
+            # -- treat every one of those as DATA UNKNOWN rather than usable.
             ts_str = data.get("timestamp")
-            if ts_str:
-                try:
-                    from datetime import datetime as _dt, timezone as _tz
-                    ts = _dt.fromisoformat(ts_str)
-                    if ts.tzinfo is None:
-                        # LTPPoller stores naive local-time (IST). Compare against
-                        # naive local-time now() — do NOT mix with UTC-aware now().
-                        age = (_dt.now() - ts).total_seconds()
-                    else:
-                        age = (_dt.now(_tz.utc) - ts).total_seconds()
-                    if age > self._MARKET_DATA_MAX_AGE_SECONDS:
-                        logger.warning(
-                            f"Stale market data for {symbol}: {age:.0f}s old "
-                            f"(limit {self._MARKET_DATA_MAX_AGE_SECONDS}s) — skipping."
-                        )
-                        return None
-                except Exception:
-                    pass  # malformed timestamp — allow data through
+            if not ts_str:
+                logger.warning(f"Market data for {symbol} has no timestamp — treating as invalid, skipping.")
+                return None
+            try:
+                from datetime import datetime as _dt, timezone as _tz
+                ts = _dt.fromisoformat(ts_str)
+                if ts.tzinfo is None:
+                    # LTPPoller stores naive local-time (IST). Compare against
+                    # naive local-time now() — do NOT mix with UTC-aware now().
+                    age = (_dt.now() - ts).total_seconds()
+                else:
+                    age = (_dt.now(_tz.utc) - ts).total_seconds()
+            except Exception as exc:
+                logger.warning(f"Market data for {symbol} has an unparseable timestamp ({ts_str!r}: {exc}) — treating as invalid, skipping.")
+                return None
+            # Small grace window for inter-container clock drift -- beyond that,
+            # a timestamp from the future indicates a corrupted/misconfigured
+            # clock somewhere, not genuinely fresh data.
+            if age < -5:
+                logger.warning(f"Market data for {symbol} has a future timestamp ({ts_str}, {-age:.0f}s ahead) — treating as invalid, skipping.")
+                return None
+            if age > self._MARKET_DATA_MAX_AGE_SECONDS:
+                logger.warning(
+                    f"Stale market data for {symbol}: {age:.0f}s old "
+                    f"(limit {self._MARKET_DATA_MAX_AGE_SECONDS}s) — skipping."
+                )
+                return None
             return data
         except Exception as exc:
             logger.error(f"Redis read [{symbol}]: {exc}")
