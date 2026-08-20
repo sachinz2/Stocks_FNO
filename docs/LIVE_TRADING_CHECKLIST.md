@@ -116,7 +116,7 @@ Current `.env`: `INITIAL_CAPITAL=300000.0`, `MAX_OPEN_POSITIONS=5`,
 
 ## A5. Testing & CI safety net
 
-- [ ] Full test suite green (currently 362 passing) immediately before flip.
+- [ ] Full test suite green (currently 368 passing) immediately before flip.
 - [ ] `deploy.sh`'s invariant-check step (`verify_invariants.py`, currently
       18 static + 4 runtime checks) wired into the actual deploy path used
       for the live-mode cutover, not run ad hoc.
@@ -438,7 +438,59 @@ Kept short — see git log / individual commit messages for full detail.
     static check, 1 existing test in
     `tests/test_zerodha_auto_auth_contracts.py` replaced with 2 reflecting
     the widened (not FNO_SYMBOLS-filtered) daily cache population.
+- **Full-system code review of the day's work (8-angle, high effort),
+  4 confirmed bugs fixed** (2026-08-20). User asked for a bug/logic-error
+  review of the whole system with emphasis on that day's changes. Ran the
+  established review process (line-by-line, removed-behavior, cross-file
+  tracer, reuse, simplification, efficiency, altitude -- conventions angle
+  skipped, no CLAUDE.md exists) against the full day's diff, verified each
+  surviving candidate directly against the code before fixing.
+  - **Most severe**: `LTPPoller` polled `self.symbols` (active-liquid list
+    UNION force-tracked open-position underlyings) and scored/published
+    ALL of them into the top-N entry-candidate pools `_process_signal`
+    reads for new entries -- meaning a symbol force-tracked *only* to keep
+    an existing position's exit data fresh could still rank into a pool
+    and trigger a brand-new reversal entry on itself, defeating the whole
+    point of demoting it. Confirmed reachable and completely unprotected
+    on the SELL/PE side (the RS-rank gate that partially covers BUY
+    doesn't apply to SELL at all). Fixed: new `LTPPoller._active_set`
+    tracks the liquidity-eligible subset separately from what's merely
+    polled; only `_active_set` members compete for entry-candidate pools,
+    while `self.symbols` (the union) still keeps market data fresh for
+    everything, including force-tracked positions.
+  - `recompute_active_universe()` wrote its computed active list to Redis
+    unconditionally, with no check for a partial data-coverage failure
+    (`compute_liquidity_turnover()` catches each symbol's fetch failure
+    individually and continues) -- a Zerodha rate-limit/timeout mid-run
+    could silently publish a tiny list as if it were a genuine liquidity
+    result, collapsing the universe for a week. Independently flagged by
+    3 of 8 finder angles. Fixed: refuses to publish (keeps the previous
+    list live, notifies) when turnover data covers under 70% of the
+    symbols attempted.
+  - The weekly job updated `LTPPoller`/`RSRanker` but never
+    `ZerodhaTicker` (the actual primary real-time tick source --
+    `LTPPoller`'s own docstring says today's bars are built ONLY from live
+    ticks, never `historical_data()`) or `ZerodhaLTPPoller` (its REST
+    fallback) -- both stayed frozen at their startup-time symbol list.
+    Fixed: new `ZerodhaLTPPoller.set_symbols()`, both components updated
+    in the same weekly-job run.
+  - Self-heal's token-recovery log line divided by the static
+    `len(FNO_SYMBOLS)` (132) even though `_provision_kite()` now resolves
+    against the full ~208-symbol universe -- could log an impossible
+    "over 100%" ratio. Cosmetic, fixed.
+  - Two findings deliberately left as-is after consideration: `RSRanker`'s
+    dynamic refresh doesn't union force-tracked underlyings the way
+    `LTPPoller` now does -- lower priority since the `LTPPoller` fix above
+    already prevents a demoted symbol from reaching any pool `RSRanker`'s
+    gate would matter for. `get_active_fno_symbols()` fails open to the
+    static `FNO_SYMBOLS` list on a Redis error -- judged acceptable on
+    reflection, since that fallback is itself a deliberately-vetted,
+    already-liquidity-verified baseline (this same day's own 132-symbol
+    expansion), not a computed guess the way the lot-size/contract
+    fail-open bug from the prior day was.
+  - 12 new tests, 2 new `verify_invariants.py` static checks. 368 tests
+    passing.
 
 ---
 
-*Last updated: 2026-08-20, after making the F&O active universe self-correcting.*
+*Last updated: 2026-08-20, after the full-system code review and its fixes.*

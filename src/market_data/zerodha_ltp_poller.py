@@ -48,6 +48,25 @@ class ZerodhaLTPPoller:
         self._permission_ok = True   # set False on first "Insufficient permission"
         self._last_known_token: Optional[str] = None
 
+    def set_symbols(self, symbols: List[str]) -> None:
+        """
+        Replace the tracked F&O underlying-stock set (NSE:SYMBOL instruments)
+        -- these were "fixed list, set at startup" per this class's own
+        docstring until 2026-08-20's dynamic active-universe recompute job
+        needed to update them without a restart. Does not touch
+        self._option_instruments (unaffected, tracked separately).
+
+        Added 2026-08-20 (code review): the weekly recompute job used to
+        push fresh tokens into LTPPoller/RSRanker but leave this REST
+        fallback (and ZerodhaTicker, the WebSocket client) frozen at their
+        startup-time symbol list -- a symbol newly promoted into the active
+        universe had no real-time tick coverage at all if the WebSocket
+        ever needed this fallback.
+        """
+        self._instruments = [f"{_NSE_PREFIX}{s}" for s in symbols]
+        self._symbol_map  = {f"{_NSE_PREFIX}{s}": s for s in symbols}
+        logger.info(f"ZerodhaLTPPoller: now tracking {len(symbols)} underlying(s) (active universe updated)")
+
     def register_option_contracts(self, contracts: List[str]) -> None:
         """
         Start tracking option contracts in real time (every 5 s).

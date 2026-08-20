@@ -128,3 +128,30 @@ async def test_no_reliable_price_skips_the_redis_write(monkeypatch):
         "must not write an unreliable price -- caller's ATR/Black-Scholes "
         "fallback should take over instead of a stale/fabricated number"
     )
+
+
+# ── set_symbols() (2026-08-20, code-review fix) ──────────────────────────────
+#
+# This class's own docstring used to say the F&O underlying-stock set is a
+# "fixed list, set at startup" -- true until the weekly active-universe
+# recompute job needed to update it without a restart, so a newly-promoted
+# symbol still gets real-time WebSocket-fallback tick coverage.
+
+def test_set_symbols_replaces_the_tracked_underlyings():
+    poller = ZerodhaLTPPoller(kite=None, redis_client=None, symbols=["OLD1", "OLD2"])
+    assert poller._instruments == ["NSE:OLD1", "NSE:OLD2"]
+
+    poller.set_symbols(["NEW1", "NEW2", "NEW3"])
+
+    assert poller._instruments == ["NSE:NEW1", "NSE:NEW2", "NSE:NEW3"]
+    assert poller._symbol_map == {"NSE:NEW1": "NEW1", "NSE:NEW2": "NEW2", "NSE:NEW3": "NEW3"}
+    assert "NSE:OLD1" not in poller._symbol_map
+
+
+def test_set_symbols_does_not_touch_registered_option_contracts():
+    poller = ZerodhaLTPPoller(kite=None, redis_client=None, symbols=["OLD1"])
+    poller.register_option_contracts(["OLD126SEP100CE"])
+
+    poller.set_symbols(["NEW1"])
+
+    assert "NFO:OLD126SEP100CE" in poller._option_instruments

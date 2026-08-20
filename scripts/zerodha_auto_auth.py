@@ -445,11 +445,40 @@ def recompute_active_universe(access_token: str) -> dict:
     tokens = resolve_nse_tokens(nse_instruments, universe)
 
     turnover = compute_liquidity_turnover(kite, tokens)
-    new_active = qualifying_symbols(turnover)
 
     r = get_redis_client()
     raw_current = r.get(REDIS_ACTIVE_FNO_SYMBOLS)
     current_active = _json.loads(raw_current) if raw_current else list(FNO_SYMBOLS)
+
+    # Fixed 2026-08-20 (code review): compute_liquidity_turnover() catches
+    # each symbol's kite.historical_data() failure individually and
+    # continues rather than aborting the whole run -- a systemic failure
+    # partway through (Zerodha rate-limit, timeout on the ~5-10MB instrument
+    # dump, both confirmed live failure modes elsewhere in this file) can
+    # silently leave turnover covering only a fraction of the real universe.
+    # qualifying_symbols() on that partial data would still return a small
+    # but non-empty list, which get_active_fno_symbols()'s only guard ("if
+    # not symbols: fall back") doesn't catch -- it would get published as
+    # if it were a genuine "the market got less liquid" result instead of
+    # "we couldn't check most of it", collapsing the live active universe
+    # for a full week. Refuse to publish on a data-COVERAGE failure like
+    # this (distinct from a genuine low-liquidity result, which covers
+    # every symbol just with low values, and is real information worth
+    # publishing) -- keep serving whatever was already live instead.
+    MIN_COVERAGE_FRACTION = 0.7
+    if tokens and len(turnover) < MIN_COVERAGE_FRACTION * len(tokens):
+        logger.error(
+            f"Weekly universe recompute: only got turnover data for {len(turnover)}/{len(tokens)} "
+            f"symbols (below {MIN_COVERAGE_FRACTION:.0%} coverage) -- likely a partial API failure, "
+            "not a genuine liquidity change. Refusing to overwrite the active list; keeping the "
+            "previous one live."
+        )
+        return {
+            "active": current_active, "added": [], "removed": [], "tokens": tokens,
+            "skipped": True, "coverage": f"{len(turnover)}/{len(tokens)}",
+        }
+
+    new_active = qualifying_symbols(turnover)
 
     added = sorted(set(new_active) - set(current_active))
     removed = sorted(set(current_active) - set(new_active))
@@ -460,7 +489,7 @@ def recompute_active_universe(access_token: str) -> dict:
         f"Active F&O universe recomputed: {len(new_active)} symbols "
         f"({len(added)} added, {len(removed)} removed)"
     )
-    return {"active": new_active, "added": added, "removed": removed, "tokens": tokens}
+    return {"active": new_active, "added": added, "removed": removed, "tokens": tokens, "skipped": False}
 
 
 def run_daily_auth():

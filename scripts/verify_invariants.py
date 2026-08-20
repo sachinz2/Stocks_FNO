@@ -487,6 +487,33 @@ def check_dynamic_active_universe_wired(repo: Path) -> Result:
     return PASS, name, "fno_universe module, weekly recompute job, LTPPoller force-tracking, and engine sync are all wired together."
 
 
+def check_force_tracked_symbols_cannot_enter_entry_pools(repo: Path) -> Result:
+    name = "A force-tracked (liquidity-demoted) symbol cannot re-enter new-entry candidate pools"
+    poller_src = _read(repo, "src/market_data/ltp_poller.py")
+    if "self._active_set" not in poller_src:
+        return FAIL, name, "LTPPoller no longer tracks _active_set separately from self.symbols -- a symbol force-tracked only for open-position exit management could get scored into the top-N entry-candidate pools again and trigger a brand-new reversal entry on itself (confirmed live bug, fixed 2026-08-20)."
+    idx = poller_src.find("ema_scores[symbol] = e")
+    if idx == -1:
+        return FAIL, name, "Couldn't locate the score-collection block in LTPPoller.poll()."
+    window = poller_src[max(0, idx - 250):idx]
+    if "self._active_set is None or symbol in self._active_set" not in window:
+        return FAIL, name, "LTPPoller.poll()'s score-collection block no longer gates on _active_set membership before adding a symbol to ema_scores/spread_scores/condor_scores/momentum_scores."
+    return PASS, name, "Score collection (and therefore entry-pool eligibility) is gated on active-universe membership, not just on being polled."
+
+
+def check_weekly_universe_refresh_fails_safe(repo: Path) -> Result:
+    name = "Weekly universe recompute refuses to publish on a partial-data-coverage failure"
+    auth_src = _read(repo, "scripts/zerodha_auto_auth.py")
+    if "MIN_COVERAGE_FRACTION" not in auth_src or '"skipped": True' not in auth_src:
+        return FAIL, name, "recompute_active_universe() no longer guards against publishing a partial-coverage result (e.g. a Zerodha rate-limit mid-run) as if it were a genuine liquidity change -- confirmed as a real gap by 3 independent code-review angles, fixed 2026-08-20."
+    main_src = _read(repo, "src/api/main.py")
+    if 'result.get("skipped")' not in main_src:
+        return FAIL, name, "main.py's _weekly_universe_refresh() no longer checks recompute_active_universe()'s skipped flag."
+    if "zt._instrument_tokens" not in main_src or "zlp.set_symbols(" not in main_src:
+        return FAIL, name, "_weekly_universe_refresh() no longer updates ZerodhaTicker/ZerodhaLTPPoller -- a newly-promoted symbol would have no real-time WebSocket/REST-fallback tick coverage (only LTPPoller/RSRanker would know about it)."
+    return PASS, name, "recompute_active_universe() fails safe on partial data coverage, and the weekly job updates all four live components (LTPPoller, RSRanker, ZerodhaTicker, ZerodhaLTPPoller)."
+
+
 STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_exit_classification_by_pnl,
     check_capital_allocation_keys,
@@ -513,6 +540,8 @@ STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_fno_sectors_covers_full_real_universe,
     check_fno_universe_expansion_consistent,
     check_dynamic_active_universe_wired,
+    check_force_tracked_symbols_cannot_enter_entry_pools,
+    check_weekly_universe_refresh_fails_safe,
 ]
 
 

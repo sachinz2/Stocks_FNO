@@ -315,6 +315,23 @@ async def lifespan(app: FastAPI):
             await engine._notify(f"WARNING: weekly F&O universe refresh failed: {e}")
             return
 
+        # Fixed 2026-08-20 (code review): recompute_active_universe() refuses
+        # to publish (keeps the previous active list live) when it only got
+        # turnover data for a fraction of the universe -- a partial API
+        # failure, not a genuine liquidity change. That's a distinct,
+        # actionable outcome from "recomputed successfully, nothing changed".
+        if result.get("skipped"):
+            logger.error(
+                f"Weekly universe refresh: skipped publishing (data coverage "
+                f"{result.get('coverage', '?')}) -- kept the previous active list live."
+            )
+            await engine._notify(
+                f"WARNING: weekly F&O universe refresh got incomplete data "
+                f"(coverage {result.get('coverage', '?')}) and was skipped -- "
+                "the previous active list is still live. Check Zerodha API health."
+            )
+            return
+
         added, removed = result["added"], result["removed"]
         logger.info(
             f"Weekly universe refresh: {len(result['active'])} active symbols "
@@ -331,6 +348,22 @@ async def lifespan(app: FastAPI):
             if kite_now is not None:
                 ltp_poller.set_kite(kite_now, result["tokens"])
                 rs_ranker.set_kite(kite_now, result["tokens"])
+                # Fixed 2026-08-20 (code review): ltp_poller/rs_ranker were
+                # updated here, but ZerodhaTicker (the WebSocket client --
+                # the actual primary real-time tick source; LTPPoller's own
+                # module docstring says today's bars are built ONLY from
+                # live ticks, never historical_data()) and ZerodhaLTPPoller
+                # (its REST fallback when the WebSocket is down) were left
+                # frozen at their startup-time static symbol list. A symbol
+                # newly promoted here would get no real-time tick coverage
+                # at all if the WebSocket ever needed the REST fallback.
+                zt = getattr(app.state, "zerodha_ticker", None)
+                if zt is not None:
+                    zt._instrument_tokens = result["tokens"].copy()
+                    zt._token_symbol = {v: k for k, v in result["tokens"].items()}
+                zlp = getattr(app.state, "zerodha_ltp_poller", None)
+                if zlp is not None:
+                    zlp.set_symbols(list(result["tokens"].keys()))
 
         if added or removed:
             summary = "F&O universe weekly review\n"
@@ -353,6 +386,7 @@ async def lifespan(app: FastAPI):
     # LTP update via REST as a complement to (or fallback for) WebSocket.
     # zerodha_ticker may be set but fail in its background thread (403), so we
     # cannot use `not zerodha_ticker` as the condition here.
+    zerodha_ltp_poller = None
     if kite_instance:
         from src.market_data.zerodha_ltp_poller import ZerodhaLTPPoller
         zerodha_ltp_poller = ZerodhaLTPPoller(kite_instance, redis_client, list(FNO_SYMBOLS))
@@ -371,6 +405,7 @@ async def lifespan(app: FastAPI):
     app.state.trading_engine    = engine
     app.state.redis             = redis_client
     app.state.zerodha_ticker    = zerodha_ticker
+    app.state.zerodha_ltp_poller = zerodha_ltp_poller
     app.state.kite              = kite_instance
     app.state.instrument_tokens = instrument_tokens
     app.state.last_kite_token   = access_token
@@ -449,10 +484,12 @@ async def lifespan(app: FastAPI):
             kite, tokens, tok = await _provision_kite()
             if kite is None:
                 return
-            logger.info(
-                f"Kite provisioning recovered — {len(tokens)}/{len(FNO_SYMBOLS)} "
-                "tokens, wiring into live components."
-            )
+            # Fixed 2026-08-20 (code review): used to divide by len(FNO_SYMBOLS)
+            # (132), but _provision_kite() resolves tokens against the full
+            # real F&O stock universe (up to ~208) -- that denominator could
+            # read as an impossible "over 100%" ratio. _provision_kite()
+            # itself already logs the accurate "X/Y F&O stock symbols" count.
+            logger.info(f"Kite provisioning recovered — {len(tokens)} tokens, wiring into live components.")
             ltp_poller.set_kite(kite, tokens)
             rs_ranker.set_kite(kite, tokens)
             engine.attach_kite(kite)
@@ -481,6 +518,7 @@ async def lifespan(app: FastAPI):
                     replace_existing=True, misfire_grace_time=3,
                 )
                 engine.attach_ltp_poller(zlp)
+                app.state.zerodha_ltp_poller = zlp
                 logger.info("ZerodhaLTPPoller: REST-based LTP refresh started late after kite recovery.")
 
         elif token != app.state.last_kite_token:

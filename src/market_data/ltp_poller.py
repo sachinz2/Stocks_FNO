@@ -114,6 +114,23 @@ class LTPPoller:
         # liquidity later fell below the weekly recompute's floor. See
         # register_underlying()/unregister_underlying().
         self._must_track: set = set()
+        # Fixed 2026-08-20 (code review): the liquidity-active subset of
+        # self.symbols, tracked SEPARATELY from the must_track union above.
+        # self.symbols itself (active | must_track) is what gets POLLED --
+        # but only _active_set is eligible to compete for the top-N
+        # entry-candidate pools published at the end of poll(). Without this
+        # split, a force-tracked symbol (open position, but demoted below
+        # the liquidity floor) still had its EMA/momentum/spread score
+        # computed and could rank into a top-N pool, letting _process_signal
+        # open a BRAND NEW reversal position on a symbol the weekly job
+        # explicitly excluded -- turning a safety mechanism meant only to
+        # preserve exit-management data into a backdoor into new-entry
+        # eligibility. None means "no active/must-track distinction yet"
+        # (before the first _refresh_active_symbols() call, or when
+        # self._dynamic_symbols is False) -- treated as "don't filter" so
+        # non-dynamic callers (tests, any future fixed-list caller) keep
+        # their original all-symbols-eligible behavior.
+        self._active_set: Optional[set] = None
         self._history: Dict[str, pd.DataFrame] = {}
         self._history_loaded_at: Dict[str, datetime] = {}
         self._history_15m: Dict[str, pd.DataFrame] = {}
@@ -143,12 +160,19 @@ class LTPPoller:
         with any force-tracked (open-position) underlyings, updating
         self.symbols in place. No-op if the caller pinned an explicit
         symbols list at construction (self._dynamic_symbols is False).
+
+        self._active_set is stored separately (not just self.symbols) so
+        poll() can tell "polled for market-data continuity only" apart from
+        "genuinely eligible to compete for a new-entry candidate pool" --
+        see self._active_set's docstring in __init__ for why that split
+        matters.
         """
         if not self._dynamic_symbols:
             return
         from src.market_data.option_chain import get_active_fno_symbols
         active = await get_active_fno_symbols(self._redis)
-        self.symbols = sorted(set(active) | self._must_track)
+        self._active_set = set(active)
+        self.symbols = sorted(self._active_set | self._must_track)
 
     def set_kite(self, kite, instrument_tokens: Dict[str, int]) -> None:
         """
@@ -254,13 +278,20 @@ class LTPPoller:
                     await self._redis.set(f"tick15:{symbol}", json.dumps(tick15), ex=1800)
 
                 e, s, c, m = self._score_all(tick)
-                ema_scores[symbol] = e
-                if s > 0:
-                    spread_scores[symbol] = s
-                if c > 0:
-                    condor_scores[symbol] = c
-                if m > 0:
-                    momentum_scores[symbol] = m
+                # Fixed 2026-08-20 (code review): a symbol only polled because
+                # it's force-tracked (open position, demoted below the
+                # liquidity floor -- see _active_set's docstring in __init__)
+                # must not compete for a new-entry candidate pool. Market
+                # data (the Redis tick/tick15 writes above) is still kept
+                # current for it either way, for exit management.
+                if self._active_set is None or symbol in self._active_set:
+                    ema_scores[symbol] = e
+                    if s > 0:
+                        spread_scores[symbol] = s
+                    if c > 0:
+                        condor_scores[symbol] = c
+                    if m > 0:
+                        momentum_scores[symbol] = m
 
                 logger.debug(
                     f"Tick: {symbol} ltp={ltp:.2f} "
