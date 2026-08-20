@@ -117,13 +117,25 @@ async def lifespan(app: FastAPI):
         tokens: dict = {}
         try:
             loop = asyncio.get_event_loop()
+            # Fixed 2026-08-20: used to resolve tokens only for the static
+            # FNO_SYMBOLS list. The weekly active-universe recompute job can
+            # promote a symbol beyond that static list -- without this, a
+            # restart between weekly runs would rebuild instrument_tokens
+            # from scratch using only the static 132, losing the
+            # already-resolved token for anything dynamically added and
+            # leaving it unpollable until the *next* Sunday's run happened
+            # to re-cover it. Resolve against the full real F&O stock
+            # universe instead, a superset that always covers whatever the
+            # dynamic active list currently contains.
+            from src.market_data.fno_universe import extract_stock_underlyings
+            nfo_instruments = await loop.run_in_executor(None, kite.instruments, "NFO")
+            full_universe = set(extract_stock_underlyings(nfo_instruments))
             nse_instruments = await loop.run_in_executor(None, kite.instruments, "NSE")
-            fno_set = set(FNO_SYMBOLS)
             for inst in nse_instruments:
                 sym = inst.get("tradingsymbol", "")
-                if sym in fno_set:
+                if sym in full_universe:
                     tokens[sym] = inst["instrument_token"]
-            logger.info(f"Instrument tokens loaded: {len(tokens)}/{len(fno_set)} F&O symbols.")
+            logger.info(f"Instrument tokens loaded: {len(tokens)}/{len(full_universe)} F&O stock symbols.")
         except Exception as e:
             logger.warning(f"Instrument token fetch failed: {e}")
         return kite, tokens, token
@@ -223,6 +235,7 @@ async def lifespan(app: FastAPI):
     await engine.start()
 
     ltp_poller = LTPPoller(redis_client, kite=kite_instance, instrument_tokens=instrument_tokens)
+    engine.attach_symbol_poller(ltp_poller)
 
     scheduler = get_scheduler()
     schedule_trading_jobs(engine)
@@ -278,6 +291,61 @@ async def lifespan(app: FastAPI):
         name="Relative Strength Ranker",
         replace_existing=True,
         misfire_grace_time=60,
+    )
+
+    # Weekly F&O universe liquidity recompute (2026-08-20) -- Sunday 07:00
+    # IST, well outside market hours and before the Monday 08:30 daily auth
+    # job. See scripts/zerodha_auto_auth.py's recompute_active_universe()
+    # docstring for why this exists: the 41->132 FNO_SYMBOLS expansion the
+    # same day was a one-time snapshot that would otherwise go stale the
+    # same way FNO_STRIKE_INTERVALS silently did before it was made
+    # self-correcting.
+    async def _weekly_universe_refresh() -> None:
+        raw = await redis_client.get("zerodha:access_token")
+        if not raw:
+            logger.warning("Weekly universe refresh: no Zerodha token available, skipping this run.")
+            return
+        token = raw.strip()
+        try:
+            from scripts.zerodha_auto_auth import recompute_active_universe
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(None, recompute_active_universe, token)
+        except Exception as e:
+            logger.error(f"Weekly universe refresh failed: {e}")
+            await engine._notify(f"WARNING: weekly F&O universe refresh failed: {e}")
+            return
+
+        added, removed = result["added"], result["removed"]
+        logger.info(
+            f"Weekly universe refresh: {len(result['active'])} active symbols "
+            f"({len(added)} added, {len(removed)} removed)"
+        )
+
+        # Push freshly-resolved tokens into the live components immediately
+        # instead of waiting for the next restart -- a symbol newly promoted
+        # into the active set needs a resolvable NSE token to actually be
+        # pollable/rankable this same run, not after the next deploy.
+        if result["tokens"]:
+            app.state.instrument_tokens = result["tokens"]
+            kite_now = getattr(app.state, "kite", None)
+            if kite_now is not None:
+                ltp_poller.set_kite(kite_now, result["tokens"])
+                rs_ranker.set_kite(kite_now, result["tokens"])
+
+        if added or removed:
+            summary = "F&O universe weekly review\n"
+            if added:
+                summary += f"+ Added ({len(added)}): {', '.join(added)}\n"
+            if removed:
+                summary += f"- Removed ({len(removed)}): {', '.join(removed)}\n"
+            await engine._notify(summary)
+
+    scheduler.add_job(
+        _weekly_universe_refresh,
+        CronTrigger(day_of_week="sun", hour=7, minute=0, timezone="Asia/Kolkata"),
+        id="weekly_universe_refresh",
+        name="Weekly F&O Universe Liquidity Recompute",
+        replace_existing=True,
     )
 
     # ── Zerodha REST LTP refresh (near-real-time, runs every 5 s) ─────────────

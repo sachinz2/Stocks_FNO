@@ -275,16 +275,25 @@ def fetch_and_cache_lot_sizes(instruments: list) -> int:
     Cache real lot sizes from the NFO instrument dump in Redis.
     Called once daily after auth so the engine always has fresh lot sizes.
     Returns number of symbols cached.
+
+    Fixed 2026-08-20: used to only cache symbols in the (currently-active)
+    FNO_SYMBOLS list. Widened to every real stock underlying in the dump
+    (excluding index options) so a symbol the weekly active-universe
+    recompute job (see recompute_active_universe()) newly promotes into
+    FNO_SYMBOLS already has a lot size cached -- otherwise _get_lot_size()'s
+    fail-closed design would correctly, but confusingly, block every trade
+    on a freshly-activated symbol until the NEXT day's auth run happened to
+    also cover it.
     """
-    from src.core.constants import FNO_SYMBOLS, REDIS_LOT_SIZE_PREFIX
+    from src.core.constants import REDIS_LOT_SIZE_PREFIX
+    from src.market_data.fno_universe import INDEX_NAMES
 
     r = get_redis_client()
-    fno_set = set(FNO_SYMBOLS)
     seen: set = set()
 
     for inst in instruments:
         name = inst.get("name", "")
-        if name in fno_set and name not in seen:
+        if name and name not in INDEX_NAMES and name not in seen:
             lot_size = inst.get("lot_size", 0)
             if lot_size > 0:
                 r.set(f"{REDIS_LOT_SIZE_PREFIX}{name}", str(lot_size), ex=86400 * 7)
@@ -309,19 +318,25 @@ def fetch_and_cache_real_contracts(instruments: list) -> int:
     Only the 3 nearest expiries per symbol are kept, both to bound payload
     size and because nothing in this system ever trades further out than
     that. Returns number of symbols cached.
+
+    Fixed 2026-08-20: same reasoning as fetch_and_cache_lot_sizes() above --
+    widened from the (currently-active) FNO_SYMBOLS list to every real stock
+    underlying (excluding index options), so a symbol newly promoted into
+    FNO_SYMBOLS by the weekly active-universe recompute already has real
+    contract data cached instead of failing closed for a day.
     """
     import json as _json
-    from src.core.constants import FNO_SYMBOLS, REDIS_CONTRACT_PREFIX
+    from src.core.constants import REDIS_CONTRACT_PREFIX
+    from src.market_data.fno_universe import INDEX_NAMES
 
     r = get_redis_client()
-    fno_set = set(FNO_SYMBOLS)
 
     # symbol -> expiry_iso -> strike_str -> {"CE": tradingsymbol, "PE": tradingsymbol}
     by_symbol: dict = {}
     for inst in instruments:
         name = inst.get("name", "")
         itype = inst.get("instrument_type", "")
-        if name not in fno_set or itype not in ("CE", "PE"):
+        if not name or name in INDEX_NAMES or itype not in ("CE", "PE"):
             continue
         expiry = inst.get("expiry")
         strike = inst.get("strike")
@@ -384,6 +399,68 @@ def refresh_instrument_caches(access_token: str) -> tuple:
     contract_count = fetch_and_cache_real_contracts(instruments)
     logger.info(f"Real contract data refreshed: {contract_count} symbols")
     return count, contract_count
+
+
+def recompute_active_universe(access_token: str) -> dict:
+    """
+    Weekly (see src/api/main.py's _weekly_universe_refresh job): recompute
+    which F&O stocks are liquid enough to actively trade, from real 20-30
+    day average daily turnover, and update the Redis-cached active list
+    (src/core/utils.py's get_active_fno_symbols()) that LTPPoller reads.
+
+    Added 2026-08-20 in response to a real gap: the FNO_SYMBOLS expansion
+    that same day (41 -> 132, see docs/LIVE_TRADING_CHECKLIST.md) was a
+    one-time snapshot -- a symbol's liquidity isn't static, so a static list
+    would silently go stale the same way FNO_STRIKE_INTERVALS did (found
+    wrong for 27/39 symbols by the time anyone re-checked it). This makes
+    the active list self-correcting instead of a second hand-maintained
+    table needing the same periodic-re-verification discipline that didn't
+    happen for the first one.
+
+    Returns {"active": [...], "added": [...], "removed": [...],
+    "tokens": {...}} -- "tokens" covers the full universe (not just the new
+    active subset) so the caller can push them straight into LTPPoller/
+    RSRanker without a second kite.instruments("NSE") round-trip; "added"/
+    "removed" are relative to whatever was active before this call, for a
+    notification summary. Uses a fixed liquidity floor (fno_universe.
+    MIN_ADTV_CR), not "worst of the currently active set" -- the latter
+    would drift: as thin symbols get dropped, the floor of "the worst
+    remaining" symbol rises, silently shrinking the universe on every
+    successive re-run.
+    """
+    import json as _json
+    from kiteconnect import KiteConnect
+    from src.core.constants import REDIS_ACTIVE_FNO_SYMBOLS, FNO_SYMBOLS
+    from src.market_data.fno_universe import (
+        extract_stock_underlyings, resolve_nse_tokens, compute_liquidity_turnover, qualifying_symbols,
+    )
+
+    kite = KiteConnect(api_key=settings.ZERODHA_API_KEY)
+    kite.set_access_token(access_token)
+
+    nfo_instruments = kite.instruments("NFO")
+    universe = extract_stock_underlyings(nfo_instruments)
+
+    nse_instruments = kite.instruments("NSE")
+    tokens = resolve_nse_tokens(nse_instruments, universe)
+
+    turnover = compute_liquidity_turnover(kite, tokens)
+    new_active = qualifying_symbols(turnover)
+
+    r = get_redis_client()
+    raw_current = r.get(REDIS_ACTIVE_FNO_SYMBOLS)
+    current_active = _json.loads(raw_current) if raw_current else list(FNO_SYMBOLS)
+
+    added = sorted(set(new_active) - set(current_active))
+    removed = sorted(set(current_active) - set(new_active))
+
+    r.set(REDIS_ACTIVE_FNO_SYMBOLS, _json.dumps(new_active))  # no TTL, see constant's own comment
+
+    logger.info(
+        f"Active F&O universe recomputed: {len(new_active)} symbols "
+        f"({len(added)} added, {len(removed)} removed)"
+    )
+    return {"active": new_active, "added": added, "removed": removed, "tokens": tokens}
 
 
 def run_daily_auth():

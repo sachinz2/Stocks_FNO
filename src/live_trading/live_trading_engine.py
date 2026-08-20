@@ -174,6 +174,47 @@ class LiveTradingEngine:
                 f"{len(self._single_leg_journals)} single-leg(s) restored from Redis"
             )
 
+    def attach_symbol_poller(self, poller: Any) -> None:
+        """
+        Attach the underlying-stock OHLC/indicator poller (LTPPoller -- NOT
+        the option-contract price poller attach_ltp_poller() above, despite
+        the similar name; that one is ZerodhaLTPPoller). Added 2026-08-20
+        alongside the dynamically-recomputed active F&O universe: this lets
+        the engine force-track (register_underlying()) any symbol with a
+        currently open position, so a position never loses market-data
+        coverage just because its symbol's liquidity later falls below the
+        weekly recompute's floor. Called after engine.start() (like
+        attach_ltp_poller()), so restored positions sync immediately instead
+        of waiting for the next signal cycle.
+        """
+        self._symbol_poller = poller
+        self._sync_must_track_underlyings()
+
+    def _sync_must_track_underlyings(self) -> None:
+        """
+        Reconcile the OHLC poller's force-tracked (open-position) underlying
+        set against whatever's actually currently open right now, rather
+        than needing an incremental register/unregister call at every one of
+        the ~15 entry/exit call sites scattered across this file. A single
+        source of truth (this engine's own _active_spreads/_active_condors/
+        _single_leg_journals), synced once per signal cycle, is far less
+        likely to drift out of sync than remembering to update it everywhere
+        a position opens or closes -- the same reasoning attach_ltp_poller()
+        above already uses for restoring option-contract tracking.
+        """
+        poller = getattr(self, "_symbol_poller", None)
+        if poller is None:
+            return
+        open_underlyings = (
+            set(self._active_spreads.keys())
+            | set(self._active_condors.keys())
+            | {v.get("underlying") for v in self._single_leg_journals.values() if v.get("underlying")}
+        )
+        for symbol in open_underlyings - poller._must_track:
+            poller.register_underlying(symbol)
+        for symbol in poller._must_track - open_underlyings:
+            poller.unregister_underlying(symbol)
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
@@ -280,6 +321,11 @@ class LiveTradingEngine:
         # Refresh risk state after exits so sector/position checks see current positions
         positions = await self._safe_get_positions()
         await self._refresh_risk_state(positions)
+
+        # Reconcile the OHLC poller's force-tracked underlyings against
+        # whatever's actually open now that exits above may have closed
+        # some — see _sync_must_track_underlyings()'s docstring.
+        self._sync_must_track_underlyings()
 
         # Auto-kill check: pause strategies that show statistical deterioration
         if self.strategy_monitor:

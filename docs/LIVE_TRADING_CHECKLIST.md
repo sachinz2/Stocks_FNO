@@ -116,7 +116,7 @@ Current `.env`: `INITIAL_CAPITAL=300000.0`, `MAX_OPEN_POSITIONS=5`,
 
 ## A5. Testing & CI safety net
 
-- [ ] Full test suite green (currently 329 passing) immediately before flip.
+- [ ] Full test suite green (currently 362 passing) immediately before flip.
 - [ ] `deploy.sh`'s invariant-check step (`verify_invariants.py`, currently
       18 static + 4 runtime checks) wired into the actual deploy path used
       for the live-mode cutover, not run ad hoc.
@@ -384,7 +384,61 @@ Kept short — see git log / individual commit messages for full detail.
   `verify_invariants.py` static check, 1 existing test relaxed
   (`FNO_LOT_SIZES` no longer needs 1:1 `FNO_SYMBOLS` coverage now that it's
   fallback-only — the daily Redis cache is authoritative).
+- **F&O active universe made self-correcting instead of a static snapshot**
+  (2026-08-20). User asked the obvious follow-up: liquidity isn't static —
+  what happens when a thin symbol excluded today gets thick in a month, or
+  vice versa? Chose full automation (system self-adjusts on a schedule, no
+  human review step) over a notify-and-approve or manual-rerun alternative.
+  - New `src/market_data/fno_universe.py`: shared pure-function logic
+    (universe discovery, liquidity ranking) deduped from both diagnostic
+    scripts and the new weekly job — `MIN_ADTV_CR = 150.0` is a **fixed**
+    Rs Crore/day threshold, deliberately not "worst of whatever's currently
+    active" (a self-referencing floor would drift: dropping thin symbols
+    raises the floor of "the worst remaining" one, silently shrinking the
+    universe on every successive run).
+  - `scripts/zerodha_auto_auth.py`'s daily lot-size/real-contract cache
+    population widened from "only the active FNO_SYMBOLS list" to the full
+    real universe (excluding index options) — otherwise a symbol the weekly
+    job newly promotes would fail closed for a day waiting for the *next*
+    day's cache refresh to happen to cover it too.
+  - New `recompute_active_universe()`: fetches the full real universe,
+    computes 20-30 day average daily turnover, writes the qualifying set to
+    Redis (`REDIS_ACTIVE_FNO_SYMBOLS`, read via `get_active_fno_symbols()`,
+    falls back to the static `FNO_SYMBOLS` list on any cache miss/error).
+    Wired into the scheduler as `_weekly_universe_refresh`, Sunday 07:00 IST
+    (outside market hours, before Monday's 08:30 auth job) — pushes freshly
+    resolved tokens straight into `LTPPoller`/`RSRanker` and notifies via
+    email with an added/removed summary.
+  - **The one hard safety requirement**: an open position must never lose
+    market-data coverage just because its symbol's liquidity later falls
+    below the floor. `LTPPoller.register_underlying()`/
+    `unregister_underlying()` force-track any symbol with a currently open
+    position regardless of active-universe membership.
+    `LiveTradingEngine._sync_must_track_underlyings()` reconciles that
+    force-tracked set against whatever's actually open
+    (`_active_spreads`/`_active_condors`/`_single_leg_journals`) once per
+    signal cycle — a single source of truth instead of an incremental
+    register/unregister call at each of the ~15 scattered entry/exit sites
+    in `live_trading_engine.py`, and immediately synced on restart via
+    `attach_symbol_poller()` (mirrors `attach_ltp_poller()`'s existing
+    restore-on-restart pattern for option contracts).
+  - `_provision_kite()` widened the same way as the daily cache population —
+    used to resolve NSE tokens only for the static `FNO_SYMBOLS` list, which
+    would have lost the token for anything the weekly job dynamically added
+    on the next restart between weekly runs.
+  - `RSRanker` got the same dynamic-symbol-list treatment as `LTPPoller`
+    (no force-tracking needed there — it's a soft entry-signal filter, not
+    the sole source of market-data coverage, so the position-safety
+    requirement above doesn't apply to it).
+  - 33 new tests across 5 new test files
+    (`tests/test_fno_universe.py`, `tests/test_active_fno_symbols.py`,
+    `tests/test_ltp_poller_dynamic_universe.py`,
+    `tests/test_engine_symbol_poller_sync.py`,
+    `tests/test_recompute_active_universe.py`), 1 new `verify_invariants.py`
+    static check, 1 existing test in
+    `tests/test_zerodha_auto_auth_contracts.py` replaced with 2 reflecting
+    the widened (not FNO_SYMBOLS-filtered) daily cache population.
 
 ---
 
-*Last updated: 2026-08-20, after the FNO_SYMBOLS 41→132 expansion.*
+*Last updated: 2026-08-20, after making the F&O active universe self-correcting.*

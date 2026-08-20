@@ -454,6 +454,39 @@ def check_fno_universe_expansion_consistent(repo: Path) -> Result:
     return PASS, name, f"FNO_SYMBOLS has {len(symbols)} unique symbols, no duplicates."
 
 
+def check_dynamic_active_universe_wired(repo: Path) -> Result:
+    name = "F&O active universe self-corrects weekly instead of staying a static snapshot"
+    fno_universe_src = _read(repo, "src/market_data/fno_universe.py")
+    if "def extract_stock_underlyings" not in fno_universe_src or "def qualifying_symbols" not in fno_universe_src:
+        return FAIL, name, "src/market_data/fno_universe.py is missing its core functions -- the 2026-08-20 self-correcting-universe feature appears to have been reverted."
+
+    auth_src = _read(repo, "scripts/zerodha_auto_auth.py")
+    if "def recompute_active_universe" not in auth_src:
+        return FAIL, name, "recompute_active_universe() missing from zerodha_auto_auth.py."
+    if "set(FNO_SYMBOLS)" in auth_src:
+        return FAIL, name, "zerodha_auto_auth.py still filters the daily lot-size/contract cache by the static FNO_SYMBOLS list -- a symbol newly promoted by the weekly recompute would fail closed for a day waiting for the next cache refresh to happen to cover it."
+
+    poller_src = _read(repo, "src/market_data/ltp_poller.py")
+    if "def register_underlying" not in poller_src or "def unregister_underlying" not in poller_src:
+        return FAIL, name, "LTPPoller is missing register_underlying()/unregister_underlying() -- an open position's underlying could lose market-data coverage if its symbol later drops below the liquidity floor."
+    if "await self._refresh_active_symbols()" not in poller_src:
+        return FAIL, name, "LTPPoller.poll() no longer refreshes self.symbols from the dynamic active universe each cycle."
+
+    engine_src = _read(repo, "src/live_trading/live_trading_engine.py")
+    if "def attach_symbol_poller" not in engine_src or "def _sync_must_track_underlyings" not in engine_src:
+        return FAIL, name, "LiveTradingEngine is missing attach_symbol_poller()/_sync_must_track_underlyings()."
+    if "self._sync_must_track_underlyings()" not in engine_src:
+        return FAIL, name, "run_signal_cycle() no longer calls _sync_must_track_underlyings() -- open positions could silently stop being force-tracked when a symbol drops from the active universe."
+
+    main_src = _read(repo, "src/api/main.py")
+    if "recompute_active_universe" not in main_src or 'CronTrigger(day_of_week="sun"' not in main_src:
+        return FAIL, name, "Weekly universe-recompute job missing from main.py's scheduler wiring."
+    if "engine.attach_symbol_poller(ltp_poller)" not in main_src:
+        return FAIL, name, "main.py no longer attaches the OHLC poller to the engine -- _sync_must_track_underlyings() would be a silent no-op (no poller attached)."
+
+    return PASS, name, "fno_universe module, weekly recompute job, LTPPoller force-tracking, and engine sync are all wired together."
+
+
 STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_exit_classification_by_pnl,
     check_capital_allocation_keys,
@@ -479,6 +512,7 @@ STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_ltp_poller_prefetches_ohlc_concurrently,
     check_fno_sectors_covers_full_real_universe,
     check_fno_universe_expansion_consistent,
+    check_dynamic_active_universe_wired,
 ]
 
 

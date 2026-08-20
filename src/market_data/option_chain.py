@@ -306,6 +306,34 @@ async def get_real_strike_interval(symbol: str, expiry: date, redis) -> Optional
         return None
 
 
+async def get_active_fno_symbols(redis) -> List[str]:
+    """
+    The dynamically-recomputed, liquidity-verified actively-traded symbol
+    list (src/core/constants.py's REDIS_ACTIVE_FNO_SYMBOLS, written weekly
+    by scripts/zerodha_auto_auth.py's recompute_active_universe()) -- falls
+    back to the static FNO_SYMBOLS list on a cache miss or Redis error
+    (fresh Redis before the first weekly run, Redis down, or a malformed
+    cached value), never to an empty list. Added 2026-08-20 alongside the
+    41->132 FNO_SYMBOLS expansion, to keep the active universe from going
+    stale the same way FNO_STRIKE_INTERVALS did before it was made
+    self-correcting.
+    """
+    from src.core.constants import FNO_SYMBOLS, REDIS_ACTIVE_FNO_SYMBOLS
+    if redis is None:
+        return list(FNO_SYMBOLS)
+    try:
+        raw = await redis.get(REDIS_ACTIVE_FNO_SYMBOLS)
+        if not raw:
+            return list(FNO_SYMBOLS)
+        symbols = json.loads(raw)
+        if not symbols:
+            return list(FNO_SYMBOLS)
+        return symbols
+    except Exception as e:
+        logger.debug(f"get_active_fno_symbols: cache lookup failed, falling back to static list: {e}")
+        return list(FNO_SYMBOLS)
+
+
 def resolve_reliable_option_price(quote: Dict) -> Optional[float]:
     """
     Given one symbol's raw kite.quote() response dict, return a price we can

@@ -100,7 +100,20 @@ class LTPPoller:
         self._redis   = redis_client
         self._kite    = kite
         self._tokens  = instrument_tokens or {}
-        self.symbols  = symbols or FNO_SYMBOLS  # default: all 40
+        self.symbols  = symbols or FNO_SYMBOLS  # default: the full active universe
+        # 2026-08-20: whether to auto-refresh self.symbols each poll() cycle
+        # from the dynamically-recomputed active universe. Only when the
+        # caller didn't pin an explicit symbols list at construction --
+        # an explicit list means the caller wants exactly that list, not to
+        # have it silently overwritten (matters for tests and any future
+        # non-default caller).
+        self._dynamic_symbols = symbols is None
+        # Underlyings with a currently open position -- force-tracked
+        # regardless of the active-universe membership above, so an exit
+        # never loses market-data coverage just because its symbol's
+        # liquidity later fell below the weekly recompute's floor. See
+        # register_underlying()/unregister_underlying().
+        self._must_track: set = set()
         self._history: Dict[str, pd.DataFrame] = {}
         self._history_loaded_at: Dict[str, datetime] = {}
         self._history_15m: Dict[str, pd.DataFrame] = {}
@@ -108,6 +121,34 @@ class LTPPoller:
         self._no_token_warned: set = set()    # suppress repeat "no token" warnings per symbol
         self._no_history_warned: set = set()  # suppress repeat "not enough history" warnings
         self._no_live_data_warned: set = set()  # suppress repeat "no live tick data yet" warnings
+
+    def register_underlying(self, symbol: str) -> None:
+        """
+        Force-track this underlying regardless of the dynamically-recomputed
+        active universe. Call when a new position opens on it -- an open
+        position needs live indicators for exit management even if the
+        symbol later drops below the weekly liquidity recompute's floor.
+        """
+        self._must_track.add(symbol)
+        logger.info(f"LTPPoller: force-tracking {symbol} (open position) -- {len(self._must_track)} total")
+
+    def unregister_underlying(self, symbol: str) -> None:
+        """Stop force-tracking this underlying. Call only once ALL positions on it are closed."""
+        self._must_track.discard(symbol)
+        logger.info(f"LTPPoller: released force-track on {symbol} -- {len(self._must_track)} remaining")
+
+    async def _refresh_active_symbols(self) -> None:
+        """
+        Pull the latest dynamically-recomputed active universe and union it
+        with any force-tracked (open-position) underlyings, updating
+        self.symbols in place. No-op if the caller pinned an explicit
+        symbols list at construction (self._dynamic_symbols is False).
+        """
+        if not self._dynamic_symbols:
+            return
+        from src.market_data.option_chain import get_active_fno_symbols
+        active = await get_active_fno_symbols(self._redis)
+        self.symbols = sorted(set(active) | self._must_track)
 
     def set_kite(self, kite, instrument_tokens: Dict[str, int]) -> None:
         """
@@ -133,6 +174,12 @@ class LTPPoller:
             return
 
         loop = asyncio.get_running_loop()
+
+        # Refresh self.symbols from the dynamically-recomputed active
+        # universe (unioned with any open-position underlying) BEFORE the
+        # OHLC prefetch below, so a symbol the weekly job just added starts
+        # getting polled the same cycle instead of waiting for a restart.
+        await self._refresh_active_symbols()
 
         # Warm both OHLC caches concurrently before the sequential per-symbol
         # loop below -- see _prefetch_stale_histories()'s docstring. By the

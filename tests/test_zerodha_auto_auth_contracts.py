@@ -72,16 +72,38 @@ def test_real_tradingsymbol_stored_correctly_per_strike_and_type(monkeypatch):
     assert data["2026-09-29"]["1170"]["CE"] == "BAJFINANCE26SEP1170CE"
 
 
-def test_non_fno_symbols_are_not_cached(monkeypatch):
+def test_stocks_not_in_the_static_fno_symbols_list_are_still_cached(monkeypatch):
+    # Fixed 2026-08-20: this used to assert the OPPOSITE -- only symbols in
+    # the (then-static, 41-entry) FNO_SYMBOLS list got cached. Widened so a
+    # symbol the weekly active-universe recompute job newly promotes into
+    # FNO_SYMBOLS already has real contract data cached, instead of failing
+    # closed for a day waiting on the next daily auth run to happen to
+    # cover it too. Real stock underlyings are cached regardless of whether
+    # they're in FNO_SYMBOLS today -- only index options are excluded (see
+    # test_index_options_are_not_cached_as_stocks below).
     fake_redis = _FakeSyncRedis()
     monkeypatch.setattr("scripts.zerodha_auto_auth.get_redis_client", lambda: fake_redis)
 
     instruments = _bajfinance_instruments() + [
-        _mock_instrument("SOME_RANDOM_STOCK_NOT_IN_FNO", date(2026, 9, 29), 100, "CE", "JUNK"),
+        _mock_instrument("SOME_STOCK_NOT_YET_ACTIVE", date(2026, 9, 29), 100, "CE", "JUNK"),
     ]
     fetch_and_cache_real_contracts(instruments)
 
-    assert f"{REDIS_CONTRACT_PREFIX}SOME_RANDOM_STOCK_NOT_IN_FNO" not in fake_redis.store
+    assert f"{REDIS_CONTRACT_PREFIX}SOME_STOCK_NOT_YET_ACTIVE" in fake_redis.store
+
+
+def test_index_options_are_not_cached_as_stocks(monkeypatch):
+    fake_redis = _FakeSyncRedis()
+    monkeypatch.setattr("scripts.zerodha_auto_auth.get_redis_client", lambda: fake_redis)
+
+    instruments = _bajfinance_instruments() + [
+        _mock_instrument("NIFTY", date(2026, 9, 29), 25000, "CE", "NIFTY26SEP25000CE"),
+        _mock_instrument("BANKNIFTY", date(2026, 9, 29), 55000, "PE", "BANKNIFTY26SEP55000PE"),
+    ]
+    fetch_and_cache_real_contracts(instruments)
+
+    assert f"{REDIS_CONTRACT_PREFIX}NIFTY" not in fake_redis.store
+    assert f"{REDIS_CONTRACT_PREFIX}BANKNIFTY" not in fake_redis.store
 
 
 def test_futures_and_non_option_rows_are_ignored(monkeypatch):

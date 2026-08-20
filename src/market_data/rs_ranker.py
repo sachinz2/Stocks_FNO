@@ -58,6 +58,10 @@ class RSRanker:
         self._kite    = kite
         self._tokens  = instrument_tokens or {}
         self.symbols  = symbols or FNO_SYMBOLS
+        # 2026-08-20: mirrors LTPPoller's same flag/reasoning -- only
+        # auto-refresh from the dynamically-recomputed active universe when
+        # the caller didn't pin an explicit symbols list at construction.
+        self._dynamic_symbols = symbols is None
         self.top_n    = top_n
         self._cache: Dict[str, pd.DataFrame] = {}    # symbol → daily OHLC
         self._nifty:  Optional[pd.DataFrame]  = None
@@ -80,6 +84,15 @@ class RSRanker:
         Returns list of {symbol, rs_score, rank} dicts.
         """
         loop = asyncio.get_event_loop()
+
+        # Pick up the latest dynamically-recomputed active universe (2026-08-
+        # 20) -- without this, a symbol newly promoted by the weekly recompute
+        # job would get OHLC/indicator coverage from LTPPoller but never an
+        # RS rank here, silently keeping it ineligible for entries that gate
+        # on RS rank (see LiveTradingEngine._process_signal).
+        if self._dynamic_symbols:
+            from src.market_data.option_chain import get_active_fno_symbols
+            self.symbols = await get_active_fno_symbols(self._redis)
 
         # Refresh underlying daily data every 5 minutes
         now = datetime.now()

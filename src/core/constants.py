@@ -426,6 +426,16 @@ REDIS_LOT_SIZE_PREFIX = "nfo:lot:"
 # strike-interval arithmetic never drifts from reality.
 REDIS_CONTRACT_PREFIX = "nfo:contracts:"
 
+# The dynamically-recomputed actively-traded symbol list (2026-08-20) -- a
+# JSON list, written weekly by scripts/zerodha_auto_auth.py's
+# recompute_active_universe() (src/api/main.py's _weekly_universe_refresh
+# job), read via src/core/utils.py's get_active_fno_symbols(). No TTL: it
+# should persist until the next weekly run overwrites it, not silently
+# expire back to the static FNO_SYMBOLS fallback between runs. FNO_SYMBOLS
+# itself remains the fallback used when this key is missing (fresh Redis,
+# before the first weekly run) or unreadable.
+REDIS_ACTIVE_FNO_SYMBOLS = "market:active_fno_symbols"
+
 # Indicator defaults
 EMA_FAST = 20
 EMA_SLOW = 50
