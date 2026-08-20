@@ -439,6 +439,59 @@ async def lifespan(app: FastAPI):
         engine.attach_ltp_poller(zerodha_ltp_poller)
     start_scheduler()
 
+    # ── Scheduler dead-man's-switch ──────────────────────────────────────────
+    # Fixed 2026-08-20 (component review): every self-heal job that already
+    # exists (kite self-heal, weekly universe refresh, etc.) is ITSELF a
+    # scheduled APScheduler job -- if the scheduler or the whole asyncio event
+    # loop wedges (not just a Kite-specific issue), none of those can fire to
+    # detect or fix it either; a hung event loop can't run more async code to
+    # report that it's hung. This uses a genuinely independent OS thread (not
+    # an asyncio task), which keeps running on its own via Python's normal
+    # thread scheduling even while the event loop is blocked, checking a
+    # heartbeat timestamp written by a lightweight dedicated job. If the
+    # heartbeat goes stale, the whole process exits -- docker-compose's
+    # `restart: unless-stopped` brings up a fresh one. Same "force a real
+    # restart rather than try to reconnect in place" philosophy already
+    # proven for the Kite WebSocket tick-staleness watchdog above.
+    import threading
+    import time
+
+    _scheduler_heartbeat = {"t": time.monotonic()}
+    _HEARTBEAT_INTERVAL_SECONDS = 30
+    # 5x the interval: generous margin against one slow cycle (a busy signal
+    # cycle, a slow broker call blocking the loop) triggering a false alarm.
+    _HEARTBEAT_STALE_THRESHOLD_SECONDS = 150
+
+    async def _scheduler_heartbeat_job() -> None:
+        _scheduler_heartbeat["t"] = time.monotonic()
+
+    scheduler.add_job(
+        _scheduler_heartbeat_job,
+        IntervalTrigger(seconds=_HEARTBEAT_INTERVAL_SECONDS),
+        id="scheduler_heartbeat",
+        name="Scheduler Dead-Man's-Switch Heartbeat",
+        replace_existing=True,
+        misfire_grace_time=15,
+    )
+
+    def _scheduler_watchdog_thread() -> None:
+        while True:
+            time.sleep(_HEARTBEAT_STALE_THRESHOLD_SECONDS)
+            age = time.monotonic() - _scheduler_heartbeat["t"]
+            if age > _HEARTBEAT_STALE_THRESHOLD_SECONDS:
+                import os
+                logger.critical(
+                    f"SCHEDULER DEAD-MAN'S-SWITCH: no heartbeat for {age:.0f}s "
+                    "-- the asyncio event loop/scheduler appears wedged. "
+                    "Exiting process for a full restart (docker-compose will "
+                    "bring up a fresh one)."
+                )
+                os._exit(1)
+
+    threading.Thread(
+        target=_scheduler_watchdog_thread, daemon=True, name="scheduler-deadman-watchdog",
+    ).start()
+
     app.state.trading_engine    = engine
     app.state.redis             = redis_client
     app.state.zerodha_ticker    = zerodha_ticker

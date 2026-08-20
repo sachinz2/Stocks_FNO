@@ -1,7 +1,7 @@
 import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.brokers.base import AbstractBroker
@@ -57,6 +57,7 @@ _REDIS_ORDER_COUNT     = "engine:order_count"
 _REDIS_EMA_STATE       = "engine:ema_crossover_state"
 _REDIS_MOMENTUM_STATE  = "engine:momentum_state"
 _REDIS_PEAK_PREMIUMS   = "engine:peak_premiums"
+_REDIS_LAST_SIGNAL     = "engine:last_signal_date"
 
 
 class LiveTradingEngine:
@@ -109,6 +110,12 @@ class LiveTradingEngine:
         # Maps option contract → {journal_id, underlying, strategy_name}
         # so _check_open_option_exits can write the exit to trade_journal.
         self._single_leg_journals:  Dict[str, Dict[str, Any]] = {}
+        # strategy_id -> ISO date of the last non-HOLD signal it generated.
+        # Fed to _check_signal_staleness() (component review, 2026-08-20) --
+        # catches the same failure signature as the 2026-07-27..07-29
+        # DTE-window incident (a silent logic bug in generate_signal() that
+        # blocked every entry for 3 full trading days with nothing watching).
+        self._last_signal_date:     Dict[str, str] = {}
         self._kite = None        # attached in live mode for real quotes + VIX
         self._ltp_poller = None  # ZerodhaLTPPoller — registers active option contracts
         # Prevents concurrent exit checks from 1-min signal cycle + 10-s exit-only job (F)
@@ -509,6 +516,7 @@ class LiveTradingEngine:
         else:
             logger.info("EOD: no trades today and no open positions, skipping report.")
 
+        await self._check_signal_staleness()
         await self._persist_state()
         self._today_order_count = 0
         self._peak_premiums.clear()
@@ -518,6 +526,60 @@ class LiveTradingEngine:
         # and will only close when: SL hit, 75% profit reached, DTE < 7, or expiry day.
         self._exited_today.clear()         # reset adverse-exit blocks for next trading day
         self._profit_closed_today.clear()  # reset profit-close re-entry tracking for next day
+
+    # Days of zero non-HOLD signals from an active strategy before alerting.
+    # Matches the exact duration of the 2026-07-27..07-29 DTE-window incident
+    # (a silent generate_signal() logic bug blocked every entry for 3 full
+    # trading days, discovered only when a human happened to notice zero
+    # trades). Deliberately conservative: a strategy legitimately waiting for
+    # its regime (e.g. credit_spread_v1/iron_condor_v1 need low ATR%) can
+    # also trip this if the market stays wrong for that strategy long enough
+    # -- a false-positive alert here is cheap; a silent multi-day outage is
+    # not. Operator-tunable like DEFAULT_EXPECTED_DRAWDOWN in strategy_monitor.py.
+    _SIGNAL_STALENESS_DAYS = 3
+
+    async def _check_signal_staleness(self) -> None:
+        """
+        Alerts once per trading day (called from send_daily_report) if an
+        active strategy has produced zero non-HOLD signals for
+        _SIGNAL_STALENESS_DAYS+ calendar days. This measures the strategy's
+        OWN generate_signal() logic still being capable of firing at all --
+        independent of whether any resulting order succeeds, and independent
+        of _process_signal()'s per-symbol try/except in run_signal_cycle
+        (which would have silently swallowed the DTE-window bug the same way
+        it swallows everything else, by design).
+        """
+        today = now_ist().date()
+        for strategy_id, strategy in StrategyRegistry.get_active_strategies().items():
+            if not strategy.is_active:
+                continue
+            last_str = self._last_signal_date.get(strategy_id)
+            if last_str is None:
+                # First time this check has seen this strategy -- establish a
+                # baseline (today) instead of skipping forever. A strategy
+                # that never signals again from this point on still trips
+                # the alert after _SIGNAL_STALENESS_DAYS, covering the "zero
+                # signals since deployment" variant of the incident too.
+                self._last_signal_date[strategy_id] = today.isoformat()
+                continue
+            try:
+                last_date = date.fromisoformat(last_str)
+            except ValueError:
+                continue
+            days_silent = (today - last_date).days
+            if days_silent >= self._SIGNAL_STALENESS_DAYS:
+                logger.warning(
+                    f"[SignalStaleness] {strategy_id}: no non-HOLD signal for "
+                    f"{days_silent} day(s) (last: {last_str})"
+                )
+                await self._notify(
+                    f"WARNING: {strategy_id} has produced ZERO trading signals for "
+                    f"{days_silent} day(s) (last signal: {last_str}).\n"
+                    f"This may be normal (quiet market conditions for this strategy's "
+                    f"regime) or may indicate a silent logic bug blocking entries -- "
+                    f"same failure signature as the 2026-07-27..07-29 DTE-window "
+                    f"incident. Worth a quick sanity check."
+                )
 
     # ── State persistence ─────────────────────────────────────────────────────
 
@@ -542,6 +604,13 @@ class LiveTradingEngine:
             # protection and letting the position ride all the way down to the
             # full hard stop instead.
             await redis.set(_REDIS_PEAK_PREMIUMS, json.dumps({"date": today, "peaks": self._peak_premiums}))
+            # Fixed 2026-08-20 (component review): _last_signal_date must
+            # survive restarts for _check_signal_staleness() to correctly
+            # span multiple days -- the incident it exists to catch (DTE-
+            # window bug, 2026-07-27..07-29) spanned several restarts, and an
+            # in-memory-only tracker would have reset its baseline every time,
+            # never accumulating enough silent days to trip the alert.
+            await redis.set(_REDIS_LAST_SIGNAL, json.dumps(self._last_signal_date))
         except Exception as e:
             logger.error(f"Failed to persist engine state: {e}")
 
@@ -809,6 +878,15 @@ class LiveTradingEngine:
                         if k in _known_contracts
                     }
                     logger.info(f"Restored {len(self._peak_premiums)} peak premium(s) for today")
+
+            # Fixed 2026-08-20 (component review): restore across restarts --
+            # unlike the other per-day state above, this is NOT date-filtered
+            # to today, since the whole point is accumulating consecutive
+            # silent days across restarts (see _persist_state()'s fix note).
+            last_signal_raw = await redis.get(_REDIS_LAST_SIGNAL)
+            if last_signal_raw:
+                self._last_signal_date = json.loads(last_signal_raw)
+                logger.info(f"Restored last-signal dates for {len(self._last_signal_date)} strategy(ies)")
         except Exception as e:
             logger.error(f"Failed to restore engine state: {e}")
 
@@ -1590,6 +1668,14 @@ class LiveTradingEngine:
         signal_str = signal.value if hasattr(signal, "value") else str(signal)
         if signal_str == "HOLD":
             return
+
+        # Fixed 2026-08-20 (component review): recorded regardless of what
+        # happens further down (entry blocked by a collision guard, order
+        # rejected, etc.) -- this measures "the strategy's own logic is
+        # still capable of producing a real signal," the exact thing that
+        # silently broke for 3 days in the DTE-window incident. See
+        # _check_signal_staleness()'s docstring.
+        self._last_signal_date[strategy.name] = now_ist().date().isoformat()
 
         logger.info(f"Signal [{strategy.name}] {signal_str} {symbol}")
 

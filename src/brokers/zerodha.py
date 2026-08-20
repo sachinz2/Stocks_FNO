@@ -113,7 +113,14 @@ class ZerodhaBroker(AbstractBroker):
         response was lost" instead of blindly resubmitting.
         """
         try:
-            orders = self.kite.orders()
+            # Fixed 2026-08-20 (component review): kiteconnect is a
+            # synchronous SDK -- calling it directly here blocks the single-
+            # threaded asyncio event loop for the full HTTP round-trip,
+            # freezing every other coroutine (price feed, other orders,
+            # FastAPI request handlers) for as long as Zerodha takes to
+            # respond. Offloaded to a worker thread via asyncio.to_thread()
+            # so a slow/hanging call only stalls this one coroutine.
+            orders = await asyncio.to_thread(self.kite.orders)
             for o in orders:
                 if o.get("tag") == tag and o.get("status") not in ("REJECTED", "CANCELLED"):
                     return o.get("order_id")
@@ -182,7 +189,12 @@ class ZerodhaBroker(AbstractBroker):
                     )
                     return existing
             try:
-                order_id = self.kite.place_order(**kwargs)
+                # Fixed 2026-08-20 (component review): offloaded to a worker
+                # thread -- see _find_order_by_tag's comment. Order placement
+                # is the single most latency-sensitive call in this file; a
+                # slow response here used to block price updates and every
+                # other order for the entire round-trip.
+                order_id = await asyncio.to_thread(self.kite.place_order, **kwargs)
                 logger.info(f"Zerodha: order placed — id={order_id}")
                 return order_id
             except _RETRYABLE_KITE_EXC as e:
@@ -215,7 +227,14 @@ class ZerodhaBroker(AbstractBroker):
 
     async def cancel_order(self, order_id: str) -> bool:
         try:
-            self._cancel_order_call(order_id)
+            # Fixed 2026-08-20 (component review): _cancel_order_call() is a
+            # SYNC function whose @retry backoff sleeps with blocking
+            # time.sleep() between attempts (up to ~1+2s across 3 tries) --
+            # calling it directly here blocked the entire event loop for
+            # that whole retry sequence, not just one HTTP round-trip.
+            # Offloaded the whole call (including its internal retry/sleep)
+            # to a worker thread.
+            await asyncio.to_thread(self._cancel_order_call, order_id)
             return True
         except Exception as e:
             logger.error(f"Zerodha: cancel_order failed: {e}")
@@ -236,7 +255,9 @@ class ZerodhaBroker(AbstractBroker):
 
     async def modify_order(self, order_id: str, new_price: float, new_quantity: int) -> bool:
         try:
-            self._modify_order_call(order_id, new_price, new_quantity)
+            # Fixed 2026-08-20 (component review): same event-loop-blocking
+            # fix as cancel_order() above.
+            await asyncio.to_thread(self._modify_order_call, order_id, new_price, new_quantity)
             return True
         except Exception as e:
             logger.error(f"Zerodha: modify_order failed: {e}")
@@ -255,7 +276,12 @@ class ZerodhaBroker(AbstractBroker):
     )
     async def get_positions(self) -> List[Dict[str, Any]]:
         try:
-            return self.kite.positions().get("net", [])
+            # Fixed 2026-08-20 (component review): offloaded to a worker
+            # thread -- see _find_order_by_tag's comment. get_positions() is
+            # called every signal cycle (60s) plus every exit check, so a
+            # slow response here was a recurring, not just occasional, stall.
+            result = await asyncio.to_thread(self.kite.positions)
+            return result.get("net", [])
         except Exception as e:
             logger.error(f"Zerodha: get_positions failed: {e}")
             raise
@@ -267,7 +293,9 @@ class ZerodhaBroker(AbstractBroker):
     )
     async def get_orders(self) -> List[Dict[str, Any]]:
         try:
-            return self.kite.orders()
+            # Fixed 2026-08-20 (component review): offloaded to a worker
+            # thread -- see get_positions()'s matching comment.
+            return await asyncio.to_thread(self.kite.orders)
         except Exception as e:
             logger.error(f"Zerodha: get_orders failed: {e}")
             raise

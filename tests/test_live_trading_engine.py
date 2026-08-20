@@ -1393,6 +1393,7 @@ class _FakeCollisionEngine:
         self._single_leg_journals = single_leg_journals or {}
         self._exited_today = set()
         self._max_daily_orders = 0
+        self._last_signal_date = {}
         self.order_manager = None  # must never be touched if the guard fires first
 
 
