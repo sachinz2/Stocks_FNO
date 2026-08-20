@@ -621,7 +621,58 @@ Kept short — see git log / individual commit messages for full detail.
     `_close_leg()` refactor. 390 tests passing. Deployed and verified live
     (30/30 static+runtime invariant checks pass; API/DB/Redis healthy,
     RSRanker's first post-deploy cycle ran clean).
+- **Component-level health audit (2026-08-20), same day, follow-up to the
+  above.** User remained skeptical after the full-system review and asked
+  for the system to be bifurcated into components and each one assessed for
+  standalone quality (correctness, robustness to its own dependencies
+  failing, internal consistency after the day's rapid patching, test
+  coverage, operational visibility) — not just another bug hunt — ending in
+  an explicit verdict per component and an overall opinion on go-live
+  readiness. 6 parallel agents each audited one component. Market data
+  pipeline and risk/capital management came back clean (SOLID / SOLID WITH
+  CAVEATS, no new bugs). 4 new bugs surfaced in the other four:
+  - **Most severe: expiry-day square-off could fabricate a close for a
+    partially-closed spread/condor.** `_square_off_all`'s consolidation
+    block (GTT cancel, trade_journal write, capital release, drop from
+    tracking) ran unconditionally for every tracked structure once
+    `is_expiry` was true — regardless of whether *all* of that structure's
+    legs actually closed in the per-position loop immediately above it. A
+    rejected/failed leg-close still got its GTT backstop cancelled, a
+    fabricated journal close (falling back to the *entry* premium for the
+    unclosed leg, as if it hadn't moved), capital released, and the
+    structure dropped from tracking — while a real naked leg stayed open at
+    the broker with its exchange-level stop now gone and its journal row
+    already (wrongly) marked closed, on the single highest gamma/assignment-
+    risk day of the position's life. This is exactly the kind of gap a
+    diff-scoped or even a full-file review can miss: the fix applied
+    directly above it (checking `order_status` per leg) was correct and
+    complete for that loop, but the *next* block, doing conceptually the
+    same job for the structure as a whole, wasn't updated to respect it.
+    Fixed: the consolidation block now only acts on a structure whose every
+    leg is confirmed closed; a partial failure stays tracked for retry with
+    a loud alert instead.
+  - `order_manager.place_order()` used to mark an order `FAILED` (discarding
+    `broker_order_id`) if the DB write immediately after a *successful*
+    broker call itself failed — orphaning a genuinely live order with no
+    reconciliation path (`sync_orders()` only reconciles `order_status ==
+    'OPEN'` rows). Fixed: retries the critical write, and a broker-confirmed
+    order is never downgraded to `FAILED`.
+  - `credit_spread.py` had no flat-EMA floor, so it could fire a directional
+    spread in the exact low-ATR/near-flat-EMA band `iron_condor.py` claims
+    exclusively — both strategies' docstrings explicitly claim "never fight
+    each other," but nothing enforced it on the credit-spread side. Fixed:
+    added the same `flat_threshold` floor `iron_condor.py` already had.
+  - `run_signal_cycle()` had no exception isolation around
+    `expire_stale_orders()`, regime detection, or the portfolio analyzer
+    (already commented "non-blocking," but nothing enforced that) — a
+    failure in any of them aborted the whole cycle, including the exit
+    checks that run immediately after `expire_stale_orders()`. Fixed: each
+    now degrades independently with a logged error instead of taking the
+    rest of the cycle down with it.
+  - 6 new regression tests. 396 tests passing. Deployed and verified live
+    (30/30 static+runtime invariant checks pass; API/DB/Redis healthy, no
+    errors in post-deploy logs).
 
 ---
 
-*Last updated: 2026-08-20, after the full-system deep review round's fixes.*
+*Last updated: 2026-08-20, after the component-level health audit's fixes.*
