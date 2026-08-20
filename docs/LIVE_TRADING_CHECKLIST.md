@@ -719,7 +719,74 @@ Kept short — see git log / individual commit messages for full detail.
   - 11 new regression tests. 407 tests passing. Deployed and verified live
     (30/30 static+runtime invariant checks pass; API/DB/Redis healthy, no
     errors in post-deploy logs).
+- **External PDF code review (2026-08-20), same day** — a third party's
+  review of `momentum_v1`, focused on strategy thesis (late-entry problem for
+  long options) plus several code-level claims. Every code claim was checked
+  against the actual repo (and, for the credentials issue, the live server)
+  before acting — one claim ("stale-order cancellation still marks EXPIRED
+  on a failed cancel") turned out to already be fixed earlier the same day
+  and was not touched again.
+  - **Real momentum_v1 trade data pulled from production first**, before
+    touching any strategy logic (matching the review's own closing advice:
+    don't redesign off an anecdotal loss-rate impression). 11 closed trades
+    since 2026-08-06: **9.1% win rate** (1 win, 10 losses), avg win
+    ₹7,789.50 vs avg loss ₹1,796.33 (4.3:1, healthier than the review's
+    assumed 3:1, but still short of the ~19% breakeven win rate that ratio
+    needs), **total P&L −₹10,173.75**. One loss (TITAN, Aug 6, −₹2,865) is
+    contaminated by an already-fixed infrastructure bug (wrong strike
+    interval) and shouldn't count against the strategy itself. Of the
+    remaining 10, most exit reasons show the option premium down double
+    digits (−21%, −50%, −10%, −9.7%, −6.6%, −5.7%, −4.8%) rather than flat-
+    but-still-lost, leaning toward "the signal itself reversed" over "the
+    signal was fine, execution was bad" — directionally consistent with the
+    review's late-entry concern, but **11 trades is nowhere near a reliable
+    sample**, and `trade_journal` doesn't yet store the ADX/RVOL/delta/DTE/
+    MFE/MAE fields the review's proposed deeper attribution analysis would
+    need. Flagged as real follow-up work, not done as part of this fix round.
+  - **Confirmed and fixed — `bar_key is None` let every ~60s engine cycle
+    count as a distinct 5-min candle**, both in `momentum.py` (as the review
+    flagged) and identically in `ema_crossover.py` (which the review didn't
+    check). A missing `ohlc_bar_key` (no live tick data yet, or a malformed
+    OHLC cache) used to advance the confirmation counter every cycle, so
+    `signal_confirm_bars=2` could complete in ~2 minutes instead of ~10.
+    Fixed: a missing bar_key now simply can't advance the count.
+  - **Confirmed and fixed — order-placement timeout marked the order FAILED
+    with no reconciliation.** `asyncio.wait_for`'s cancellation can't
+    actually stop the underlying `kite.place_order()` call once it's
+    running in a worker thread (see the defense-in-depth round above) — a
+    client-side timeout doesn't mean the broker didn't process the order.
+    Fixed: `OrderManager.place_order()` now reconciles against
+    `broker.get_orders()` (matched by the same tag `ZerodhaBroker` already
+    attaches, now a shared `broker_order_tag()` helper so the two call sites
+    can't drift) before deciding FAILED vs. the real OPEN state.
+  - **Confirmed and fixed — RS and 15-min MTF entry filters failed OPEN** on
+    any data-unavailability, proceeding without the filter instead of
+    blocking the entry — inconsistent with this codebase's established
+    fail-closed convention for explicitly-chosen entry-blocking filters
+    (lot size, contract resolution, margin, RVOL already fail closed).
+    Fixed: both now block the BUY entry when the filter can't be evaluated.
+    Trade-off, accepted: BUY entries are delayed each morning until
+    RSRanker's first cycle completes, same as the existing RVOL-unavailable
+    behavior already accepts.
+  - **Confirmed and fixed — no production guard against insecure default
+    credentials.** `config.py`'s `DB_PASSWORD`/`JWT_SECRET`/
+    `DASHBOARD_PASSWORD` fallback defaults are real, memorable, and
+    public (this file is on GitHub) — and a direct check against the live
+    server found **`DB_PASSWORD` was still literally `"password123"`**
+    (MySQL is only bound to `127.0.0.1:3307`, not internet-facing, which
+    limited but didn't eliminate the exposure). Fixed two ways: (1) rotated
+    the password on the server immediately — generated a strong 32-char
+    value, `ALTER USER` against the live MySQL instance, updated `.env`,
+    restarted the API container, verified clean (infrastructure action, not
+    a code change — `.env` is gitignored and was never in the repo); (2)
+    added `validate_production_secrets()`, called at lifespan startup, that
+    refuses to boot when `ENV=production` and any of the three is still its
+    known-insecure default — so this can't silently regress again.
+  - 9 new regression tests. 416 tests passing. Deployed and verified live
+    (30/30 static+runtime invariant checks pass; API/DB/Redis healthy, no
+    errors in post-deploy logs; confirmed the app boots cleanly with the new
+    production-secrets guard active).
 
 ---
 
-*Last updated: 2026-08-20, after the defense-in-depth round's fixes.*
+*Last updated: 2026-08-20, after the external PDF review round's fixes and the DB password rotation.*
