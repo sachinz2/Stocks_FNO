@@ -506,12 +506,26 @@ def check_weekly_universe_refresh_fails_safe(repo: Path) -> Result:
     auth_src = _read(repo, "scripts/zerodha_auto_auth.py")
     if "MIN_COVERAGE_FRACTION" not in auth_src or '"skipped": True' not in auth_src:
         return FAIL, name, "recompute_active_universe() no longer guards against publishing a partial-coverage result (e.g. a Zerodha rate-limit mid-run) as if it were a genuine liquidity change -- confirmed as a real gap by 3 independent code-review angles, fixed 2026-08-20."
+    # Fixed 2026-08-20 (code review round 2): the original guard only compared
+    # turnover-vs-tokens, blind to a truncated NFO/NSE instrument dump
+    # shrinking `tokens` itself before turnover ever runs.
+    if "len(tokens) < MIN_COVERAGE_FRACTION * len(universe)" not in auth_src:
+        return FAIL, name, "recompute_active_universe() no longer checks token-resolution coverage against the full known universe -- a truncated kite.instruments() response that shrinks `tokens` before the turnover step runs would bypass the coverage guard entirely."
     main_src = _read(repo, "src/api/main.py")
     if 'result.get("skipped")' not in main_src:
         return FAIL, name, "main.py's _weekly_universe_refresh() no longer checks recompute_active_universe()'s skipped flag."
-    if "zt._instrument_tokens" not in main_src or "zlp.set_symbols(" not in main_src:
+    if "zt.set_instrument_tokens(" not in main_src or "zlp.set_symbols(" not in main_src:
         return FAIL, name, "_weekly_universe_refresh() no longer updates ZerodhaTicker/ZerodhaLTPPoller -- a newly-promoted symbol would have no real-time WebSocket/REST-fallback tick coverage (only LTPPoller/RSRanker would know about it)."
-    return PASS, name, "recompute_active_universe() fails safe on partial data coverage, and the weekly job updates all four live components (LTPPoller, RSRanker, ZerodhaTicker, ZerodhaLTPPoller)."
+    if "zt._instrument_tokens =" in main_src:
+        return FAIL, name, "main.py reverted to mutating zt._instrument_tokens directly -- that never pushes the update to the LIVE WebSocket connection (subscribe()/set_mode() only run from _on_connect()), confirmed by 5 of 6 code-review finder angles as the most severe finding in this feature. Use zt.set_instrument_tokens() instead."
+    ticker_src = _read(repo, "src/market_data/zerodha_ticker.py")
+    if "def set_instrument_tokens" not in ticker_src or "self._ticker.subscribe(" not in ticker_src.split("def set_instrument_tokens")[1][:2500]:
+        return FAIL, name, "ZerodhaTicker.set_instrument_tokens() missing or no longer calls subscribe() on the live connection -- a newly-promoted symbol would get no real-time WebSocket ticks until an unrelated reconnect."
+    token_push_idx = main_src.find("zt.set_instrument_tokens(")
+    skip_check_idx = main_src.find('result.get("skipped")')
+    if token_push_idx == -1 or skip_check_idx == -1 or not (token_push_idx < skip_check_idx):
+        return FAIL, name, "_weekly_universe_refresh() must push tokens to live components BEFORE the skip-path early return -- token resolution succeeds/fails independently of the turnover-coverage failure that triggers a skip, so a skipped run must not also discard valid, already-fetched tokens."
+    return PASS, name, "recompute_active_universe() fails safe on both coverage stages, pushes tokens before the skip-check, and ZerodhaTicker's update actually reaches the live WebSocket connection."
 
 
 STATIC_CHECKS: List[Callable[[Path], Result]] = [

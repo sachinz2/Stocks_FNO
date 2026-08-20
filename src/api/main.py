@@ -315,11 +315,55 @@ async def lifespan(app: FastAPI):
             await engine._notify(f"WARNING: weekly F&O universe refresh failed: {e}")
             return
 
+        # Push freshly-resolved tokens into the live components immediately
+        # instead of waiting for the next restart -- a symbol newly promoted
+        # into the active set needs a resolvable NSE token to actually be
+        # pollable/rankable this same run, not after the next deploy.
+        #
+        # Fixed 2026-08-20 (code review round 2): this used to run AFTER the
+        # skipped-check below and return early on a skip, discarding a fully
+        # valid, already-fetched tokens dict (resolve_nse_tokens() succeeds
+        # or fails independently of the turnover-fetch failure that triggers
+        # a skip) -- instrument tokens would then go stale for a week even
+        # though the data to refresh them was sitting right there.
+        if result["tokens"]:
+            app.state.instrument_tokens = result["tokens"]
+            kite_now = getattr(app.state, "kite", None)
+            if kite_now is not None:
+                ltp_poller.set_kite(kite_now, result["tokens"])
+                rs_ranker.set_kite(kite_now, result["tokens"])
+                # Fixed 2026-08-20 (code review): ltp_poller/rs_ranker were
+                # updated here, but ZerodhaTicker (the WebSocket client --
+                # the actual primary real-time tick source; LTPPoller's own
+                # module docstring says today's bars are built ONLY from
+                # live ticks, never historical_data()) and ZerodhaLTPPoller
+                # (its REST fallback when the WebSocket is down) were left
+                # frozen at their startup-time static symbol list. A symbol
+                # newly promoted here would get no real-time tick coverage
+                # at all if the WebSocket ever needed the REST fallback.
+                #
+                # Fixed 2026-08-20 (code review round 2): the ZerodhaTicker
+                # update below used to mutate zt._instrument_tokens/
+                # _token_symbol directly -- correct bookkeeping, but
+                # subscribe()/set_mode() are only ever called from
+                # ZerodhaTicker._on_connect(), so an already-open WebSocket
+                # connection was never actually told about the change (5 of
+                # 6 code-review finder angles independently caught this).
+                # set_instrument_tokens() pushes the update to the live
+                # connection immediately instead.
+                zt = getattr(app.state, "zerodha_ticker", None)
+                if zt is not None:
+                    zt.set_instrument_tokens(result["tokens"])
+                zlp = getattr(app.state, "zerodha_ltp_poller", None)
+                if zlp is not None:
+                    zlp.set_symbols(list(result["tokens"].keys()))
+
         # Fixed 2026-08-20 (code review): recompute_active_universe() refuses
         # to publish (keeps the previous active list live) when it only got
         # turnover data for a fraction of the universe -- a partial API
         # failure, not a genuine liquidity change. That's a distinct,
         # actionable outcome from "recomputed successfully, nothing changed".
+        # Checked AFTER the token push above (tokens are valid either way).
         if result.get("skipped"):
             logger.error(
                 f"Weekly universe refresh: skipped publishing (data coverage "
@@ -337,33 +381,6 @@ async def lifespan(app: FastAPI):
             f"Weekly universe refresh: {len(result['active'])} active symbols "
             f"({len(added)} added, {len(removed)} removed)"
         )
-
-        # Push freshly-resolved tokens into the live components immediately
-        # instead of waiting for the next restart -- a symbol newly promoted
-        # into the active set needs a resolvable NSE token to actually be
-        # pollable/rankable this same run, not after the next deploy.
-        if result["tokens"]:
-            app.state.instrument_tokens = result["tokens"]
-            kite_now = getattr(app.state, "kite", None)
-            if kite_now is not None:
-                ltp_poller.set_kite(kite_now, result["tokens"])
-                rs_ranker.set_kite(kite_now, result["tokens"])
-                # Fixed 2026-08-20 (code review): ltp_poller/rs_ranker were
-                # updated here, but ZerodhaTicker (the WebSocket client --
-                # the actual primary real-time tick source; LTPPoller's own
-                # module docstring says today's bars are built ONLY from
-                # live ticks, never historical_data()) and ZerodhaLTPPoller
-                # (its REST fallback when the WebSocket is down) were left
-                # frozen at their startup-time static symbol list. A symbol
-                # newly promoted here would get no real-time tick coverage
-                # at all if the WebSocket ever needed the REST fallback.
-                zt = getattr(app.state, "zerodha_ticker", None)
-                if zt is not None:
-                    zt._instrument_tokens = result["tokens"].copy()
-                    zt._token_symbol = {v: k for k, v in result["tokens"].items()}
-                zlp = getattr(app.state, "zerodha_ltp_poller", None)
-                if zlp is not None:
-                    zlp.set_symbols(list(result["tokens"].keys()))
 
         if added or removed:
             summary = "F&O universe weekly review\n"
@@ -503,8 +520,12 @@ async def lifespan(app: FastAPI):
                     api_key=settings.ZERODHA_API_KEY, access_token=tok,
                     redis_url=settings.get_redis_url(), symbols=set(FNO_SYMBOLS),
                 )
-                zt._instrument_tokens = tokens.copy()
-                zt._token_symbol      = {v: k for k, v in tokens.items()}
+                # set_instrument_tokens() is a no-op beyond bookkeeping here
+                # (self._ticker is still None pre-.start()) -- used instead
+                # of direct attribute mutation for consistency with the
+                # weekly-refresh call site below, which DOES need the live
+                # WebSocket push this same method provides once started.
+                zt.set_instrument_tokens(tokens)
                 zt.start()
                 app.state.zerodha_ticker = zt
                 logger.info(f"ZerodhaTicker: live stream started late ({len(tokens)} symbols) after kite recovery.")

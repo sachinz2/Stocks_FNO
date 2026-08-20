@@ -90,6 +90,51 @@ class ZerodhaTicker:
             logger.error(f"ZerodhaTicker: failed to fetch instrument tokens: {e}")
             return 0
 
+    def set_instrument_tokens(self, tokens: Dict[str, int]) -> None:
+        """
+        Replace the tracked instrument-token map AND push the change to the
+        LIVE WebSocket connection immediately (subscribe newly-added tokens,
+        unsubscribe removed ones) -- not just update the local bookkeeping
+        dicts.
+
+        Fixed 2026-08-20 (code-review round 2, confirmed independently by 5
+        of 6 finder angles as the review's most severe finding): the weekly
+        active-universe recompute job used to mutate self._instrument_tokens/
+        self._token_symbol directly from outside this class. That's correct
+        bookkeeping, but subscribe()/set_mode() are ONLY ever called from
+        _on_connect() -- an already-open WebSocket connection is never told
+        about the change, so a newly-promoted symbol got real-time ticks
+        only if the connection happened to reconnect for an unrelated
+        reason (which, on a healthy connection, can be days or the rest of
+        the session). Calling subscribe()/unsubscribe() directly here pushes
+        the update immediately, the same way KiteConnect's own docs describe
+        for dynamic subscription changes on an already-connected ticker.
+        """
+        old_tokens = set(self._instrument_tokens.values())
+        new_tokens = set(tokens.values())
+
+        self._instrument_tokens = dict(tokens)
+        self._token_symbol = {v: k for k, v in tokens.items()}
+
+        if self._ticker is None:
+            return  # not started yet -- start()/_on_connect() will subscribe everything fresh
+
+        added   = list(new_tokens - old_tokens)
+        removed = list(old_tokens - new_tokens)
+        try:
+            if added:
+                self._ticker.subscribe(added)
+                self._ticker.set_mode(self._ticker.MODE_QUOTE, added)
+            if removed:
+                self._ticker.unsubscribe(removed)
+            if added or removed:
+                logger.info(
+                    f"ZerodhaTicker: live-updated WebSocket subscription -- "
+                    f"+{len(added)} / -{len(removed)} token(s), no reconnect needed"
+                )
+        except Exception as e:
+            logger.error(f"ZerodhaTicker: failed to update live WebSocket subscription: {e}")
+
     def start(self) -> None:
         """Start KiteTicker in a background daemon thread (non-blocking)."""
         if not self._instrument_tokens:

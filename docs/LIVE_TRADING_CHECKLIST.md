@@ -116,7 +116,7 @@ Current `.env`: `INITIAL_CAPITAL=300000.0`, `MAX_OPEN_POSITIONS=5`,
 
 ## A5. Testing & CI safety net
 
-- [ ] Full test suite green (currently 368 passing) immediately before flip.
+- [ ] Full test suite green (currently 375 passing) immediately before flip.
 - [ ] `deploy.sh`'s invariant-check step (`verify_invariants.py`, currently
       18 static + 4 runtime checks) wired into the actual deploy path used
       for the live-mode cutover, not run ad hoc.
@@ -490,7 +490,45 @@ Kept short — see git log / individual commit messages for full detail.
     fail-open bug from the prior day was.
   - 12 new tests, 2 new `verify_invariants.py` static checks. 368 tests
     passing.
+- **Second review round: fixes to the first round's fixes** (2026-08-20).
+  User asked for another review; scoped it to just the fix commit above
+  rather than re-covering the whole day's diff again, since that had
+  already been thoroughly reviewed. Same 8-angle process. 3 confirmed bugs,
+  all in the newly-fixed code:
+  - **Most severe, independently confirmed by 5 of 6 finder angles**: the
+    ZerodhaTicker fix from the first round mutated `zt._instrument_tokens`/
+    `_token_symbol` directly, but `subscribe()`/`set_mode()` are ONLY ever
+    called from `_on_connect()` -- an already-open WebSocket connection was
+    never actually told about a newly-promoted symbol, so it silently got
+    zero real-time ticks until an unrelated reconnect (which, on a healthy
+    connection, could be the rest of the trading week). This exact class of
+    "looks fixed, isn't wired to the live connection" bug undercut the
+    first round's own stated goal. Fixed: new
+    `ZerodhaTicker.set_instrument_tokens()` calls `subscribe()`/`set_mode()`/
+    `unsubscribe()` directly on the live connection instead of only
+    updating bookkeeping dicts.
+  - `_weekly_universe_refresh()` discarded a fully-valid, already-fetched
+    tokens dict whenever the run was skipped (partial-coverage failure) --
+    token resolution succeeds/fails independently of the turnover-fetch
+    failure that triggers a skip. Fixed: tokens are now pushed to all live
+    components BEFORE the skip-path check, not after.
+  - The `MIN_COVERAGE_FRACTION` guard only compared turnover-vs-tokens,
+    blind to a truncated `kite.instruments()` response that shrinks
+    `tokens` itself before turnover ever runs (100% coverage of an
+    already-collapsed set passes cleanly). Independently confirmed by 3
+    finder angles. Fixed: added a second guard comparing tokens resolved
+    against the full known universe, at the pipeline stage where a
+    truncation would actually first appear.
+  - Two lower-severity findings deliberately deferred: `compute_liquidity_
+    turnover()` can't distinguish an API failure from a symbol legitimately
+    having sparse trading data (judged very low probability for NSE F&O-
+    eligible stocks, which must already meet minimum liquidity criteria to
+    be listed); `ZerodhaLTPPoller.set_symbols()` has a narrow single-cycle
+    race window with an in-flight `refresh_ltp()` call (self-heals next
+    cycle, once a week).
+  - 15 new tests, 1 existing `verify_invariants.py` check strengthened.
+    375 tests passing.
 
 ---
 
-*Last updated: 2026-08-20, after the full-system code review and its fixes.*
+*Last updated: 2026-08-20, after the second review round's fixes.*

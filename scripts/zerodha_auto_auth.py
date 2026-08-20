@@ -466,6 +466,27 @@ def recompute_active_universe(access_token: str) -> dict:
     # every symbol just with low values, and is real information worth
     # publishing) -- keep serving whatever was already live instead.
     MIN_COVERAGE_FRACTION = 0.7
+
+    # Fixed 2026-08-20 (code review round 2): the single turnover-vs-tokens
+    # check below is blind to a truncated/partial kite.instruments("NFO") or
+    # kite.instruments("NSE") response that doesn't raise -- that would
+    # shrink `tokens` itself BEFORE the turnover step ever runs, so 100%
+    # turnover coverage of an already-collapsed `tokens` dict passes the
+    # other check cleanly (independently confirmed by 3 finder angles).
+    # Check tokens against the full known universe too, at the pipeline
+    # stage where a truncation would actually first appear.
+    if universe and len(tokens) < MIN_COVERAGE_FRACTION * len(universe):
+        logger.error(
+            f"Weekly universe recompute: only resolved NSE tokens for {len(tokens)}/{len(universe)} "
+            f"known F&O stocks (below {MIN_COVERAGE_FRACTION:.0%} coverage) -- likely a truncated "
+            "instrument dump, not a real drop in the F&O universe. Refusing to overwrite the "
+            "active list; keeping the previous one live."
+        )
+        return {
+            "active": current_active, "added": [], "removed": [], "tokens": tokens,
+            "skipped": True, "coverage": f"tokens {len(tokens)}/{len(universe)}",
+        }
+
     if tokens and len(turnover) < MIN_COVERAGE_FRACTION * len(tokens):
         logger.error(
             f"Weekly universe recompute: only got turnover data for {len(turnover)}/{len(tokens)} "
@@ -475,7 +496,7 @@ def recompute_active_universe(access_token: str) -> dict:
         )
         return {
             "active": current_active, "added": [], "removed": [], "tokens": tokens,
-            "skipped": True, "coverage": f"{len(turnover)}/{len(tokens)}",
+            "skipped": True, "coverage": f"turnover {len(turnover)}/{len(tokens)}",
         }
 
     new_active = qualifying_symbols(turnover)

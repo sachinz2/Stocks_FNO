@@ -90,3 +90,109 @@ def test_watchdog_exits_process_on_staleness_not_inplace_reconnect():
     assert "ticker.stop()\n                    ticker.start()" not in body, (
         "old in-place reconnect (proven insufficient) must not be present"
     )
+
+
+# ── set_instrument_tokens() (2026-08-20, code-review round 2) ───────────────
+#
+# The weekly active-universe recompute job used to mutate
+# _instrument_tokens/_token_symbol directly from outside this class --
+# correct bookkeeping, but subscribe()/set_mode() are only ever called from
+# _on_connect(), so an already-open WebSocket connection never actually
+# learned about the change. Confirmed independently by 5 of 6 code-review
+# finder angles as the review's most severe finding.
+
+class _FakeUnderlyingTicker:
+    MODE_QUOTE = "quote"
+
+    def __init__(self):
+        self.subscribed = []
+        self.unsubscribed = []
+        self.mode_calls = []
+
+    def subscribe(self, tokens):
+        self.subscribed.append(list(tokens))
+
+    def unsubscribe(self, tokens):
+        self.unsubscribed.append(list(tokens))
+
+    def set_mode(self, mode, tokens):
+        self.mode_calls.append((mode, list(tokens)))
+
+
+def test_set_instrument_tokens_updates_bookkeeping_dicts():
+    t = _bare_ticker()
+    t._ticker = None
+    t._instrument_tokens = {}
+    t._token_symbol = {}
+
+    t.set_instrument_tokens({"RELIANCE": 100, "TCS": 200})
+
+    assert t._instrument_tokens == {"RELIANCE": 100, "TCS": 200}
+    assert t._token_symbol == {100: "RELIANCE", 200: "TCS"}
+
+
+def test_set_instrument_tokens_is_a_noop_beyond_bookkeeping_when_not_started():
+    # self._ticker is None before .start() -- nothing to push to yet;
+    # start()'s own _on_connect() will subscribe everything fresh.
+    t = _bare_ticker()
+    t._ticker = None
+    t._instrument_tokens = {}
+    t._token_symbol = {}
+
+    t.set_instrument_tokens({"RELIANCE": 100})  # must not raise
+
+
+def test_set_instrument_tokens_pushes_new_tokens_to_the_live_connection():
+    t = _bare_ticker()
+    fake_ticker = _FakeUnderlyingTicker()
+    t._ticker = fake_ticker
+    t._instrument_tokens = {"RELIANCE": 100}
+    t._token_symbol = {100: "RELIANCE"}
+
+    t.set_instrument_tokens({"RELIANCE": 100, "TCS": 200})
+
+    assert fake_ticker.subscribed == [[200]]
+    assert fake_ticker.mode_calls == [("quote", [200])]
+    assert fake_ticker.unsubscribed == []
+
+
+def test_set_instrument_tokens_unsubscribes_removed_tokens_from_the_live_connection():
+    t = _bare_ticker()
+    fake_ticker = _FakeUnderlyingTicker()
+    t._ticker = fake_ticker
+    t._instrument_tokens = {"RELIANCE": 100, "THIN": 999}
+    t._token_symbol = {100: "RELIANCE", 999: "THIN"}
+
+    t.set_instrument_tokens({"RELIANCE": 100})  # THIN dropped
+
+    assert fake_ticker.unsubscribed == [[999]]
+    assert fake_ticker.subscribed == []
+
+
+def test_set_instrument_tokens_no_op_on_the_wire_when_token_set_unchanged():
+    t = _bare_ticker()
+    fake_ticker = _FakeUnderlyingTicker()
+    t._ticker = fake_ticker
+    t._instrument_tokens = {"RELIANCE": 100}
+    t._token_symbol = {100: "RELIANCE"}
+
+    t.set_instrument_tokens({"RELIANCE": 100})
+
+    assert fake_ticker.subscribed == []
+    assert fake_ticker.unsubscribed == []
+
+
+def test_set_instrument_tokens_survives_a_broken_live_connection():
+    t = _bare_ticker()
+
+    class _BrokenTicker(_FakeUnderlyingTicker):
+        def subscribe(self, tokens):
+            raise ConnectionError("websocket send failed")
+
+    t._ticker = _BrokenTicker()
+    t._instrument_tokens = {}
+    t._token_symbol = {}
+
+    t.set_instrument_tokens({"RELIANCE": 100})  # must not raise
+
+    assert t._instrument_tokens == {"RELIANCE": 100}  # bookkeeping still updated

@@ -173,6 +173,54 @@ def test_full_coverage_result_is_not_marked_skipped(monkeypatch):
     assert result["skipped"] is False
 
 
+# ── tokens-vs-universe coverage guard (2026-08-20, code-review round 2) ─────
+#
+# The original guard only compared turnover-vs-tokens, which is blind to a
+# truncated kite.instruments("NSE") response that shrinks `tokens` itself
+# BEFORE the turnover step even runs -- 100% turnover coverage of an
+# already-collapsed `tokens` dict would pass the original check cleanly.
+
+class _FakeKiteConnectTruncatedNSEDump:
+    """20 real F&O stocks on NFO, but the NSE instrument dump (used to
+    resolve tokens) is truncated to just 2 of them -- simulates a timeout/
+    truncation on kite.instruments("NSE") that doesn't raise."""
+
+    def __init__(self, api_key=None):
+        pass
+
+    def set_access_token(self, token):
+        pass
+
+    def instruments(self, exchange):
+        if exchange == "NFO":
+            return [
+                {"name": f"SYM{i}", "instrument_type": "CE", "tradingsymbol": f"SYM{i}26SEP100CE"}
+                for i in range(20)
+            ]
+        if exchange == "NSE":
+            # Only 2 of the 20 real F&O stocks resolved -- 10% coverage, well below the 70% floor.
+            return [{"tradingsymbol": "SYM0", "instrument_token": 0}, {"tradingsymbol": "SYM1", "instrument_token": 1}]
+        return []
+
+    def historical_data(self, token, from_date, to_date, interval, continuous, oi):
+        # Both resolved tokens succeed -- 100% coverage of `tokens`, which is
+        # exactly why the OLD single guard (turnover vs tokens) would have
+        # missed this failure entirely.
+        return [{"close": 1000.0, "volume": 10_000_000}]
+
+
+def test_truncated_nse_dump_does_not_overwrite_the_active_list(monkeypatch):
+    fake_redis = _FakeSyncRedis({REDIS_ACTIVE_FNO_SYMBOLS: json.dumps(["PREVIOUSLY_ACTIVE"])})
+    monkeypatch.setattr("scripts.zerodha_auto_auth.get_redis_client", lambda: fake_redis)
+    monkeypatch.setattr("kiteconnect.KiteConnect", _FakeKiteConnectTruncatedNSEDump)
+
+    result = recompute_active_universe("fake-token")
+
+    assert result["skipped"] is True
+    assert result["active"] == ["PREVIOUSLY_ACTIVE"]
+    assert json.loads(fake_redis.store[REDIS_ACTIVE_FNO_SYMBOLS]) == ["PREVIOUSLY_ACTIVE"]
+
+
 def test_weekly_job_wired_into_the_scheduler():
     # main.py's lifespan is too heavy (real DB/broker/redis wiring) to
     # invoke directly in a unit test -- static-source regression guard,
@@ -184,7 +232,7 @@ def test_weekly_job_wired_into_the_scheduler():
 
     assert "recompute_active_universe" in src
     idx = src.index("_weekly_universe_refresh")
-    block = src[idx:idx + 4000]
+    block = src[idx:idx + 5500]
     assert 'CronTrigger(day_of_week="sun"' in block
     assert "ltp_poller.set_kite(" in block
     assert "rs_ranker.set_kite(" in block
@@ -193,8 +241,17 @@ def test_weekly_job_wired_into_the_scheduler():
     # ZerodhaTicker/ZerodhaLTPPoller frozen at their startup-time symbol
     # list, and used to publish a partial-coverage recompute unconditionally.
     assert 'result.get("skipped")' in block
-    assert "zt._instrument_tokens" in block
     assert "zlp.set_symbols(" in block
+    # Fixed 2026-08-20 (code review round 2): the direct zt._instrument_tokens
+    # mutation never pushed the update to the live WebSocket connection --
+    # replaced with a real method that does. Also: tokens must be pushed to
+    # live components even on a skipped run (before the skip-path return),
+    # not discarded along with the (unrelated) turnover-coverage failure.
+    assert "zt.set_instrument_tokens(" in block
+    assert "zt._instrument_tokens =" not in block, "reverted to the direct-mutation bug that never live-updated the WebSocket subscription"
+    token_push_idx = block.index("zt.set_instrument_tokens(")
+    skip_check_idx = block.index('result.get("skipped")')
+    assert token_push_idx < skip_check_idx, "tokens must be pushed to live components BEFORE the skip-path early return, not after"
 
 
 def test_provision_kite_resolves_tokens_for_the_full_universe_not_just_static_list():
