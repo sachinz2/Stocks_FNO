@@ -528,7 +528,100 @@ Kept short — see git log / individual commit messages for full detail.
     cycle, once a week).
   - 15 new tests, 1 existing `verify_invariants.py` check strengthened.
     375 tests passing.
+- **Full-system deep review (2026-08-20)** — non-diff-scoped, unlike every
+  round above. User remained skeptical after two diff-scoped review rounds
+  ("I am still skeptical... deep review") and explicitly wanted the whole
+  system read end-to-end, not just recently-changed lines. 7 parallel agents
+  each read a full subsystem (live_trading_engine.py in three passes covering
+  single-leg exit/persistence, spread/condor exit, and risk/capital helpers;
+  order_manager/risk_manager/paper_broker/zerodha broker; the market data
+  pipeline; all five strategies; api/main.py's lifespan+scheduling). Every
+  finding verified against the actual code before fixing, not trusted from
+  the agent report alone. 18 findings reported, all fixed (user chose "fix
+  everything").
+  - **Critical — 3 exit paths never checked order_status before treating a
+    SELL as closed**: `_close_option_positions` (reversal exit),
+    `_square_off_all` (mandatory EOD close), and `_exit_all_options_for`
+    (EXIT-signal close) all placed a broker order and then unconditionally
+    journaled it as closed and released capital — unlike the sibling
+    `_execute_single_leg_exit`, which already checked. A rejected/failed
+    broker order would fabricate a closed position while the real position
+    stayed open, untracked, for the rest of the day (or overnight, for
+    square-off). Fixed: all three now check `order_status` and leave the
+    position tracked for retry on rejection, matching the established
+    pattern.
+  - **Critical — daily-loss kill switch never actually saw realized P&L**:
+    `_refresh_risk_state` summed `positions[i]['realized_pnl']`/
+    `['unrealized_pnl']` — keys neither broker ever populates (Zerodha's real
+    fields are `realised`/`unrealised`/`pnl`; PaperBroker's positions only
+    carry symbol/quantity/avg_price) — so `daily_realized_pnl` was silently
+    always 0.0 in both modes, regardless of real losses. The one fallback
+    that gave unrealized P&L any value only summed `_active_spreads`/
+    `_active_condors`, so open single-leg positions contributed nothing
+    either. Fixed: realized P&L now comes from `trade_journal` (correct in
+    both modes, same pattern `send_daily_report()` already used); unrealized
+    P&L is computed from the real broker position list (covers every open
+    leg, single- and multi-leg alike).
+  - **Critical — `expire_stale_orders()` could place a genuine duplicate
+    order**: discarded `cancel_order()`'s return value entirely. If an order
+    had actually already filled at the broker in the window since the last
+    periodic sync (up to ~1 minute), `cancel_order()` correctly returned
+    `False` — but that was never checked, so the order got marked `EXPIRED`
+    and retried anyway. Fixed: syncs against the broker's real status first,
+    and on a failed cancel, re-syncs and trusts the real terminal status
+    instead of assuming "stale, safe to retry."
+  - **Critical — multi-leg exit retry resent orders for already-closed
+    legs**: on a partial rejection (one leg's closing order fills, the
+    sibling is rejected), the code correctly kept the position tracked for
+    retry — but the *next* retry cycle resent orders for *all* legs,
+    including the one that already closed and is now flat, opening an
+    accidental new position on it (up to 3 accidental positions for a
+    4-leg iron condor). Fixed: `_close_leg()` remembers each leg that
+    already closed (this cycle or a previous partial attempt) and never
+    resubmits an order for it; only re-fetches broker positions to detect
+    "already flat" when the fetch is known-good (an empty/failed fetch
+    must not be misread as "everything's already closed").
+  - **Critical — NaN/None `atr14` bypassed the low-volatility gate**:
+    `credit_spread.py`/`iron_condor.py`'s `generate_signal()` excluded
+    `atr14` from the missing-data guard. `NaN >= threshold` is `False` in
+    Python, so a NaN ATR (possible with insufficient bar history in the
+    upstream EWM calc) fell through into the directional/condor branch with
+    genuinely unknown volatility instead of returning `HOLD`. Fixed: both
+    now treat `None`/NaN `atr14` as missing data.
+  - **Critical — `StrategyMonitor`'s recovery log could crash and silently
+    block all new entries**: `_profit_factor()` legitimately returns `None`
+    whenever the rolling window has zero losing trades — but the "now
+    healthy" log line formatted it with `:.3f` unconditionally, raising an
+    uncaught `TypeError`. `evaluate_all()` had no per-strategy isolation and
+    is called directly from `run_signal_cycle()` with no try/except, so this
+    would abort the rest of that entire cycle (regime detection + all
+    entry-signal generation) and repeat every cycle for as long as the
+    zero-losers condition persisted. Fixed: both the format crash and the
+    missing isolation.
+  - High/medium, also fixed: `ZerodhaBroker.place_order()`'s bare `@retry`
+    had no idempotency check (a lost response after Zerodha already accepted
+    the order would place a genuine duplicate) — replaced with a manual
+    retry loop that tags each order with the internal DB order id and checks
+    for an existing order by tag before resubmitting; paper-mode margin
+    check used the static `INITIAL_CAPITAL` instead of the broker's live
+    balance; spread/condor exit DTE was computed from the global near-month
+    expiry instead of each position's own stored (possibly next-month)
+    expiry, risking a weeks-early force-close; new spread/condor entries
+    mutated `_active_spreads`/`_active_condors` without the lock the 10s
+    exit job iterates them under, risking a "dict changed size during
+    iteration" abort; `RSRanker`'s per-symbol scoring loop had no exception
+    isolation (unlike `LTPPoller`'s) and its published keys had no TTL;
+    `TRADING_MODE=LIVE` silently falling back to `PaperBroker` on a missing
+    token only logged, never alerted; `_peak_premiums` (the trailing-stop/
+    breakeven-stop high-water mark) was never persisted across restarts;
+    orphaned single-leg positions restored from a previous day were silently
+    dropped instead of force-closed (with a best-effort `trade_journal`
+    match for genuinely-orphaned live-mode positions that predate this fix).
+  - 15 new tests, 1 existing `verify_invariants.py` check updated for the
+    `_close_leg()` refactor. 390 tests passing. Deployed and verified live
+    (30/30 static+runtime invariant checks pass; API/DB/Redis healthy,
+    RSRanker's first post-deploy cycle ran clean).
 
 ---
 
-*Last updated: 2026-08-20, after the second review round's fixes.*
+*Last updated: 2026-08-20, after the full-system deep review round's fixes.*
