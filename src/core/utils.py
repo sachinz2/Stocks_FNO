@@ -459,3 +459,16 @@ def pct_change(old: float, new: float) -> float:
 
 def round2(value: float) -> float:
     return round(value, 2)
+
+
+def broker_order_tag(client_order_id: str) -> str:
+    """
+    Shared tag format for matching a broker order back to the internal DB
+    order that requested it -- used both when placing an order
+    (ZerodhaBroker.place_order() attaches this as the order's `tag`) and
+    when reconciling one afterward (OrderManager's retry-after-lost-response
+    and timeout-reconciliation paths search broker.get_orders() for it).
+    Kept in one place so the two call sites can't drift out of sync with
+    each other. Kite Connect caps tags at 20 characters.
+    """
+    return f"ft{client_order_id}"[:20]

@@ -174,7 +174,8 @@ class ZerodhaBroker(AbstractBroker):
         # `tag` and later search orders() for it -- so on any retry (attempt
         # > 0) we check for an order already carrying this attempt's tag
         # before resubmitting, and reuse it instead of placing a duplicate.
-        tag = f"ft{client_order_id}"[:20] if client_order_id else None
+        from src.core.utils import broker_order_tag
+        tag = broker_order_tag(client_order_id) if client_order_id else None
         if tag:
             kwargs["tag"] = tag
 

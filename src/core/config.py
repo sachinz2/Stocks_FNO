@@ -86,3 +86,37 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
+
+# Known-insecure fallback values baked into the class defaults above -- fine
+# for local dev (no .env present at all), dangerous if they're still active
+# in a real deployment. Checked by validate_production_secrets() at startup
+# rather than here at import time, so importing this module (e.g. in tests,
+# scripts, or a dev shell) never has the side effect of raising.
+_INSECURE_DEFAULTS = {
+    "DB_PASSWORD":        "password123",
+    "JWT_SECRET":          "change-me-in-production",
+    "DASHBOARD_PASSWORD":  "falcon123",
+}
+
+
+def validate_production_secrets(s: Settings = settings) -> None:
+    """
+    Fail fast at startup if ENV=production and any credential is still the
+    known-insecure hardcoded default (external review, 2026-08-20 -- found
+    DB_PASSWORD literally still "password123" on the live server, sitting
+    in a public GitHub repo as this class's own fallback value). A
+    misconfigured or incomplete .env should refuse to boot in production
+    rather than silently run with a publicly-known credential.
+    """
+    if s.ENV != "production":
+        return
+    still_default = [
+        name for name, default_value in _INSECURE_DEFAULTS.items()
+        if getattr(s, name) == default_value
+    ]
+    if still_default:
+        raise RuntimeError(
+            f"FATAL: ENV=production but these settings are still their known-"
+            f"insecure hardcoded defaults: {', '.join(still_default)}. Set real "
+            f"values in .env before starting in production."
+        )

@@ -1821,26 +1821,58 @@ class LiveTradingEngine:
         # which is the correct gate for "buy calls on strength," but it has no
         # symmetric "weakest stocks" ranking that would justify gating SELL
         # (put-buying) entries the same way, so SELL is intentionally left
-        # ungated here. Fails open (allows the trade) whenever ranks aren't
-        # available yet (e.g. first few minutes after market open, before
-        # RSRanker's first cycle has completed) rather than blocking on an
-        # empty/placeholder list.
+        # ungated here.
+        #
+        # Fixed 2026-08-20 (external review): used to fail OPEN (allow the
+        # trade) whenever ranks weren't available -- both on a genuine
+        # exception and, every single morning, for the first few minutes
+        # after market open before RSRanker's first cycle completes. Since
+        # RS is an explicitly-chosen entry filter (not a refinement of an
+        # already-validated decision), that's inconsistent with this
+        # codebase's fail-closed convention for entry-blocking data (lot
+        # size, contract resolution, margin, RVOL validity all already fail
+        # closed) -- now blocks the BUY entry instead of silently skipping
+        # the filter. Trade-off: BUY entries for both strategies are delayed
+        # by however long RSRanker's first cycle takes each morning, same as
+        # the existing RVOL-unavailable behavior already accepts.
         if signal_str == "BUY" and self.rs_ranker:
             try:
                 _rs_ranks = await self.rs_ranker.get_ranks()
-            except Exception:
-                _rs_ranks = []
-            if _rs_ranks:
-                _rs_top_syms = {e["symbol"] for e in _rs_ranks[:10]}
-                if symbol not in _rs_top_syms:
-                    logger.info(
-                        f"[{strategy.name}] {symbol} skipped — not in RS top-10 "
-                        "vs NIFTY (relative strength too weak for a long entry)"
-                    )
-                    return
+            except Exception as _rs_exc:
+                logger.info(
+                    f"[{strategy.name}] {symbol} skipped — RS ranks unavailable "
+                    f"({_rs_exc}), failing closed on this entry filter."
+                )
+                return
+            if not _rs_ranks:
+                logger.info(
+                    f"[{strategy.name}] {symbol} skipped — RS ranks not published "
+                    "yet (RSRanker hasn't completed its first cycle), failing "
+                    "closed on this entry filter."
+                )
+                return
+            _rs_top_syms = {e["symbol"] for e in _rs_ranks[:10]}
+            if symbol not in _rs_top_syms:
+                logger.info(
+                    f"[{strategy.name}] {symbol} skipped — not in RS top-10 "
+                    "vs NIFTY (relative strength too weak for a long entry)"
+                )
+                return
 
         # Multi-timeframe confirmation — 15-min EMA direction must agree with 5-min signal.
         # A 5-min crossover against the 15-min trend is counter-trend and fails more often.
+        #
+        # Fixed 2026-08-20 (external review): used to fail OPEN (proceed
+        # without the filter) on ANY exception -- Redis error, malformed
+        # cache entry, JSON parse failure. Same fail-closed reasoning as the
+        # RS filter above: this is an explicitly-chosen confirmation gate,
+        # not a re-validated estimate, so "can't confirm" should block the
+        # entry, not silently skip the check. A missing/not-yet-populated
+        # tick15 cache (e.g. right after market open) is not an exception --
+        # `if _raw15:` already handles that case by simply not entering the
+        # inner block, which correctly proceeds without the filter (there's
+        # nothing to contradict yet); only genuine failures to read/parse
+        # data that IS present now block the entry.
         _redis_mtf = getattr(self, "_redis", None)
         if _redis_mtf:
             try:
@@ -1859,8 +1891,12 @@ class LiveTradingEngine:
                                 f"contradicts 5-min signal ({signal_str})"
                             )
                             return
-            except Exception:
-                pass  # MTF data unavailable — proceed without filter
+            except Exception as _mtf_exc:
+                logger.info(
+                    f"[{strategy.name}] {symbol} skipped — 15-min MTF data "
+                    f"unreadable ({_mtf_exc}), failing closed on this entry filter."
+                )
+                return
 
         lot_size = await self._get_lot_size(symbol)
         if not lot_size:

@@ -35,9 +35,15 @@ async def lifespan(app: FastAPI):
     from apscheduler.triggers.interval import IntervalTrigger
     from apscheduler.triggers.cron import CronTrigger
 
-    from src.core.config import settings
+    from src.core.config import settings, validate_production_secrets
     from src.core.constants import FNO_SYMBOLS
     from src.core.enums import TradingMode
+
+    # Fixed 2026-08-20 (external review): refuse to boot in production with
+    # a known-insecure default credential still active -- see
+    # validate_production_secrets()'s docstring for the live incident this
+    # closes (DB_PASSWORD found still "password123" in production).
+    validate_production_secrets(settings)
     from src.core.scheduler import (
         get_scheduler,
         schedule_trading_jobs,

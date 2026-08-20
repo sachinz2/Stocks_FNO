@@ -121,10 +121,20 @@ class EMACrossoverStrategy(StrategyBase):
         elif current_dir == self._pending_signal.get(symbol):
             # Still in the same pending direction as last time we saw it —
             # keep counting distinct confirming bars.
-            if bar_key is None or bar_key != self._pending_bar_key.get(symbol):
+            #
+            # Fixed 2026-08-20 (external review): bar_key is None whenever
+            # ltp_poller can't identify the current 5-min bar (no live tick
+            # data yet, or a malformed OHLC cache missing "date") -- the old
+            # `bar_key is None or ...` condition treated EVERY such cycle as
+            # a "new bar," so signal_confirm_bars could complete in a couple
+            # of 60s engine cycles instead of 2 genuinely distinct candles.
+            # A missing bar_key now simply can't advance the count -- same
+            # bar or unknown bar, don't double-count either way. Same fix as
+            # momentum.py's identical pattern.
+            if bar_key is not None and bar_key != self._pending_bar_key.get(symbol):
                 self._pending_count[symbol] = self._pending_count.get(symbol, 0) + 1
                 self._pending_bar_key[symbol] = bar_key
-            # else: same bar as last cycle — don't double-count
+            # else: same bar as last cycle (or bar unknown) — don't double-count
         else:
             # Direction differs from whatever was pending (or nothing was
             # pending) — only start a fresh pending count if this is a

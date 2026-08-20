@@ -130,11 +130,20 @@ class MomentumStrategy(StrategyBase):
                 self._pending_signal[symbol] = raw
                 self._pending_count[symbol] = 1
                 self._pending_bar_key[symbol] = bar_key
-            elif bar_key is None or bar_key != self._pending_bar_key.get(symbol):
-                # Same direction AND we're on a new 5-min bar
+            elif bar_key is not None and bar_key != self._pending_bar_key.get(symbol):
+                # Same direction AND we're on a genuinely new, identifiable 5-min bar
                 self._pending_count[symbol] = self._pending_count.get(symbol, 0) + 1
                 self._pending_bar_key[symbol] = bar_key
-            # else: same bar as last cycle — don't double-count
+            # Fixed 2026-08-20 (external review): bar_key is None whenever
+            # ltp_poller can't identify the current 5-min bar (no live tick
+            # data yet, or a malformed OHLC cache missing "date") -- the old
+            # `bar_key is None or ...` condition treated EVERY such cycle as
+            # a "new bar," so signal_confirm_bars could complete in a couple
+            # of 60s engine cycles instead of 2 genuinely distinct candles,
+            # defeating the point of the confirmation debounce. A missing
+            # bar_key now simply can't advance the count (falls through to
+            # neither branch above) -- same bar or unknown bar, don't
+            # double-count either way.
 
             if self._pending_count.get(symbol, 0) >= self.signal_confirm_bars:
                 logger.info(

@@ -266,6 +266,31 @@ class OrderManager:
             return db_order
         except asyncio.TimeoutError:
             logger.error(f"Broker order timed out after {BROKER_TIMEOUT_SEC}s: {side} {quantity} {symbol}")
+            # Fixed 2026-08-20 (external review): a client-side timeout does
+            # NOT mean the broker never processed the order -- the
+            # underlying kite.place_order() call runs in a worker thread
+            # (see ZerodhaBroker.place_order()) that asyncio.wait_for's
+            # cancellation cannot actually stop; it can keep running and
+            # succeed seconds after we've already given up waiting.
+            # Immediately marking FAILED risked the exact same "broker
+            # accepted it, we think it didn't" split already fixed this
+            # session for the post-success DB-write-failure case. Reconcile
+            # against the broker's real order list (matched by the same tag
+            # place_order() attached) before deciding.
+            reconciled_id = await self._reconcile_after_timeout(db_order.id)
+            if reconciled_id:
+                db_order = await self.order_repo.update(db_order, {
+                    "broker_order_id": reconciled_id, "order_status": "OPEN",
+                })
+                await self._audit("ORDER_TIMEOUT_RECONCILED", {
+                    "order_id": db_order.id, "broker_order_id": reconciled_id,
+                })
+                logger.warning(
+                    f"Order {db_order.id} timed out client-side but WAS found "
+                    f"live at the broker (id={reconciled_id}) -- corrected to "
+                    f"OPEN, not FAILED."
+                )
+                return db_order
             db_order = await self.order_repo.update(db_order, {"order_status": "FAILED"})
             await self._audit("ORDER_TIMEOUT", {"order_id": db_order.id, "symbol": symbol})
             return db_order
@@ -274,6 +299,28 @@ class OrderManager:
             db_order = await self.order_repo.update(db_order, {"order_status": "FAILED"})
             await self._audit("ORDER_FAILED", {"order_id": db_order.id, "error": str(e)})
             return db_order
+
+    async def _reconcile_after_timeout(self, internal_order_id: int) -> Optional[str]:
+        """
+        After a client-side place_order() timeout, check whether the broker
+        actually processed the order anyway -- see the 2026-08-20 fix note
+        in place_order()'s TimeoutError handler above. Matches by the same
+        tag ZerodhaBroker.place_order() attaches (broker_order_tag()).
+        PaperBroker orders never legitimately time out (synchronous,
+        instant) and don't support tags, so this safely finds nothing for
+        it -- effectively a Zerodha-only path.
+        """
+        from src.core.utils import broker_order_tag
+        tag = broker_order_tag(str(internal_order_id))
+        try:
+            broker_orders = await asyncio.wait_for(self.broker.get_orders(), timeout=BROKER_TIMEOUT_SEC)
+        except Exception as e:
+            logger.error(f"Timeout reconciliation: get_orders() failed for order {internal_order_id}: {e}")
+            return None
+        for o in broker_orders:
+            if o.get("tag") == tag and o.get("status") not in ("REJECTED", "CANCELLED"):
+                return str(o.get("order_id"))
+        return None
 
     # ── Stale order expiry ────────────────────────────────────────────────────
 
