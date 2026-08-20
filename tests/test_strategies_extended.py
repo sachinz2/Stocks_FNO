@@ -193,11 +193,14 @@ def test_momentum_weakening_stop_fires_once_trend_no_longer_reconfirms():
     mom = MomentumStrategy("mom_test", {})
     mom.initialize()
     assert mom.weakening_stop_loss_pct == 0.25
-
-    # ADX=30 is below the 35 entry threshold (no longer reconfirming) but
-    # above the 22 exhaustion threshold -- the TATASTEEL dead zone. A 25%+
-    # loss here must now exit instead of riding to the full 50% hard stop.
-    pos = {"avg_price": 100.0, "peak_premium": 100.0, "current_adx": 30.0}
+    # adx_entry_threshold lowered 35 -> 25 on 2026-08-20 (external review
+    # integration, paired with the new adx_rising_required entry filter) --
+    # the weakening-stop dead zone is defined relative to this threshold, so
+    # it shifted down too. ADX=24 is below the CURRENT 25 entry threshold
+    # (no longer reconfirming) but above the 22 exhaustion threshold -- the
+    # TATASTEEL dead zone. A 25%+ loss here must now exit instead of riding
+    # to the full 50% hard stop.
+    pos = {"avg_price": 100.0, "peak_premium": 100.0, "current_adx": 24.0}
     assert mom.manage_position(pos, 74.0) == "EXIT"  # -26%
 
 
@@ -223,10 +226,13 @@ def test_momentum_weakening_stop_not_active_below_its_own_threshold():
 def test_momentum_weakening_stop_reproduces_tatasteel_dead_zone_2026_08_14():
     mom = MomentumStrategy("mom_test", {})
     mom.initialize()
-    # The actual live entry price -- ADX had fallen under 35 well before the
-    # position was down 25%, so the new stop should exit around Rs2.685
-    # (-25%) instead of riding all the way to Rs1.78 (-50.3%) like it did live.
+    # The actual live entry price -- ADX had fallen under the (then) 35
+    # entry threshold well before the position was down 25%, so the new
+    # stop should exit around Rs2.685 (-25%) instead of riding all the way
+    # to Rs1.78 (-50.3%) like it did live. adx_entry_threshold lowered
+    # 35 -> 25 on 2026-08-20 (external review integration) -- use an ADX
+    # value below the CURRENT threshold to keep testing the same mechanism.
     entry = 3.58
     weakening_exit_price = entry * (1 - mom.weakening_stop_loss_pct)
-    pos = {"avg_price": entry, "peak_premium": entry, "current_adx": 28.0}
+    pos = {"avg_price": entry, "peak_premium": entry, "current_adx": 24.0}
     assert mom.manage_position(pos, weakening_exit_price) == "EXIT"

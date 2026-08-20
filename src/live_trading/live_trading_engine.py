@@ -1459,6 +1459,11 @@ class LiveTradingEngine:
                             # is a no-op addition for anything else.
                             "current_ema_fast": market_data.get("ema20"),
                             "current_ema_slow": market_data.get("ema50"),
+                            # Added 2026-08-20 (external review integration) --
+                            # feeds MomentumStrategy's underlying-based
+                            # structural invalidation exit; unused (no-op) by
+                            # strategies that don't check it.
+                            "current_close":    market_data.get("close"),
                             "is_call":          contract.endswith("CE"),
                             "entry_regime":     owner_info.get("entry_regime"),
                         },
@@ -1788,9 +1793,17 @@ class LiveTradingEngine:
                 "(insufficient volume history; cannot confirm breakout strength)"
             )
             return
-        if _rvol < 1.3:
+        # Fixed 2026-08-20 (external review integration): strategy-overridable
+        # via rvol_entry_threshold (defaults to the original 1.3 for anything
+        # that doesn't set one, e.g. ema_crossover_v1) -- momentum_v1 raises
+        # its own bar higher (see momentum.py's rvol_entry_threshold param
+        # and its docstring for why: a bare RVOL>1.3 confirms a move is
+        # ALREADY underway, "everybody's rushing in," which is more useful as
+        # a late-entry warning than an edge).
+        _rvol_threshold = getattr(strategy, "rvol_entry_threshold", 1.3)
+        if _rvol < _rvol_threshold:
             logger.info(
-                f"[{strategy.name}] {symbol} skipped — RVOL={_rvol:.2f} < 1.3 "
+                f"[{strategy.name}] {symbol} skipped — RVOL={_rvol:.2f} < {_rvol_threshold} "
                 "(below-average volume; weak breakout confirmation)"
             )
             return
@@ -1909,7 +1922,24 @@ class LiveTradingEngine:
         atr      = float(market_data.get("atr14", underlying_price * 0.01))
         iv_rank  = await self._get_iv_rank(symbol, underlying_price, atr, dte)
         strike_interval = await self._get_strike_interval(symbol, expiry)
-        strike   = get_atm_strike(underlying_price, symbol, interval=strike_interval)
+
+        # Fixed 2026-08-20 (external review integration): strategy-overridable
+        # strike selection -- ATM by default (unchanged for ema_crossover_v1),
+        # but momentum_v1 sets entry_option_delta (~0.60) to buy slightly ITM
+        # instead. Rationale from the review: ATM options are the most
+        # sensitive to IV/theta/gamma noise relative to how much they actually
+        # track the underlying; a real intrinsic-value cushion makes the
+        # position behave more like the underlying itself, which is what a
+        # trend-continuation thesis is actually betting on.
+        _delta_target = getattr(strategy, "entry_option_delta", None)
+        if _delta_target:
+            from src.market_data.option_chain import atr_to_annualised_vol, find_delta_strike
+            _atr_sigma = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, underlying_price)
+            sigma  = await self._get_live_sigma(symbol, underlying_price, dte, strike_interval, expiry, _atr_sigma)
+            target = _delta_target if option_type == "CE" else -_delta_target
+            strike = find_delta_strike(underlying_price, target, option_type, dte, sigma, strike_interval)
+        else:
+            strike = get_atm_strike(underlying_price, symbol, interval=strike_interval)
         resolved = await self._resolve_contract(symbol, expiry, strike, option_type)
         if resolved is None:
             logger.warning(

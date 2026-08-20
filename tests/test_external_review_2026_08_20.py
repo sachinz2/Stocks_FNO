@@ -40,7 +40,16 @@ def _momentum_data(adx=40.0, ema20=105.0, ema50=100.0, bar_key=None, symbol="REL
 
 
 def test_momentum_bar_key_none_does_not_fast_track_confirmation():
-    strat = MomentumStrategy("momentum_v1", {"signal_confirm_bars": 2})
+    # Entry-quality filters added 2026-08-20 (external review integration,
+    # same day as this bar_key fix) disabled here -- this test isolates the
+    # bar_key debounce mechanism specifically, not the newer filters (which
+    # fail closed on insufficient ADX/EMA history and would otherwise reject
+    # every candidate before the debounce logic is ever reached).
+    strat = MomentumStrategy("momentum_v1", {
+        "signal_confirm_bars": 2,
+        "adx_rising_required": False, "ema_slope_required": False,
+        "extension_atr_mult": 0, "vwap_extension_pct": 0,
+    })
     strat.initialize()
 
     # First call establishes pending state (count=1) regardless of bar_key.
