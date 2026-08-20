@@ -672,7 +672,54 @@ Kept short — see git log / individual commit messages for full detail.
   - 6 new regression tests. 396 tests passing. Deployed and verified live
     (30/30 static+runtime invariant checks pass; API/DB/Redis healthy, no
     errors in post-deploy logs).
+- **Defense-in-depth round (2026-08-20), same day, closing the 4 items the
+  component audit explicitly flagged as "open, not fixed, deliberately
+  deferred as lower priority — gaps, not active bugs."** User asked to close
+  them rather than leave them open.
+  1. **Scheduler dead-man's-switch.** Every existing self-heal job (kite
+     self-heal, weekly universe refresh) is itself a scheduled APScheduler
+     job — if the scheduler or the whole asyncio event loop wedges entirely,
+     none of them can fire to detect or fix it either; a hung event loop
+     can't run more async code to report that it's hung. Added a genuinely
+     independent OS thread (not an asyncio task) that keeps running via
+     normal Python thread scheduling even while the event loop is blocked,
+     checking a heartbeat written by a lightweight dedicated 30s job. A
+     stale heartbeat (150s, 5x margin) forces a full process exit —
+     docker-compose's `restart: unless-stopped` brings up a fresh one, same
+     philosophy already proven for the Kite WebSocket tick-staleness
+     watchdog.
+  2. **Strategy "stopped signaling" self-check.** Tracks, per strategy, the
+     date it last produced a real (non-HOLD) signal — independent of
+     whether any resulting order succeeds, and independent of the per-
+     symbol `try/except` in `run_signal_cycle` that would otherwise swallow
+     this the exact same way it swallowed the 2026-07-27..07-29 DTE-window
+     bug (3 full trading days of silent zero signals, found only when a
+     human happened to notice). Alerts once daily (from `send_daily_report`)
+     if an active strategy goes 3+ calendar days without one; a brand-new
+     or never-yet-observed strategy gets today as its baseline instead of
+     being skipped forever, so "zero signals since deployment" is caught
+     too, not just "went quiet later." Persisted across restarts, since the
+     original incident spanned several.
+  3. **Kill switch / daily-loss limit realistic sequence test.** This logic
+     was previously only ever unit-tested per function in isolation. Added
+     an integration test against the REAL `RiskManager` + `OrderManager`
+     (not simulated): two entries succeed, a realized loss trips the 5%
+     daily-loss limit mid-sequence, a third entry attempt is correctly
+     `REJECTED_BY_RISK` while an exit for an existing position still goes
+     through (kill switch/daily-loss bypass exits by design), and deployed-
+     capital tracking stays consistent released across the whole sequence.
+  4. **Zerodha broker calls no longer block the event loop.** `kiteconnect`
+     is a synchronous SDK — `place_order`/`cancel_order`/`modify_order`/
+     `get_positions`/`get_orders` all called `self.kite.*` directly on the
+     single-threaded asyncio loop, freezing every other coroutine (price
+     feed, other orders, FastAPI requests) for the full HTTP round-trip;
+     worse for `cancel_order`/`modify_order`, whose `@retry` backoff sleeps
+     with blocking `time.sleep()` between attempts (up to ~1+2s across 3
+     tries). Offloaded every one via `asyncio.to_thread()`.
+  - 11 new regression tests. 407 tests passing. Deployed and verified live
+    (30/30 static+runtime invariant checks pass; API/DB/Redis healthy, no
+    errors in post-deploy logs).
 
 ---
 
-*Last updated: 2026-08-20, after the component-level health audit's fixes.*
+*Last updated: 2026-08-20, after the defense-in-depth round's fixes.*
