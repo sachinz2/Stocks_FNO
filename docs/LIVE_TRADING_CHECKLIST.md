@@ -36,6 +36,13 @@ artifact.
 - [ ] Compare paper fills vs a spot-check of real quotes for a few trades —
       confirm PaperBroker's slippage model is realistic, not systematically
       generous or harsh vs what Zerodha would actually fill.
+- [ ] Re-baseline the "2-3 more weeks" clock from 2026-08-20, not 2026-08-13
+      — found live 2026-08-20: `ema_crossover_v1`/`momentum_v1` placed ZERO
+      orders 2026-08-17..08-20 (and, traced back, 2026-07-25..08-05) due to a
+      `max_dte` bug fixed this same day (see "Already done"). The existing
+      22-closed-trade paper track record under-samples these two strategies
+      by roughly one dead week per month; give it a few full cycles on the
+      fixed code before trusting the win rate.
 
 ## A2. Risk & capital configuration — sized for the REAL account
 
@@ -103,7 +110,7 @@ Current `.env`: `INITIAL_CAPITAL=300000.0`, `MAX_OPEN_POSITIONS=5`,
 
 ## A5. Testing & CI safety net
 
-- [ ] Full test suite green (currently 302 passing) immediately before flip.
+- [ ] Full test suite green (currently 307 passing) immediately before flip.
 - [ ] `deploy.sh`'s invariant-check step (`verify_invariants.py`, currently
       18 static + 4 runtime checks) wired into the actual deploy path used
       for the live-mode cutover, not run ad hoc.
@@ -284,7 +291,23 @@ Kept short — see git log / individual commit messages for full detail.
     real-account trigger/order-parameter verification itself (A3) is still
     open, this was a documentation-accuracy fix, not a substitute for it.
   - 13 new tests added (`tests/test_prelive_external_review_2026_08_14.py`).
+- **Single-leg (`ema_crossover_v1`/`momentum_v1`) monthly DTE dead zone
+  fixed** (2026-08-20). User flagged zero trades for 3 days; traced to
+  `_process_signal`'s expiry resolution (`get_near_month_expiry()`, only
+  rolls at DTE<7 — unlike credit_spread/iron_condor's `get_entry_expiry()`,
+  which was fixed for exactly this reason on 2026-08-13 but never wired into
+  the single-leg path). Right after a monthly roll the fresh contract's DTE
+  can be as high as 41, above the old `max_dte=25` — blocking every entry
+  for ~1-2 weeks each month. Confirmed via order history this happened twice
+  already (2026-07-25..08-05, 2026-08-17..08-20), not a regression from any
+  change made this session — the code path dates to 2026-06-18. Separately
+  confirmed `credit_spread_v1`/`iron_condor_v1` were independently idle over
+  the same window purely because VIX sat below the 12.0 premium-selling
+  floor — that part is working as designed, not a bug. Fix: raised
+  `max_dte` from 25 to 42 (covers the real worst case of 41, verified by
+  walking every month's expiry-to-expiry gap on the actual NSE calendar
+  function). 5 new tests, 1 new `verify_invariants.py` static check.
 
 ---
 
-*Last updated: 2026-08-14, after the external-review pre-live fixes above.*
+*Last updated: 2026-08-20, after the single-leg DTE dead-zone fix.*

@@ -76,7 +76,13 @@ class MomentumStrategy(StrategyBase):
         # spread can transiently spike without the trend actually continuing.
         self.signal_confirm_bars: int = self.parameters.get("signal_confirm_bars", 2)
         self.min_dte: int = self.parameters.get("min_dte", 10)
-        self.max_dte: int = self.parameters.get("max_dte", 25)
+        # Fixed 2026-08-20: 25 left a structural monthly dead zone -- see
+        # EMACrossoverStrategy.initialize()'s matching comment for the full
+        # explanation (both strategies share the same _process_signal entry
+        # path and get_near_month_expiry()-based expiry resolution). Confirmed
+        # live: zero momentum_v1/ema_crossover_v1 orders 2026-07-25..08-05 and
+        # again 2026-08-17..08-20, both immediately after a monthly roll.
+        self.max_dte: int = self.parameters.get("max_dte", 42)
 
         # Keyed by symbol — this single strategy instance evaluates every symbol
         # in its rotating top-5 pool each cycle, so flat scalars would let one

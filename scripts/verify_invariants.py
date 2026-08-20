@@ -364,6 +364,25 @@ def check_margin_and_broker_position_failures_fail_closed(repo: Path) -> Result:
     return PASS, name, "Margin API errors and broker-position-fetch failures both block new entries instead of assuming a safe default."
 
 
+def check_single_leg_dte_window_covers_post_roll_dte(repo: Path) -> Result:
+    name = "ema_crossover_v1/momentum_v1 max_dte covers the DTE right after a monthly roll"
+    ema_src = _read(repo, "src/strategies/ema_crossover.py")
+    mom_src = _read(repo, "src/strategies/momentum.py")
+    # Fixed 2026-08-20: max_dte=25 left a structural monthly dead zone --
+    # get_near_month_expiry() only rolls at DTE<7, so a freshly-rolled
+    # contract can be up to DTE=41, well above the old max_dte=25. Confirmed
+    # live: zero single-leg orders 2026-07-25..08-05 and 2026-08-17..08-20.
+    for label, src in (("ema_crossover.py", ema_src), ("momentum.py", mom_src)):
+        idx = src.find('self.max_dte: int = self.parameters.get("max_dte",')
+        if idx == -1:
+            return FAIL, name, f"{label} no longer sets max_dte via self.parameters.get(...) -- can't verify its default."
+        window = src[idx:idx + 60]
+        m = re.search(r'"max_dte",\s*(\d+)\)', window)
+        if not m or int(m.group(1)) < 41:
+            return FAIL, name, f"{label}'s max_dte default is below 41 -- reintroduces the monthly post-roll dead zone that blocked all single-leg entries 2026-08-17..08-20."
+    return PASS, name, "Both single-leg strategies' max_dte covers the worst-case post-roll DTE (41)."
+
+
 STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_exit_classification_by_pnl,
     check_capital_allocation_keys,
@@ -384,6 +403,7 @@ STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_stale_option_price_resolved,
     check_auth_self_heal_actively_retries,
     check_margin_and_broker_position_failures_fail_closed,
+    check_single_leg_dte_window_covers_post_roll_dte,
 ]
 
 
