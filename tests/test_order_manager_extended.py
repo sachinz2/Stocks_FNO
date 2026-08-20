@@ -61,7 +61,7 @@ class _FakeBroker:
         self.cancelled = []
 
     async def place_order(self, symbol, side, qty, price, is_exit_order=False,
-                           strategy_name=None, product_override=None):
+                           strategy_name=None, product_override=None, client_order_id=None):
         oid = f"bo-{len(self.placed) + 1}"
         self.placed.append((symbol, side, qty, price))
         return oid
@@ -257,7 +257,7 @@ class _SynchronousFillBroker:
         self._orders = {}
 
     async def place_order(self, symbol, side, quantity, price, is_exit_order=False,
-                           strategy_name=None, product_override=None):
+                           strategy_name=None, product_override=None, client_order_id=None):
         order_id = "paper-order-1"
         self._orders[order_id] = {
             "order_id": order_id, "symbol": symbol, "side": side,
@@ -304,7 +304,7 @@ async def test_place_order_falls_back_gracefully_when_fill_unavailable():
     # sync_orders() picks it up later, same as before this fix.
     class _PendingBroker:
         async def place_order(self, symbol, side, quantity, price, is_exit_order=False,
-                               strategy_name=None, product_override=None):
+                               strategy_name=None, product_override=None, client_order_id=None):
             return "broker-order-pending"
         async def get_orders(self):
             return [{"order_id": "broker-order-pending", "status": "OPEN"}]  # no fill_price yet

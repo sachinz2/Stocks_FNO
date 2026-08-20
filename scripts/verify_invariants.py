@@ -201,10 +201,18 @@ def check_spread_condor_exit_uses_real_fill(repo: Path) -> Result:
     # that instead of the old inline pattern.
     if "def _real_fill(order, fallback: float) -> float:" not in src:
         return FAIL, name, "_real_fill() shared helper missing."
-    real_fill_hits = len(re.findall(r"self\._real_fill\(\w+,\s*cur_\w+\)", src))
-    if real_fill_hits < 6:  # 2 spread legs (short/long) + 4 condor legs
-        return FAIL, name, f"Expected 6 self._real_fill(...) exit-price reads total (2 spread + 4 condor legs), found {real_fill_hits}."
-    return PASS, name, f"Exit pricing reads real fill_price at {real_fill_hits} leg-exit sites (spread + condor) via the shared helper."
+    # Fixed 2026-08-20 (deep review): each function's per-leg place_order()
+    # calls were further consolidated into a shared _close_leg() inner
+    # helper (so a leg that already closed on a prior partial-exit attempt
+    # isn't resubmitted on retry). self._real_fill(order, quote_price) now
+    # appears once per function, inside _close_leg(); _close_leg() itself is
+    # invoked once per leg (2 for a spread, 4 for a condor).
+    if "return self._real_fill(order, quote_price), True" not in src:
+        return FAIL, name, "_close_leg() no longer reads the real fill via self._real_fill()."
+    close_leg_hits = len(re.findall(r"await _close_leg\(", src))
+    if close_leg_hits < 6:  # 2 spread legs (short/long) + 4 condor legs
+        return FAIL, name, f"Expected 6 await _close_leg(...) calls total (2 spread + 4 condor legs), found {close_leg_hits}."
+    return PASS, name, f"Exit pricing reads real fill_price via _close_leg()'s shared self._real_fill() call, invoked at {close_leg_hits} leg-exit sites (spread + condor)."
 
 
 def check_spread_condor_entry_uses_real_fill(repo: Path) -> Result:

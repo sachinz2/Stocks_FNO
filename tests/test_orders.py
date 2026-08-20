@@ -66,10 +66,13 @@ async def test_place_order_success(order_manager, mock_risk_manager, mock_broker
     )
     # 3. Broker called (is_exit_order forwarded so ZerodhaBroker can route
     # exits to a MARKET order; strategy_name/product_override forwarded so
-    # it can select MIS vs NRML -- see its place_order() for why)
+    # it can select MIS vs NRML -- see its place_order() for why;
+    # client_order_id -- added 2026-08-20 -- lets ZerodhaBroker detect and
+    # avoid resubmitting a duplicate order on a retry after a lost response)
     mock_broker.place_order.assert_called_once_with(
         "RELIANCE", "BUY", 10, 2000.0,
         is_exit_order=False, strategy_name=None, product_override=None,
+        client_order_id="1",
     )
     # 4. DB Update called to OPEN
     mock_order_repo.update.assert_called_once()

@@ -139,12 +139,20 @@ def test_check_open_option_exits_wraps_per_position_body_in_try_except():
 # existing spread/condor position.
 
 def test_spread_and_condor_exit_legs_all_carry_is_exit_order():
+    # Fixed 2026-08-20 (deep review): each function's per-leg place_order()
+    # calls were consolidated into a shared _close_leg() inner helper (so a
+    # leg that already closed on a prior partial-exit attempt isn't
+    # resubmitted on retry -- see _close_leg()'s own docstring/comment).
+    # is_spread_leg=True/is_exit_order=True now appear once each, on the
+    # single place_order() call inside _close_leg(), but _close_leg() itself
+    # is invoked once per leg (2 for a spread, 4 for a condor).
     spread_src = inspect.getsource(LiveTradingEngine._check_spread_exits)
     condor_src = inspect.getsource(LiveTradingEngine._check_condor_exits)
 
     for name, src, n_legs in [("_check_spread_exits", spread_src, 2), ("_check_condor_exits", condor_src, 4)]:
-        assert src.count("is_spread_leg=True") >= n_legs, name
-        assert src.count("is_exit_order=True") >= n_legs, name
+        assert "is_spread_leg=True" in src, name
+        assert "is_exit_order=True" in src, name
+        assert src.count("await _close_leg(") >= n_legs, name
 
 
 def test_kill_switch_blocks_spread_leg_alone_but_not_with_exit_order():
@@ -501,6 +509,7 @@ async def test_single_leg_exit_handles_decimal_fill_price_without_crashing():
 class _FakeSquareOffOrder:
     def __init__(self, fill_price):
         self.fill_price = fill_price
+        self.order_status = "OPEN"
 
 
 class _FakeSquareOffOrderManager:
@@ -801,6 +810,7 @@ async def test_expiry_journal_close_failure_alerts_and_still_clears_the_entry():
 class _FakeExitAllOrder:
     def __init__(self, fill_price):
         self.fill_price = fill_price
+        self.order_status = "OPEN"
 
 
 class _FakeExitAllOrderManager:
@@ -1103,6 +1113,17 @@ class _FakeSpreadExitEngine:
     async def _cancel_gtt(self, gtt_id, contract=""):
         pass
 
+    async def _safe_get_positions(self):
+        # Both legs still genuinely open at the broker -- 2026-08-20 fix's
+        # "already flat, skip re-submitting" shortcut in _close_leg() must
+        # NOT trigger here, so the order actually gets placed and its real
+        # fill (not the quote) is what the test verifies.
+        self._broker_position_state_known = True
+        return [
+            {"symbol": "TITAN26SEP4650PE", "quantity": -175, "avg_price": 82.0},
+            {"symbol": "TITAN26SEP4400PE", "quantity": 175,  "avg_price": 13.0},
+        ]
+
 
 @pytest.mark.asyncio
 async def test_spread_exit_pnl_uses_real_fill_not_quote():
@@ -1214,6 +1235,17 @@ class _FakeCondorExitEngine:
 
     async def _cancel_gtt(self, gtt_id, contract=""):
         pass
+
+    async def _safe_get_positions(self):
+        # All 4 legs still genuinely open at the broker -- see the matching
+        # comment on _FakeSpreadExitEngine._safe_get_positions().
+        self._broker_position_state_known = True
+        return [
+            {"symbol": "SBIN26SEP4400PE", "quantity": -175, "avg_price": 20.0},
+            {"symbol": "SBIN26SEP4300PE", "quantity": 175,  "avg_price": 8.0},
+            {"symbol": "SBIN26SEP4900CE", "quantity": -175, "avg_price": 18.0},
+            {"symbol": "SBIN26SEP5000CE", "quantity": 175,  "avg_price": 7.0},
+        ]
 
 
 @pytest.mark.asyncio

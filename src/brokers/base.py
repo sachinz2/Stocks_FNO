@@ -6,9 +6,16 @@ class AbstractBroker(ABC):
     def place_order(
         self, symbol: str, side: str, quantity: int, price: float,
         is_exit_order: bool = False, strategy_name: Optional[str] = None,
-        product_override: Optional[str] = None,
+        product_override: Optional[str] = None, client_order_id: Optional[str] = None,
     ):
         """
+        client_order_id: added 2026-08-20. A stable identifier (the internal
+        DB order's id) callers pass so a broker implementation can detect and
+        avoid resubmitting a duplicate order when a retry follows a lost/
+        timed-out response to an order the broker actually already accepted.
+        PaperBroker ignores it (each call is a fresh, synchronous, in-memory
+        fill with no network to lose a response over).
+
         is_exit_order: added 2026-08-07. Real (ZerodhaBroker) exits use a
         MARKET order regardless of `price` -- a LIMIT exit order can sit
         unfilled if the market moves away, but every exit path in

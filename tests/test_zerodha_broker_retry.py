@@ -99,17 +99,19 @@ async def test_place_order_retries_transient_network_failures():
 
 @pytest.mark.asyncio
 async def test_place_order_raises_after_exhausting_retries():
-    # place_order's @retry has no reraise=True, so tenacity wraps the final
-    # failure in its own RetryError rather than re-raising NetworkException
-    # directly -- fine in practice, since OrderManager.place_order()'s
-    # caller-side `except Exception` (order_manager.py) catches either form
-    # the same way and marks the order FAILED. Confirmed here rather than
-    # assumed.
-    import tenacity
+    # Fixed 2026-08-20 (deep review): place_order() no longer uses a bare
+    # @retry on the whole method -- a lost response after Zerodha had
+    # already accepted the order caused a genuine duplicate live order (no
+    # idempotency check). Replaced with a manual retry loop that checks for
+    # an existing order by tag before resubmitting. It now re-raises the
+    # real underlying exception directly (not wrapped in tenacity.RetryError)
+    # after exhausting attempts -- OrderManager.place_order()'s caller-side
+    # `except Exception` catches this the same way either way.
     broker = _bare_broker()
+    broker.kite.orders.return_value = []  # no tag-matched order found on any retry check
     broker.kite.place_order.side_effect = kite_exc.NetworkException("permanent failure")
 
-    with pytest.raises(tenacity.RetryError):
+    with pytest.raises(kite_exc.NetworkException):
         await broker.place_order("SBIN", "BUY", 100, 500.0)
 
     assert broker.kite.place_order.call_count == 3, "stop_after_attempt(3)"

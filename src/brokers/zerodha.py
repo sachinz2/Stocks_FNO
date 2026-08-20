@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import Dict, Any, List, Optional
 from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
@@ -104,15 +105,26 @@ class ZerodhaBroker(AbstractBroker):
             return self.kite.PRODUCT_MIS
         return self.kite.PRODUCT_NRML
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type(_RETRYABLE_KITE_EXC),
-    )
+    async def _find_order_by_tag(self, tag: str) -> Optional[str]:
+        """
+        Look up today's orders for one already carrying `tag` and still live
+        (not REJECTED/CANCELLED) -- used by place_order()'s retry path to
+        detect "the previous attempt actually reached the broker, only the
+        response was lost" instead of blindly resubmitting.
+        """
+        try:
+            orders = self.kite.orders()
+            for o in orders:
+                if o.get("tag") == tag and o.get("status") not in ("REJECTED", "CANCELLED"):
+                    return o.get("order_id")
+        except Exception as e:
+            logger.error(f"Zerodha: failed to check for existing order by tag={tag}: {e}")
+        return None
+
     async def place_order(
         self, symbol: str, side: str, quantity: int, price: float,
         is_exit_order: bool = False, strategy_name: Optional[str] = None,
-        product_override: Optional[str] = None,
+        product_override: Optional[str] = None, client_order_id: Optional[str] = None,
     ) -> str:
         # Fixed 2026-08-07: exits always used ORDER_TYPE_LIMIT, same as
         # entries -- but every exit path in live_trading_engine.py treats
@@ -130,28 +142,58 @@ class ZerodhaBroker(AbstractBroker):
         # matters more than price. Entries are unaffected, still LIMIT.
         order_type = self.kite.ORDER_TYPE_MARKET if is_exit_order else self.kite.ORDER_TYPE_LIMIT
         logger.info(f"Zerodha: {side} {quantity} {symbol} @ {'MARKET' if is_exit_order else price}")
-        try:
-            kwargs = dict(
-                variety=self.kite.VARIETY_REGULAR,
-                exchange=self._exchange_for(symbol),
-                tradingsymbol=symbol,
-                transaction_type=(
-                    self.kite.TRANSACTION_TYPE_BUY
-                    if side == "BUY"
-                    else self.kite.TRANSACTION_TYPE_SELL
-                ),
-                quantity=quantity,
-                product=self._product_for(symbol, strategy_name, product_override),
-                order_type=order_type,
-            )
-            if not is_exit_order:
-                kwargs["price"] = price  # MARKET orders execute at best available price, no price param
-            order_id = self.kite.place_order(**kwargs)
-            logger.info(f"Zerodha: order placed — id={order_id}")
-            return order_id
-        except Exception as e:
-            logger.error(f"Zerodha: place_order failed: {e}")
-            raise
+        kwargs = dict(
+            variety=self.kite.VARIETY_REGULAR,
+            exchange=self._exchange_for(symbol),
+            tradingsymbol=symbol,
+            transaction_type=(
+                self.kite.TRANSACTION_TYPE_BUY
+                if side == "BUY"
+                else self.kite.TRANSACTION_TYPE_SELL
+            ),
+            quantity=quantity,
+            product=self._product_for(symbol, strategy_name, product_override),
+            order_type=order_type,
+        )
+        if not is_exit_order:
+            kwargs["price"] = price  # MARKET orders execute at best available price, no price param
+
+        # Fixed 2026-08-20 (deep review): this used to be a bare @retry on the
+        # whole method with no idempotency key -- if kite.place_order() itself
+        # succeeded at the exchange but the HTTP response was lost (raising
+        # NetworkException on our side), tenacity retried with the identical
+        # kwargs, placing a genuine SECOND live order. Kite Connect has no
+        # server-side dedupe, but it does let us attach a client-supplied
+        # `tag` and later search orders() for it -- so on any retry (attempt
+        # > 0) we check for an order already carrying this attempt's tag
+        # before resubmitting, and reuse it instead of placing a duplicate.
+        tag = f"ft{client_order_id}"[:20] if client_order_id else None
+        if tag:
+            kwargs["tag"] = tag
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(3):
+            if attempt > 0 and tag:
+                existing = await self._find_order_by_tag(tag)
+                if existing:
+                    logger.warning(
+                        f"Zerodha: order tag={tag} already exists at the broker "
+                        f"(id={existing}) — not resubmitting, reusing it."
+                    )
+                    return existing
+            try:
+                order_id = self.kite.place_order(**kwargs)
+                logger.info(f"Zerodha: order placed — id={order_id}")
+                return order_id
+            except _RETRYABLE_KITE_EXC as e:
+                last_exc = e
+                logger.error(f"Zerodha: place_order attempt {attempt + 1}/3 failed: {e}")
+                if attempt < 2:
+                    await asyncio.sleep(min(10, 2 ** attempt))
+            except Exception as e:
+                logger.error(f"Zerodha: place_order failed: {e}")
+                raise
+        raise last_exc
 
     # cancel_order/modify_order must never raise — OrderManager.cancel_order()
     # calls broker.cancel_order() with no try/except around it and checks the

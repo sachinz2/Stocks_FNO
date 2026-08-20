@@ -92,7 +92,18 @@ class StrategyMonitor:
         """
         active = StrategyRegistry.get_active_strategies()
         for strategy_id in list(active.keys()):
-            await self._evaluate_strategy(strategy_id)
+            # Fixed 2026-08-20 (deep review): one strategy's evaluation
+            # exception (e.g. the pf=None format-string crash fixed below)
+            # used to propagate straight out of evaluate_all() -- which is
+            # called directly from run_signal_cycle() with no try/except
+            # around it -- aborting every other strategy's evaluation AND the
+            # rest of that cycle's regime detection and entry-signal
+            # generation. Isolate per-strategy like every other per-item loop
+            # in this codebase (LTPPoller.poll(), the engine's exit loops).
+            try:
+                await self._evaluate_strategy(strategy_id)
+            except Exception as exc:
+                logger.error(f"StrategyMonitor: evaluation failed for {strategy_id}: {exc}")
 
     async def get_report(self) -> Dict[str, dict]:
         """
@@ -156,9 +167,20 @@ class StrategyMonitor:
 
         # ── All checks passed — log if previously paused ──────────────────────
         if self._pause_reasons.get(strategy_id):
+            # Fixed 2026-08-20 (deep review): pf/rolling_dd can legitimately
+            # be None here (_profit_factor() returns None whenever the
+            # rolling window has zero losing trades -- "can't compute a
+            # denominator"), but this f-string used to format them with
+            # `:.3f`/`:.0f` unconditionally, raising an uncaught TypeError
+            # that -- with no try/except around evaluate_all()'s caller at
+            # the time -- aborted the rest of that signal cycle, including
+            # all new-entry generation, and would repeat every cycle for as
+            # long as the zero-losers condition persisted.
+            pf_str = f"{pf:.3f}" if pf is not None else "N/A"
+            dd_str = f"₹{rolling_dd:.0f}" if rolling_dd is not None else "N/A"
             logger.info(
                 f"StrategyMonitor: {strategy_id} now healthy "
-                f"(PF={pf:.3f}, DD=₹{rolling_dd:.0f}). "
+                f"(PF={pf_str}, DD={dd_str}). "
                 "Operator must manually /resume to re-enable."
             )
 

@@ -171,6 +171,11 @@ async def lifespan(app: FastAPI):
             "picks one up. Run scripts/zerodha_auto_auth.py to fix this immediately."
         )
 
+    # Constructed here (moved ahead of the broker-selection block below) so the
+    # LIVE->PaperBroker silent-fallback case immediately below can actually
+    # alert someone, not just log — see its 2026-08-20 fix note.
+    notifier = EmailNotifier()
+
     # ── Order execution broker ─────────────────────────────────────────────────
     if mode == TradingMode.LIVE:
         if not access_token:
@@ -178,6 +183,22 @@ async def lifespan(app: FastAPI):
                 "LIVE mode: Zerodha access token missing. Falling back to PaperBroker."
             )
             broker = PaperBroker(initial_balance=settings.INITIAL_CAPITAL)
+            # Fixed 2026-08-20 (deep review): this fallback used to be a
+            # logger.critical() call and nothing else -- the app boots fine,
+            # /health reports UP, and the system silently trades on paper
+            # money all day with no active alert, only a log line nobody is
+            # watching. TRADING_MODE=LIVE with no real broker is exactly the
+            # kind of gap the self-heal watchdog exists to catch for market
+            # data; it was never applied to this order-execution choice.
+            try:
+                await notifier.send(
+                    "CRITICAL: TRADING_MODE=LIVE but no Zerodha access token was "
+                    "found at startup -- falling back to PaperBroker. NO REAL "
+                    "ORDERS will be placed until this is fixed and the app is "
+                    "restarted. Run scripts/zerodha_auto_auth.py."
+                )
+            except Exception as exc:
+                logger.error(f"Failed to send LIVE->PaperBroker fallback alert: {exc}")
         else:
             from src.brokers.zerodha import ZerodhaBroker
             broker = ZerodhaBroker.from_redis_token(
@@ -190,7 +211,6 @@ async def lifespan(app: FastAPI):
 
     order_mgr     = OrderManager(broker, risk_mgr, order_repo, audit_repo)
     portfolio_mgr = PortfolioManager(broker, position_repo, stock_repo)
-    notifier      = EmailNotifier()
 
     # ── Strategies ─────────────────────────────────────────────────────────────
     StrategyRegistry.load_strategy("EMA_CROSSOVER", "ema_crossover_v1", {

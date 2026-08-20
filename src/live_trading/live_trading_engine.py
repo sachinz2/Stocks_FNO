@@ -56,6 +56,7 @@ _REDIS_PROFIT_CLOSED   = "engine:profit_closed_today"
 _REDIS_ORDER_COUNT     = "engine:order_count"
 _REDIS_EMA_STATE       = "engine:ema_crossover_state"
 _REDIS_MOMENTUM_STATE  = "engine:momentum_state"
+_REDIS_PEAK_PREMIUMS   = "engine:peak_premiums"
 
 
 class LiveTradingEngine:
@@ -510,6 +511,15 @@ class LiveTradingEngine:
             await redis.set(_REDIS_EXITED_TODAY,  json.dumps({"date": today, "symbols": list(self._exited_today)}))
             await redis.set(_REDIS_PROFIT_CLOSED, json.dumps({"date": today, "symbols": list(self._profit_closed_today)}))
             await redis.set(_REDIS_ORDER_COUNT,   json.dumps({"date": today, "count": self._today_order_count}))
+            # Fixed 2026-08-20 (deep review): the trailing-stop/breakeven-stop
+            # high-water mark was never persisted, unlike every other piece of
+            # per-position state -- a restart after a position had already
+            # rallied enough to earn its breakeven-stop guarantee (see
+            # ema_crossover.py/momentum.py's manage_position()) silently reset
+            # peak to entry price on the next cycle, discarding that earned
+            # protection and letting the position ride all the way down to the
+            # full hard stop instead.
+            await redis.set(_REDIS_PEAK_PREMIUMS, json.dumps({"date": today, "peaks": self._peak_premiums}))
         except Exception as e:
             logger.error(f"Failed to persist engine state: {e}")
 
@@ -705,11 +715,32 @@ class LiveTradingEngine:
             if jrnl_raw:
                 self._single_leg_journals = json.loads(jrnl_raw)
                 today = now_ist().date().isoformat()
-                self._single_leg_journals = {
-                    k: v for k, v in self._single_leg_journals.items()
-                    if v.get("date", today) == today
-                }
-                logger.info(f"Restored {len(self._single_leg_journals)} single-leg journal(s) for today")
+                # Fixed 2026-08-20 (deep review): entries from a previous day
+                # used to be silently DROPPED here (a crash before EOD
+                # square-off, followed by a restart on a LATER day) -- with
+                # nothing analogous to spreads/condors' near-expiry restore
+                # safety net. In paper mode this meant the position never
+                # even reappeared in _rebuild_paper_broker_positions()'s
+                # source, so _reconcile_broker_positions() had nothing to
+                # compare against and could never detect it as an orphan
+                # either -- the position (and its permanently-open
+                # trade_journal row) simply vanished. Keep every entry (so
+                # it's still rebuilt into the broker's position list and
+                # exit-checked normally); _check_open_option_exits() force-
+                # closes anything whose date != today on the very first
+                # cycle, the same "restore, then force-close" pattern used
+                # for near-expiry spreads/condors above.
+                stale_single_leg = [
+                    k for k, v in self._single_leg_journals.items()
+                    if v.get("date", today) != today
+                ]
+                if stale_single_leg:
+                    logger.warning(
+                        f"Restored {len(stale_single_leg)} single-leg position(s) from a "
+                        f"PREVIOUS day (should have been closed at EOD) — will force-close "
+                        f"on the first cycle: {stale_single_leg}"
+                    )
+                logger.info(f"Restored {len(self._single_leg_journals)} single-leg journal(s) total")
 
             # Restore today-only state — discard if it's from a previous day
             exited_raw = await redis.get(_REDIS_EXITED_TODAY)
@@ -730,6 +761,32 @@ class LiveTradingEngine:
                 if count_data.get("date") == today:
                     self._today_order_count = count_data.get("count", 0)
                     logger.info(f"Restored today's order count: {self._today_order_count}")
+
+            # Fixed 2026-08-20 (deep review): restore the trailing-stop/
+            # breakeven-stop high-water mark -- see _persist_state()'s fix
+            # note. Same-day only (a stale peak from a position that closed
+            # yesterday and a same-named contract reopened today would be
+            # meaningless); further filtered to contracts that actually
+            # survived the restore above (single-leg journal, or a leg of a
+            # restored spread/condor) so a peak for a position that no longer
+            # exists can't leak in.
+            peaks_raw = await redis.get(_REDIS_PEAK_PREMIUMS)
+            if peaks_raw:
+                peaks_data = json.loads(peaks_raw)
+                if peaks_data.get("date") == today:
+                    _known_contracts = set(self._single_leg_journals.keys())
+                    for s in self._active_spreads.values():
+                        _known_contracts.update((s.get("short_contract"), s.get("long_contract")))
+                    for c in self._active_condors.values():
+                        _known_contracts.update((
+                            c.get("put_short_contract"), c.get("put_long_contract"),
+                            c.get("call_short_contract"), c.get("call_long_contract"),
+                        ))
+                    self._peak_premiums = {
+                        k: v for k, v in peaks_data.get("peaks", {}).items()
+                        if k in _known_contracts
+                    }
+                    logger.info(f"Restored {len(self._peak_premiums)} peak premium(s) for today")
         except Exception as e:
             logger.error(f"Failed to restore engine state: {e}")
 
@@ -946,11 +1003,23 @@ class LiveTradingEngine:
                 f"  ORPHAN CLOSE: {side} {abs(qty)} {contract} @ ₹{exit_p:.2f}"
             )
             try:
-                await self.order_manager.place_order(
+                order = await self.order_manager.place_order(
                     contract, side, abs(qty), exit_p, is_exit_order=True,
                     product_override=p.get("product"),
                 )
                 closed_orphans += 1
+                # Fixed 2026-08-20 (deep review): orphan closes never wrote a
+                # trade_journal exit -- a single-leg position that survived
+                # past its entry day (e.g. a crash before EOD square-off,
+                # then a restart on a LATER day) has its journal entry
+                # filtered out of _single_leg_journals by _restore_state()'s
+                # today-only date check, so it lands here as an "orphan"
+                # even though a real open trade_journal row for it exists.
+                # It got closed for real, but the row's exit_time/exit_price/
+                # pnl stayed permanently NULL with no record of the close --
+                # best-effort match it back by contract and close it properly.
+                fill_p = self._real_fill(order, exit_p)
+                await self._close_orphan_journal_if_found(contract, qty, fill_p)
             except Exception as e:
                 logger.error(f"  ORPHAN CLOSE FAILED for {contract}: {e}")
 
@@ -963,6 +1032,51 @@ class LiveTradingEngine:
                 for p in orphans
             )
         )
+
+    async def _close_orphan_journal_if_found(self, contract: str, qty: int, fill_price: float) -> None:
+        """
+        Best-effort trade_journal close for an orphaned single-leg position
+        whose journal entry was filtered out of _single_leg_journals by
+        _restore_state()'s today-only date check (see the 2026-08-20 fix note
+        in _reconcile_broker_positions() above) -- e.g. a crash before EOD
+        square-off followed by a restart on a LATER day. Without this, the
+        position gets closed for real here, but the trade_journal row created
+        at entry stays permanently open (exit_time/exit_price/pnl all NULL)
+        forever, with no record the close ever happened.
+
+        Multi-leg orphans are skipped -- their legs are always accounted for
+        via _active_spreads/_active_condors, which have their own separate
+        stale-expiry handling in _restore_state().
+        """
+        try:
+            from src.database.connection import AsyncSessionLocal
+            from src.database.models.trade_journal import TradeJournal
+            from sqlalchemy import select as _select
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    _select(TradeJournal).where(
+                        TradeJournal.exit_time.is_(None),
+                        TradeJournal.structure_type == "SINGLE_LEG",
+                        TradeJournal.contracts.contains(contract),
+                    )
+                )
+                journal = result.scalars().first()
+            if journal is None:
+                return
+            entry_price = float(journal.entry_price or 0)
+            pnl = round((fill_price - entry_price) * qty, 2)
+            await self._log_trade_close(
+                journal_id=journal.id,
+                exit_price=fill_price,
+                pnl=pnl,
+                exit_reason="Orphan position auto-close (engine lost tracking across a restart)",
+            )
+            logger.info(
+                f"Orphan close: matched trade_journal id={journal.id} for {contract}, "
+                f"recorded pnl=Rs{pnl:,.2f}"
+            )
+        except Exception as e:
+            logger.error(f"Orphan close: failed to match/close trade_journal for {contract}: {e}")
 
     # ── Portfolio delta monitoring ─────────────────────────────────────────────
 
@@ -1204,7 +1318,16 @@ class LiveTradingEngine:
                     peak = current_p
 
                 exit_reason: Optional[str] = None
-                if dte < 4:
+                # Fixed 2026-08-20 (deep review): force-close any position
+                # restored from a PREVIOUS day -- single-leg positions must
+                # ALWAYS close same-day (_square_off_all's own "ALWAYS close,
+                # overnight gap risk" contract), so surviving past that means
+                # a crash before EOD square-off. See _restore_state()'s fix
+                # note for why this is no longer silently dropped instead.
+                _jrnl_date = self._single_leg_journals.get(contract, {}).get("date")
+                if _jrnl_date and _jrnl_date != now_ist().date().isoformat():
+                    exit_reason = f"Restored from a previous day ({_jrnl_date}) — overnight position, force-closing"
+                elif dte < 4:
                     exit_reason = f"DTE={dte} — entering illiquid expiry window"
 
                 # Resolve the strategy that actually OPENED this position (via the
@@ -1763,6 +1886,15 @@ class LiveTradingEngine:
             _rev_order = await self.order_manager.place_order(
                 contract, "SELL", abs(qty), exit_p, is_exit_order=True, strategy_name=_owner,
             )
+            # Fixed 2026-08-20 (deep review): this path used to treat the
+            # position as closed unconditionally, even if the broker SELL
+            # itself was rejected/failed -- fabricating a journal close and
+            # releasing capital while the real position stayed open and
+            # un-monitored. Mirrors the order_status check _execute_single_leg_exit
+            # already had (line ~1278).
+            if not (_rev_order and _rev_order.order_status not in ("REJECTED_BY_RISK", "FAILED")):
+                logger.error(f"REVERSAL EXIT FAILED [{contract}]: order rejected or failed — position left open, will retry next cycle")
+                continue
             self._peak_premiums.pop(contract, None)
             # Fixed 2026-08-07: sixth instance of the fill_price bug fixed
             # earlier today (single-leg/spread/condor exits, square-off,
@@ -2249,20 +2381,29 @@ class LiveTradingEngine:
         # leg above (same max-loss figure already passed as the risk-layer-5
         # budget check).
         self.risk_manager.add_deployed_capital(strategy.name, _capital_at_risk)
-        self._active_spreads[symbol] = {
-            "spread_type":    spread_type,
-            "short_contract": short_contract, "long_contract":  long_contract,
-            "short_strike":   short_strike,   "long_strike":    long_strike,
-            "option_type":    opt,
-            "short_premium":  short_fill,      "long_premium":   long_fill,
-            "net_credit":     net_credit,     "lot_size":       lot_size,
-            "journal_id":     journal_id,
-            "strategy_name":  strategy.name,
-            "expiry_date":    expiry.isoformat(),
-            "entry_date":     now_ist().replace(tzinfo=None).date().isoformat(),
-            "entry_vix":      vix or 0.0,    # E: stored for VIX spike threshold adjustment
-            "gtt_id":         None,           # I: filled below after GTT placement
-        }
+        # Fixed 2026-08-20 (deep review): inserting a new key here used to run
+        # unlocked, while the independently-scheduled 10-second exit-only job
+        # iterates this exact dict under _exit_cycle_lock. If that iteration
+        # was suspended at an await inside its loop body (e.g. get_option_quote)
+        # right as this insert landed, resuming it raises "dictionary changed
+        # size during iteration", silently aborting the SL/profit/breach check
+        # for every OTHER spread still left in that pass. The lock only ever
+        # protected exits against each other, not against a concurrent entry.
+        async with self._exit_cycle_lock:
+            self._active_spreads[symbol] = {
+                "spread_type":    spread_type,
+                "short_contract": short_contract, "long_contract":  long_contract,
+                "short_strike":   short_strike,   "long_strike":    long_strike,
+                "option_type":    opt,
+                "short_premium":  short_fill,      "long_premium":   long_fill,
+                "net_credit":     net_credit,     "lot_size":       lot_size,
+                "journal_id":     journal_id,
+                "strategy_name":  strategy.name,
+                "expiry_date":    expiry.isoformat(),
+                "entry_date":     now_ist().replace(tzinfo=None).date().isoformat(),
+                "entry_vix":      vix or 0.0,    # E: stored for VIX spike threshold adjustment
+                "gtt_id":         None,           # I: filled below after GTT placement
+            }
         if self._ltp_poller:
             self._ltp_poller.register_option_contracts([short_contract, long_contract])
 
@@ -2293,8 +2434,10 @@ class LiveTradingEngine:
         if not self._active_spreads:
             return
 
-        expiry   = get_near_month_expiry()
-        dte      = (expiry - now_ist().replace(tzinfo=None)).days
+        # Fallback only -- each spread's real dte is computed per-iteration
+        # below from its own stored expiry_date (see the 2026-08-20 fix note
+        # in the loop).
+        expiry = get_near_month_expiry()
         profit_closes: List[str] = []
         adverse_closes: List[str] = []
 
@@ -2307,6 +2450,21 @@ class LiveTradingEngine:
             market_data = await self._get_market_data(underlying)
             if not market_data:
                 continue
+
+            # Fixed 2026-08-20 (deep review): dte used to be the module-level
+            # near-month expiry's DTE for every spread, but a spread rolled to
+            # NEXT month at entry (get_entry_expiry(), when near-month DTE was
+            # already < entry_min_dte) has a real expiry that
+            # get_near_month_expiry() won't reflect for up to ~2 weeks (it
+            # only rolls forward once DTE < 7). For that whole window this
+            # spread's DTE floor, DTE-tiered profit thresholds, and delta
+            # calc's time-to-expiry were all computed off the wrong, too-small
+            # DTE -- risking force-closing a healthy position weeks early.
+            try:
+                spread_expiry = datetime.fromisoformat(spread["expiry_date"])
+            except (KeyError, ValueError, TypeError):
+                spread_expiry = expiry
+            dte = (spread_expiry - now_ist().replace(tzinfo=None)).days
 
             current_price = float(market_data.get("close", 0))
             atr = float(market_data.get("atr14", 0))
@@ -2430,32 +2588,71 @@ class LiveTradingEngine:
             # breaker would block the system from closing an existing credit
             # spread via its normal exit path -- exactly when it most needs to
             # (found 2026-08-06).
-            exit_short = await self.order_manager.place_order(spread["short_contract"], "BUY",  lot, cur_short, is_spread_leg=True, is_exit_order=True)
-            exit_long  = await self.order_manager.place_order(spread["long_contract"],  "SELL", lot, cur_long,  is_spread_leg=True, is_exit_order=True)
-
+            #
+            # Fixed 2026-08-20 (deep review): a rejected sibling leg used to
+            # just `continue` (correctly not fabricating a close), but the
+            # NEXT retry re-sent orders for BOTH legs again -- including the
+            # one that already closed, which is now flat, so re-buying/
+            # re-selling it opened a brand-new unintended position instead of
+            # a no-op. _close_leg() remembers a leg that already closed
+            # (either this cycle or a previous partial attempt, via
+            # spread["_short_exit_fill"]/["_long_exit_fill"]) and never
+            # resubmits an order for it.
+            _leg_positions = await self._safe_get_positions()
+            # _safe_get_positions() fails OPEN to [] on a broker fetch error
+            # (see its own docstring/flag) -- an empty list there means
+            # "unknown", not "confirmed flat". Only trust the "already
+            # closed" shortcut below when the fetch actually succeeded;
+            # otherwise every leg would look flat and get silently skipped
+            # instead of retried, which is worse than the bug being fixed.
+            _pos_known = getattr(self, "_broker_position_state_known", True)
+            _pos_qty = {p.get("symbol", ""): p.get("quantity", 0) for p in _leg_positions}
             _bad = {"REJECTED", "REJECTED_BY_RISK", "CANCELLED", "FAILED"}
-            if exit_short is None or exit_long is None or \
-               getattr(exit_short, "order_status", "") in _bad or \
-               getattr(exit_long,  "order_status", "") in _bad:
+
+            async def _close_leg(contract: str, side: str, quote_price: float, fill_key: str):
+                stored = spread.get(fill_key)
+                if stored is not None:
+                    return stored, True
+                if _pos_known and _pos_qty.get(contract, 0) == 0:
+                    # Already flat at the broker (e.g. closed by the GTT
+                    # backstop or a manual admin close) -- nothing to submit.
+                    return quote_price, True
+                order = await self.order_manager.place_order(
+                    contract, side, lot, quote_price, is_spread_leg=True, is_exit_order=True,
+                )
+                if order is None or getattr(order, "order_status", "") in _bad:
+                    return None, False
+                return self._real_fill(order, quote_price), True
+
+            _short_fill, _short_ok = await _close_leg(spread["short_contract"], "BUY",  cur_short, "_short_exit_fill")
+            _long_fill,  _long_ok  = await _close_leg(spread["long_contract"],  "SELL", cur_long,  "_long_exit_fill")
+
+            if not (_short_ok and _long_ok):
+                if _short_ok:
+                    spread["_short_exit_fill"] = _short_fill
+                if _long_ok:
+                    spread["_long_exit_fill"] = _long_fill
+                if _short_ok or _long_ok:
+                    await self._persist_state()
                 logger.warning(
                     f"[CreditSpread] Exit orders for {underlying} partially rejected — "
                     f"keeping position in tracking to retry next cycle."
                 )
                 continue
 
-            # Fixed 2026-08-13: net_pnl/exit_price were computed from cur_short/
-            # cur_long -- the pre-trade QUOTE fed into place_order(), not the
-            # real fill -- despite the real fill being computed right below
-            # this, immediately, for the slippage diagnostic only. Same class
-            # of bug as the single-leg/square-off fill_price fixes earlier this
-            # project, just never closed here. Confirmed live 2026-08-13: a
-            # real TITAN BULL_PUT_SPREAD closed with recorded pnl=Rs7,638.75
-            # (quote-based) vs the real fill-based pnl of Rs7,390.25 -- a
-            # Rs248.50 overstatement from slippage the record never reflected.
-            # float() cast: see 2026-08-12 fix note in _execute_single_leg_exit.
-            _short_fill = self._real_fill(exit_short, cur_short)
-            _long_fill  = self._real_fill(exit_long,  cur_long)
-            _slippage   = abs(_short_fill - cur_short) + abs(_long_fill - cur_long)
+            spread.pop("_short_exit_fill", None)
+            spread.pop("_long_exit_fill", None)
+
+            # Fixed 2026-08-13: net_pnl/exit_price used to be computed from
+            # cur_short/cur_long -- the pre-trade QUOTE fed into place_order(),
+            # not the real fill. Confirmed live 2026-08-13: a real TITAN
+            # BULL_PUT_SPREAD closed with recorded pnl=Rs7,638.75 (quote-based)
+            # vs the real fill-based pnl of Rs7,390.25 -- a Rs248.50
+            # overstatement from slippage the record never reflected.
+            # _short_fill/_long_fill above are already real fills (from
+            # _close_leg -> _real_fill(), or a previous cycle's stored real
+            # fill) -- not the quote.
+            _slippage = abs(_short_fill - cur_short) + abs(_long_fill - cur_long)
 
             net_pnl = (
                 (spread["short_premium"] - _short_fill)
@@ -2910,22 +3107,25 @@ class LiveTradingEngine:
         # Reuses _capital_at_risk computed before the legs loop above (same
         # max-loss figure already passed as the risk-layer-5 budget check).
         self.risk_manager.add_deployed_capital(strategy.name, _capital_at_risk)
-        self._active_condors[symbol] = {
-            "put_short_contract":  psc,  "put_long_contract":   plc,
-            "call_short_contract": csc,  "call_long_contract":  clc,
-            "put_short_strike":    put_short_strike,  "put_long_strike":   put_long_strike,
-            "call_short_strike":   call_short_strike, "call_long_strike":  call_long_strike,
-            "put_short_premium":   put_short_fill,  "put_long_premium":  put_long_fill,
-            "call_short_premium":  call_short_fill, "call_long_premium": call_long_fill,
-            "net_credit":          net_credit,   "lot_size":          lot_size,
-            "journal_id":          journal_id,
-            "strategy_name":       strategy.name,
-            "expiry_date":         expiry.isoformat(),
-            "entry_date":          now_ist().replace(tzinfo=None).date().isoformat(),
-            "entry_vix":           vix or 0.0,  # E: stored for VIX spike threshold adjustment
-            "put_short_gtt_id":    None,         # I: filled below
-            "call_short_gtt_id":   None,         # I: filled below
-        }
+        # Fixed 2026-08-20 (deep review): same entry/exit dict-mutation race
+        # fixed in _process_credit_spread -- see its comment above.
+        async with self._exit_cycle_lock:
+            self._active_condors[symbol] = {
+                "put_short_contract":  psc,  "put_long_contract":   plc,
+                "call_short_contract": csc,  "call_long_contract":  clc,
+                "put_short_strike":    put_short_strike,  "put_long_strike":   put_long_strike,
+                "call_short_strike":   call_short_strike, "call_long_strike":  call_long_strike,
+                "put_short_premium":   put_short_fill,  "put_long_premium":  put_long_fill,
+                "call_short_premium":  call_short_fill, "call_long_premium": call_long_fill,
+                "net_credit":          net_credit,   "lot_size":          lot_size,
+                "journal_id":          journal_id,
+                "strategy_name":       strategy.name,
+                "expiry_date":         expiry.isoformat(),
+                "entry_date":          now_ist().replace(tzinfo=None).date().isoformat(),
+                "entry_vix":           vix or 0.0,  # E: stored for VIX spike threshold adjustment
+                "put_short_gtt_id":    None,         # I: filled below
+                "call_short_gtt_id":   None,         # I: filled below
+            }
         if self._ltp_poller:
             self._ltp_poller.register_option_contracts([psc, plc, csc, clc])
 
@@ -2954,8 +3154,10 @@ class LiveTradingEngine:
         if not self._active_condors:
             return
 
-        expiry   = get_near_month_expiry()
-        dte      = (expiry - now_ist().replace(tzinfo=None)).days
+        # Fallback only -- each condor's real dte is computed per-iteration
+        # below from its own stored expiry_date (same 2026-08-20 fix as
+        # _check_spread_exits).
+        expiry = get_near_month_expiry()
         to_close_adverse_c: List[str] = []
         to_close_profit_c:  List[str] = []
 
@@ -2968,6 +3170,12 @@ class LiveTradingEngine:
             market_data = await self._get_market_data(underlying)
             if not market_data:
                 continue
+
+            try:
+                condor_expiry = datetime.fromisoformat(c["expiry_date"])
+            except (KeyError, ValueError, TypeError):
+                condor_expiry = expiry
+            dte = (condor_expiry - now_ist().replace(tzinfo=None)).days
 
             current_price = float(market_data.get("close", 0))
             atr = float(market_data.get("atr14", 0))
@@ -3108,33 +3316,69 @@ class LiveTradingEngine:
             # risk_manager.validate_trade(), which would block closing an
             # existing iron condor exactly when a tripped kill switch makes
             # that most urgent.
-            exit_ps = await self.order_manager.place_order(c["put_short_contract"],  "BUY",  lot, cur_ps, is_spread_leg=True, is_exit_order=True)
-            exit_pl = await self.order_manager.place_order(c["put_long_contract"],   "SELL", lot, cur_pl, is_spread_leg=True, is_exit_order=True)
-            exit_cs = await self.order_manager.place_order(c["call_short_contract"], "BUY",  lot, cur_cs, is_spread_leg=True, is_exit_order=True)
-            exit_cl = await self.order_manager.place_order(c["call_long_contract"],  "SELL", lot, cur_cl, is_spread_leg=True, is_exit_order=True)
-
+            # Fixed 2026-08-20 (deep review): same partial-exit-retry bug as
+            # _check_spread_exits -- a rejected leg used to `continue`
+            # correctly, but the next retry re-sent orders for ALL 4 legs,
+            # including any that already closed (now flat), opening 1-3
+            # accidental new positions depending on how many legs succeeded
+            # before the first rejection. _close_leg() remembers each leg
+            # that already closed (this cycle or a previous partial attempt,
+            # via c["_ps_exit_fill"]/["_pl_exit_fill"]/["_cs_exit_fill"]/
+            # ["_cl_exit_fill"]) and never resubmits an order for it.
+            _leg_positions = await self._safe_get_positions()
+            # See _check_spread_exits' matching comment: an empty list here
+            # can mean "confirmed flat" OR "fetch failed" -- only trust the
+            # shortcut below when _safe_get_positions() actually succeeded.
+            _pos_known = getattr(self, "_broker_position_state_known", True)
+            _pos_qty = {p.get("symbol", ""): p.get("quantity", 0) for p in _leg_positions}
             _bad = {"REJECTED", "REJECTED_BY_RISK", "CANCELLED", "FAILED"}
-            if any(
-                o is None or getattr(o, "order_status", "") in _bad
-                for o in (exit_ps, exit_pl, exit_cs, exit_cl)
-            ):
+
+            async def _close_leg(contract: str, side: str, quote_price: float, fill_key: str):
+                stored = c.get(fill_key)
+                if stored is not None:
+                    return stored, True
+                if _pos_known and _pos_qty.get(contract, 0) == 0:
+                    return quote_price, True
+                order = await self.order_manager.place_order(
+                    contract, side, lot, quote_price, is_spread_leg=True, is_exit_order=True,
+                )
+                if order is None or getattr(order, "order_status", "") in _bad:
+                    return None, False
+                return self._real_fill(order, quote_price), True
+
+            _ps_fill, _ps_ok = await _close_leg(c["put_short_contract"],  "BUY",  cur_ps, "_ps_exit_fill")
+            _pl_fill, _pl_ok = await _close_leg(c["put_long_contract"],   "SELL", cur_pl, "_pl_exit_fill")
+            _cs_fill, _cs_ok = await _close_leg(c["call_short_contract"], "BUY",  cur_cs, "_cs_exit_fill")
+            _cl_fill, _cl_ok = await _close_leg(c["call_long_contract"],  "SELL", cur_cl, "_cl_exit_fill")
+
+            if not (_ps_ok and _pl_ok and _cs_ok and _cl_ok):
+                if _ps_ok:
+                    c["_ps_exit_fill"] = _ps_fill
+                if _pl_ok:
+                    c["_pl_exit_fill"] = _pl_fill
+                if _cs_ok:
+                    c["_cs_exit_fill"] = _cs_fill
+                if _cl_ok:
+                    c["_cl_exit_fill"] = _cl_fill
+                if _ps_ok or _pl_ok or _cs_ok or _cl_ok:
+                    await self._persist_state()
                 logger.warning(
                     f"[IronCondor] Exit orders for {underlying} partially rejected — "
                     f"keeping position in tracking to retry next cycle."
                 )
                 continue
 
-            # Fixed 2026-08-13: net_pnl/exit_price were computed from the
-            # pre-trade QUOTEs (cur_ps/cur_pl/cur_cs/cur_cl), not the real
+            c.pop("_ps_exit_fill", None)
+            c.pop("_pl_exit_fill", None)
+            c.pop("_cs_exit_fill", None)
+            c.pop("_cl_exit_fill", None)
+
+            # Fixed 2026-08-13: net_pnl/exit_price used to be computed from
+            # the pre-trade QUOTEs (cur_ps/cur_pl/cur_cs/cur_cl), not the real
             # fills -- same bug just fixed in the matching credit-spread exit
-            # above (see its comment for the confirmed live example and
-            # rationale). The real fills were already being computed right
-            # below, immediately, but only for the slippage diagnostic.
-            # float() cast: see 2026-08-12 fix note in _execute_single_leg_exit.
-            _ps_fill = self._real_fill(exit_ps, cur_ps)
-            _pl_fill = self._real_fill(exit_pl, cur_pl)
-            _cs_fill = self._real_fill(exit_cs, cur_cs)
-            _cl_fill = self._real_fill(exit_cl, cur_cl)
+            # above. _ps_fill/_pl_fill/_cs_fill/_cl_fill above are already
+            # real fills (from _close_leg -> _real_fill(), or a previous
+            # cycle's stored real fill) -- not the quote.
             _slippage = (abs(_ps_fill - cur_ps) + abs(_pl_fill - cur_pl)
                          + abs(_cs_fill - cur_cs) + abs(_cl_fill - cur_cl))
 
@@ -3259,6 +3503,12 @@ class LiveTradingEngine:
                 contract, "SELL", abs(pos["quantity"]), exit_p,
                 is_exit_order=True, strategy_name=_ex_owner_strategy,
             )
+            # Fixed 2026-08-20 (deep review): same missing order_status check
+            # as the other exit paths -- a rejected/failed SELL used to be
+            # journaled as a successful close anyway.
+            if not (_ex_order and _ex_order.order_status not in ("REJECTED_BY_RISK", "FAILED")):
+                logger.error(f"EXIT-SIGNAL CLOSE FAILED [{contract}]: order rejected or failed — position left open, will retry next cycle")
+                continue
             self._peak_premiums.pop(contract, None)
             # float() cast: see 2026-08-12 fix note in _execute_single_leg_exit.
             _ex_fill_p = self._real_fill(_ex_order, exit_p)
@@ -3367,6 +3617,14 @@ class LiveTradingEngine:
                 _sq_order = await self.order_manager.place_order(
                     contract, side, abs(qty), exit_p, is_exit_order=True, strategy_name=_sq_owner_strategy,
                 )
+                # Fixed 2026-08-20 (deep review): EOD square-off used to treat
+                # a rejected/failed close order as a successful close anyway --
+                # fabricating the journal exit and releasing capital while the
+                # real position (this method's own docstring: "ALWAYS close",
+                # overnight gap risk) stayed open overnight untracked.
+                if not (_sq_order and _sq_order.order_status not in ("REJECTED_BY_RISK", "FAILED")):
+                    logger.error(f"SQUARE-OFF FAILED [{contract}]: order rejected or failed — position left open overnight, will retry next cycle")
+                    continue
                 self._peak_premiums.pop(contract, None)
                 # Fixed 2026-08-07: same fill_price bug as _execute_single_leg_exit
                 # / credit-spread / iron-condor exits (fixed earlier today) --
@@ -3686,7 +3944,16 @@ class LiveTradingEngine:
         # src/core/config.py means only "INITIAL_CAPITAL" exists, so this
         # getattr() silently missed every time and always fell back to the
         # hardcoded 300_000 default regardless of the actual configured value.
-        capital = float(getattr(settings, "INITIAL_CAPITAL", 300_000))
+        #
+        # Fixed 2026-08-20 (deep review): this still used the STATIC
+        # INITIAL_CAPITAL constant rather than the broker's own live-tracked
+        # balance, so the check never reflected realized losses/fees --
+        # self.broker.balance is what the engine itself already treats as
+        # authoritative paper capital elsewhere (_reconcile_paper_broker_balance:
+        # INITIAL_CAPITAL + total_realized - deployed_cash). After a losing
+        # stretch this used to keep approving entries against a phantom
+        # capital figure the real paper account could no longer support.
+        capital = float(getattr(getattr(self, "broker", None), "balance", None) or getattr(settings, "INITIAL_CAPITAL", 300_000))
         locked = 0.0
         for s in self._active_spreads.values():
             wing = abs(s.get("short_strike", 0) - s.get("long_strike", 0))
@@ -3823,20 +4090,58 @@ class LiveTradingEngine:
         )
 
     async def _refresh_risk_state(self, positions: List[Dict]) -> None:
-        realized   = sum(p.get("realized_pnl",   0) for p in positions)
-        unrealized = sum(p.get("unrealized_pnl", 0) for p in positions)
+        # Fixed 2026-08-20 (deep review): realized/unrealized P&L used to be
+        # read from positions[i]['realized_pnl']/['unrealized_pnl'] -- keys
+        # neither broker ever populates (ZerodhaBroker passes through Kite's
+        # raw dict verbatim, whose real fields are 'realised'/'unrealised'/
+        # 'pnl'; PaperBroker's positions only ever carry symbol/quantity/
+        # avg_price). daily_realized_pnl was therefore silently always 0.0 in
+        # BOTH modes, regardless of real losses -- the daily-loss kill switch
+        # (risk_manager.py's total_daily_pnl check) never actually saw a loss.
+        # trade_journal is the one source that's correct in both modes: every
+        # close (single-leg or multi-leg) writes its real fill-based pnl there
+        # via _log_trade_close, same pattern already used by send_daily_report().
+        realized = await self._todays_realized_pnl()
 
-        # In paper mode broker.get_positions() has unrealized_pnl=0.
-        # Compute it from the engine's in-memory active positions instead.
-        if unrealized == 0.0 and (self._active_spreads or self._active_condors):
-            redis = getattr(self, "_redis", None)
-            if redis:
-                unrealized = await self._compute_engine_unrealized_pnl(redis)
+        # Unrealized P&L: previously only summed _active_spreads/_active_condors,
+        # so open single-leg (ema_crossover_v1/momentum_v1) positions contributed
+        # nothing. Compute directly from the real broker position list instead --
+        # it already covers every open leg, single- and multi-leg alike.
+        redis = getattr(self, "_redis", None)
+        unrealized = await self._compute_engine_unrealized_pnl(redis, positions) if redis else 0.0
 
         self.risk_manager.update_state(positions, realized, unrealized)
 
-    async def _compute_engine_unrealized_pnl(self, redis) -> float:
-        """Sum unrealized PnL across active spreads and condors using Redis option price cache."""
+    async def _todays_realized_pnl(self) -> float:
+        """Sum of trade_journal.pnl for every position closed today -- the
+        authoritative realized-P&L source in both paper and live mode."""
+        try:
+            from datetime import date as _date, datetime as _datetime
+            from src.database.connection import AsyncSessionLocal
+            from src.database.models.trade_journal import TradeJournal
+            from sqlalchemy import select as _select, func as _func
+            today = _date.today()
+            today_start = _datetime(today.year, today.month, today.day, 0, 0, 0)
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    _select(_func.sum(TradeJournal.pnl)).where(
+                        TradeJournal.exit_time.isnot(None),
+                        TradeJournal.exit_time >= today_start,
+                    )
+                )
+                total = result.scalar()
+                return float(total) if total is not None else 0.0
+        except Exception as exc:
+            logger.error(f"Failed to read today's realized P&L from trade_journal: {exc}")
+            return 0.0
+
+    async def _compute_engine_unrealized_pnl(self, redis, positions: List[Dict]) -> float:
+        """Sum unrealized PnL across every open broker position (single-leg
+        and every multi-leg's individual legs alike) using the Redis option
+        price cache -- neither broker's own position dict carries a usable
+        running P&L figure (see _refresh_risk_state's fix note above)."""
+        if not redis:
+            return 0.0
 
         async def _get_price(contract: str) -> float:
             if not contract:
@@ -3853,33 +4158,16 @@ class LiveTradingEngine:
             return 0.0
 
         total = 0.0
-        for s in self._active_spreads.values():
-            lot = s.get("lot_size", 0)
-            if not lot:
+        for pos in positions:
+            qty = pos.get("quantity", 0)
+            if not qty:
                 continue
-            cur_short = await _get_price(s.get("short_contract", ""))
-            cur_long  = await _get_price(s.get("long_contract", ""))
-            if cur_short > 0 and cur_long > 0:
-                total += (
-                    (s.get("short_premium", 0) - cur_short)
-                    + (cur_long - s.get("long_premium", 0))
-                ) * lot
-
-        for c in self._active_condors.values():
-            lot = c.get("lot_size", 0)
-            if not lot:
+            avg_price = float(pos.get("avg_price") or 0)
+            if avg_price <= 0:
                 continue
-            cur_ps = await _get_price(c.get("put_short_contract",  ""))
-            cur_pl = await _get_price(c.get("put_long_contract",   ""))
-            cur_cs = await _get_price(c.get("call_short_contract", ""))
-            cur_cl = await _get_price(c.get("call_long_contract",  ""))
-            if all(p > 0 for p in (cur_ps, cur_pl, cur_cs, cur_cl)):
-                total += (
-                    (c.get("put_short_premium",  0) - cur_ps)
-                    + (c.get("call_short_premium", 0) - cur_cs)
-                    - (cur_pl - c.get("put_long_premium",  0))
-                    - (cur_cl - c.get("call_long_premium", 0))
-                ) * lot
+            cur = await _get_price(pos.get("symbol", ""))
+            if cur > 0:
+                total += (cur - avg_price) * qty
 
         return total
 

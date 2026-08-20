@@ -158,6 +158,7 @@ class OrderManager:
                     symbol, side, quantity, price,
                     is_exit_order=is_exit_order, strategy_name=strategy_name,
                     product_override=product_override,
+                    client_order_id=str(db_order.id),
                 ),
                 timeout=BROKER_TIMEOUT_SEC,
             )
@@ -276,6 +277,20 @@ class OrderManager:
 
         Returns the number of orders cancelled (including any retried).
         """
+        # Fixed 2026-08-20 (deep review): reconcile against the broker's real
+        # status FIRST. This used to go straight to cancel_order() below and
+        # discard its return value entirely -- if the order had actually
+        # already filled at the broker in the window since the last periodic
+        # sync_orders() (up to ~1 minute, one signal cycle), cancel_order()
+        # correctly returned False (nothing left to cancel), but that was
+        # never checked: the order got marked EXPIRED anyway and then RETRIED,
+        # placing a genuine duplicate order at the broker for an already-live
+        # position, plus a capital double-count (release here, re-add on the
+        # retry). Syncing first moves any order the broker reports as
+        # COMPLETED/CANCELLED/REJECTED out of the "OPEN" bucket before the
+        # query below ever sees it.
+        await self.sync_orders()
+
         cutoff = now_ist().replace(tzinfo=None) - timedelta(minutes=ORDER_EXPIRY_MINUTES)
         open_orders = await self.order_repo.filter(order_status="OPEN")
         cancelled = 0
@@ -293,14 +308,32 @@ class OrderManager:
                 f"Stale order detected: id={order.id} {order.side} {order.symbol} "
                 f"open for >{ORDER_EXPIRY_MINUTES} min. Cancelling."
             )
+            cancel_ok = True
             try:
                 if order.broker_order_id:
-                    await asyncio.wait_for(
+                    cancel_ok = await asyncio.wait_for(
                         self.broker.cancel_order(order.broker_order_id),
                         timeout=BROKER_TIMEOUT_SEC,
                     )
             except (asyncio.TimeoutError, Exception) as e:
                 logger.error(f"Broker cancel failed for order {order.id}: {e}")
+                cancel_ok = False
+
+            if not cancel_ok:
+                # A failed cancel almost always means the broker no longer
+                # considers the order cancellable -- i.e. it resolved
+                # (filled/rejected/already cancelled) in the tiny window
+                # between the sync_orders() call above and this cancel
+                # attempt. Re-sync and trust whatever real terminal status
+                # comes back rather than assuming "stale, safe to retry."
+                await self.sync_orders()
+                refreshed = await self.order_repo.get_by_id(order.id)
+                if refreshed and refreshed.order_status != "OPEN":
+                    logger.info(
+                        f"Stale order {order.id} was already {refreshed.order_status} "
+                        "at the broker — not expiring/retrying."
+                    )
+                    continue
 
             await self.order_repo.update(order, {
                 "order_status": "EXPIRED",

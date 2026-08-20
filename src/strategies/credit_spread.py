@@ -60,7 +60,13 @@ class CreditSpreadStrategy(StrategyBase):
         close = data.get("close", 0)
         atr = data.get("atr14", 0)
 
-        if not fast_ema or not slow_ema or not close:
+        # Fixed 2026-08-20 (deep review): atr wasn't included in this guard,
+        # so a NaN/None atr14 (possible with insufficient bar history in the
+        # upstream EWM calc) silently bypassed the low-vol gate below --
+        # `NaN >= threshold` is False in Python, so execution fell through
+        # into the directional branch with genuinely unknown volatility
+        # instead of returning HOLD.
+        if not fast_ema or not slow_ema or not close or atr is None or atr != atr:
             return "HOLD"
 
         atr_pct = (atr / close * 100) if close > 0 else 0

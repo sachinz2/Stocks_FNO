@@ -110,7 +110,18 @@ class RSRanker:
 
         scores: List[dict] = []
         for sym in self.symbols:
-            score = self._compute_rs(sym)
+            # Fixed 2026-08-20 (deep review): unlike LTPPoller.poll()'s
+            # equivalent per-symbol loop, this had no exception isolation --
+            # one symbol with a malformed cached DataFrame (e.g. a zero/
+            # degenerate close triggering ZeroDivisionError in _compute_rs)
+            # aborted rank() entirely, leaving the published rank keys
+            # (previously also with no TTL -- see below) serving arbitrarily
+            # stale data indefinitely with no visible error.
+            try:
+                score = self._compute_rs(sym)
+            except Exception as exc:
+                logger.error(f"RSRanker: _compute_rs failed for {sym}: {exc}")
+                continue
             if score is not None:
                 scores.append({"symbol": sym, "rs_score": round(score, 2)})
 
@@ -121,8 +132,12 @@ class RSRanker:
 
         top10 = [e["symbol"] for e in scores[: self.top_n]]
 
-        await self._redis.set(REDIS_RS_RANKS_KEY, json.dumps(scores))
-        await self._redis.set(REDIS_RS_TOP10_KEY, json.dumps(top10))
+        # TTL = 3x the 5-minute schedule interval: survives one or two missed/
+        # slow cycles, but a sustained outage lets these keys expire rather
+        # than serve hours-old ranks to RS-gated entries with no signal that
+        # they're stale (fixed 2026-08-20, deep review).
+        await self._redis.set(REDIS_RS_RANKS_KEY, json.dumps(scores), ex=900)
+        await self._redis.set(REDIS_RS_TOP10_KEY, json.dumps(top10), ex=900)
 
         if scores:
             logger.info(

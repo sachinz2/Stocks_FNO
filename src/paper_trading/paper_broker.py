@@ -113,7 +113,7 @@ class PaperBroker(AbstractBroker):
     async def place_order(
         self, symbol: str, side: str, quantity: int, price: float,
         is_exit_order: bool = False, strategy_name: Optional[str] = None,
-        product_override: Optional[str] = None,
+        product_override: Optional[str] = None, client_order_id: Optional[str] = None,
     ) -> str:
         """
         Simulates order execution with realistic bid-ask slippage, occasional
