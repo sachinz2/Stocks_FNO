@@ -789,4 +789,61 @@ Kept short — see git log / individual commit messages for full detail.
 
 ---
 
-*Last updated: 2026-08-20, after the external PDF review round's fixes and the DB password rotation.*
+- **momentum_v1 entry-quality redesign (2026-08-20), same day.** User's
+  explicit call: "I feel what the review is saying is also correct" — but
+  don't build a separate `momentum_v2`, integrate the recommendations into
+  `momentum_v1` itself directly, and incorporate the real `trade_journal`
+  data already pulled (11 trades, 9.1% win rate, most losses showing the
+  underlying reversing double-digit % after entry).
+  - **Integrated:**
+    - `adx_entry_threshold` lowered 35 → 25, now paired with a new
+      `adx_rising_required` check (ADX must not be declining vs. 2 bars
+      ago) — "is momentum accelerating right now" instead of "is ADX high
+      right now," distinguishing an accelerating 27→30→34→37 from an
+      already-exhausted 43→42→41→40 (both satisfied the old bare threshold
+      equally).
+    - New `ema_slope_required` — EMA20 must be sloping in the signal's own
+      direction vs. 2 bars ago, not just sitting above/below EMA50.
+    - New `extension_atr_mult` (1.5× ATR) and `vwap_extension_pct` (1.5%) —
+      reject entries already too far from EMA20 or session VWAP. Computed
+      directly from existing `market_data` fields, no pipeline changes.
+    - New structural-invalidation exit in `manage_position()` — if the
+      underlying's close crosses back to the wrong side of EMA20, exit
+      regardless of option premium P&L (which theta/IV can mask for a
+      while). Additional to, not a replacement for, the premium-based
+      stops, which stay authoritative.
+    - `rvol_entry_threshold` raised to 1.5 (from the shared 1.3 floor
+      `ema_crossover_v1` still uses) and `entry_option_delta=0.60` —
+      near-ITM strike selection via the existing `find_delta_strike()`
+      instead of ATM, both strategy-overridable via `getattr()` in
+      `live_trading_engine.py` so `ema_crossover_v1` is provably unaffected.
+    - All seven new parameters independently toggleable, so any one can be
+      disabled without a code change if it proves too restrictive live.
+  - **Explicitly NOT done:** a full pullback-then-breakout event model (the
+    review's own preferred design — needs real historical-bar state not
+    currently tracked anywhere in the pipeline); any change to
+    `stop_loss_pct`/`target_pct`/`trailing_stop_pct` themselves (the real
+    trade data showed the win/loss size ratio was already healthier than
+    the review assumed, so entry timing looked like the more likely lever,
+    not exit sizing); disabling `momentum_v1` from live trading (the
+    review's own top "before live" priority — not selected).
+  - **Caught post-first-deploy, fixed same round:** `api/main.py`'s
+    `StrategyRegistry.load_strategy("MOMENTUM", "momentum_v1", {...})` call
+    hardcoded `adx_entry_threshold=35` — the OLD value — which silently
+    shadowed `momentum.py`'s new default (25), since an explicit override
+    always wins over a class default. The redesign's central change never
+    actually took effect in production until the startup log line
+    ("Initialized Momentum... ADX entry>=35") was checked and the stale
+    override found. Fixed by listing every new parameter explicitly in that
+    config dict, plus a regression test asserting the two files can't drift
+    apart silently again. Verified live post-fix: log line now correctly
+    reads `ADX entry>=25`.
+  - 17 new regression tests (2 pre-existing tests updated for the threshold
+    default change). 433 tests passing. Deployed in two rounds (redesign,
+    then the main.py override fix) and verified live both times (30/30
+    static+runtime invariant checks pass; API/DB/Redis healthy; no errors
+    in post-deploy logs).
+
+---
+
+*Last updated: 2026-08-20, after the momentum_v1 entry-quality redesign and its post-deploy override fix.*
