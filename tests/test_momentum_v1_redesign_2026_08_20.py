@@ -184,3 +184,27 @@ def test_engine_strike_selection_uses_delta_when_strategy_sets_it():
 def test_momentum_v1_defaults_to_a_near_itm_delta_target():
     strat = _mom()
     assert strat.entry_option_delta == 0.60
+
+
+# ── Production wiring must not silently shadow the new class defaults ───────
+
+def test_main_py_does_not_override_adx_entry_threshold_back_to_the_old_value():
+    """Fixed 2026-08-20 (caught post-deploy): api/main.py's
+    StrategyRegistry.load_strategy("MOMENTUM", "momentum_v1", {...}) call
+    hardcoded adx_entry_threshold=35 -- the OLD value -- which silently
+    overrode momentum.py's new default (25) in the actual running config.
+    The class default change alone never took effect in production until
+    this was caught (the "Initialized Momentum" startup log line still read
+    "ADX entry>=35" after deploying the redesign) and fixed here. This is a
+    real, general risk whenever a strategy's default changes: main.py's
+    config dict is a separate, independent source of truth that has to be
+    updated too."""
+    import inspect
+    from src.api import main as main_module
+    src = inspect.getsource(main_module)
+    idx = src.index('StrategyRegistry.load_strategy("MOMENTUM"')
+    block = src[idx:idx + 800]
+    assert '"adx_entry_threshold": 25' in block, (
+        "main.py's momentum_v1 wiring must match momentum.py's current "
+        "adx_entry_threshold default, not a stale hardcoded value"
+    )

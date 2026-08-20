@@ -236,7 +236,20 @@ async def lifespan(app: FastAPI):
     })
     StrategyRegistry.load_strategy("MOMENTUM", "momentum_v1", {
         "fast_period": 20, "slow_period": 50,
-        "adx_entry_threshold": 35, "adx_exit_threshold": 22,
+        # Fixed 2026-08-20 (external review integration): adx_entry_threshold
+        # was hardcoded here at the OLD value (35), which silently overrode
+        # momentum.py's new default (25) -- the class default change alone
+        # never actually took effect in production until this was caught and
+        # fixed. Every one of the new entry-quality parameters is listed
+        # explicitly here now (even where it just matches the class default)
+        # so this dict is a complete, self-documenting picture of what's
+        # actually running, not something that has to be cross-referenced
+        # against momentum.py to know.
+        "adx_entry_threshold": 25, "adx_exit_threshold": 22,
+        "adx_rising_required": True, "ema_slope_required": True,
+        "extension_atr_mult": 1.5, "vwap_extension_pct": 1.5,
+        "rvol_entry_threshold": 1.5, "entry_option_delta": 0.60,
+        "underlying_invalidation_exit": True,
         "min_ema_spread_pct": 0.30,
         "stop_loss_pct": 0.50, "target_pct": 1.50, "trailing_stop_pct": 0.30,
     })
