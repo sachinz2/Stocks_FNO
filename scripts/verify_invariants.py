@@ -56,6 +56,21 @@ def _read(repo: Path, rel_path: str) -> str:
     return (repo / rel_path).read_text(encoding="utf-8")
 
 
+def _strip_comments(python_src_snippet: str) -> str:
+    """
+    Drop everything from '#' to end-of-line on every line.
+
+    Regex-based checks below extract quoted strings from a raw source slice
+    (e.g. "everything inside FNO_SYMBOLS = [...]") to compare against actual
+    list/dict contents. A source comment that happens to contain a quoted
+    string (found 2026-08-20: a Tier-6 comment mentioning kite.instruments'
+    "NFO" argument) gets swept up by that extraction as if it were a real
+    list entry otherwise -- strip comments first so only genuine code
+    (however naively parsed) is considered.
+    """
+    return "\n".join(line.split("#", 1)[0] for line in python_src_snippet.splitlines())
+
+
 def _is_market_hours() -> bool:
     now = datetime.now(IST)
     if now.weekday() >= 5:
@@ -416,12 +431,27 @@ def check_fno_sectors_covers_full_real_universe(repo: Path) -> Result:
     fno_sectors_match = re.search(r"FNO_SECTORS = \{(.*?)\n\}", src, re.DOTALL)
     if not fno_symbols_match or not fno_sectors_match:
         return FAIL, name, "Couldn't locate FNO_SYMBOLS/FNO_SECTORS in constants.py to cross-check."
-    symbols = set(re.findall(r'"([^"]+)"', fno_symbols_match.group(1)))
-    sectors = set(re.findall(r'"([^"]+)":\s*"[^"]+"', fno_sectors_match.group(1)))
+    symbols = set(re.findall(r'"([^"]+)"', _strip_comments(fno_symbols_match.group(1))))
+    sectors = set(re.findall(r'"([^"]+)":\s*"[^"]+"', _strip_comments(fno_sectors_match.group(1))))
     missing = symbols - sectors
     if missing:
         return FAIL, name, f"{len(missing)} traded symbol(s) have no FNO_SECTORS entry -- the sector-concentration risk check silently no-ops for them: {sorted(missing)}"
     return PASS, name, f"All {len(symbols)} currently-traded symbols have a sector mapping."
+
+
+def check_fno_universe_expansion_consistent(repo: Path) -> Result:
+    name = "FNO_SYMBOLS universe expansion (41->132) is internally consistent"
+    src = _read(repo, "src/core/constants.py")
+    fno_symbols_match = re.search(r"FNO_SYMBOLS = \[(.*?)\]", src, re.DOTALL)
+    if not fno_symbols_match:
+        return FAIL, name, "Couldn't locate FNO_SYMBOLS in constants.py."
+    symbols = re.findall(r'"([^"]+)"', _strip_comments(fno_symbols_match.group(1)))
+    if len(symbols) < 132:
+        return FAIL, name, f"FNO_SYMBOLS has only {len(symbols)} entries -- the 2026-08-20 liquidity-verified expansion to 132 appears to have been reverted or reduced."
+    if len(symbols) != len(set(symbols)):
+        dupes = sorted({s for s in symbols if symbols.count(s) > 1})
+        return FAIL, name, f"FNO_SYMBOLS has duplicate entries: {dupes}"
+    return PASS, name, f"FNO_SYMBOLS has {len(symbols)} unique symbols, no duplicates."
 
 
 STATIC_CHECKS: List[Callable[[Path], Result]] = [
@@ -448,6 +478,7 @@ STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_strike_interval_derived_from_real_contracts,
     check_ltp_poller_prefetches_ohlc_concurrently,
     check_fno_sectors_covers_full_real_universe,
+    check_fno_universe_expansion_consistent,
 ]
 
 

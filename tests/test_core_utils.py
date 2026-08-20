@@ -92,9 +92,18 @@ def test_all_strike_intervals_are_positive_and_known_symbols():
 from src.core.constants import FNO_LOT_SIZES, FNO_SYMBOLS
 
 
-def test_all_lot_sizes_are_positive_and_cover_every_traded_symbol():
-    assert set(FNO_LOT_SIZES.keys()) == set(FNO_SYMBOLS), (
-        "FNO_LOT_SIZES must have an entry for every symbol the engine actually trades, no more, no less"
+def test_all_lot_sizes_are_positive_and_have_no_dead_entries():
+    # Fixed 2026-08-20: this used to require exact 1:1 coverage of
+    # FNO_SYMBOLS, back when this static table was the ONLY source of truth
+    # (see the module comment above). It's fallback-only now -- the daily
+    # Redis cache (scripts/zerodha_auto_auth.py's fetch_and_cache_lot_sizes())
+    # is authoritative, and _get_lot_size() fails closed on a cache miss
+    # rather than falling back to this table for a live trading decision.
+    # FNO_SYMBOLS grew to 132 the same day without every new symbol needing
+    # a manual entry here. What still matters: no entry should reference a
+    # symbol that isn't traded at all (a genuinely dead/stale config value).
+    assert set(FNO_LOT_SIZES.keys()) <= set(FNO_SYMBOLS), (
+        "FNO_LOT_SIZES has an entry for a symbol no longer in FNO_SYMBOLS -- dead config"
     )
     for symbol, lot in FNO_LOT_SIZES.items():
         assert lot > 0, f"{symbol} has a non-positive lot size: {lot}"

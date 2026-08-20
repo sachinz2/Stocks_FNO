@@ -6,14 +6,12 @@ MARKET_CLOSE_MINUTE = 30
 SQUARE_OFF_HOUR = 15
 SQUARE_OFF_MINUTE = 20  # Auto square-off 10 mins before close
 
-# NSE F&O option-eligible stocks (40 most liquid)
-# Lot sizes and strike intervals are hardcoded here. NOTE: despite what this
-# comment used to claim, there is no live daily refresh from
-# kite.instruments("NFO") anywhere in this codebase (grepped and confirmed
-# 2026-08-06) -- this hardcoded table is the ONLY source of truth. Verify at
-# nseindia.com/market-data/fo-equity-securities (or against a fresh
-# kite.instruments("NFO") pull) periodically, since NSE revises these when a
-# stock's price moves into a different band.
+# NSE F&O option-eligible stocks.
+# Lot sizes and strike intervals for these are dynamically refreshed daily
+# from a live kite.instruments("NFO") pull (see scripts/zerodha_auto_auth.py's
+# fetch_and_cache_lot_sizes()/fetch_and_cache_real_contracts(), both filtered
+# to this exact list) -- the FNO_LOT_SIZES/FNO_STRIKE_INTERVALS tables below
+# are fallback-only, used solely on a cache miss.
 FNO_SYMBOLS = [
     # Tier 1 — highest liquidity
     "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK",
@@ -29,6 +27,38 @@ FNO_SYMBOLS = [
     "ONGC", "NTPC", "POWERGRID", "ULTRACEMCO", "TATASTEEL",
     # Tier 5 — added
     "COALINDIA",
+
+    # Tier 6 — added 2026-08-20: expanded from the real 208-symbol NSE F&O
+    # universe (confirmed live via a real NFO instrument-dump pull, see
+    # scripts/diagnostic_universe_timing.py) to every symbol whose measured
+    # 20-day average daily turnover (scripts/diagnostic_universe_liquidity.py
+    # -- volume x close, not just NSE's minimum F&O-eligibility bar) is at
+    # least as high as TATACONSUM's, the least-liquid symbol already traded
+    # above. Purely additive -- nothing above was removed or reordered.
+    # Prerequisites already in place before this: FNO_SECTORS covers all 208
+    # (sector-concentration check), get_real_strike_interval() derives
+    # strike spacing from real listed contracts (no per-symbol manual
+    # verification needed), and LTPPoller's OHLC prefetch is concurrent
+    # (cold-start cycle time stays well under the 60s budget at this size).
+    "ABB", "ADANIENSOL", "ADANIENT", "ADANIGREEN", "ADANIPOWER",
+    "AMBER", "ASHOKLEY", "AUBANK", "BAJAJFINSV", "BANDHANBNK",
+    "BANKBARODA", "BDL", "BEL", "BHARATFORG", "BHEL",
+    "BOSCHLTD", "BRITANNIA", "BSE", "CANBK", "CGPOWER",
+    "CHOLAFIN", "COFORGE", "CUMMINSIND", "DELHIVERY", "DIXON",
+    "DLF", "DMART", "ETERNAL", "FORCEMOT", "GAIL",
+    "GODREJCP", "GVT&D", "HAL", "HDFCAMC", "HDFCLIFE",
+    "HEROMOTOCO", "HINDPETRO", "HINDZINC", "HYUNDAI", "IDEA",
+    "IDFCFIRSTB", "INDIGO", "INDUSTOWER", "JIOFIN", "JUBLFOOD",
+    "KALYANKJIL", "KAYNES", "KEI", "KPITTECH", "LAURUSLABS",
+    "LICI", "LODHA", "LTF", "LTM", "LUPIN",
+    "MANAPPURAM", "MAXHEALTH", "MAZDOCK", "MCX", "MOTHERSON",
+    "MUTHOOTFIN", "NATIONALUM", "NAUKRI", "NYKAA", "OFSS",
+    "PATANJALI", "PAYTM", "PERSISTENT", "PFC", "PIDILITIND",
+    "POLICYBZR", "POLYCAB", "POWERINDIA", "RADICO", "RECLTD",
+    "SAIL", "SBILIFE", "SHRIRAMFIN", "SOLARINDS", "SONACOMS",
+    "SUZLON", "SWIGGY", "TMPV", "TORNTPHARM", "TRENT",
+    "TVSMOTOR", "UNIONBANK", "VBL", "VEDL", "WAAREEENER",
+    "ZYDUSLIFE",
 ]
 
 # Hardcoded lot sizes -- fallback ONLY. Unlike FNO_STRIKE_INTERVALS above

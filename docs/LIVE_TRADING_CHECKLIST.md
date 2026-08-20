@@ -43,6 +43,12 @@ artifact.
       22-closed-trade paper track record under-samples these two strategies
       by roughly one dead week per month; give it a few full cycles on the
       fixed code before trusting the win rate.
+- [ ] Same re-baseline note applies even more strongly now: `FNO_SYMBOLS`
+      expanded 41 → 132 the same day (also "Already done") — the existing
+      22-trade track record reflects a completely different, much smaller
+      candidate universe. Don't compare pre-2026-08-20 win rate/P&L against
+      post-expansion results as if they're the same system; treat everything
+      before this date as informative but not directly comparable.
 
 ## A2. Risk & capital configuration — sized for the REAL account
 
@@ -110,7 +116,7 @@ Current `.env`: `INITIAL_CAPITAL=300000.0`, `MAX_OPEN_POSITIONS=5`,
 
 ## A5. Testing & CI safety net
 
-- [ ] Full test suite green (currently 324 passing) immediately before flip.
+- [ ] Full test suite green (currently 329 passing) immediately before flip.
 - [ ] `deploy.sh`'s invariant-check step (`verify_invariants.py`, currently
       18 static + 4 runtime checks) wired into the actual deploy path used
       for the live-mode cutover, not run ad hoc.
@@ -216,23 +222,11 @@ pressure is worse than leaving a known, bounded gap for now.
   improvement, not a pre-launch fix.
 - **Unifying EMA/Momentum into a shared SignalConfirmationStateMachine.**
   Pure refactor; both already work correctly and are tested.
-- **Dynamic FNO_SYMBOLS universe via `kite.instruments()`.** The current
-  hardcoded ~40-symbol universe was already validated against real Zerodha
-  data this session (lot sizes and strike intervals corrected). Dynamic
-  discovery is a maintenance improvement, not a correctness fix right now.
-  Update (2026-08-20): the prep work for this is now done — real F&O
-  universe confirmed at 208 stocks (`scripts/diagnostic_universe_timing.py`,
-  live `kite.instruments("NFO")` pull), strike interval is derived from real
-  contracts (see below, no per-symbol verification needed), `FNO_SECTORS`
-  now covers all 208 (verified against live sources, not guessed), and
-  `LTPPoller`'s OHLC prefetch is concurrent so a 208-symbol cold start fits
-  the 60s cycle budget instead of the ~48s-of-60s sequential version risking
-  a skipped cycle. **Still not flipping `FNO_SYMBOLS` itself pre-launch** —
-  that's a separate decision (changes actual trading behavior / candidate
-  pools, further affects the paper-trading track record already being
-  re-baselined from 2026-08-20) and still needs an explicit go-ahead, plus a
-  liquidity filter for the ~167 additional names (many are far thinner than
-  the current hand-picked 41 — more symbols isn't automatically more edge).
+- ~~**Dynamic FNO_SYMBOLS universe via `kite.instruments()`.**~~ Done
+  2026-08-20 — see "Already done" below. (Originally deferred as "a
+  maintenance improvement, not a correctness fix right now"; the user asked
+  to actually measure the effect with real data instead of leaving it
+  deferred, which changed the calculus once the numbers were in hand.)
 
 ---
 
@@ -364,9 +358,33 @@ Kept short — see git log / individual commit messages for full detail.
     full-parallel, to stay well under Zerodha's rate limits) before the main
     per-symbol loop, for both the 5-min and 15-min caches. Removes the cold-
     start cycle-skip risk regardless of universe size.
-  - Still **not** flipping `FNO_SYMBOLS` itself — see the Part B note above.
   - 6 new tests, 2 new `verify_invariants.py` static checks.
+- **FNO_SYMBOLS expanded 41 → 132, liquidity-verified** (2026-08-20). With
+  the prep above done, ran a second read-only diagnostic
+  (`scripts/diagnostic_universe_liquidity.py`) computing real 20-day average
+  daily turnover (`volume × close`) for all 208 symbols via
+  `kite.historical_data(interval="day")` — 36.4s, zero failures. Found the
+  current 41 was never actually "the 41 most liquid" — it's a legacy
+  curated list with real gaps (e.g. `BSE` ranks #6 by turnover, more liquid
+  than `TCS`, but wasn't traded; `KALYANKJIL`, `ETERNAL`, `PAYTM`, `MCX`,
+  `LICI`, `SWIGGY` are all comparably liquid newer/renamed listings that
+  arrived after the list was built). Used "at least as liquid as
+  TATACONSUM" (the least-liquid symbol already traded, #132 by rank) as the
+  floor: 132 of 208 symbols clear it. Expanded `FNO_SYMBOLS` to exactly that
+  132-symbol set — purely additive, nothing previously traded was removed,
+  every addition liquidity-verified against real turnover data rather than
+  "NSE says it's F&O eligible." The remaining 76 (e.g. `DALBHARAT` ₹38
+  Cr/day, `PETRONET`/`BAJAJHLDNG` ₹55 Cr/day) stayed excluded as genuinely
+  too thin. Also fixed a regex fragility this surfaced in
+  `verify_invariants.py`: a source comment containing a quoted string
+  (`kite.instruments("NFO")`) inside the `FNO_SYMBOLS` list literal was
+  getting swept up by a naive `re.findall` as if it were a real list entry
+  — added `_strip_comments()` so future comments can't trip the same check.
+  5 new tests (`tests/test_fno_universe_expansion_2026_08_20.py`), 1 new
+  `verify_invariants.py` static check, 1 existing test relaxed
+  (`FNO_LOT_SIZES` no longer needs 1:1 `FNO_SYMBOLS` coverage now that it's
+  fallback-only — the daily Redis cache is authoritative).
 
 ---
 
-*Last updated: 2026-08-20, after the F&O universe-expansion prep work.*
+*Last updated: 2026-08-20, after the FNO_SYMBOLS 41→132 expansion.*
