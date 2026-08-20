@@ -309,8 +309,18 @@ class LiveTradingEngine:
         positions = await self._safe_get_positions()
         await self._refresh_risk_state(positions)
 
-        # Cancel orders that have been pending > 5 minutes
-        await self.order_manager.expire_stale_orders()
+        # Cancel orders that have been pending > 5 minutes.
+        # Fixed 2026-08-20 (deep review): run_signal_cycle() has no top-level
+        # try/except -- an unhandled exception here (this call was just
+        # substantially rewritten today: sync_orders() first, retry-and-
+        # recheck on a failed cancel) used to abort the ENTIRE cycle,
+        # including the exit checks immediately below, which are the most
+        # safety-critical action in this method. A stale-order-expiry error
+        # must not block SL/target/breach checks for every open position.
+        try:
+            await self.order_manager.expire_stale_orders()
+        except Exception as exc:
+            logger.error(f"expire_stale_orders() failed — continuing with exit checks: {exc}")
 
         # Exit checks — lock prevents interleaving with the 10-second exit-only job (F)
         async with self._exit_cycle_lock:
@@ -332,19 +342,31 @@ class LiveTradingEngine:
         if self.strategy_monitor:
             await self.strategy_monitor.evaluate_all()
 
-        # Regime detection + strategy switching (runs every cycle, lightweight)
+        # Regime detection + strategy switching (runs every cycle, lightweight).
+        # Fixed 2026-08-20 (deep review): unguarded -- a transient failure
+        # (e.g. a Redis blip inside detect()) used to abort the rest of the
+        # cycle, including entry-signal generation below and the EMA/momentum
+        # state persistence at the end of this method.
         regime = None
         if self.regime_detector:
-            regime = await self.regime_detector.detect()
-            await self.regime_detector.enforce_regime_switching()
+            try:
+                regime = await self.regime_detector.detect()
+                await self.regime_detector.enforce_regime_switching()
+            except Exception as exc:
+                logger.error(f"Regime detection/switching failed — continuing without it this cycle: {exc}")
 
-        # Log correlation / sector concentration warnings (non-blocking)
+        # Log correlation / sector concentration warnings (non-blocking) --
+        # fixed 2026-08-20: this comment already claimed "non-blocking" but
+        # nothing enforced it; an exception here used to block entries below.
         if self.portfolio_analyzer and positions:
-            report = self.portfolio_analyzer.get_report(positions)
-            for flag in report.get("correlation_flags", []):
-                logger.warning(f"PortfolioAnalyzer: {flag}")
-            for alert in report.get("concentration_alerts", []):
-                logger.warning(f"PortfolioAnalyzer: {alert}")
+            try:
+                report = self.portfolio_analyzer.get_report(positions)
+                for flag in report.get("correlation_flags", []):
+                    logger.warning(f"PortfolioAnalyzer: {flag}")
+                for alert in report.get("concentration_alerts", []):
+                    logger.warning(f"PortfolioAnalyzer: {alert}")
+            except Exception as exc:
+                logger.error(f"PortfolioAnalyzer report failed — continuing (non-blocking by design): {exc}")
 
         # Entry signals — only after the warm-up window has elapsed.
         # Prevents entering all positions in the first cycle on stale data.
@@ -3667,11 +3689,70 @@ class LiveTradingEngine:
                 logger.error(f"Square-off error [{contract}]: {exc} -- position may still be open, will retry next cycle")
 
         if is_expiry:
+            # Fixed 2026-08-20 (deep review): this whole block used to run
+            # unconditionally for every tracked spread/condor once is_expiry
+            # was True, regardless of whether all of that structure's legs
+            # actually closed in the per-position loop above (a leg is only
+            # present in _exit_prices on a successful close -- absent if its
+            # order was REJECTED_BY_RISK/FAILED and the loop `continue`d
+            # past it). That meant a partially-closed structure still got
+            # its GTT backstop cancelled, a fabricated trade_journal close
+            # (falling back to the ENTRY premium for the unclosed leg, as if
+            # it hadn't moved), its deployed capital released, and dropped
+            # from _active_spreads/_active_condors entirely -- while a REAL
+            # naked leg was still open at the broker, with its exchange-level
+            # stop now gone and its journal row already (wrongly) marked
+            # closed, on the single highest gamma/assignment-risk day of its
+            # life. Only fully-closed structures (every leg present in
+            # _exit_prices) get that treatment now; a partially-closed one
+            # stays tracked so the normal _check_spread_exits/_check_condor_
+            # exits path retries the remaining leg(s) next cycle, with a loud
+            # alert since this is expiry day.
+            _spreads_done: List[str] = []
+            for _sym, _s in self._active_spreads.items():
+                _legs = (_s.get("short_contract", ""), _s.get("long_contract", ""))
+                if all(leg and leg in _exit_prices for leg in _legs):
+                    _spreads_done.append(_sym)
+                else:
+                    logger.critical(
+                        f"EXPIRY DAY: spread {_sym} has a leg that failed to close {_legs} "
+                        f"-- leaving it tracked for retry; GTT/journal/capital-release skipped."
+                    )
+                    await self._notify(
+                        f"CRITICAL: expiry-day close FAILED for spread {_sym}\n"
+                        f"Legs: {_legs}\n"
+                        f"At least one leg's close order was rejected/failed. This structure "
+                        f"remains open past expiry -- manual review required."
+                    )
+
+            _condors_done: List[str] = []
+            for _sym, _c in self._active_condors.items():
+                _legs = (
+                    _c.get("put_short_contract", ""), _c.get("put_long_contract", ""),
+                    _c.get("call_short_contract", ""), _c.get("call_long_contract", ""),
+                )
+                if all(leg and leg in _exit_prices for leg in _legs):
+                    _condors_done.append(_sym)
+                else:
+                    logger.critical(
+                        f"EXPIRY DAY: condor {_sym} has a leg that failed to close {_legs} "
+                        f"-- leaving it tracked for retry; GTT/journal/capital-release skipped."
+                    )
+                    await self._notify(
+                        f"CRITICAL: expiry-day close FAILED for condor {_sym}\n"
+                        f"Legs: {_legs}\n"
+                        f"At least one leg's close order was rejected/failed. This structure "
+                        f"remains open past expiry -- manual review required."
+                    )
+
             # Cancel GTT backstops before clearing so exchange-level orders don't
             # fire after our positions are already closed by the square-off above.
-            for _s in self._active_spreads.values():
+            # Only for structures that FULLY closed -- see fix note above.
+            for _sym in _spreads_done:
+                _s = self._active_spreads[_sym]
                 await self._cancel_gtt(_s.get("gtt_id"), _s.get("short_contract", ""))
-            for _c in self._active_condors.values():
+            for _sym in _condors_done:
+                _c = self._active_condors[_sym]
                 await self._cancel_gtt(_c.get("put_short_gtt_id"),  _c.get("put_short_contract",  ""))
                 await self._cancel_gtt(_c.get("call_short_gtt_id"), _c.get("call_short_contract", ""))
 
@@ -3683,7 +3764,9 @@ class LiveTradingEngine:
             # square-off loop above -- one malformed spread/condor record shouldn't
             # block the journal close (and capital release) for every other one,
             # especially on expiry day when getting this right matters most.
-            for _s in self._active_spreads.values():
+            # Only for structures that FULLY closed -- see 2026-08-20 fix note above.
+            for _sym in _spreads_done:
+                _s = self._active_spreads[_sym]
                 try:
                     _short_x = _exit_prices.get(_s.get("short_contract", ""), _s.get("short_premium", 0))
                     _long_x  = _exit_prices.get(_s.get("long_contract", ""),  _s.get("long_premium", 0))
@@ -3728,7 +3811,8 @@ class LiveTradingEngine:
                         f"trade_journal.exit_time/exit_price/pnl for journal_id="
                         f"{_s.get('journal_id')} by hand."
                     )
-            for _c in self._active_condors.values():
+            for _sym in _condors_done:
+                _c = self._active_condors[_sym]
                 try:
                     _ps_x = _exit_prices.get(_c.get("put_short_contract", ""),  _c.get("put_short_premium", 0))
                     _pl_x = _exit_prices.get(_c.get("put_long_contract", ""),   _c.get("put_long_premium", 0))
@@ -3772,9 +3856,13 @@ class LiveTradingEngine:
                         f"{_c.get('journal_id')} by hand."
                     )
 
-            # Full expiry-day clear — all positions force-closed
-            self._active_spreads.clear()
-            self._active_condors.clear()
+            # Expiry-day clear — only structures confirmed fully closed above
+            # (2026-08-20 fix: previously an unconditional .clear() dropped
+            # every structure regardless of whether all its legs actually closed).
+            for _sym in _spreads_done:
+                del self._active_spreads[_sym]
+            for _sym in _condors_done:
+                del self._active_condors[_sym]
             await self._persist_state()
             if closed_expiry and not self._eod_notified_today:
                 self._eod_notified_today = True

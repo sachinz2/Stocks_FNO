@@ -33,6 +33,10 @@ class CreditSpreadStrategy(StrategyBase):
         self.slow_period = self.parameters.get("slow_period", 50)
         # ATR as % of price — below this we use credit spreads, above we hold
         self.low_vol_threshold = self.parameters.get("low_vol_threshold", 1.2)
+        # Below this EMA spread% the trend is flat -- iron_condor_v1's territory,
+        # not ours (see generate_signal()'s 2026-08-20 fix note). Same default as
+        # IronCondorStrategy.flat_threshold so the two partitions actually meet.
+        self.flat_threshold = self.parameters.get("flat_threshold", 0.1)
         # How many strike intervals wide the spread should be
         self.spread_width = self.parameters.get("spread_width", 2)
         # Close short leg when it has decayed to this fraction of sold price (75% profit)
@@ -73,7 +77,20 @@ class CreditSpreadStrategy(StrategyBase):
 
         # High volatility → long options are better, we step aside
         if atr_pct >= self.low_vol_threshold:
-            return "HOLD"
+            return "HOLD"  # EMA crossover territory
+
+        # Fixed 2026-08-20 (deep review): this strategy had no floor on EMA
+        # spread magnitude, so it could fire a directional spread in the same
+        # low-ATR/near-flat-EMA band iron_condor_v1 claims exclusively --
+        # both this module's docstring and iron_condor.py's explicitly claim
+        # "the two strategies never fight each other," but with no
+        # flat_threshold check here, a symbol with e.g. atr_pct=0.5% and
+        # ema_spread_pct=0.05% (below iron_condor's 0.1% flat floor) would
+        # trigger BOTH a credit spread AND an iron condor concurrently,
+        # double-allocating capital/risk to the same underlying.
+        ema_spread_pct = abs(fast_ema - slow_ema) / slow_ema * 100 if slow_ema > 0 else 0
+        if ema_spread_pct < self.flat_threshold:
+            return "HOLD"  # iron_condor territory
 
         if fast_ema > slow_ema:
             return "BULL_PUT_SPREAD"

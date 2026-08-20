@@ -745,7 +745,19 @@ class _FakeExpiryJournalFailEngine:
         self._redis = None
 
     async def _safe_get_positions(self):
-        return []
+        # Fixed 2026-08-20 (deep review): the expiry-day consolidation block
+        # now only journals/clears a structure whose legs are ALL confirmed
+        # closed in the per-position loop above (present in _exit_prices) --
+        # so this fixture must supply real broker positions for every leg of
+        # both spreads for that loop to actually run and succeed, letting
+        # this test isolate the downstream journal-write failure it's meant
+        # to exercise, rather than a leg never having been attempted at all.
+        return [
+            {"symbol": "GOODSPR26AUG100PE", "quantity": -100, "avg_price": 10.0},
+            {"symbol": "GOODSPR26AUG90PE",  "quantity": 100,  "avg_price": 4.0},
+            {"symbol": "BADSPR26AUG200PE",  "quantity": -50,  "avg_price": 8.0},
+            {"symbol": "BADSPR26AUG190PE",  "quantity": 50,   "avg_price": 3.0},
+        ]
 
     async def _get_market_data(self, symbol):
         return {"atr14": 5.0}

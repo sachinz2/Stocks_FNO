@@ -199,7 +199,57 @@ class OrderManager:
 
             # Must capture the return — BaseRepository.update() returns a new merged
             # SQLAlchemy object; the original db_order is detached and NOT updated in place.
-            db_order = await self.order_repo.update(db_order, updates)
+            #
+            # Fixed 2026-08-20 (deep review): this write used to sit inside the
+            # same try/except as the broker call above -- if it itself raised
+            # (transient DB hiccup right after a genuinely successful broker
+            # placement), control fell into the generic `except Exception`
+            # below, which persisted order_status=FAILED using the STALE
+            # db_order (broker_order_id never written). sync_orders() only
+            # ever reconciles order_status=='OPEN' rows, so a FAILED row with
+            # no broker_order_id can never be tied back to the real, live
+            # broker order again -- capital/position tracking would silently
+            # diverge from reality with no reconciliation path. A DB failure
+            # AFTER the broker has already accepted the order must never
+            # downgrade it to FAILED. Retry the critical write a few times;
+            # if it still fails, keep the order live in the caller's eyes
+            # (in-memory broker_order_id/OPEN) and escalate loudly instead of
+            # silently orphaning it.
+            _db_exc: Optional[Exception] = None
+            for _attempt in range(3):
+                try:
+                    db_order = await self.order_repo.update(db_order, updates)
+                    _db_exc = None
+                    break
+                except Exception as e:
+                    _db_exc = e
+                    if _attempt < 2:
+                        await asyncio.sleep(0.5 * (_attempt + 1))
+
+            if _db_exc is not None:
+                logger.critical(
+                    f"CRITICAL: order placed at broker (broker_order_id={broker_order_id}, "
+                    f"{side} {quantity} {symbol}) but persisting it to the DB failed after "
+                    f"3 attempts: {_db_exc}. Order is LIVE at the broker -- NOT marking FAILED. "
+                    f"Manual reconciliation required for internal order id={db_order.id}."
+                )
+                try:
+                    await self._audit("ORDER_DB_PERSIST_FAILED", {
+                        "order_id": db_order.id, "broker_order_id": broker_order_id,
+                        "error": str(_db_exc),
+                    })
+                except Exception:
+                    pass
+                # Return an in-memory-patched record so the immediate caller
+                # (e.g. live_trading_engine.py reading order_status/fill_price
+                # right after this call) still sees the real broker outcome,
+                # even though the DB row itself may still read PENDING.
+                db_order.broker_order_id = broker_order_id
+                db_order.order_status = updates.get("order_status", "OPEN")
+                if "fill_price" in updates:
+                    db_order.fill_price = updates["fill_price"]
+                return db_order
+
             await self._audit("ORDER_ROUTED", {
                 "order_id": db_order.id, "broker_order_id": broker_order_id,
             })
