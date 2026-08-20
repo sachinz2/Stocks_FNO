@@ -110,7 +110,7 @@ Current `.env`: `INITIAL_CAPITAL=300000.0`, `MAX_OPEN_POSITIONS=5`,
 
 ## A5. Testing & CI safety net
 
-- [ ] Full test suite green (currently 318 passing) immediately before flip.
+- [ ] Full test suite green (currently 324 passing) immediately before flip.
 - [ ] `deploy.sh`'s invariant-check step (`verify_invariants.py`, currently
       18 static + 4 runtime checks) wired into the actual deploy path used
       for the live-mode cutover, not run ad hoc.
@@ -220,14 +220,19 @@ pressure is worse than leaving a known, bounded gap for now.
   hardcoded ~40-symbol universe was already validated against real Zerodha
   data this session (lot sizes and strike intervals corrected). Dynamic
   discovery is a maintenance improvement, not a correctness fix right now.
-  Note (2026-08-20): the strike-interval half of this got materially safer
-  regardless of whether the symbol list itself is ever expanded — see
-  `get_real_strike_interval()` in "Already done" below, which derives the
-  interval from real listed contracts instead of a hand-maintained table, so
-  a future symbol addition would need zero manual strike-interval
-  verification. Still not doing the universe expansion itself pre-launch —
-  liquidity filtering for the ~150 additional F&O names is a separate,
-  unstarted piece of work.
+  Update (2026-08-20): the prep work for this is now done — real F&O
+  universe confirmed at 208 stocks (`scripts/diagnostic_universe_timing.py`,
+  live `kite.instruments("NFO")` pull), strike interval is derived from real
+  contracts (see below, no per-symbol verification needed), `FNO_SECTORS`
+  now covers all 208 (verified against live sources, not guessed), and
+  `LTPPoller`'s OHLC prefetch is concurrent so a 208-symbol cold start fits
+  the 60s cycle budget instead of the ~48s-of-60s sequential version risking
+  a skipped cycle. **Still not flipping `FNO_SYMBOLS` itself pre-launch** —
+  that's a separate decision (changes actual trading behavior / candidate
+  pools, further affects the paper-trading track record already being
+  re-baselined from 2026-08-20) and still needs an explicit go-ahead, plus a
+  liquidity filter for the ~167 additional names (many are far thinner than
+  the current hand-picked 41 — more symbols isn't automatically more edge).
 
 ---
 
@@ -334,7 +339,34 @@ Kept short — see git log / individual commit messages for full detail.
   decision). Also de-risks a future `FNO_SYMBOLS` universe expansion (see
   Part B note above) — a new symbol needs zero manual strike-interval
   verification. 11 new tests, 1 new `verify_invariants.py` static check.
+- **F&O universe-expansion prep: real universe sizing, sector mapping,
+  concurrent OHLC prefetch** (2026-08-20). User asked to actually measure
+  the effect of a ~208-symbol universe instead of reasoning about it
+  abstractly. Read-only diagnostic (`scripts/diagnostic_universe_timing.py`,
+  no orders/writes, live `kite.instruments("NFO")` + `kite.historical_data()`
+  calls) found: real universe is 208 stocks (not the ~190 estimated), and a
+  sequential cold-start OHLC fetch across all 208 takes 48.4s of the 60s
+  cycle budget with zero rate-limit errors — safe in steady state (~10s/
+  cycle, since only ~1/5 of symbols refresh per minute) but risks a skipped
+  cycle on every restart. Also found `FNO_SECTORS` (sector-concentration
+  risk check) was *also* a hardcoded 41-entry table, same shape as the
+  strike-interval gap, silently no-op'ing for any symbol not in it — unlike
+  strike interval, sector classification isn't in Zerodha's instrument data,
+  so this needed external verification (web search against live sources,
+  not memory) rather than a derivation. Two fixes:
+  - `FNO_SECTORS` extended to all 208 real symbols (currently only 41 are
+    active via `FNO_SYMBOLS`; the rest sit ready, unused, for a future
+    expansion) — every entry verified against a live source, not guessed,
+    including recent listings (`TMPV`, `PREMIERENE`, `VMM`, `LTM`, `GVT&D`,
+    `WAAREEENER`, `PGEL`).
+  - New `LTPPoller._prefetch_stale_histories()`: fetches every symbol's
+    stale OHLC concurrently (bounded to 5 at a time via a semaphore, not
+    full-parallel, to stay well under Zerodha's rate limits) before the main
+    per-symbol loop, for both the 5-min and 15-min caches. Removes the cold-
+    start cycle-skip risk regardless of universe size.
+  - Still **not** flipping `FNO_SYMBOLS` itself — see the Part B note above.
+  - 6 new tests, 2 new `verify_invariants.py` static checks.
 
 ---
 
-*Last updated: 2026-08-20, after the real-strike-interval fix.*
+*Last updated: 2026-08-20, after the F&O universe-expansion prep work.*

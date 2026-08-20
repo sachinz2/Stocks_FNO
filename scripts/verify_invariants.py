@@ -396,6 +396,34 @@ def check_strike_interval_derived_from_real_contracts(repo: Path) -> Result:
     return PASS, name, "All 3 entry paths derive their strike interval from the real contract cache, falling back to the static table only on a cache miss."
 
 
+def check_ltp_poller_prefetches_ohlc_concurrently(repo: Path) -> Result:
+    name = "LTPPoller prefetches stale OHLC concurrently (bounded), not one symbol at a time"
+    src = _read(repo, "src/market_data/ltp_poller.py")
+    if "async def _prefetch_stale_histories" not in src:
+        return FAIL, name, "_prefetch_stale_histories() missing -- poll() reverted to sequential kite.historical_data() calls, risking the cycle-budget overrun found scaling toward the 208-symbol F&O universe."
+    if "asyncio.Semaphore" not in src:
+        return FAIL, name, "_prefetch_stale_histories() no longer bounds concurrency with a semaphore -- either reverted to sequential, or now fires fully unbounded-parallel requests at Zerodha."
+    poll_src = _read(repo, "src/market_data/ltp_poller.py")
+    if poll_src.count("await self._prefetch_stale_histories(") < 2:
+        return FAIL, name, "poll() no longer calls _prefetch_stale_histories() for both the 5-min and 15-min OHLC caches."
+    return PASS, name, "Both 5-min and 15-min OHLC caches are prefetched concurrently (bounded) before poll()'s main per-symbol loop."
+
+
+def check_fno_sectors_covers_full_real_universe(repo: Path) -> Result:
+    name = "FNO_SECTORS has an entry for every symbol traded (no silent sector-check gap)"
+    src = _read(repo, "src/core/constants.py")
+    fno_symbols_match = re.search(r"FNO_SYMBOLS = \[(.*?)\]", src, re.DOTALL)
+    fno_sectors_match = re.search(r"FNO_SECTORS = \{(.*?)\n\}", src, re.DOTALL)
+    if not fno_symbols_match or not fno_sectors_match:
+        return FAIL, name, "Couldn't locate FNO_SYMBOLS/FNO_SECTORS in constants.py to cross-check."
+    symbols = set(re.findall(r'"([^"]+)"', fno_symbols_match.group(1)))
+    sectors = set(re.findall(r'"([^"]+)":\s*"[^"]+"', fno_sectors_match.group(1)))
+    missing = symbols - sectors
+    if missing:
+        return FAIL, name, f"{len(missing)} traded symbol(s) have no FNO_SECTORS entry -- the sector-concentration risk check silently no-ops for them: {sorted(missing)}"
+    return PASS, name, f"All {len(symbols)} currently-traded symbols have a sector mapping."
+
+
 STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_exit_classification_by_pnl,
     check_capital_allocation_keys,
@@ -418,6 +446,8 @@ STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_margin_and_broker_position_failures_fail_closed,
     check_single_leg_dte_window_covers_post_roll_dte,
     check_strike_interval_derived_from_real_contracts,
+    check_ltp_poller_prefetches_ohlc_concurrently,
+    check_fno_sectors_covers_full_real_universe,
 ]
 
 

@@ -134,6 +134,19 @@ class LTPPoller:
 
         loop = asyncio.get_running_loop()
 
+        # Warm both OHLC caches concurrently before the sequential per-symbol
+        # loop below -- see _prefetch_stale_histories()'s docstring. By the
+        # time the loop calls _get_history()/_get_history_15m(), any symbol
+        # prefetched here just returns the now-warm cache, no blocking I/O.
+        await self._prefetch_stale_histories(
+            self.symbols, loop, self._fetch_kite_ohlc,
+            self._history_loaded_at, self._history, HISTORY_REFRESH_SECONDS,
+        )
+        await self._prefetch_stale_histories(
+            self.symbols, loop, self._fetch_kite_ohlc_15m,
+            self._history_15m_loaded_at, self._history_15m, _HISTORY_15M_REFRESH_SECONDS,
+        )
+
         ema_scores: Dict[str, float] = {}
         spread_scores: Dict[str, float] = {}
         condor_scores: Dict[str, float] = {}
@@ -322,6 +335,61 @@ class LTPPoller:
         except Exception as e:
             logger.debug(f"LTPPoller: day-range read failed for {symbol}: {e}")
             return None
+
+    # Bounded concurrency for the OHLC prefetch below -- NOT full-parallel
+    # across every symbol needing a refresh in the same cycle, to stay well
+    # under Zerodha's request-rate limits rather than trading a cold-start
+    # timing risk for a rate-limit risk. Diagnostic run (scripts/
+    # diagnostic_universe_timing.py, 2026-08-20) completed 208 SEQUENTIAL
+    # kite.historical_data() calls with zero errors at ~0.23s/call, so 5
+    # concurrent requests has a wide safety margin either way.
+    _MAX_CONCURRENT_OHLC_FETCHES = 5
+
+    async def _prefetch_stale_histories(
+        self, symbols: List[str], loop, fetch_fn, loaded_at: Dict[str, datetime],
+        history: Dict[str, pd.DataFrame], refresh_seconds: int,
+    ) -> None:
+        """
+        Fetch OHLC concurrently (bounded) for every symbol whose cache is
+        stale, instead of poll()'s per-symbol loop hitting
+        kite.historical_data() one at a time.
+
+        Added 2026-08-20: at the 41-symbol universe, the sequential version
+        comfortably fit the 60s signal-cycle budget (measured ~9s for a full
+        cold-start burst). Scaling toward the real 208-symbol NSE F&O
+        universe (see FNO_SECTORS' 2026-08-20 comment), a cold start (every
+        container restart) hits ~48s sequentially for the 5-min OHLC alone --
+        close enough to the 60s budget, before the 15-min OHLC fetch and
+        indicator computation are even added, that one slow Zerodha response
+        could push a scheduled cycle past its misfire_grace_time=30s and get
+        it skipped. This is called once per refresh kind (5-min, 15-min) at
+        the top of poll(), before the main per-symbol loop -- by the time
+        that loop calls _get_history()/_get_history_15m(), the caches it
+        needs are already warm and those calls return instantly.
+        """
+        now = datetime.now()
+        stale = [
+            s for s in symbols
+            if self._kite and s in self._tokens
+            and (loaded_at.get(s) is None or (now - loaded_at[s]).total_seconds() > refresh_seconds)
+        ]
+        if not stale:
+            return
+
+        semaphore = asyncio.Semaphore(self._MAX_CONCURRENT_OHLC_FETCHES)
+
+        async def _fetch_one(symbol: str) -> None:
+            async with semaphore:
+                try:
+                    df = await loop.run_in_executor(None, fetch_fn, symbol)
+                except Exception as e:
+                    logger.warning(f"LTPPoller: concurrent OHLC prefetch failed for {symbol}: {e}")
+                    df = None
+                loaded_at[symbol] = datetime.now()
+                if df is not None and not df.empty:
+                    history[symbol] = df
+
+        await asyncio.gather(*(_fetch_one(s) for s in stale))
 
     async def _get_history(self, symbol: str, loop) -> Optional[pd.DataFrame]:
         """Return Zerodha 5-min OHLC, refreshing cache every 5 minutes.
