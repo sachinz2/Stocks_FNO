@@ -80,6 +80,14 @@ FNO_LOT_SIZES = {
 # on an affected symbol to run on the synthetic ATR-estimate fallback for its
 # entire life (entry AND every exit check) instead of ever touching a real
 # quote -- 27 of the 39 symbols below had a wrong value, not just TITAN.
+#
+# Fallback ONLY as of 2026-08-20: LiveTradingEngine._get_strike_interval()
+# now derives the real interval from the same daily-refreshed real-contract
+# cache _resolve_contract() validates against (option_chain.
+# get_real_strike_interval()) and only falls back to this static table on a
+# cache miss. This table can still drift out of sync with NSE (a strike band
+# change moves the interval); the derived value can't, since it's read from
+# strikes Zerodha has actually listed for the exact expiry being traded.
 FNO_STRIKE_INTERVALS = {
     "RELIANCE":    10,   "TCS":         20,   "INFY":        15,
     "HDFCBANK":    10,   "ICICIBANK":   10,   "SBIN":        10,

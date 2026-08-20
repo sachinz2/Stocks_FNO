@@ -257,6 +257,55 @@ async def get_real_contract(
         return None
 
 
+async def get_real_strike_interval(symbol: str, expiry: date, redis) -> Optional[float]:
+    """
+    Derive the real NSE strike interval for (symbol, expiry) from the same
+    daily-refreshed real-contract cache get_real_contract() reads, instead of
+    a hand-maintained FNO_STRIKE_INTERVALS table.
+
+    Added 2026-08-20: that table was already found wrong for 27/39 symbols
+    once this project. get_real_contract() already protects against ordering
+    a PHANTOM (non-listed) strike by snapping to the nearest real one -- but
+    a wrong interval still corrupts the *candidate* strike fed into it,
+    especially find_delta_strike()'s scan grid (candidates spaced by
+    strike_interval across up to 30 strikes from ATM): too large an interval
+    overshoots the intended delta range entirely, too small clusters every
+    candidate near ATM and never reaches it. This is self-correcting instead
+    -- the interval is read from strikes Zerodha has actually listed for this
+    exact expiry, so it can never drift out of sync the way a static table can,
+    and a newly-added symbol needs zero manual verification to get this right.
+
+    Returns the minimum gap between consecutive real listed strikes, or None
+    on a cache miss (Redis down, symbol not cached, expiry not in the cached
+    window, or fewer than 2 strikes listed) -- callers should fall back to
+    the static FNO_STRIKE_INTERVALS table exactly like today, since a missing
+    real interval is an availability gap, not new information that trading
+    should stop (get_real_contract()'s own snap-to-nearest-listed-strike
+    check downstream is what actually guards against a phantom contract).
+    """
+    if redis is None:
+        return None
+    try:
+        from src.core.constants import REDIS_CONTRACT_PREFIX
+        raw = await redis.get(f"{REDIS_CONTRACT_PREFIX}{symbol}")
+        if not raw:
+            return None
+        data = json.loads(raw)
+        expiry_iso = expiry.strftime("%Y-%m-%d") if hasattr(expiry, "strftime") else str(expiry)
+        strikes_for_expiry = data.get(expiry_iso)
+        if not strikes_for_expiry or len(strikes_for_expiry) < 2:
+            return None
+        strikes = sorted(float(k) for k in strikes_for_expiry.keys())
+        gaps = [round(b - a, 4) for a, b in zip(strikes, strikes[1:]) if b > a]
+        if not gaps:
+            return None
+        interval = min(gaps)
+        return int(interval) if interval == int(interval) else interval
+    except Exception as e:
+        logger.debug(f"get_real_strike_interval: cache lookup failed for {symbol}: {e}")
+        return None
+
+
 def resolve_reliable_option_price(quote: Dict) -> Optional[float]:
     """
     Given one symbol's raw kite.quote() response dict, return a price we can

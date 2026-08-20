@@ -110,7 +110,7 @@ Current `.env`: `INITIAL_CAPITAL=300000.0`, `MAX_OPEN_POSITIONS=5`,
 
 ## A5. Testing & CI safety net
 
-- [ ] Full test suite green (currently 307 passing) immediately before flip.
+- [ ] Full test suite green (currently 318 passing) immediately before flip.
 - [ ] `deploy.sh`'s invariant-check step (`verify_invariants.py`, currently
       18 static + 4 runtime checks) wired into the actual deploy path used
       for the live-mode cutover, not run ad hoc.
@@ -220,6 +220,14 @@ pressure is worse than leaving a known, bounded gap for now.
   hardcoded ~40-symbol universe was already validated against real Zerodha
   data this session (lot sizes and strike intervals corrected). Dynamic
   discovery is a maintenance improvement, not a correctness fix right now.
+  Note (2026-08-20): the strike-interval half of this got materially safer
+  regardless of whether the symbol list itself is ever expanded — see
+  `get_real_strike_interval()` in "Already done" below, which derives the
+  interval from real listed contracts instead of a hand-maintained table, so
+  a future symbol addition would need zero manual strike-interval
+  verification. Still not doing the universe expansion itself pre-launch —
+  liquidity filtering for the ~150 additional F&O names is a separate,
+  unstarted piece of work.
 
 ---
 
@@ -307,7 +315,26 @@ Kept short — see git log / individual commit messages for full detail.
   `max_dte` from 25 to 42 (covers the real worst case of 41, verified by
   walking every month's expiry-to-expiry gap on the actual NSE calendar
   function). 5 new tests, 1 new `verify_invariants.py` static check.
+- **Strike interval now derived from real listed contracts, not just the
+  static table** (2026-08-20). `FNO_STRIKE_INTERVALS` was already found
+  wrong for 27/39 symbols once this project — `get_real_contract()` protects
+  against ordering a strike that isn't listed (snaps to nearest real one),
+  but a wrong interval still corrupts the *candidate* fed into it, especially
+  `find_delta_strike()`'s scan grid (candidates spaced by `strike_interval`
+  across up to 30 strikes from ATM — too large overshoots the intended delta
+  range, too small never reaches it). New `get_real_strike_interval()`
+  (`option_chain.py`) derives the interval from the minimum gap between
+  consecutive real strikes in the same daily-refreshed real-contract cache
+  `get_real_contract()` already reads — self-correcting, can't drift out of
+  sync with NSE the way a hand-maintained table can. Wired into all 3 entry
+  paths (`_process_signal`/`_process_credit_spread`/`_process_iron_condor`)
+  via new `LiveTradingEngine._get_strike_interval()`, which falls back to the
+  static table on a cache miss (intentionally fail-open here — this feeds a
+  candidate that still gets validated/snapped downstream, not a final trade
+  decision). Also de-risks a future `FNO_SYMBOLS` universe expansion (see
+  Part B note above) — a new symbol needs zero manual strike-interval
+  verification. 11 new tests, 1 new `verify_invariants.py` static check.
 
 ---
 
-*Last updated: 2026-08-20, after the single-leg DTE dead-zone fix.*
+*Last updated: 2026-08-20, after the real-strike-interval fix.*

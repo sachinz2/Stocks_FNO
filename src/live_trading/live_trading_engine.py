@@ -1595,7 +1595,8 @@ class LiveTradingEngine:
             return
         atr      = float(market_data.get("atr14", underlying_price * 0.01))
         iv_rank  = await self._get_iv_rank(symbol, underlying_price, atr, dte)
-        strike   = get_atm_strike(underlying_price, symbol)
+        strike_interval = await self._get_strike_interval(symbol, expiry)
+        strike   = get_atm_strike(underlying_price, symbol, interval=strike_interval)
         resolved = await self._resolve_contract(symbol, expiry, strike, option_type)
         if resolved is None:
             logger.warning(
@@ -1772,12 +1773,10 @@ class LiveTradingEngine:
         if underlying_price <= 0:
             return
 
-        from src.core.constants import FNO_STRIKE_INTERVALS
         from src.market_data.nse_oi import get_oi_data, pcr_allows_spread
         from src.market_data.option_chain import (
             atr_to_annualised_vol, find_delta_strike, get_entry_prices_for_spread,
         )
-        interval = FNO_STRIKE_INTERVALS.get(symbol, 50)
         expiry   = get_near_month_expiry()
         now      = now_ist()
         dte      = (expiry - now.replace(tzinfo=None)).days
@@ -1859,6 +1858,7 @@ class LiveTradingEngine:
             return
         atr        = float(market_data.get("atr14", underlying_price * 0.01))
         iv_rank    = await self._get_iv_rank(symbol, underlying_price, atr, dte)
+        interval   = await self._get_strike_interval(symbol, expiry)
         _atr_sigma = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, underlying_price)
         sigma      = await self._get_live_sigma(symbol, underlying_price, dte, interval, expiry, _atr_sigma)
 
@@ -2515,9 +2515,7 @@ class LiveTradingEngine:
         if underlying_price <= 0:
             return
 
-        from src.core.constants import FNO_STRIKE_INTERVALS
         from src.market_data.option_chain import atr_to_annualised_vol, find_delta_strike
-        interval = FNO_STRIKE_INTERVALS.get(symbol, 50)
         expiry   = get_near_month_expiry()
         now      = now_ist()
         dte      = (expiry - now.replace(tzinfo=None)).days
@@ -2593,6 +2591,7 @@ class LiveTradingEngine:
             return
         atr        = float(market_data.get("atr14", underlying_price * 0.01))
         iv_rank    = await self._get_iv_rank(symbol, underlying_price, atr, dte)
+        interval   = await self._get_strike_interval(symbol, expiry)
         _atr_sigma = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, underlying_price)
         sigma      = await self._get_live_sigma(symbol, underlying_price, dte, interval, expiry, _atr_sigma)
 
@@ -3969,6 +3968,27 @@ class LiveTradingEngine:
         if real:
             return real[1], real[0]
         return None
+
+    async def _get_strike_interval(self, symbol: str, expiry: datetime) -> float:
+        """
+        Real NSE strike interval for (symbol, expiry), derived from the same
+        real-contract cache _resolve_contract() validates against -- falls
+        back to the static FNO_STRIKE_INTERVALS table on a cache miss.
+
+        Intentionally fail-OPEN to the static table here (unlike
+        _resolve_contract()/_get_lot_size(), which fail closed): this feeds a
+        CANDIDATE strike into find_delta_strike()/get_atm_strike(), which
+        still gets validated/snapped to an actually-listed strike by
+        _resolve_contract() downstream before any order is placed -- same
+        "estimate refinement, not the final trade decision" reasoning as
+        _get_live_sigma()'s fail-open to ATR sigma.
+        """
+        from src.core.constants import FNO_STRIKE_INTERVALS
+        from src.market_data.option_chain import get_real_strike_interval
+        real_interval = await get_real_strike_interval(symbol, expiry, getattr(self, "_redis", None))
+        if real_interval is not None:
+            return real_interval
+        return FNO_STRIKE_INTERVALS.get(symbol, 50)
 
     async def _get_active_symbols(self, strategy=None) -> List[str]:
         redis = getattr(self, "_redis", None)

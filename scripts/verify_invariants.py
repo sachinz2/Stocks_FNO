@@ -383,6 +383,19 @@ def check_single_leg_dte_window_covers_post_roll_dte(repo: Path) -> Result:
     return PASS, name, "Both single-leg strategies' max_dte covers the worst-case post-roll DTE (41)."
 
 
+def check_strike_interval_derived_from_real_contracts(repo: Path) -> Result:
+    name = "Strike interval is derived from the real contract cache, not just the static table"
+    oc_src = _read(repo, "src/market_data/option_chain.py")
+    if "def get_real_strike_interval" not in oc_src:
+        return FAIL, name, "get_real_strike_interval() missing from option_chain.py -- strike-interval selection reverted to the static-only FNO_STRIKE_INTERVALS table (already found wrong for 27/39 symbols once)."
+    engine_src = _read(repo, "src/live_trading/live_trading_engine.py")
+    if "async def _get_strike_interval" not in engine_src:
+        return FAIL, name, "_get_strike_interval() missing from LiveTradingEngine."
+    if engine_src.count("await self._get_strike_interval(") < 3:
+        return FAIL, name, "_get_strike_interval() is no longer called from all 3 entry paths (single-leg/_process_signal, credit_spread, iron_condor) -- one may have reverted to FNO_STRIKE_INTERVALS.get(symbol, 50) directly."
+    return PASS, name, "All 3 entry paths derive their strike interval from the real contract cache, falling back to the static table only on a cache miss."
+
+
 STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_exit_classification_by_pnl,
     check_capital_allocation_keys,
@@ -404,6 +417,7 @@ STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_auth_self_heal_actively_retries,
     check_margin_and_broker_position_failures_fail_closed,
     check_single_leg_dte_window_covers_post_roll_dte,
+    check_strike_interval_derived_from_real_contracts,
 ]
 
 

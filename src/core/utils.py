@@ -98,9 +98,16 @@ def get_lot_size(symbol: str) -> int:
     return FNO_LOT_SIZES.get(symbol, 1)
 
 
-def get_atm_strike(price: float, symbol: str) -> float:
+def get_atm_strike(price: float, symbol: str, interval: Optional[float] = None) -> float:
     """
     Round the underlying price to the nearest valid strike for this symbol.
+
+    `interval` lets a caller pass a real, cache-derived strike interval (see
+    LiveTradingEngine._get_strike_interval() / option_chain.get_real_strike_interval(),
+    added 2026-08-20) instead of trusting the static FNO_STRIKE_INTERVALS
+    table, which was already found wrong for 27/39 symbols once this
+    project. Defaults to the static table when omitted, so this stays a
+    plain sync/pure function for any caller without live Redis access.
 
     Some symbols (e.g. ITC, WIPRO, ONGC, POWERGRID, TATASTEEL) have a
     fractional NSE strike interval (2.5) whose grid includes genuine
@@ -111,7 +118,8 @@ def get_atm_strike(price: float, symbol: str) -> float:
     Returns int when the result is a whole number (the common case), float
     otherwise -- build_option_symbol() formats either correctly.
     """
-    interval = FNO_STRIKE_INTERVALS.get(symbol, 50)
+    if interval is None:
+        interval = FNO_STRIKE_INTERVALS.get(symbol, 50)
     strike = round(price / interval) * interval
     return int(strike) if strike == int(strike) else strike
 
