@@ -238,7 +238,17 @@ async def test_expire_stale_orders_syncs_before_treating_an_order_as_expired(mon
             self.updates = []
 
         async def filter(self, **kw):
-            return [self.row] if self.row.order_status == "OPEN" else []
+            # Fixed 2026-08-21: must actually respect the requested
+            # order_status (expire_stale_orders() now also queries
+            # PENDING_VERIFICATION via _retry_pending_verification_orders()
+            # before its OPEN-order pass) -- the old unconditional "return
+            # the row whenever it's OPEN, regardless of what status was
+            # asked for" let that new PENDING_VERIFICATION query incorrectly
+            # match this OPEN-status row too.
+            wanted = kw.get("order_status")
+            if wanted is not None and self.row.order_status != wanted:
+                return []
+            return [self.row]
 
         async def get_by_id(self, oid):
             return self.row

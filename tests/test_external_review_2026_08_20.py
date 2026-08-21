@@ -70,8 +70,19 @@ def test_momentum_bar_key_none_does_not_fast_track_confirmation():
         assert signal == "HOLD"
     assert strat._pending_count["RELIANCE"] == 1
 
-    # A genuinely new, identifiable bar_key correctly advances it and fires.
+    # Fixed 2026-08-21 (external review): the FIRST real bar_key we ever
+    # see, after being seeded on an unidentified bar, must NOT itself count
+    # as a second confirming bar -- it might be the SAME anonymous candle
+    # the count was seeded on. It only backfills the reference; the count
+    # stays at 1.
     signal = strat.generate_signal(_momentum_data(bar_key="live:2026-08-20T10:05:00"))
+    assert signal == "HOLD"
+    assert strat._pending_count["RELIANCE"] == 1
+    assert strat._pending_bar_key["RELIANCE"] == "live:2026-08-20T10:05:00"
+
+    # A SECOND, genuinely different, also-known bar_key correctly advances
+    # past the now-known reference and fires.
+    signal = strat.generate_signal(_momentum_data(bar_key="live:2026-08-20T10:10:00"))
     assert signal == "BUY"
 
 

@@ -253,10 +253,30 @@ class EMACrossoverStrategy(StrategyBase):
             # A missing bar_key now simply can't advance the count -- same
             # bar or unknown bar, don't double-count either way. Same fix as
             # momentum.py's identical pattern.
-            if bar_key is not None and bar_key != self._pending_bar_key.get(symbol):
+            #
+            # Fixed 2026-08-21 (external review): a SECOND, subtler gap --
+            # if the pending count was originally SEEDED while bar_key was
+            # still unknown (see the fresh-crossover branch below, which
+            # seeds unconditionally so signal_confirm_bars=1 still fires
+            # immediately), the stored reference bar_key is None. The old
+            # `bar_key != self._pending_bar_key.get(symbol)` check alone
+            # then treated the FIRST real bar_key we ever see as "different
+            # from None" and advanced the count -- even though that real
+            # bar_key might identify the very SAME anonymous candle the
+            # count was seeded on, not a genuinely new one. Split into two
+            # cases: only advance when BOTH sides are known real values
+            # that differ; when the stored side is still None, just record
+            # the now-known bar_key without advancing.
+            if (
+                bar_key is not None
+                and self._pending_bar_key.get(symbol) is not None
+                and bar_key != self._pending_bar_key.get(symbol)
+            ):
                 self._pending_count[symbol] = self._pending_count.get(symbol, 0) + 1
                 self._pending_bar_key[symbol] = bar_key
-            # else: same bar as last cycle (or bar unknown) — don't double-count
+            elif bar_key is not None and self._pending_bar_key.get(symbol) is None:
+                self._pending_bar_key[symbol] = bar_key
+            # else: same bar as last cycle, or bar still unknown — don't double-count
         else:
             # Direction differs from whatever was pending (or nothing was
             # pending) — only start a fresh pending count if this is a
@@ -271,6 +291,16 @@ class EMACrossoverStrategy(StrategyBase):
                 elif prev_fast < prev_slow:
                     prev_dir = "SELL"
             if prev_dir is not None and prev_dir != current_dir:
+                # Genuine fresh crossover. Seeds UNCONDITIONALLY (even if
+                # bar_key is currently unknown) so signal_confirm_bars=1
+                # still fires immediately on the crossing bar itself --
+                # needed both for live trading with signal_confirm_bars=1
+                # and for any bar_key-agnostic caller (e.g. the backtest
+                # engine, which never sets ohlc_bar_key since each row
+                # already deterministically represents one distinct bar).
+                # The "same direction" branch above is what actually
+                # prevents a stale-None-reference from being miscounted as
+                # advancing on a later cycle.
                 self._pending_signal[symbol] = current_dir
                 self._pending_count[symbol] = 1
                 self._pending_bar_key[symbol] = bar_key

@@ -277,7 +277,38 @@ class OrderManager:
             # session for the post-success DB-write-failure case. Reconcile
             # against the broker's real order list (matched by the same tag
             # place_order() attached) before deciding.
-            reconciled_id = await self._reconcile_after_timeout(db_order.id)
+            #
+            # Fixed 2026-08-21 (external review): _reconcile_after_timeout()
+            # used to swallow its OWN failure to check (get_orders() itself
+            # erroring, e.g. the exact kind of transient connectivity blip
+            # that caused the 2026-08-21 KAYNES incident) and return None --
+            # indistinguishable from "checked, genuinely not there." Both
+            # outcomes then fell through to the same `order_status=FAILED`
+            # line below, silently concluding failure for an order whose
+            # real fate is actually unknown. If the broker DID accept it,
+            # a real position now exists completely untracked (no capital
+            # allocation, no exit monitoring, nothing). Now:
+            # _reconcile_after_timeout() raises instead of swallowing, so
+            # this can distinguish "verified not found" (below, still
+            # legitimately FAILED) from "could not verify at all" (this
+            # except clause) and refuse to guess for the latter.
+            try:
+                reconciled_id = await self._reconcile_after_timeout(db_order.id)
+            except Exception as _verify_exc:
+                logger.critical(
+                    f"CRITICAL: order {db_order.id} ({side} {quantity} {symbol}) timed out "
+                    f"client-side AND verification against the broker's order list also "
+                    f"failed ({_verify_exc}) -- outcome is genuinely unknown. NOT marking "
+                    f"FAILED (a real broker fill would then go completely untracked). "
+                    f"Left as PENDING_VERIFICATION -- expire_stale_orders() retries this "
+                    f"automatically every cycle; escalate manually if it persists."
+                )
+                db_order = await self.order_repo.update(db_order, {"order_status": "PENDING_VERIFICATION"})
+                await self._audit("ORDER_VERIFICATION_FAILED", {
+                    "order_id": db_order.id, "symbol": symbol, "error": str(_verify_exc),
+                })
+                return db_order
+
             if reconciled_id:
                 db_order = await self.order_repo.update(db_order, {
                     "broker_order_id": reconciled_id, "order_status": "OPEN",
@@ -291,6 +322,9 @@ class OrderManager:
                     f"OPEN, not FAILED."
                 )
                 return db_order
+            # Reaching here means _reconcile_after_timeout() genuinely
+            # checked the broker's order list and found no matching tag --
+            # safe to conclude FAILED, unlike the except clause above.
             db_order = await self.order_repo.update(db_order, {"order_status": "FAILED"})
             await self._audit("ORDER_TIMEOUT", {"order_id": db_order.id, "symbol": symbol})
             return db_order
@@ -309,14 +343,17 @@ class OrderManager:
         PaperBroker orders never legitimately time out (synchronous,
         instant) and don't support tags, so this safely finds nothing for
         it -- effectively a Zerodha-only path.
+
+        Fixed 2026-08-21 (external review): used to catch get_orders()
+        failures itself and return None -- indistinguishable from "checked,
+        genuinely not found." Now RAISES instead, so the caller can tell
+        "couldn't verify" (exception) apart from "verified not there"
+        (returns None), since those require opposite-risk responses -- see
+        place_order()'s TimeoutError handler.
         """
         from src.core.utils import broker_order_tag
         tag = broker_order_tag(str(internal_order_id))
-        try:
-            broker_orders = await asyncio.wait_for(self.broker.get_orders(), timeout=BROKER_TIMEOUT_SEC)
-        except Exception as e:
-            logger.error(f"Timeout reconciliation: get_orders() failed for order {internal_order_id}: {e}")
-            return None
+        broker_orders = await asyncio.wait_for(self.broker.get_orders(), timeout=BROKER_TIMEOUT_SEC)
         for o in broker_orders:
             if o.get("tag") == tag and o.get("status") not in ("REJECTED", "CANCELLED"):
                 return str(o.get("order_id"))
@@ -352,6 +389,56 @@ class OrderManager:
             return round(price * (1 + RETRY_PRICE_ADJUSTMENT), 2)
         return round(price * (1 - RETRY_PRICE_ADJUSTMENT), 2)
 
+    async def _retry_pending_verification_orders(self) -> None:
+        """
+        Fixed 2026-08-21 (external review): re-attempt broker verification
+        for every order left PENDING_VERIFICATION by a prior timeout whose
+        _reconcile_after_timeout() check itself failed (e.g. a transient
+        connectivity blip -- get_orders() couldn't be reached, so the
+        outcome was genuinely unknown and NOT safe to conclude FAILED; see
+        place_order()'s TimeoutError handler). Called every cycle via
+        expire_stale_orders(), same cadence as the rest of order-lifecycle
+        bookkeeping.
+
+        - Found live at the broker now -> correct to OPEN.
+        - Verified genuinely not there (broker reachable, no matching tag)
+          -> NOW safe to conclude FAILED, since this is a real, checked
+          answer, not a guess.
+        - Still can't verify -> leave as PENDING_VERIFICATION, log again
+          next cycle. Never auto-concludes FAILED on an unverifiable
+          outcome, no matter how many cycles it takes -- a stuck order here
+          means a human needs to check the broker directly, not that the
+          system should guess.
+        """
+        pending = await self.order_repo.filter(order_status="PENDING_VERIFICATION")
+        for order in pending:
+            try:
+                reconciled_id = await self._reconcile_after_timeout(order.id)
+            except Exception as e:
+                logger.warning(
+                    f"PENDING_VERIFICATION retry: order {order.id} still can't be "
+                    f"verified ({e}) -- leaving as-is, will retry next cycle."
+                )
+                continue
+            if reconciled_id:
+                await self.order_repo.update(order, {
+                    "broker_order_id": reconciled_id, "order_status": "OPEN",
+                })
+                await self._audit("ORDER_TIMEOUT_RECONCILED", {
+                    "order_id": order.id, "broker_order_id": reconciled_id,
+                })
+                logger.warning(
+                    f"PENDING_VERIFICATION retry: order {order.id} found live at "
+                    f"the broker (id={reconciled_id}) -- corrected to OPEN."
+                )
+            else:
+                await self.order_repo.update(order, {"order_status": "FAILED"})
+                await self._audit("ORDER_TIMEOUT", {"order_id": order.id, "symbol": order.symbol})
+                logger.warning(
+                    f"PENDING_VERIFICATION retry: order {order.id} verified "
+                    f"genuinely not at the broker -- now safe to mark FAILED."
+                )
+
     async def expire_stale_orders(self) -> int:
         """
         Cancel any OPEN orders that have been pending for more than
@@ -374,6 +461,13 @@ class OrderManager:
 
         Returns the number of orders cancelled (including any retried).
         """
+        # Fixed 2026-08-21 (external review): retry any order left in
+        # PENDING_VERIFICATION by a prior timeout-verification failure (see
+        # place_order()'s TimeoutError handler and _reconcile_after_timeout())
+        # before touching OPEN orders below -- a fresh attempt to verify
+        # against the broker now that this cycle is running.
+        await self._retry_pending_verification_orders()
+
         # Fixed 2026-08-20 (deep review): reconcile against the broker's real
         # status FIRST. This used to go straight to cancel_order() below and
         # discard its return value entirely -- if the order had actually

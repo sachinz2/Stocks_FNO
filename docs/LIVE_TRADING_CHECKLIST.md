@@ -1137,6 +1137,69 @@ Kept short — see git log / individual commit messages for full detail.
   wing-failure breakdown panel. 3 new regression tests. 499 tests passing
   before the incident fix above brought the total to 506.
 
+- **Second-opinion review (2026-08-21), same day, on code already touched
+  earlier the same day.** 5 issues flagged; all 5 verified against the
+  actual code before fixing, and all 5 were real.
+  1. **momentum_v1 / ema_crossover_v1 — bar_key=None residual edge case.**
+     The 2026-08-20 fix stopped REPEATED bar_key=None cycles from
+     advancing the confirmation count, but the transition from an
+     unidentified bar to the FIRST real bar_key was still silently
+     counted as advancing — a single real candle could masquerade as two
+     confirming bars right when a fresh candidate emerges. Fixed by
+     splitting the "same direction, advance count" check into two cases:
+     only advance when BOTH the stored reference and the current bar_key
+     are known real values that differ; when the stored side is still
+     None, just record the now-known bar_key without advancing. Seeding
+     itself stays unconditional (even with bar_key=None) so
+     `signal_confirm_bars=1` still fires immediately, matching a
+     pre-existing dependency in the backtest engine (which never sets
+     `ohlc_bar_key` at all) — caught by a real test regression while
+     fixing this, not anticipated in advance.
+  2. **Order timeout + failed reconciliation could still become FAILED.**
+     `_reconcile_after_timeout()` swallowed its OWN verification failures
+     (`get_orders()` itself erroring — the exact kind of transient
+     connectivity blip that caused the KAYNES incident earlier the same
+     day) and returned `None`, indistinguishable from "checked, genuinely
+     not there." Both outcomes fell through to the same
+     `order_status=FAILED` line, silently concluding failure for an order
+     whose real fate might be a genuinely live, completely untracked
+     broker position. Fixed: `_reconcile_after_timeout()` now raises
+     instead of swallowing; a verification failure marks the order
+     `PENDING_VERIFICATION` (new status) instead of `FAILED`, with a
+     `CRITICAL` log. A new `_retry_pending_verification_orders()`, wired
+     into `expire_stale_orders()` (already called every cycle), retries
+     verification each cycle — corrects to `OPEN` if found live, only
+     concludes `FAILED` once a check is genuinely completed and finds
+     nothing, and never auto-guesses `FAILED` on a still-unverifiable
+     outcome no matter how long it persists (a human needs to check the
+     broker directly at that point, not have the system guess).
+  3. **Single-leg live entries could still trade on an estimated option
+     price.** If no real Zerodha quote was available, the entry fell back
+     to `estimate_option_premium()` (an ATR-based guess) and placed a real
+     LIMIT order at that price anyway. Unlike exits (MARKET orders, where
+     the estimate only ever informed a HOLD/EXIT decision and the real
+     fill always came from the market), this is a LIMIT order priced
+     directly off the guess — a bad estimate could fill far worse than
+     intended, or never fill at all. Fixed: entries now skip (fail closed)
+     when no real quote is available, matching this function's existing
+     convention for other explicitly-chosen entry-blocking data (lot
+     size, contract resolution).
+  4. **Credit spread / iron condor strike adjustment could still drift
+     from target delta without revalidation — a subtler case than the
+     crowded-OI fix earlier the same day.** `_resolve_contract()` can
+     itself silently snap a candidate strike to a different, actually-
+     listed real strike (documented in its own docstring) — this happens
+     on EVERY entry, not just the crowded-OI-avoidance path already
+     delta-verified. The FINAL, actually-resolved strike's real delta was
+     never re-checked against the original target. New
+     `_resolved_strike_delta_ok()` re-verifies the actual resolved short
+     strike's Black-Scholes delta is still within tolerance (reusing the
+     same ±0.08 band as the crowded-OI fix) right before entry prices are
+     fetched — covers both the ordinary and crowded-OI-adjusted paths in
+     credit_spread_v1, and both short legs independently in
+     iron_condor_v1. Fails closed (skips the entry) if drifted too far.
+  - 18 new regression tests. 524 tests passing.
+
 ---
 
-*Last updated: 2026-08-21, after the live KAYNES incident fix (stale-data exit decoupling + staleness alert) and the dashboard audit that surfaced it.*
+*Last updated: 2026-08-21, after the second-opinion review fixes (bar_key first-real-transition edge case, order-timeout PENDING_VERIFICATION status, entry quote fail-closed, resolved-strike delta re-verification).*

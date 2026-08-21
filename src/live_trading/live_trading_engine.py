@@ -1907,6 +1907,30 @@ class LiveTradingEngine:
                 return candidate
         return None
 
+    @staticmethod
+    def _resolved_strike_delta_ok(
+        strike: float, opt: str, target_delta: float,
+        underlying_price: float, dte: int, sigma: float, delta_tol: float = 0.08,
+    ) -> bool:
+        """
+        Fixed 2026-08-21 (external review): _resolve_contract() can itself
+        silently snap a candidate strike to a different, actually-listed
+        real strike (see its own docstring: "strike_to_use equals
+        candidate_strike unless the cache had to snap to a different,
+        actually-listed strike") -- this can happen on EVERY entry, not
+        just the crowded-OI-avoidance path already delta-verified via
+        _find_non_crowded_strike_within_delta_tolerance(). The FINAL, real
+        short strike actually being traded was never re-checked against the
+        original delta target -- a real, if usually small, gap between
+        "what we computed" and "what we actually sold." Verifies the actual
+        resolved strike's real Black-Scholes delta is still within
+        delta_tol of the original target.
+        """
+        from src.market_data.option_chain import bs_delta
+        T = max(dte, 1) / 365.0
+        actual_delta = bs_delta(underlying_price, strike, T, sigma, opt)
+        return abs(abs(actual_delta) - abs(target_delta)) <= delta_tol
+
     def _audit_gate(self, strategy_name: str, gate: str) -> None:
         """Increment the (strategy, gate) counter -- see _signal_gate_stats'
         docstring in __init__. Called at each entry-gate checkpoint in
@@ -2336,9 +2360,32 @@ class LiveTradingEngine:
         # bug (get_entry_prices_for_spread() already tries a real quote
         # first) — this brings single-leg entries in line with that same,
         # already-correct pattern.
+        #
+        # Fixed 2026-08-21 (external review): the ATR-estimate fallback
+        # itself is still fine for EXIT decisions (see the exit paths named
+        # above) since those place MARKET orders (ZerodhaBroker.place_order:
+        # order_type = MARKET if is_exit_order else LIMIT) -- the estimate
+        # only ever informed a HOLD/EXIT decision, the actual fill always
+        # comes from the real market regardless. But this is an ENTRY, which
+        # places a LIMIT order at exactly option_p -- trading on a crude
+        # ATR-derived guess here doesn't just mis-price internal bookkeeping,
+        # it can genuinely misprice a real limit order (fill far worse than
+        # intended, or a bad-enough guess never fills at all while the
+        # engine's own state has already moved on). Consistent with this
+        # function's established fail-closed convention for other
+        # explicitly-chosen entry-blocking data (lot size, contract
+        # resolution, just above) -- skip the entry entirely rather than
+        # place a real order on a guessed price.
         from src.market_data.option_chain import get_option_quote
         _real_p = await get_option_quote(contract, getattr(self, "_kite", None), getattr(self, "_redis", None))
-        option_p = _real_p if (_real_p and _real_p > 0) else estimate_option_premium(atr, dte)
+        if not (_real_p and _real_p > 0):
+            logger.warning(
+                f"[{strategy.name}] {symbol} skipped — no real option quote available "
+                f"for {contract} (fail-closed, not placing a LIMIT entry order on a "
+                "guessed ATR-based price)."
+            )
+            return
+        option_p = _real_p
 
         order = await self.order_manager.place_order(
             contract, "BUY", lot_size, option_p,
@@ -2798,6 +2845,22 @@ class LiveTradingEngine:
                 logger.warning(f"[CreditSpread] {symbol} skipped — no verified real contract for re-validated long strike {long_strike}.")
                 return
             long_strike, long_contract = resolved
+
+        # Fixed 2026-08-21 (external review): re-verify the FINAL, actually-
+        # resolved short strike's real delta against the original target --
+        # covers both paths above (the ordinary resolve and the crowded-OI
+        # one), since _resolve_contract() can itself silently snap to a
+        # different real, listed strike than what was delta-targeted/
+        # verified (see _resolved_strike_delta_ok()'s docstring). Fail
+        # closed, matching this function's convention elsewhere.
+        _short_target_delta = -0.20 if opt == "PE" else 0.20
+        if not self._resolved_strike_delta_ok(short_strike, opt, _short_target_delta, underlying_price, dte, sigma):
+            logger.warning(
+                f"[CreditSpread] {symbol} skipped — resolved short strike {short_strike} "
+                f"drifted outside delta tolerance of target {_short_target_delta} after "
+                "contract-cache resolution."
+            )
+            return
 
         short_p, long_p = await get_entry_prices_for_spread(
             symbol, short_contract, long_contract,
@@ -3585,6 +3648,25 @@ class LiveTradingEngine:
         put_long_strike,   plc = _resolved_legs["put_long"]
         call_short_strike, csc = _resolved_legs["call_short"]
         call_long_strike,  clc = _resolved_legs["call_long"]
+
+        # Fixed 2026-08-21 (external review): re-verify BOTH short legs'
+        # FINAL, actually-resolved deltas against their original targets --
+        # _resolve_contract() can itself silently snap to a different real,
+        # listed strike than what was delta-targeted/verified (see
+        # _resolved_strike_delta_ok()'s docstring). Fail closed for the
+        # whole structure, matching this function's convention elsewhere.
+        if not self._resolved_strike_delta_ok(put_short_strike, "PE", -0.20, underlying_price, dte, sigma):
+            logger.warning(
+                f"[IronCondor] {symbol} skipped — resolved put short strike {put_short_strike} "
+                "drifted outside delta tolerance of target -0.20 after contract-cache resolution."
+            )
+            return
+        if not self._resolved_strike_delta_ok(call_short_strike, "CE", 0.20, underlying_price, dte, sigma):
+            logger.warning(
+                f"[IronCondor] {symbol} skipped — resolved call short strike {call_short_strike} "
+                "drifted outside delta tolerance of target 0.20 after contract-cache resolution."
+            )
+            return
 
         # Fetch real Kite LTPs for all 4 legs — same as credit spread entry.
         # ATR estimates are CE/PE-blind (put_short_p == call_short_p always), which

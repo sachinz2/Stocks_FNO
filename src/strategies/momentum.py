@@ -413,24 +413,43 @@ class MomentumStrategy(StrategyBase):
         signal = "HOLD"
         if raw is not None:
             if raw != self._pending_signal.get(symbol):
-                # New direction — start fresh
+                # New direction (or first candidate) — start fresh. Seeds
+                # UNCONDITIONALLY (even if bar_key is currently unknown) so
+                # signal_confirm_bars=1 still fires immediately on the very
+                # cycle a candidate first appears -- needed both for live
+                # trading with signal_confirm_bars=1 and for any
+                # bar_key-agnostic caller (e.g. the backtest engine, which
+                # never sets ohlc_bar_key at all since each row already
+                # deterministically represents one distinct bar).
                 self._pending_signal[symbol] = raw
                 self._pending_count[symbol] = 1
                 self._pending_bar_key[symbol] = bar_key
-            elif bar_key is not None and bar_key != self._pending_bar_key.get(symbol):
-                # Same direction AND we're on a genuinely new, identifiable 5-min bar
+            elif (
+                bar_key is not None
+                and self._pending_bar_key.get(symbol) is not None
+                and bar_key != self._pending_bar_key.get(symbol)
+            ):
+                # Same direction, and BOTH the stored reference and the
+                # current bar_key are known real values that differ --
+                # genuinely a new, distinct bar. Safe to advance.
                 self._pending_count[symbol] = self._pending_count.get(symbol, 0) + 1
                 self._pending_bar_key[symbol] = bar_key
-            # Fixed 2026-08-20 (external review): bar_key is None whenever
-            # ltp_poller can't identify the current 5-min bar (no live tick
-            # data yet, or a malformed OHLC cache missing "date") -- the old
-            # `bar_key is None or ...` condition treated EVERY such cycle as
-            # a "new bar," so signal_confirm_bars could complete in a couple
-            # of 60s engine cycles instead of 2 genuinely distinct candles,
-            # defeating the point of the confirmation debounce. A missing
-            # bar_key now simply can't advance the count (falls through to
-            # neither branch above) -- same bar or unknown bar, don't
-            # double-count either way.
+            elif bar_key is not None and self._pending_bar_key.get(symbol) is None:
+                # Fixed 2026-08-21 (external review): the reference bar was
+                # seeded while bar_key was still unknown -- this is the
+                # first cycle we can actually identify which bar we're on.
+                # Record it WITHOUT advancing the count: we can't tell
+                # whether this real bar_key is the SAME anonymous candle
+                # the count was seeded on, or a genuinely new one, so this
+                # is "now we know bar 1's identity," not "here's bar 2."
+                # Previously this branch didn't exist -- the elif above it
+                # alone (bar_key != stored, with stored possibly None) let
+                # None-to-real-value transitions silently count as
+                # advancing, fast-tracking signal_confirm_bars by one cycle
+                # right when a fresh candidate emerges. Only a LATER,
+                # different, also-known bar_key can advance the count now.
+                self._pending_bar_key[symbol] = bar_key
+            # else: same bar as last cycle, or bar still unknown -- don't double-count
 
             if self._pending_count.get(symbol, 0) >= self.signal_confirm_bars:
                 logger.info(
@@ -514,7 +533,20 @@ class MomentumStrategy(StrategyBase):
         direction = self._trend_direction.get(symbol)
 
         if state is None or direction != raw:
-            # Fresh qualification, or a direction flip mid-setup — start over.
+            # Fresh qualification, or a direction flip mid-setup — start
+            # over. Fixed 2026-08-21 (external review): only seed the
+            # ESTABLISHED baseline once bar_key is actually known -- same
+            # principle as the legacy debounce fix (see
+            # _legacy_confirm_bars_signal). Crediting a later-identified
+            # bar_key as "the next bar" when it might be the SAME
+            # anonymous candle this cycle already saw would let the
+            # pullback/breakout timeline fast-track by one cycle right at
+            # the moment a fresh candidate emerges. Always clears any stale
+            # state for a different direction regardless, so nothing
+            # mismatched lingers either way.
+            self._reset_pullback_state(symbol)
+            if bar_key is None:
+                return "HOLD"
             self._trend_state[symbol] = "ESTABLISHED"
             self._trend_direction[symbol] = raw
             self._pullback_ref[symbol] = close

@@ -43,16 +43,28 @@ def test_bootstrap_fallback_guard_logic(market_data, expected_skip):
     assert would_skip is expected_skip
 
 
-# ── Entry pricing (2026-08-06) ───────────────────────────────────────────────
+# ── Entry pricing (2026-08-06, tightened 2026-08-21) ─────────────────────────
 #
 # Single-leg entries (ema_crossover_v1/momentum_v1) must try a real Zerodha
-# quote before falling back to the ATR-heuristic estimate, matching every
-# exit path (which already did this correctly).
+# quote. Originally (2026-08-06) fell back to the ATR-heuristic estimate if
+# unavailable, matching the exit paths' pattern -- but exits place MARKET
+# orders (the estimate only ever informs a HOLD/EXIT decision, the real fill
+# always comes from the market), while entries place LIMIT orders at exactly
+# this price. Fixed 2026-08-21 (external review): trading a real LIMIT order
+# on a crude ATR-derived guess can genuinely misprice the fill (or never
+# fill at all) -- entries now skip (fail closed) instead of estimating,
+# matching this function's convention for other explicitly-chosen
+# entry-blocking data (lot size, contract resolution).
 
 def test_entry_path_tries_real_quote_before_estimate_fallback():
     src = inspect.getsource(LiveTradingEngine._process_signal)
     assert "get_option_quote(contract" in src
-    assert '_real_p if (_real_p and _real_p > 0) else estimate_option_premium' in src
+    entry_block = src[src.index("get_option_quote(contract"):src.index("option_p = _real_p") + 40]
+    assert "estimate_option_premium" not in entry_block, (
+        "entries must fail closed on a missing real quote, not fall back to an estimate"
+    )
+    assert 'if not (_real_p and _real_p > 0):' in entry_block
+    assert "return" in entry_block
 
     # Fixed 2026-08-13: contract construction now goes through _resolve_contract()
     # (validates/corrects the computed strike + symbol against Zerodha's real,
