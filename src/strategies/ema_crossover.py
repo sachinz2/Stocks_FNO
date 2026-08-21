@@ -12,6 +12,49 @@ class EMACrossoverStrategy(StrategyBase):
     - If EMA20 crosses above EMA50 -> BUY
     - If EMA20 crosses below EMA50 -> SELL
     Requires maintaining the previous state of EMAs to detect the actual "cross".
+
+    Redesign (2026-08-21, external PDF review of ema_crossover_v1): the review's
+    core thesis is the mirror image of the one that drove momentum_v1's redesign
+    the day before -- momentum_v1 was entering too LATE (confirming an already-
+    played-out move), while ema_crossover_v1 was filtered so aggressively (ADX>=25
+    + RVOL>=1.3 hard gates + strict 15m agreement, stacked on top of the 2-bar
+    confirmation) that its opportunity set was almost eliminated -- confirmed live:
+    1 trade in ~2 months. "EMA crossover" had effectively become "EMA crossover +
+    volume breakout + already-strong trend + higher-timeframe agreement," a much
+    narrower strategy than the one actually being evaluated. Per the user's
+    established preference (integrate into v1 directly, no separate v2 -- same
+    call made for momentum_v1's redesign), addressed here:
+    - ADX moved from a flat, engine-level hard gate (>=25) to this strategy's own
+      internal, looser gate (>=adx_entry_threshold OR ADX rising -- see
+      generate_signal()) -- an early crossover with a still-low-but-rising ADX
+      is exactly the setup the review argues the old flat threshold discarded.
+    - RVOL demoted from a hard gate to a non-blocking confidence note
+      (rvol_hard_gate=False) -- a crossover doesn't require above-average volume
+      to be real, per the review's own example (a valid EMA20/50 cross at
+      RVOL=0.95 was being rejected outright).
+    - The 15-min MTF filter made asymmetric/graduated (mtf_strict=False) --
+      only a STRONGLY opposing higher timeframe still blocks the entry; a
+      weakly opposing or turning 15m trend no longer does, since that's
+      precisely the higher-timeframe-weakening-into-a-reversal setup a
+      crossover strategy should be able to catch.
+    - The EMA-reversal exit, previously scoped only to VOLATILE-entered
+      positions, is now the PRIMARY exit for every position (see
+      manage_position()) -- "the thesis that justified entry has reversed"
+      is not a VOLATILE-specific concept.
+    - A new underlying-based stop/target (underlying_stop_atr_mult /
+      underlying_target_atr_mult), mirroring momentum_v1's round-2 addition,
+      using the same entry_underlying_price/entry_atr already captured by the
+      engine for every single-leg entry.
+    NOT done (needs real backtesting infrastructure this system doesn't have,
+    and the review itself frames these as things to TEST, not firm
+    recommendations): a full weighted composite entry score (the review's own
+    "something like this would be much better" diagram is explicitly
+    illustrative, not tuned); testing alternate EMA pairs (10/30, 13/21, 9/21)
+    or alternate stop_loss_pct/target_pct values; comparing 10-25 vs 20-35 DTE.
+    One review claim was already outdated by the time this was read: the
+    15-minute MTF filter's fail-OPEN-on-exception bug (review section 22) was
+    fixed the day before in the external review (2026-08-20) that redesigned
+    momentum_v1 -- that filter already fails closed for both strategies.
     """
     def initialize(self):
         self.fast_period = self.parameters.get("fast_period", 20)
@@ -23,6 +66,63 @@ class EMACrossoverStrategy(StrategyBase):
         # never be allowed to close as a realized loss -- see manage_position()'s
         # breakeven-stop check for why trailing_stop_pct alone doesn't guarantee this.
         self.breakeven_activation_pct = self.parameters.get("breakeven_activation_pct", 0.15)
+
+        # Fixed 2026-08-21 (external review): ADX moved in-strategy and
+        # loosened -- previously a flat, engine-level `ADX < 25` hard gate
+        # applied AFTER generate_signal() already fired, unconditionally,
+        # to every BUY/SELL this strategy produced. Per the review: "a
+        # crossover is often the beginning of a trend; ADX measures an
+        # already-developed one" -- 25 discarded early, still-developing
+        # setups. Now: passes at ADX >= adx_entry_threshold (18, the low
+        # end of the review's own "test 18/20/22" range) OR ADX rising
+        # (using the same bar-aligned history pattern as momentum.py's
+        # adx_rising_required), matching the review's own "ADX>=18 OR ADX
+        # rising" diagram box. adx_checked_internally=True tells the engine
+        # to skip its own now-redundant flat gate for this strategy.
+        self.adx_entry_threshold = self.parameters.get("adx_entry_threshold", 18)
+        self.adx_checked_internally = True
+        self._HISTORY_LEN = 3
+
+        # Fixed 2026-08-21 (external review): RVOL demoted from a hard
+        # engine-level gate to a non-blocking confidence note -- a genuine
+        # EMA20/50 cross doesn't require above-average volume to be real
+        # (the review's own example: a valid cross at RVOL=0.95 was
+        # rejected outright). rvol_entry_threshold is still read for the
+        # confidence note itself; rvol_hard_gate=False tells the engine not
+        # to block on it.
+        self.rvol_hard_gate = self.parameters.get("rvol_hard_gate", False)
+
+        # Fixed 2026-08-21 (external review): the 15-min MTF filter becomes
+        # asymmetric/graduated instead of a binary reject-on-disagreement --
+        # only a STRONGLY opposing 15m trend (spread magnitude >=
+        # mtf_strong_opposition_pct) still blocks the entry; a weakly
+        # opposing or turning 15m trend is allowed, since that's precisely
+        # the "higher timeframe weakening into a reversal" setup a
+        # crossover strategy should be able to catch (review section 10).
+        self.mtf_strict = self.parameters.get("mtf_strict", False)
+        self.mtf_strong_opposition_pct = self.parameters.get("mtf_strong_opposition_pct", 0.3)
+
+        # Fixed 2026-08-21 (external review, sections 15-18): the EMA-
+        # reversal exit, previously scoped only to VOLATILE-entered
+        # positions, is now the PRIMARY exit for every position (see
+        # manage_position()) -- toggleable in case it proves too twitchy
+        # against normal EMA20/50 noise in practice, same convention as
+        # momentum_v1's structural-invalidation exit.
+        self.ema_reversal_exit = self.parameters.get("ema_reversal_exit", True)
+
+        # Fixed 2026-08-21 (external review, sections 16-18): underlying-
+        # based stop AND target, mirroring momentum_v1's round-2 addition --
+        # uses entry_underlying_price/entry_atr, already captured by the
+        # engine for every single-leg entry regardless of strategy. See
+        # manage_position(). 0 disables either independently.
+        self.underlying_stop_atr_mult   = self.parameters.get("underlying_stop_atr_mult", 1.0)
+        self.underlying_target_atr_mult = self.parameters.get("underlying_target_atr_mult", 2.0)
+
+        # Fixed 2026-08-21 (external review, section 14): expose the same
+        # delta-based strike selection mechanism built for momentum_v1 --
+        # None/0 keeps the existing ATM behavior (this strategy's own
+        # default, unchanged) unless explicitly tuned.
+        self.entry_option_delta = self.parameters.get("entry_option_delta", None)
 
         # Signal confirmation: crossover must persist for this many consecutive cycles
         # before a BUY/SELL fires. Prevents rapid BUY↔SELL alternation when EMAs are close.
@@ -51,11 +151,22 @@ class EMACrossoverStrategy(StrategyBase):
         self._pending_signal: Dict[str, str] = {}
         self._pending_count: Dict[str, int] = {}
         self._pending_bar_key: Dict[str, str] = {}  # tracks last 5-min bar seen, per symbol
+        # Fixed 2026-08-21 (external review): bar-aligned ADX history per
+        # symbol, feeding the ADX-rising half of the new internal gate --
+        # same pattern as momentum.py's _adx_history/_history_bar_key.
+        self._adx_history: Dict[str, list] = {}
+        self._history_bar_key: Dict[str, str] = {}
 
         logger.info(
             f"Initialized EMA Crossover '{self.name}' ({self.fast_period}/{self.slow_period}) | "
+            f"ADX entry>={self.adx_entry_threshold} (OR rising) | "
+            f"RVOL hard_gate={self.rvol_hard_gate} | "
+            f"MTF strict={self.mtf_strict} strong_opposition>={self.mtf_strong_opposition_pct}% | "
+            f"delta_target={self.entry_option_delta or 'ATM'} | "
             f"SL={self.stop_loss_pct:.0%} TP={self.target_pct:.0%} Trail={self.trailing_stop_pct:.0%} "
             f"Breakeven activates at +{self.breakeven_activation_pct:.0%} | "
+            f"UnderlyingStop={self.underlying_stop_atr_mult}xATR "
+            f"UnderlyingTarget={self.underlying_target_atr_mult}xATR | "
             f"ConfirmBars={self.signal_confirm_bars}"
         )
 
@@ -73,10 +184,21 @@ class EMACrossoverStrategy(StrategyBase):
         fast_ema = data.get(f"ema{self.fast_period}")
         slow_ema = data.get(f"ema{self.slow_period}")
         bar_key  = data.get("ohlc_bar_key")  # None in test/backtest contexts
+        adx      = data.get("adx14")
 
         if fast_ema is None or slow_ema is None:
             logger.warning(f"Strategy {self.name}: Missing EMA data.")
             return "HOLD"
+
+        # Fixed 2026-08-21 (external review): bar-aligned ADX history,
+        # advanced only on a genuinely new, identifiable bar -- same
+        # debounce as _pending_bar_key below and the identical pattern in
+        # momentum.py. Feeds the ADX-rising half of the gate applied below,
+        # once a crossover has actually confirmed.
+        if adx is not None and bar_key is not None and bar_key != self._history_bar_key.get(symbol):
+            self._adx_history.setdefault(symbol, []).append(adx)
+            self._adx_history[symbol] = self._adx_history[symbol][-self._HISTORY_LEN:]
+            self._history_bar_key[symbol] = bar_key
 
         signal = "HOLD"
         prev_fast = self.prev_fast_ema.get(symbol)
@@ -161,14 +283,38 @@ class EMACrossoverStrategy(StrategyBase):
         # up the pending state — needed so signal_confirm_bars=1 fires right
         # on the fresh-cross bar instead of only being checked one branch up.
         if current_dir is not None and self._pending_count.get(symbol, 0) >= self.signal_confirm_bars:
-            logger.info(
-                f"[{self.name}] {symbol} {current_dir} confirmed after "
-                f"{self._pending_count[symbol]} bars — firing."
-            )
-            signal = current_dir
-            self._pending_signal.pop(symbol, None)
-            self._pending_count.pop(symbol, None)
-            self._pending_bar_key.pop(symbol, None)
+            # Fixed 2026-08-21 (external review): ADX gate applied only
+            # AFTER the crossover has already confirmed, matching the
+            # review's own "2-BAR CONFIRMATION -> ADX>=18 OR ADX rising"
+            # ordering -- passes at adx_entry_threshold OR a rising ADX
+            # (an early, still-developing trend is exactly what a flat
+            # threshold alone would discard). Missing adx14 doesn't block
+            # here -- the engine's separate adx_valid check (still fail-
+            # closed, unaffected by adx_checked_internally) is the real
+            # data-availability gate downstream of this signal.
+            adx_ok = adx is None
+            if adx is not None:
+                hist_adx = self._adx_history.get(symbol, [])
+                adx_ok = adx >= self.adx_entry_threshold or (len(hist_adx) >= 2 and adx > hist_adx[-2])
+
+            if adx_ok:
+                logger.info(
+                    f"[{self.name}] {symbol} {current_dir} confirmed after "
+                    f"{self._pending_count[symbol]} bars (ADX={adx}) — firing."
+                )
+                signal = current_dir
+                self._pending_signal.pop(symbol, None)
+                self._pending_count.pop(symbol, None)
+                self._pending_bar_key.pop(symbol, None)
+            else:
+                # Crossover confirmed but ADX hasn't caught up yet -- leave
+                # the pending state intact (don't clear it) so a later bar
+                # can still fire without needing a brand new crossover to
+                # restart the confirmation count.
+                logger.debug(
+                    f"[{self.name}] {symbol} {current_dir} confirmed but ADX={adx} "
+                    f"< {self.adx_entry_threshold} and not rising — holding, not firing yet."
+                )
         elif current_dir is not None and symbol in self._pending_signal:
             logger.debug(
                 f"[{self.name}] {symbol} {current_dir} crossover pending "
@@ -188,17 +334,34 @@ class EMACrossoverStrategy(StrategyBase):
           - avg_price      : entry premium paid
           - peak_premium   : highest premium seen since entry (tracked by engine)
           - current_ema_fast/current_ema_slow : underlying's current EMA20/50
-                              (optional — only the VOLATILE reversal exit uses them)
+                              (optional — feeds the EMA-reversal exit)
           - is_call        : True for a CE position, False for PE (optional, same)
-          - entry_regime   : regime string at entry time (optional, same)
+          - entry_regime   : regime string at entry time (optional, informational only)
+          - entry_underlying_price, entry_atr : optional, feed the
+                              underlying-based stop/target added 2026-08-21;
+                              skipped gracefully if either is missing.
 
         Exit conditions (in priority order):
-          1. Hard stop loss  — premium fell >= stop_loss_pct (default 50%) from entry
-          2. Profit target   — premium rose >= target_pct (default 100%, i.e. 2×) from entry
-          3. Trailing stop   — premium fell >= trailing_stop_pct (default 25%) from its peak
-          4. Breakeven stop  — once up >= breakeven_activation_pct (default 15%) from
+          1. EMA reversal (generalized 2026-08-21, external review sections
+                                16-18) — the underlying's EMA20/50
+                                relationship that justified entry has
+                                flipped back. Previously scoped only to
+                                VOLATILE-entered positions; the review's
+                                point stands generally: "the thesis that
+                                justified entry has reversed" isn't a
+                                VOLATILE-specific concept. Now the PRIMARY
+                                exit for every position. Toggle via
+                                ema_reversal_exit.
+          2. Underlying-based stop/target (added 2026-08-21) — mirrors
+                                momentum_v1's round-2 addition: underlying's
+                                close has moved underlying_stop_atr_mult/
+                                underlying_target_atr_mult ATRs against/in
+                                favor of entry.
+          3. Hard stop loss  — premium fell >= stop_loss_pct (default 50%) from entry
+          4. Profit target   — premium rose >= target_pct (default 100%, i.e. 2×) from entry
+          5. Trailing stop   — premium fell >= trailing_stop_pct (default 25%) from its peak
+          6. Breakeven stop  — once up >= breakeven_activation_pct (default 15%) from
                                 entry, never allow a close below entry (see below)
-          5. EMA reversal    — VOLATILE-entered positions only (see below)
         """
         entry_premium = float(current_position.get("avg_price") or 0)
         if entry_premium <= 0 or current_premium <= 0:
@@ -206,7 +369,64 @@ class EMACrossoverStrategy(StrategyBase):
 
         pnl_pct = (current_premium - entry_premium) / entry_premium
 
-        # 1. Hard stop loss
+        # 1. EMA reversal -- see docstring. Generalized 2026-08-21 from a
+        # VOLATILE-only check to the primary exit for every position;
+        # entry_regime is read only for the log line now, not to scope
+        # whether the check runs at all.
+        if self.ema_reversal_exit:
+            ema_fast = current_position.get("current_ema_fast")
+            ema_slow = current_position.get("current_ema_slow")
+            is_call  = current_position.get("is_call")
+            if ema_fast is not None and ema_slow is not None and is_call is not None:
+                reversed_ = (ema_fast <= ema_slow) if is_call else (ema_fast >= ema_slow)
+                if reversed_:
+                    logger.info(
+                        f"[{self.name}] EMA reversal exit: EMA20/50 relationship "
+                        f"flipped back (fast={ema_fast:.2f} slow={ema_slow:.2f}, "
+                        f"is_call={is_call}, entry_regime={current_position.get('entry_regime')}) "
+                        f"— exiting regardless of premium P&L ({pnl_pct:+.1%})."
+                    )
+                    return "EXIT"
+
+        # 2. Underlying-based stop/target (added 2026-08-21) -- see
+        # docstring and momentum.py's identical pattern for the rationale.
+        entry_underlying = current_position.get("entry_underlying_price")
+        entry_atr        = current_position.get("entry_atr")
+        current_close     = current_position.get("current_close")
+        is_call_u         = current_position.get("is_call")
+        if (
+            (self.underlying_stop_atr_mult > 0 or self.underlying_target_atr_mult > 0)
+            and entry_underlying and entry_atr and current_close
+            and entry_underlying > 0 and entry_atr > 0 and is_call_u is not None
+        ):
+            if is_call_u:
+                stop_level   = entry_underlying - self.underlying_stop_atr_mult * entry_atr
+                target_level = entry_underlying + self.underlying_target_atr_mult * entry_atr
+                hit_stop     = self.underlying_stop_atr_mult > 0 and current_close <= stop_level
+                hit_target   = self.underlying_target_atr_mult > 0 and current_close >= target_level
+            else:
+                stop_level   = entry_underlying + self.underlying_stop_atr_mult * entry_atr
+                target_level = entry_underlying - self.underlying_target_atr_mult * entry_atr
+                hit_stop     = self.underlying_stop_atr_mult > 0 and current_close >= stop_level
+                hit_target   = self.underlying_target_atr_mult > 0 and current_close <= target_level
+            if hit_stop:
+                logger.info(
+                    f"[{self.name}] Underlying-based stop: close={current_close:.2f} "
+                    f"past {stop_level:.2f} (entry {entry_underlying:.2f} "
+                    f"{'-' if is_call_u else '+'} {self.underlying_stop_atr_mult}x "
+                    f"ATR({entry_atr:.2f})) -- exiting."
+                )
+                return "EXIT"
+            if hit_target:
+                logger.info(
+                    f"[{self.name}] Underlying-based target: close={current_close:.2f} "
+                    f"past {target_level:.2f} (entry {entry_underlying:.2f} "
+                    f"{'+' if is_call_u else '-'} {self.underlying_target_atr_mult}x "
+                    f"ATR({entry_atr:.2f})) -- exiting."
+                )
+                return "EXIT"
+
+        # 3. Hard stop loss
         if pnl_pct <= -self.stop_loss_pct:
             logger.info(
                 f"[{self.name}] Stop loss: entry=Rs{entry_premium:.2f} "
@@ -214,7 +434,7 @@ class EMACrossoverStrategy(StrategyBase):
             )
             return "EXIT"
 
-        # 2. Profit target
+        # 4. Profit target
         if pnl_pct >= self.target_pct:
             logger.info(
                 f"[{self.name}] Target hit: entry=Rs{entry_premium:.2f} "
@@ -222,7 +442,7 @@ class EMACrossoverStrategy(StrategyBase):
             )
             return "EXIT"
 
-        # 3. Trailing stop — only activates once we've been in profit
+        # 5. Trailing stop — only activates once we've been in profit
         peak = float(current_position.get("peak_premium") or entry_premium)
         if peak > entry_premium:
             trail_drawdown = (peak - current_premium) / peak
@@ -233,7 +453,7 @@ class EMACrossoverStrategy(StrategyBase):
                 )
                 return "EXIT"
 
-        # 4. Breakeven stop (added 2026-08-13) -- the trailing stop above is
+        # 6. Breakeven stop (added 2026-08-13) -- the trailing stop above is
         # scoped to the PEAK premium, not to locked-in profit. For a peak
         # gain below roughly trailing_stop_pct/(1-trailing_stop_pct) (~33%
         # at the default 25%), trailing_stop_pct off that peak lands BELOW
@@ -255,33 +475,6 @@ class EMACrossoverStrategy(StrategyBase):
             )
             return "EXIT"
 
-        # 5. EMA reversal — VOLATILE-entered positions only (added 2026-07-31).
-        # These are crash-catching PE entries (see REGIME_STRATEGY_MAP/
-        # live_trading_engine.py._process_signal's VOLATILE gate) opened
-        # specifically because EMA20 crossed below EMA50 during a VIX spike.
-        # A genuine panic can V-reverse fast; waiting for the normal SL/TP/
-        # trailing-stop thresholds (tuned for ordinary trending days) risks
-        # riding the reversal most of the way back. If the same EMA
-        # relationship that justified entry has already flipped, exit
-        # immediately regardless of premium P&L — smaller profit is fine,
-        # getting caught in the reversal is not. Not applied to positions
-        # entered outside VOLATILE — this is intentionally scoped, not a
-        # general new exit rule for every EMA crossover trade.
-        if current_position.get("entry_regime") == "VOLATILE":
-            ema_fast = current_position.get("current_ema_fast")
-            ema_slow = current_position.get("current_ema_slow")
-            is_call  = current_position.get("is_call")
-            if ema_fast is not None and ema_slow is not None and is_call is not None:
-                reversed_ = (ema_fast <= ema_slow) if is_call else (ema_fast >= ema_slow)
-                if reversed_:
-                    logger.info(
-                        f"[{self.name}] VOLATILE reversal exit: EMA20/50 relationship "
-                        f"flipped back (fast={ema_fast:.2f} slow={ema_slow:.2f}, "
-                        f"is_call={is_call}) — exiting regardless of premium P&L "
-                        f"({pnl_pct:+.1%})."
-                    )
-                    return "EXIT"
-
         return "HOLD"
 
     def on_pause(self) -> None:
@@ -295,6 +488,11 @@ class EMACrossoverStrategy(StrategyBase):
         self._pending_signal.clear()
         self._pending_count.clear()
         self._pending_bar_key.clear()
+        # Fixed 2026-08-21 (external review): same staleness risk as
+        # _pending_* above -- ADX history observed before a pause shouldn't
+        # be trusted against bars that occurred while paused.
+        self._adx_history.clear()
+        self._history_bar_key.clear()
 
     def shutdown(self):
         logger.info(f"Shutting down EMA Crossover Strategy '{self.name}'")

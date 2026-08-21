@@ -1386,6 +1386,7 @@ class _FakeCollisionEngine:
     # called as fake._has_active_multi_leg_structure(symbol).
     _has_active_multi_leg_structure = LiveTradingEngine._has_active_multi_leg_structure
     _has_open_single_leg_position   = LiveTradingEngine._has_open_single_leg_position
+    _audit_gate                     = LiveTradingEngine._audit_gate
 
     def __init__(self, active_spreads=None, active_condors=None, single_leg_journals=None):
         self._active_spreads = active_spreads or {}
@@ -1394,6 +1395,7 @@ class _FakeCollisionEngine:
         self._exited_today = set()
         self._max_daily_orders = 0
         self._last_signal_date = {}
+        self._signal_gate_stats = {}
         self.order_manager = None  # must never be touched if the guard fires first
 
 

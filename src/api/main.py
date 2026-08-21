@@ -222,6 +222,21 @@ async def lifespan(app: FastAPI):
     StrategyRegistry.load_strategy("EMA_CROSSOVER", "ema_crossover_v1", {
         "fast_period": 20, "slow_period": 50,
         "stop_loss_pct": 0.50, "target_pct": 1.0, "trailing_stop_pct": 0.25,
+        # Fixed 2026-08-21 (external review of ema_crossover_v1) -- listed
+        # explicitly per the same convention established for momentum_v1's
+        # config dict (see its comment below): a strategy's class defaults
+        # can silently drift from what's actually wired here if this dict
+        # isn't kept in sync, already caught once for momentum_v1.
+        "adx_entry_threshold": 18,
+        # adx_checked_internally is hardcoded True in ema_crossover.py's
+        # initialize() (not parameter-driven, unlike everything else here)
+        # -- listing it would silently be a no-op, so it's intentionally
+        # left out of this dict.
+        "rvol_hard_gate": False,
+        "mtf_strict": False, "mtf_strong_opposition_pct": 0.3,
+        "ema_reversal_exit": True,
+        "underlying_stop_atr_mult": 1.0, "underlying_target_atr_mult": 2.0,
+        "entry_option_delta": None,
     })
     StrategyRegistry.load_strategy("CREDIT_SPREAD", "credit_spread_v1", {
         "fast_period": 20, "slow_period": 50,

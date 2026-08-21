@@ -303,6 +303,28 @@ async def get_strategy_health(request: Request):
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+@router.get("/signal-audit")
+async def get_signal_audit(request: Request):
+    """
+    Per-strategy, per-gate counts of how many candidate signals reached each
+    entry gate in LiveTradingEngine._process_signal since this process
+    started (external review of ema_crossover_v1, 2026-08-21, section 20 --
+    "signal audit"). In-memory only, resets on restart -- a lightweight
+    diagnostic for "why are we getting so few trades," not a persistent
+    audit trail. Gate order: signal_generated -> dte_passed -> rvol_passed
+    -> adx_passed -> rs_passed -> mtf_passed -> lot_passed ->
+    contract_resolved -> trade_placed.
+    """
+    try:
+        engine = getattr(request.app.state, "trading_engine", None)
+        if not engine:
+            return {"message": "Trading engine not initialised."}
+        return engine.get_signal_audit_report()
+    except Exception as e:
+        logger.error(f"Analytics /signal-audit error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
 @router.get("/portfolio-exposure")
 async def get_portfolio_exposure(request: Request):
     """

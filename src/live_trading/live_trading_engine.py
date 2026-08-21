@@ -116,6 +116,15 @@ class LiveTradingEngine:
         # DTE-window incident (a silent logic bug in generate_signal() that
         # blocked every entry for 3 full trading days with nothing watching).
         self._last_signal_date:     Dict[str, str] = {}
+        # Fixed 2026-08-21 (external review of ema_crossover_v1, section 20
+        # -- "signal audit"): per-strategy, per-gate counters showing how
+        # many candidate signals reached each entry gate in _process_signal
+        # and how many passed it -- exactly the diagnostic the review
+        # argued was needed before guessing at threshold changes ("Gate
+        # Signals reached / Passed" table). In-memory only (resets on
+        # restart) -- a lightweight diagnostic, not a persistent audit
+        # trail; see get_signal_audit_report().
+        self._signal_gate_stats: Dict[str, Dict[str, int]] = {}
         self._kite = None        # attached in live mode for real quotes + VIX
         self._ltp_poller = None  # ZerodhaLTPPoller — registers active option contracts
         # Prevents concurrent exit checks from 1-min signal cycle + 10-s exit-only job (F)
@@ -1665,6 +1674,22 @@ class LiveTradingEngine:
         """
         return float(getattr(order, "fill_price", None) or fallback)
 
+    def _audit_gate(self, strategy_name: str, gate: str) -> None:
+        """Increment the (strategy, gate) counter -- see _signal_gate_stats'
+        docstring in __init__. Called at each entry-gate checkpoint in
+        _process_signal with the gate the candidate just reached/passed."""
+        self._signal_gate_stats.setdefault(strategy_name, {})
+        self._signal_gate_stats[strategy_name][gate] = (
+            self._signal_gate_stats[strategy_name].get(gate, 0) + 1
+        )
+
+    def get_signal_audit_report(self) -> Dict[str, Dict[str, int]]:
+        """Per-strategy, per-gate counts of how many candidate signals
+        reached each entry gate since this process started. Read-only
+        snapshot -- see _signal_gate_stats' docstring in __init__ for why
+        this exists and its limitations (in-memory, resets on restart)."""
+        return {k: dict(v) for k, v in self._signal_gate_stats.items()}
+
     async def _process_signal(
         self, strategy, symbol: str, vix: Optional[float] = None,
         regime: Optional[str] = None,
@@ -1724,6 +1749,8 @@ class LiveTradingEngine:
             return
         if signal_str not in ("BUY", "SELL"):
             return
+
+        self._audit_gate(strategy.name, "signal_generated")
 
         # VOLATILE (VIX>20) crash-catching gate — added 2026-07-31. VIX is a
         # fear/uncertainty gauge, not a directional one: a spike overwhelmingly
@@ -1793,6 +1820,7 @@ class LiveTradingEngine:
                 f"— skipping entry for {symbol}"
             )
             return
+        self._audit_gate(strategy.name, "dte_passed")
 
         # RVOL filter — require above-average volume (RVOL > 1.3) for momentum entries.
         # Low-volume breakouts have higher false-positive rates and wider bid-ask spreads.
@@ -1844,15 +1872,35 @@ class LiveTradingEngine:
         if not getattr(strategy, "rvol_checked_internally", False):
             _rvol_threshold = getattr(strategy, "rvol_entry_threshold", 1.3)
             if _rvol < _rvol_threshold:
+                # Fixed 2026-08-21 (external review of ema_crossover_v1):
+                # RVOL demoted from a hard gate to a non-blocking confidence
+                # note for strategies that set rvol_hard_gate=False -- a
+                # genuine EMA20/50 cross doesn't require above-average
+                # volume to be real (the review's own example: a valid
+                # cross at RVOL=0.95 was rejected outright). Default stays
+                # True (hard gate, unchanged behavior) for anything that
+                # doesn't opt out, e.g. momentum_v1.
+                if getattr(strategy, "rvol_hard_gate", True):
+                    logger.info(
+                        f"[{strategy.name}] {symbol} skipped — RVOL={_rvol:.2f} < {_rvol_threshold} "
+                        "(below-average volume; weak breakout confirmation)"
+                    )
+                    return
                 logger.info(
-                    f"[{strategy.name}] {symbol} skipped — RVOL={_rvol:.2f} < {_rvol_threshold} "
-                    "(below-average volume; weak breakout confirmation)"
+                    f"[{strategy.name}] {symbol} RVOL={_rvol:.2f} < {_rvol_threshold} "
+                    "(below-average volume) -- not a hard gate for this strategy, "
+                    "proceeding with lower confidence."
                 )
-                return
+        self._audit_gate(strategy.name, "rvol_passed")
 
         # ADX filter — require strong trend (ADX > 25) for EMA crossover momentum plays.
         # A crossover in a low-ADX environment is likely noise rather than a trend change.
         # Fixed 2026-08-06: same fail-open-on-missing-data issue as RVOL above.
+        #
+        # The adx_valid check stays universal (fail-closed for everyone,
+        # regardless of adx_checked_internally) -- it's a data-availability
+        # signal (insufficient history to compute ADX at all), not a
+        # strategy-specific threshold decision.
         _adx_ema = float(market_data.get("adx14", 0))
         _adx_ema_valid = bool(market_data.get("adx_valid", False))
         if not _adx_ema_valid:
@@ -1861,12 +1909,27 @@ class LiveTradingEngine:
                 "(insufficient history; cannot confirm trend strength)"
             )
             return
-        if _adx_ema < 25:
-            logger.info(
-                f"[{strategy.name}] {symbol} skipped — ADX={_adx_ema:.1f} < 25 "
-                "(trend not strong enough for momentum entry)"
-            )
-            return
+        # Fixed 2026-08-21 (external review of ema_crossover_v1): this flat
+        # ADX>=25 threshold applied unconditionally to EVERY BUY/SELL,
+        # AFTER generate_signal() had already fired -- the review's core
+        # critique was that this discarded early, still-developing
+        # crossovers ("a crossover is often the beginning of a trend; ADX
+        # measures an already-developed one"). ema_crossover_v1 now does its
+        # own looser, internal ADX gate (>=18 OR rising -- see
+        # ema_crossover.py's generate_signal()) and sets
+        # adx_checked_internally=True to skip this now-redundant flat
+        # check. momentum_v1 already had its own stricter internal gate
+        # (>=25, paired with adx_rising_required) since the 2026-08-20
+        # redesign and sets the same flag for the same reason -- this flat
+        # check was already fully redundant for it, just not yet marked so.
+        if not getattr(strategy, "adx_checked_internally", False):
+            if _adx_ema < 25:
+                logger.info(
+                    f"[{strategy.name}] {symbol} skipped — ADX={_adx_ema:.1f} < 25 "
+                    "(trend not strong enough for momentum entry)"
+                )
+                return
+        self._audit_gate(strategy.name, "adx_passed")
 
         # Relative Strength filter (wired in 2026-07-30 — RSRanker was computing
         # and publishing ranks every cycle but nothing ever consulted them).
@@ -1913,6 +1976,7 @@ class LiveTradingEngine:
                     "vs NIFTY (relative strength too weak for a long entry)"
                 )
                 return
+        self._audit_gate(strategy.name, "rs_passed")
 
         # Multi-timeframe confirmation — 15-min EMA direction must agree with 5-min signal.
         # A 5-min crossover against the 15-min trend is counter-trend and fails more often.
@@ -1940,18 +2004,49 @@ class LiveTradingEngine:
                         _tf15_bull = _ema20_15 > _ema50_15
                         _tf5_bull  = signal_str == "BUY"
                         if _tf15_bull != _tf5_bull:
+                            # Fixed 2026-08-21 (external review of
+                            # ema_crossover_v1): binary reject-on-
+                            # disagreement replaced with a graduated check
+                            # for strategies that set mtf_strict=False --
+                            # only a STRONGLY opposing 15m trend (spread
+                            # magnitude >= mtf_strong_opposition_pct) still
+                            # blocks the entry; a weakly opposing or turning
+                            # 15m trend is allowed, since that's precisely
+                            # the "higher timeframe weakening into a
+                            # reversal" setup a crossover strategy should be
+                            # able to catch. Default stays True (strict,
+                            # unchanged behavior) for anything that doesn't
+                            # opt out, e.g. momentum_v1.
+                            if getattr(strategy, "mtf_strict", True):
+                                logger.info(
+                                    f"[{strategy.name}] {symbol} skipped — "
+                                    f"15-min EMA trend ({'bullish' if _tf15_bull else 'bearish'}) "
+                                    f"contradicts 5-min signal ({signal_str})"
+                                )
+                                return
+                            _spread15_pct = abs(_ema20_15 - _ema50_15) / _ema50_15 * 100
+                            _strong_opp = getattr(strategy, "mtf_strong_opposition_pct", 0.3)
+                            if _spread15_pct >= _strong_opp:
+                                logger.info(
+                                    f"[{strategy.name}] {symbol} skipped — "
+                                    f"15-min EMA trend ({'bullish' if _tf15_bull else 'bearish'}) "
+                                    f"STRONGLY contradicts 5-min signal ({signal_str}), "
+                                    f"spread={_spread15_pct:.2f}% >= {_strong_opp}%"
+                                )
+                                return
                             logger.info(
-                                f"[{strategy.name}] {symbol} skipped — "
-                                f"15-min EMA trend ({'bullish' if _tf15_bull else 'bearish'}) "
-                                f"contradicts 5-min signal ({signal_str})"
+                                f"[{strategy.name}] {symbol} 15-min trend "
+                                f"({'bullish' if _tf15_bull else 'bearish'}) weakly opposes "
+                                f"5-min signal ({signal_str}), spread={_spread15_pct:.2f}% "
+                                f"< {_strong_opp}% -- allowing (possible reversal setup)."
                             )
-                            return
             except Exception as _mtf_exc:
                 logger.info(
                     f"[{strategy.name}] {symbol} skipped — 15-min MTF data "
                     f"unreadable ({_mtf_exc}), failing closed on this entry filter."
                 )
                 return
+        self._audit_gate(strategy.name, "mtf_passed")
 
         lot_size = await self._get_lot_size(symbol)
         if not lot_size:
@@ -1961,6 +2056,7 @@ class LiveTradingEngine:
                 "the static table). Fail-closed: won't trade this symbol until it's resolvable."
             )
             return
+        self._audit_gate(strategy.name, "lot_passed")
         atr      = float(market_data.get("atr14", underlying_price * 0.01))
         iv_rank  = await self._get_iv_rank(symbol, underlying_price, atr, dte)
         strike_interval = await self._get_strike_interval(symbol, expiry)
@@ -1990,6 +2086,7 @@ class LiveTradingEngine:
             )
             return
         strike, contract = resolved
+        self._audit_gate(strategy.name, "contract_resolved")
 
         # Fixed 2026-08-06: this unconditionally used the crude ATR-heuristic
         # estimate at entry, while every exit path (_check_open_option_exits,
@@ -2016,6 +2113,7 @@ class LiveTradingEngine:
             iv_rank=iv_rank, vix=vix,
         )
         if order and order.order_status == "OPEN":
+            self._audit_gate(strategy.name, "trade_placed")
             self._today_order_count += 1
             self._peak_premiums[contract] = option_p
             # Fixed 2026-08-06: was entry_price=option_p (the pre-slippage

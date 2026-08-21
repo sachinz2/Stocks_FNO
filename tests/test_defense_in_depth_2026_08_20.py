@@ -59,6 +59,7 @@ async def test_process_signal_records_last_signal_date_on_a_real_signal(monkeypa
         _get_market_data=AsyncMock(return_value={"ltp_source": "zerodha_live_ticks", "close": 100.0}),
         _max_daily_orders=0, _today_order_count=0,
         _has_active_multi_leg_structure=lambda symbol: True,  # short-circuit before any order logic
+        _audit_gate=lambda strategy_name, gate: None,
     )
 
     await LiveTradingEngine._process_signal(fake, strategy, "RELIANCE", vix=15.0, regime="TRENDING")

@@ -725,14 +725,20 @@ class LTPPoller:
         Score a symbol for all three strategy regimes.
         Returns (ema_score, spread_score, condor_score).
 
-        EMA Crossover score (high = volatile + NEAR a crossover):
-          ATR% × 0.6 + max(0, EMA_PROXIMITY_CAP - EMA_spread%) × 0.4
-          → rewards stocks moving enough to matter AND close to EMA20/50 crossing —
+        EMA Crossover score (high = NEAR a crossover, moving enough to matter):
+          ATR% × 0.3 + max(0, EMA_PROXIMITY_CAP - EMA_spread%) × 0.7
+          → rewards stocks close to EMA20/50 crossing, moving enough to matter —
             NOT stocks already deep in an established trend. The strategy fires on
             the sign change between adjacent cycles; once the gap has widened past
             EMA_PROXIMITY_CAP, that already happened several bars ago and can't
             recur without a reversal, so wide-spread stocks score ~0 on this term
             regardless of how much they're moving.
+            Fixed 2026-08-21 (external review of ema_crossover_v1): weights
+            flipped from ATR×0.6/proximity×0.4 to proximity×0.7/ATR×0.3 --
+            the review's point: "the strategy doesn't need stocks with high
+            ATR, it needs stocks that are actually approaching a crossover."
+            The old weighting let a high-ATR, far-from-crossing stock
+            outscore a genuinely close-to-crossing, lower-ATR one.
 
         Credit Spread score (high = low-vol + directional, 0 if ATR% >= 1.2%):
           (1.2 - ATR%) × 0.4 + EMA_spread% × 0.6
@@ -764,8 +770,10 @@ class LTPPoller:
         ema_spread_pct = abs(ema20 - ema50) / ema50 * 100 if ema50 > 0 else 0.0
 
         # Regime 1: EMA crossover — always gets a score
+        # Fixed 2026-08-21 (external review): weights flipped, proximity now
+        # dominant -- see docstring above.
         ema_score = round(
-            atr_pct * 0.6 + max(0.0, _EMA_PROXIMITY_CAP - ema_spread_pct) * 0.4, 4
+            atr_pct * 0.3 + max(0.0, _EMA_PROXIMITY_CAP - ema_spread_pct) * 0.7, 4
         )
 
         # Regime 2: Credit spread — only when low vol

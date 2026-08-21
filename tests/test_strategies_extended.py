@@ -1,9 +1,11 @@
 """
 Strategy-level behavioral tests not covered by tests/test_strategy.py:
   - MomentumStrategy.on_pause() clears pending-confirmation state
-  - VOLATILE crash-catching: EMACrossoverStrategy's EMA-reversal exit and
-    MomentumStrategy's tightened ADX-exit threshold, both scoped ONLY to
-    positions entered while regime==VOLATILE
+  - VOLATILE crash-catching: MomentumStrategy's tightened ADX-exit threshold,
+    scoped ONLY to positions entered while regime==VOLATILE
+  - EMACrossoverStrategy's EMA-reversal exit: generalized 2026-08-21
+    (external review) from VOLATILE-only to the PRIMARY exit for every
+    position, regardless of entry_regime
 """
 from src.strategies.momentum import MomentumStrategy
 from src.strategies.ema_crossover import EMACrossoverStrategy
@@ -56,26 +58,41 @@ def test_ema_crossover_holds_while_relationship_intact():
     assert ema.manage_position(pos, 51.0) == "HOLD"
 
 
-def test_ema_crossover_reversal_exit_scoped_only_to_volatile_entries():
+def test_ema_crossover_reversal_exit_fires_regardless_of_entry_regime():
+    """Fixed 2026-08-21 (external review): generalized from VOLATILE-only
+    to the primary exit for every position -- "the thesis that justified
+    entry has reversed" isn't a VOLATILE-specific concept."""
     ema = EMACrossoverStrategy("ema_test", {})
     ema.initialize()
-    # Same "reversed" EMA data, entry_regime is NOT VOLATILE -> must not exit.
     pos = {
         "avg_price": 50.0, "peak_premium": 52.0,
         "current_ema_fast": 99.0, "current_ema_slow": 100.0,
         "is_call": True, "entry_regime": "TRENDING",
     }
-    assert ema.manage_position(pos, 51.0) == "HOLD"
+    assert ema.manage_position(pos, 51.0) == "EXIT"
 
 
-def test_ema_crossover_missing_entry_regime_is_safe_noop():
-    # Legacy/older journal entries without the entry_regime field must not crash.
+def test_ema_crossover_missing_entry_regime_still_exits_on_reversal():
+    # Legacy/older journal entries without the entry_regime field must not
+    # crash, and the (now general) reversal exit must still fire -- only
+    # the log line's entry_regime mention is affected by its absence.
     ema = EMACrossoverStrategy("ema_test", {})
     ema.initialize()
     pos = {
         "avg_price": 50.0, "peak_premium": 52.0,
         "current_ema_fast": 99.0, "current_ema_slow": 100.0,
         "is_call": True,
+    }
+    assert ema.manage_position(pos, 51.0) == "EXIT"
+
+
+def test_ema_crossover_reversal_exit_can_be_disabled():
+    ema = EMACrossoverStrategy("ema_test", {"ema_reversal_exit": False})
+    ema.initialize()
+    pos = {
+        "avg_price": 50.0, "peak_premium": 52.0,
+        "current_ema_fast": 99.0, "current_ema_slow": 100.0,
+        "is_call": True, "entry_regime": "TRENDING",
     }
     assert ema.manage_position(pos, 51.0) == "HOLD"
 

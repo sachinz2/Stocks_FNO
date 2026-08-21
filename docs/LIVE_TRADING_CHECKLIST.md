@@ -905,6 +905,93 @@ Kept short — see git log / individual commit messages for full detail.
     the quality-gate filters in isolation, not the confirmation timing.
     454 tests passing.
 
+- **ema_crossover_v1 redesign, external PDF review (2026-08-21), same day.**
+  A separate review of the sibling strategy, prompted by its real result: 1
+  trade in ~2 months, +₹59. The review's thesis is the mirror image of
+  momentum_v1's: not too-late entries, but a filter stack (ADX≥25 + RVOL≥1.3
+  hard gates + strict 15m agreement, stacked on the 2-bar confirmation) so
+  aggressive it had "almost eliminated its opportunity set" — effectively
+  testing "EMA crossover + volume breakout + already-strong trend +
+  higher-timeframe agreement," not a plain EMA crossover. Verified every
+  code-level claim against the actual source before acting (all confirmed
+  accurate, including the exact `atr_pct×0.6 + proximity×0.4` pool-scoring
+  formula and the `0.5%` proximity cap) except one: the review's section 22
+  claim that the 15-minute MTF filter still fails OPEN on exception was
+  **already outdated** — that was fixed the day before, in momentum_v1's own
+  external review round 1 (2026-08-20), and covers both strategies since
+  they share the same `_process_signal` code path. Per the same "integrate
+  into v1, no separate v2" choice already made for momentum_v1 (the review
+  itself proposed `ema_crossover_v2`, but the user's established preference
+  this session has been direct integration):
+  - **ADX moved in-strategy and loosened**: the flat, engine-level
+    `ADX<25` hard gate (applied unconditionally to EVERY BUY/SELL, after
+    `generate_signal()` had already fired) is now skippable via
+    `adx_checked_internally`. `ema_crossover_v1` gates internally instead,
+    at `adx_entry_threshold`=18 (the low end of the review's own "test
+    18/20/22" range) **OR** ADX rising — matching the review's own "ADX≥18
+    OR ADX rising" diagram box, checked only once the crossover itself has
+    already confirmed. A confirmed crossover that fails this gate is held
+    pending (not discarded) so a later bar can still fire once ADX catches
+    up. `momentum_v1` already had its own stricter internal gate (≥25 +
+    rising) since 2026-08-20 and now sets the same flag, since the flat
+    check was already fully redundant for it.
+  - **RVOL demoted from a hard gate to a non-blocking confidence note**
+    (`rvol_hard_gate=False`) for `ema_crossover_v1` — a genuine EMA20/50
+    cross doesn't require above-average volume to be real (the review's own
+    example: a valid cross at RVOL=0.95 was rejected outright). Default
+    stays a hard gate for anything that doesn't opt out (`momentum_v1`
+    unaffected).
+  - **15-min MTF filter made asymmetric** (`mtf_strict=False`,
+    `mtf_strong_opposition_pct=0.3`) — only a STRONGLY opposing 15m trend
+    (spread magnitude ≥0.3%) still blocks the entry; a weakly opposing or
+    turning 15m trend is now allowed, since that's precisely the
+    "higher-timeframe-weakening-into-a-reversal" setup a crossover strategy
+    should be able to catch (review section 10's own asymmetric example).
+  - **EMA-reversal exit generalized from VOLATILE-only to the PRIMARY exit
+    for every position** (review sections 15-18: "opposite EMA crossover
+    the primary exit") — previously only crash-catching VOLATILE-entered
+    positions got this exit; the underlying thesis reversing isn't a
+    VOLATILE-specific concept, so it's now checked first for every position,
+    before the premium-based stop/target.
+  - **Underlying-based stop AND target** added (`underlying_stop_atr_mult`
+    =1.0 / `underlying_target_atr_mult`=2.0), mirroring momentum_v1's own
+    round-2 addition and reusing the same `entry_underlying_price`/
+    `entry_atr` the engine already captures for every single-leg entry.
+  - **EMA candidate pool re-weighted** toward crossover proximity: `atr_pct
+    ×0.6 + proximity×0.4` → `atr_pct×0.3 + proximity×0.7` (`ltp_poller.py`)
+    — the review's point: "the strategy doesn't need stocks with high ATR,
+    it needs stocks actually approaching a crossover." The old weighting
+    let a high-ATR, far-from-crossing stock outscore a genuinely
+    close-to-crossing one.
+  - **Signal audit** (review section 20, "what I recommend most strongly"):
+    lightweight, in-memory per-strategy/per-gate counters
+    (`LiveTradingEngine._signal_gate_stats`, incremented at each of the 9
+    existing entry-gate checkpoints in `_process_signal`), exposed via a new
+    `GET /api/v1/analytics/signal-audit` endpoint — answers "how many
+    signals reached each gate and how many passed" without guessing.
+    In-memory only (resets on restart), not a persistent audit trail.
+  - `entry_option_delta` exposed for `ema_crossover_v1` too (mechanism
+    already existed for `momentum_v1`) — defaults to `None` (ATM, unchanged
+    current behavior) so it can be tuned later without a code change.
+  - **Explicitly NOT done, and why:** a full weighted composite entry score
+    (review section 25's "something like this would be much better" diagram
+    is explicitly illustrative, its point values not tuned/validated — same
+    reasoning as declining to hardcode an untested DTE range for
+    momentum_v1); testing alternate EMA pairs (10/30, 13/21, 9/21 — the
+    review's own section 23 explicitly warns against changing this just
+    because of low trade count without first testing); testing alternate
+    `stop_loss_pct`/`target_pct` values (review frames as "test," not a firm
+    recommendation); comparing 10-25 vs 20-35 DTE (same "test both, no A/B
+    infra" reasoning as momentum_v1's round 2). The full underlying-vs-option
+    MFE/MAE attribution the review asks for in its "ADD" list is already
+    covered for `ema_crossover_v1` for free — that instrumentation
+    (entry-context snapshot + running MFE/MAE, `trade_journal` migration
+    `b005`) was built as shared engine code in momentum_v1's round 2 the
+    same day, not gated to a specific strategy.
+  - 21 new regression tests, plus fixes to 2 pre-existing tests whose
+    assumptions (EMA-reversal exit scoped to VOLATILE only) were the exact
+    behavior being intentionally generalized. 476 tests passing.
+
 ---
 
-*Last updated: 2026-08-21, after the momentum_v1 entry-quality redesign round 2 (pullback+breakout model, two-tier RVOL, underlying-based stop/target, VOLATILE exclusion, entry-context/MFE-MAE data collection).*
+*Last updated: 2026-08-21, after the ema_crossover_v1 redesign (internal ADX gate, soft RVOL, asymmetric MTF, generalized EMA-reversal exit, underlying-based stop/target, candidate-pool re-weighting, signal audit).*

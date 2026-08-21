@@ -272,6 +272,17 @@ class MomentumStrategy(StrategyBase):
         # already been consumed (fired), losing the setup with no retry.
         self.rvol_checked_internally = self.use_pullback_continuation_model
 
+        # Fixed 2026-08-21 (external review of ema_crossover_v1, applied
+        # here too): generate_signal() already gates on its own
+        # adx_entry_threshold (paired with adx_rising_required) before ever
+        # returning BUY/SELL -- the engine's separate flat ADX>=25 check
+        # was already fully redundant for this strategy, just not
+        # previously marked so. True regardless of
+        # use_pullback_continuation_model, since both the pullback model
+        # and the legacy debounce path route through the same ADX gate in
+        # generate_signal().
+        self.adx_checked_internally = True
+
         logger.info(
             f"Initialized Momentum '{self.name}' ({self.fast_period}/{self.slow_period}) | "
             f"ADX entry>={self.adx_entry_threshold} (rising={self.adx_rising_required}) "
