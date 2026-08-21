@@ -1071,6 +1071,72 @@ Kept short — see git log / individual commit messages for full detail.
     duplication (review: "a maintenance risk," not a current bug, P2).
   - 20 new regression tests. 496 tests passing.
 
+- **Live incident (2026-08-21, 12:55-13:01 IST): KAYNES26SEP3900CE
+  (ema_crossover_v1) exited at -67.2% instead of the intended -50% hard
+  stop, a real ₹21,498 loss on a 150-lot position (entry Rs210.12, exit
+  Rs66.80).** Found by the user asking "how is that possible?" after
+  spotting it in the dashboard — a good example of why the dashboard
+  audit earlier the same day mattered.
+  - **Root cause**: a ~6-minute Zerodha connectivity blip (`Network is
+    unreachable` from the container to `api.kite.trade`, self-resolving)
+    made the underlying's cached market data go stale past the existing
+    90-second circuit breaker. `_check_open_option_exits()` used to
+    `continue` on stale/missing market data — skipping the ENTIRE exit
+    check for every open position on that underlying, including the plain
+    premium-based hard stop (and the DTE/overnight-position forced-close
+    checks), none of which actually need the underlying's indicator data
+    at all — they only need the option's own quote, fetched via
+    `get_option_quote()`, a **separate** data path from the underlying's
+    cached tick pipeline that was never even being reached because the
+    `continue` fired first. By the time fresh data returned, the option
+    had already fallen 17+ percentage points past the intended stop.
+  - **Compounded by two of the same day's own deploy restarts** landing in
+    that exact window (12:55:37 for the dashboard deploy, 12:58:38
+    attempting to fix the WebSocket fallback) — `/health` and
+    `verify_invariants.py` both looked clean at the time, but neither
+    actually checks "is the exit-check loop getting fresh quotes for open
+    positions," a real gap in how those deploys were verified.
+  - **Fixed**: stale/missing `market_data` now degrades to an empty dict
+    instead of aborting the check. Every downstream `market_data.get(...)`
+    already treats a missing field as "skip that specific conditional
+    exit" (the established convention for every EMA/ADX/structural-
+    invalidation check in `manage_position()`), so those indicator-
+    dependent exits correctly stay paused during an outage, while the
+    premium-based hard stop/target/trailing/breakeven checks — and the
+    DTE/overnight-position forced-close checks — keep running off the
+    option's own quote. Deliberately **not** a new "force-exit after N
+    minutes" mechanism: in live mode, a data outage is often correlated
+    with the broker connection itself being degraded, so an automated
+    exit order placed on data nobody trusts risks silently failing a
+    second time and creating false confidence. Decoupling reuses a fallback
+    ladder (`get_option_quote()` → ATR estimate → entry price) that
+    already existed and was simply never being reached.
+  - **Added**: a one-time visibility alert (Telegram/email via `_notify`)
+    if a position's underlying market data has been stale for more than
+    120 seconds — far short of the 6 minutes this incident ran silently —
+    so a human notices a prolonged outage regardless of what the automated
+    fallback manages to do. Clears and can re-fire on a later, separate
+    stale episode.
+  - 7 new regression tests (behavioral, using a fake engine binding the
+    real method — the established pattern for this file's other
+    large/high-precondition-chain methods is static-source-only testing,
+    but this specific correctness property was worth real behavioral
+    coverage). 506 tests passing.
+
+- **Dashboard audit (2026-08-21), same day, prompted the incident being
+  caught.** User asked to review the dashboard after the three review
+  rounds above. Found `/analytics/trades` (`_trade_to_dict()`) was
+  silently dropping every field added across all three rounds — entry-
+  context snapshot, running MFE/MAE, daily ATR, credit/max-loss%,
+  wing-failure classification — the data was in `trade_journal` but never
+  reached the API response. Fixed, plus: a new "Signal audit" expander per
+  strategy on the Strategies page (the ema_crossover_v1 review's own top
+  recommendation, previously built with zero UI); an optional entry-
+  context/MFE-MAE detail toggle on the Analytics page's Closed Trade Log
+  (off by default to keep the core table readable); a new Iron Condor
+  wing-failure breakdown panel. 3 new regression tests. 499 tests passing
+  before the incident fix above brought the total to 506.
+
 ---
 
-*Last updated: 2026-08-21, after the credit_spread_v1/iron_condor_v1 review (crowded-strike delta verification, GTT-asymmetry reconciliation, daily-ATR/credit-max-loss/wing-failure data collection).*
+*Last updated: 2026-08-21, after the live KAYNES incident fix (stale-data exit decoupling + staleness alert) and the dashboard audit that surfaced it.*

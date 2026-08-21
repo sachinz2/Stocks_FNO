@@ -125,6 +125,22 @@ class LiveTradingEngine:
         # restart) -- a lightweight diagnostic, not a persistent audit
         # trail; see get_signal_audit_report().
         self._signal_gate_stats: Dict[str, Dict[str, int]] = {}
+        # Fixed 2026-08-21 (incident: KAYNES26SEP3900CE exited at -67% instead
+        # of the intended -50% hard stop, 2026-08-21 12:55-13:01, during a
+        # ~6-minute Zerodha connectivity blip). Tracks, per underlying, when
+        # its market data was first observed stale and whether the staleness
+        # alert has already fired for the CURRENT episode -- see
+        # _check_open_option_exits()'s staleness-alert block. Cleared the
+        # moment fresh data returns, so a later, separate episode alerts again.
+        self._stale_data_since:    Dict[str, datetime] = {}
+        self._stale_data_alerted:  set = set()
+        # How long a position's underlying market data may stay stale before
+        # this fires a one-time notification (premium-based exits keep
+        # running off the option's own quote regardless -- see
+        # _check_open_option_exits(); this is purely a visibility alert so a
+        # human notices a prolonged data outage well before it does real
+        # damage, not a trading decision in itself).
+        self._STALE_DATA_ALERT_SECONDS = 120
         self._kite = None        # attached in live mode for real quotes + VIX
         self._ltp_poller = None  # ZerodhaLTPPoller — registers active option contracts
         # Prevents concurrent exit checks from 1-min signal cycle + 10-s exit-only job (F)
@@ -1528,9 +1544,66 @@ class LiveTradingEngine:
                 if not underlying:
                     continue
 
-                market_data = await self._get_market_data(underlying)
-                if not market_data:
-                    continue
+                # Fixed 2026-08-21 (incident: KAYNES26SEP3900CE exited at
+                # -67% instead of the intended -50% hard stop, 2026-08-21
+                # 12:55-13:01, during a ~6-minute Zerodha connectivity blip).
+                # This used to `continue` here on stale/missing underlying
+                # market data -- skipping the ENTIRE exit check for the
+                # position, including the plain premium-based hard stop
+                # (and the DTE/overnight-position forced-close checks
+                # below), none of which actually need the underlying's
+                # indicator data at all -- they only need the option's own
+                # quote, fetched separately just below via a DIFFERENT data
+                # path (get_option_quote() hits the option's own Zerodha
+                # quote endpoint directly, independent of the underlying's
+                # cached tick pipeline) that was never even being reached
+                # because this `continue` fired first. By the time the
+                # underlying's data recovered, the position had already
+                # fallen 17 points past the intended stop.
+                #
+                # Now: a stale/missing market_data degrades to an empty
+                # dict instead of aborting the check. Every downstream
+                # `market_data.get(...)` below already treats a missing
+                # field as "skip that specific conditional exit" (the
+                # established convention for every EMA/ADX/structural-
+                # invalidation check in manage_position() -- e.g. "if
+                # ema_fast is not None and ema_slow is not None"), so those
+                # indicator-dependent exits correctly stay paused during an
+                # outage, while the premium-based hard stop/target/trailing/
+                # breakeven checks -- and the DTE/overnight force-close
+                # checks -- keep running off the option's own quote.
+                #
+                # Paired with a one-time visibility alert if staleness
+                # persists past _STALE_DATA_ALERT_SECONDS while a position
+                # is open, so a human notices a prolonged outage well
+                # before it does real damage -- this alert is purely
+                # informational, not itself a trading decision.
+                _raw_market_data = await self._get_market_data(underlying)
+                _now_naive = now_ist().replace(tzinfo=None)
+                if _raw_market_data is None:
+                    _since = self._stale_data_since.setdefault(underlying, _now_naive)
+                    _stale_secs = (_now_naive - _since).total_seconds()
+                    if (
+                        _stale_secs >= self._STALE_DATA_ALERT_SECONDS
+                        and underlying not in self._stale_data_alerted
+                    ):
+                        self._stale_data_alerted.add(underlying)
+                        logger.critical(
+                            f"Market data for {underlying} has been stale for "
+                            f"{_stale_secs:.0f}s while position {contract} is open."
+                        )
+                        await self._notify(
+                            f"DATA STALENESS ALERT\n{underlying}: market data stale for "
+                            f"{_stale_secs:.0f}s+ while position {contract} is open.\n"
+                            "Premium-based stop/target/trailing exits are still running "
+                            "off the option's own quote where available; EMA/ADX/"
+                            "structural-invalidation exits are paused until fresh data "
+                            "returns."
+                        )
+                else:
+                    self._stale_data_since.pop(underlying, None)
+                    self._stale_data_alerted.discard(underlying)
+                market_data = _raw_market_data or {}
 
                 atr = float(market_data.get("atr14", 0))
                 from src.market_data.option_chain import get_option_quote
