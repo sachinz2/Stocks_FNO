@@ -65,5 +65,13 @@ class TradeJournal(Base):
     option_mfe_pct            = Column(Float, nullable=True)   # best favorable option premium move since entry, %
     option_mae_pct            = Column(Float, nullable=True)   # worst adverse option premium move since entry, %
 
+    # Added 2026-08-21 (external review of credit_spread_v1/iron_condor_v1):
+    # data collection for premium-selling strategies specifically, per the
+    # review's explicit "first collect the data, don't gate on it yet"
+    # recommendation -- none of these are entry/exit gates.
+    daily_atr_pct           = Column(Float, nullable=True)   # daily ATR14 %, vs the existing 5m-derived regime_atr_pct
+    credit_to_max_loss_pct  = Column(Float, nullable=True)   # net_credit / max_loss * 100, at entry -- the review's "critical number for a condor"
+    wing_failed             = Column(String(10), nullable=True)  # iron_condor_v1 only: PUT / CALL / BOTH / NULL (not wing-related)
+
     created_at = Column(TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
     updated_at = Column(TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"))

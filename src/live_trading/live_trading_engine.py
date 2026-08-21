@@ -909,6 +909,11 @@ class LiveTradingEngine:
 
         # After Redis restore, cross-check broker positions for orphans
         await self._reconcile_broker_positions()
+        # Fixed 2026-08-21 (external review): must run AFTER the orphan
+        # reconcile above, since it operates on _active_spreads/_active_condors
+        # entries that are still tracked (not orphans) but may have had their
+        # short leg closed via GTT while this process was offline.
+        await self._reconcile_partially_closed_multi_leg_legs()
 
     async def _reconcile_paper_broker_balance(self) -> None:
         """
@@ -1141,6 +1146,122 @@ class LiveTradingEngine:
                 for p in orphans
             )
         )
+
+    async def _reconcile_partially_closed_multi_leg_legs(self) -> None:
+        """
+        Fixed 2026-08-21 (external review of credit_spread_v1/iron_condor_v1,
+        "Credit Spread issue #5" -- GTT is asymmetric): a GTT backstop is
+        placed on the SHORT leg only (see _place_gtt_backstop()'s docstring).
+        If it fires at the exchange while this process is dead (crash,
+        deploy, restart), the short leg closes for real but the long hedge
+        does not. On restart, _reconcile_broker_positions() correctly does
+        NOT flag the surviving long leg as an orphan -- it's still listed in
+        _active_spreads/_active_condors' tracked set -- but the engine's own
+        model of the structure is now wrong: it still believes both legs are
+        open and will keep computing spread/condor P&L and exit rules
+        assuming a short leg that no longer exists at the broker.
+
+        This checks each tracked short leg's ACTUAL broker quantity; any
+        structure whose short leg is already flat while its paired long
+        leg(s) remain open is force-flattened entirely here (a lone
+        surviving long leg was only ever meant as temporary insurance while
+        the short was live, not a standalone bet -- "this is no longer a
+        credit spread/condor, I now have a naked long option," per the
+        review) and removed from active tracking, rather than left for the
+        normal exit-check loop to keep mis-modeling.
+
+        Live mode only -- PaperBroker has no GTT mechanism, so this
+        divergence can't occur there (paper positions are reconstructed
+        FROM engine state on restart, not the other way around -- see
+        _rebuild_paper_broker_positions()).
+        """
+        if self.mode != TradingMode.LIVE:
+            return
+        try:
+            broker_positions = await self.broker.get_positions()
+        except Exception as e:
+            logger.warning(f"Partial-close reconcile: could not fetch broker positions: {e}")
+            return
+        _qty = {p.get("symbol"): p.get("quantity", 0) for p in (broker_positions or [])}
+
+        from src.market_data.option_chain import get_option_quote
+
+        async def _flatten(contract: Optional[str]) -> None:
+            if not contract or _qty.get(contract, 0) == 0:
+                return
+            q = _qty[contract]
+            exit_p = await get_option_quote(contract, getattr(self, "_kite", None), getattr(self, "_redis", None)) or 0.0
+            side = "BUY" if q < 0 else "SELL"
+            logger.critical(
+                f"RECONCILE: force-flattening {contract} (qty={q}) -- part of a structure "
+                f"whose short leg was already closed via GTT while this process was offline."
+            )
+            try:
+                await self.order_manager.place_order(contract, side, abs(q), exit_p, is_exit_order=True)
+            except Exception as e:
+                logger.error(f"RECONCILE: failed to flatten {contract}: {e}")
+
+        for symbol, s in list(self._active_spreads.items()):
+            short_c, long_c = s.get("short_contract"), s.get("long_contract")
+            if short_c and _qty.get(short_c, 0) == 0 and long_c and _qty.get(long_c, 0) != 0:
+                logger.critical(
+                    f"RECONCILE: credit_spread {symbol} short leg {short_c} already closed "
+                    f"(GTT likely fired while offline) -- flattening orphaned long leg {long_c}."
+                )
+                await _flatten(long_c)
+                await self._cancel_gtt(s.get("gtt_id"), short_c)
+                self.risk_manager.release_deployed_capital(
+                    s.get("strategy_name", "credit_spread_v1"),
+                    (abs(s.get("short_strike", 0) - s.get("long_strike", 0)) - s.get("net_credit", 0))
+                    * s.get("lot_size", 0),
+                )
+                await self._log_trade_close(
+                    journal_id=s.get("journal_id"), exit_price=0.0, pnl=0.0,
+                    exit_reason=(
+                        "GTT fired on short leg while process was down -- structure "
+                        "force-closed on recovery; realized P&L not recoverable from this event."
+                    ),
+                )
+                del self._active_spreads[symbol]
+                await self._notify(
+                    f"RECONCILE ALERT\ncredit_spread {symbol}: short leg was closed via GTT "
+                    f"while offline. Long leg force-flattened on recovery."
+                )
+
+        for symbol, c in list(self._active_condors.items()):
+            put_short, put_long   = c.get("put_short_contract"),  c.get("put_long_contract")
+            call_short, call_long = c.get("call_short_contract"), c.get("call_long_contract")
+            put_orphaned  = bool(put_short)  and _qty.get(put_short, 0)  == 0 and bool(put_long)  and _qty.get(put_long, 0)  != 0
+            call_orphaned = bool(call_short) and _qty.get(call_short, 0) == 0 and bool(call_long) and _qty.get(call_long, 0) != 0
+            if not (put_orphaned or call_orphaned):
+                continue
+            logger.critical(
+                f"RECONCILE: iron_condor {symbol} had a short leg already closed via GTT "
+                f"while offline (put={put_orphaned}, call={call_orphaned}) -- flattening the "
+                f"entire structure."
+            )
+            for _c in (put_short, put_long, call_short, call_long):
+                await _flatten(_c)
+            await self._cancel_gtt(c.get("put_short_gtt_id"),  put_short)
+            await self._cancel_gtt(c.get("call_short_gtt_id"), call_short)
+            _put_wing  = abs(c.get("put_short_strike", 0)  - c.get("put_long_strike", 0))
+            _call_wing = abs(c.get("call_short_strike", 0) - c.get("call_long_strike", 0))
+            self.risk_manager.release_deployed_capital(
+                c.get("strategy_name", "iron_condor_v1"),
+                (max(_put_wing, _call_wing) - c.get("net_credit", 0)) * c.get("lot_size", 0),
+            )
+            await self._log_trade_close(
+                journal_id=c.get("journal_id"), exit_price=0.0, pnl=0.0,
+                exit_reason=(
+                    "GTT fired on a short leg while process was down -- entire structure "
+                    "force-closed on recovery; realized P&L not recoverable from this event."
+                ),
+            )
+            del self._active_condors[symbol]
+            await self._notify(
+                f"RECONCILE ALERT\niron_condor {symbol}: a short leg was closed via GTT "
+                f"while offline. Entire structure force-flattened on recovery."
+            )
 
     async def _close_orphan_journal_if_found(self, contract: str, qty: int, fill_price: float) -> None:
         """
@@ -1673,6 +1794,45 @@ class LiveTradingEngine:
         right one by default instead of by copy-paste).
         """
         return float(getattr(order, "fill_price", None) or fallback)
+
+    @staticmethod
+    def _find_non_crowded_strike_within_delta_tolerance(
+        oi_data, opt: str, base_strike: float, interval: float,
+        target_delta: float, underlying_price: float, dte: int, sigma: float,
+        max_steps: int = 3, delta_tol: float = 0.08,
+    ) -> Optional[float]:
+        """
+        Fixed 2026-08-21 (external review of credit_spread_v1/iron_condor_v1,
+        "Credit Spread issue #1"): when the originally-computed short strike
+        sits at a crowded OI level, this used to move exactly 1 interval
+        further OTM unconditionally, with no check that the RESULTING delta
+        was still close to the original target -- e.g. a 20-delta target
+        could silently become an actual 14-delta or 25-delta strike,
+        depending on strike interval/volatility surface, changing the
+        position's real risk profile without anyone deciding that.
+
+        Now searches up to max_steps further OTM intervals, recalculating
+        the real Black-Scholes delta at each candidate (via the same
+        bs_delta() used by find_delta_strike() itself) and returns the first
+        one that's both non-crowded AND within delta_tol of target_delta.
+        Returns None (fail closed -- the caller should skip the entry) if no
+        acceptable strike is found in range, consistent with this
+        codebase's convention for explicitly-chosen entry-risk parameters.
+        """
+        from src.market_data.nse_oi import is_strike_crowded
+        from src.market_data.option_chain import bs_delta
+        T = max(dte, 1) / 365.0
+        direction = -1 if opt == "PE" else 1
+        for step in range(1, max_steps + 1):
+            candidate = base_strike + direction * step * interval
+            if candidate <= 0:
+                continue
+            if is_strike_crowded(candidate, oi_data, opt):
+                continue
+            actual_delta = bs_delta(underlying_price, candidate, T, sigma, opt)
+            if abs(abs(actual_delta) - abs(target_delta)) <= delta_tol:
+                return candidate
+        return None
 
     def _audit_gate(self, strategy_name: str, gate: str) -> None:
         """Increment the (strategy, gate) counter -- see _signal_gate_stats'
@@ -2526,14 +2686,28 @@ class LiveTradingEngine:
         # Avoid selling at crowded OI strikes (high OI = frequently tested)
         from src.market_data.nse_oi import is_strike_crowded
         if is_strike_crowded(short_strike, oi_data, opt):
+            # Fixed 2026-08-21 (external review): search for a non-crowded
+            # strike that ALSO keeps the real delta close to the original
+            # 20-delta target, rather than blindly moving 1 interval and
+            # letting delta drift unchecked -- see
+            # _find_non_crowded_strike_within_delta_tolerance()'s docstring.
+            _target_delta = -0.20 if opt == "PE" else 0.20
+            _new_strike = self._find_non_crowded_strike_within_delta_tolerance(
+                oi_data, opt, short_strike, interval, _target_delta,
+                underlying_price, dte, sigma,
+            )
+            if _new_strike is None:
+                logger.info(
+                    f"[CreditSpread] {symbol} skipped — short strike {short_strike} is "
+                    f"crowded OI and no non-crowded alternative within delta tolerance "
+                    f"of target {_target_delta} was found nearby."
+                )
+                return
             logger.info(
                 f"[CreditSpread] {symbol} short strike {short_strike} is crowded OI — "
-                f"moving 1 interval further OTM"
+                f"moved to {_new_strike} (delta-verified within tolerance of {_target_delta})"
             )
-            if opt == "PE":
-                short_strike -= interval
-            else:
-                short_strike += interval
+            short_strike = _new_strike
             resolved = await self._resolve_contract(symbol, expiry, short_strike, opt)
             if resolved is None:
                 logger.warning(f"[CreditSpread] {symbol} skipped — no verified real contract for OI-bumped short strike {short_strike}.")
@@ -2690,12 +2864,24 @@ class LiveTradingEngine:
         short_fill = self._real_fill(short_order, short_p)
         long_fill  = self._real_fill(long_order,  long_p)
 
+        # Added 2026-08-21 (external review): "the critical number for a
+        # credit spread is credit/max_loss" -- data collection only, not a
+        # gate (the 20%-of-wing-width check above already gates on this
+        # same ratio's near-equivalent; this stores the precise figure for
+        # later expectancy analysis across the actual traded distribution).
+        _credit_to_max_loss = (
+            round(net_credit / (spread_width - net_credit) * 100, 2)
+            if (spread_width - net_credit) > 0 else None
+        )
+        _daily_atr = self.rs_ranker.get_daily_atr_pct(symbol) if getattr(self, "rs_ranker", None) else None
+
         journal_id = await self._log_trade_open(
             strategy=strategy.name, underlying=symbol,
             structure_type=spread_type,
             contracts=[short_contract, long_contract],
             entry_price=round(short_fill - long_fill, 2), quantity=lot_size,
             market_data=market_data, iv_rank=iv_rank, vix=vix,
+            daily_atr_pct=_daily_atr, credit_to_max_loss_pct=_credit_to_max_loss,
         )
         # Track deployed capital by actual max loss (width - net credit), not just
         # the long/hedge leg's premium — found this was previously never called at
@@ -3258,21 +3444,45 @@ class LiveTradingEngine:
         if call_long_strike <= call_short_strike:
             call_long_strike = call_short_strike + 2 * interval
 
-        # Crowded-strike avoidance for both short legs
+        # Crowded-strike avoidance for both short legs. Fixed 2026-08-21
+        # (external review, same fix as credit_spread_v1's "issue #1"):
+        # search for a non-crowded strike that ALSO keeps the real delta
+        # close to the original 20-delta target, instead of blindly moving
+        # 1 interval and letting delta drift unchecked.
         if is_strike_crowded(put_short_strike, oi_data, "PE"):
+            _new_put_short = self._find_non_crowded_strike_within_delta_tolerance(
+                oi_data, "PE", put_short_strike, interval, -0.20,
+                underlying_price, dte, sigma,
+            )
+            if _new_put_short is None:
+                logger.info(
+                    f"[IronCondor] {symbol} skipped — put short strike {put_short_strike} is "
+                    f"crowded OI and no non-crowded alternative within delta tolerance was found."
+                )
+                return
             logger.info(
                 f"[IronCondor] {symbol} put short strike {put_short_strike} is crowded OI — "
-                f"moving 1 interval further OTM"
+                f"moved to {_new_put_short} (delta-verified)"
             )
-            put_short_strike -= interval
+            put_short_strike = _new_put_short
             if put_long_strike >= put_short_strike:
                 put_long_strike = put_short_strike - 2 * interval
         if is_strike_crowded(call_short_strike, oi_data, "CE"):
+            _new_call_short = self._find_non_crowded_strike_within_delta_tolerance(
+                oi_data, "CE", call_short_strike, interval, 0.20,
+                underlying_price, dte, sigma,
+            )
+            if _new_call_short is None:
+                logger.info(
+                    f"[IronCondor] {symbol} skipped — call short strike {call_short_strike} is "
+                    f"crowded OI and no non-crowded alternative within delta tolerance was found."
+                )
+                return
             logger.info(
                 f"[IronCondor] {symbol} call short strike {call_short_strike} is crowded OI — "
-                f"moving 1 interval further OTM"
+                f"moved to {_new_call_short} (delta-verified)"
             )
-            call_short_strike += interval
+            call_short_strike = _new_call_short
             if call_long_strike <= call_short_strike:
                 call_long_strike = call_short_strike + 2 * interval
 
@@ -3420,12 +3630,21 @@ class LiveTradingEngine:
         put_short_fill,  put_long_fill  = _fills[psc], _fills[plc]
         call_short_fill, call_long_fill = _fills[csc], _fills[clc]
 
+        # Added 2026-08-21 (external review) -- same rationale as the
+        # matching credit-spread addition above.
+        _credit_to_max_loss = (
+            round(net_credit / (wing_spread - net_credit) * 100, 2)
+            if (wing_spread - net_credit) > 0 else None
+        )
+        _daily_atr = self.rs_ranker.get_daily_atr_pct(symbol) if getattr(self, "rs_ranker", None) else None
+
         journal_id  = await self._log_trade_open(
             strategy=strategy.name, underlying=symbol,
             structure_type="IRON_CONDOR", contracts=[psc, plc, csc, clc],
             entry_price=round(put_short_fill + call_short_fill - put_long_fill - call_long_fill, 2),
             quantity=lot_size,
             market_data=market_data, iv_rank=iv_rank, vix=vix,
+            daily_atr_pct=_daily_atr, credit_to_max_loss_pct=_credit_to_max_loss,
         )
         # Track deployed capital by actual max loss, not just the long/hedge legs'
         # premium — same fix and rationale as _process_credit_spread. Max loss for
@@ -3726,12 +3945,29 @@ class LiveTradingEngine:
                 (max(_put_wing, _call_wing) - c["net_credit"]) * lot,
             )
 
+            # Added 2026-08-21 (external review): "wing failure analysis" --
+            # classify which wing's exit condition actually fired, derived
+            # from exit_reason's own wording (every put/call-specific branch
+            # above says "Put ..."/"Call ..." or "put short δ"/"call short
+            # δ"; structural exits -- DTE, near-expiry, regime shift -- don't
+            # mention either and correctly classify as neither wing).
+            _reason_lower = exit_reason.lower()
+            _put_failed  = "put" in _reason_lower
+            _call_failed = "call" in _reason_lower
+            wing_failed = (
+                "BOTH" if _put_failed and _call_failed
+                else "PUT" if _put_failed
+                else "CALL" if _call_failed
+                else None
+            )
+
             await self._log_trade_close(
                 journal_id=c.get("journal_id"),
                 exit_price=round(_ps_fill + _cs_fill - _pl_fill - _cl_fill, 2),
                 pnl=net_pnl, exit_reason=exit_reason,
                 market_data=market_data,
                 total_slippage_pts=round(_slippage, 4) if _slippage > 0 else None,
+                wing_failed=wing_failed,
             )
             if self._ltp_poller:
                 self._ltp_poller.unregister_option_contracts([
@@ -4216,6 +4452,8 @@ class LiveTradingEngine:
         vix: Optional[float],
         dte: Optional[int] = None,
         entry_option_delta: Optional[float] = None,
+        daily_atr_pct: Optional[float] = None,
+        credit_to_max_loss_pct: Optional[float] = None,
     ) -> Optional[int]:
         try:
             from src.database.connection import AsyncSessionLocal
@@ -4258,6 +4496,8 @@ class LiveTradingEngine:
                 "underlying_mae_pct": 0.0 if _close_e else None,
                 "option_mfe_pct":     0.0,
                 "option_mae_pct":     0.0,
+                "daily_atr_pct":            daily_atr_pct,
+                "credit_to_max_loss_pct":   credit_to_max_loss_pct,
             })
             return row.id
         except Exception as e:
@@ -4276,6 +4516,7 @@ class LiveTradingEngine:
         underlying_mae_pct: Optional[float] = None,
         option_mfe_pct: Optional[float] = None,
         option_mae_pct: Optional[float] = None,
+        wing_failed: Optional[str] = None,
     ) -> None:
         if not journal_id:
             return
@@ -4332,6 +4573,8 @@ class LiveTradingEngine:
                 updates["option_mfe_pct"] = round(option_mfe_pct, 4)
             if option_mae_pct is not None:
                 updates["option_mae_pct"] = round(option_mae_pct, 4)
+            if wing_failed is not None:
+                updates["wing_failed"] = wing_failed
             await repo.update(row, updates)
         except Exception as e:
             logger.error(f"TradeJournal close log failed: {e}")

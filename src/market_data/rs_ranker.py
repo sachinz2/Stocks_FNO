@@ -174,6 +174,35 @@ class RSRanker:
                 return entry["rs_score"]
         return None
 
+    def get_daily_atr_pct(self, symbol: str, period: int = 14) -> Optional[float]:
+        """
+        Daily ATR14 as a % of the latest close -- added 2026-08-21 (external
+        review of credit_spread_v1/iron_condor_v1): "you are using 5-minute
+        ATR as the primary volatility/regime measure, but positions are held
+        for weeks (DTE>=21 at entry) -- 5-minute ATR tells you how much a
+        stock has moved intraday, daily ATR tells you how much it normally
+        moves day-to-day, which is arguably more relevant to a multi-week
+        short option's eventual probability of touching the short strike."
+        Non-gating -- collected for analysis only, per the review's own
+        explicit "first collect the data, don't gate on it yet"
+        recommendation. Returns None if insufficient cached history (this
+        symbol hasn't been through a rank() cycle yet, or is too new).
+        """
+        df = self._cache.get(symbol)
+        if df is None or len(df) < period + 1:
+            return None
+        high, low, close = df["high"].values, df["low"].values, df["close"].values
+        prev_close = np.roll(close, 1)
+        true_range = np.maximum(
+            high[1:] - low[1:],
+            np.maximum(np.abs(high[1:] - prev_close[1:]), np.abs(low[1:] - prev_close[1:])),
+        )
+        if len(true_range) < period:
+            return None
+        atr = float(np.mean(true_range[-period:]))
+        last_close = float(close[-1])
+        return round((atr / last_close) * 100, 4) if last_close > 0 else None
+
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _load_all_history(self) -> None:
@@ -198,6 +227,11 @@ class RSRanker:
             logger.warning(f"RSRanker: NIFTY download failed: {e}")
 
         # All F&O symbols — one kite call each
+        # Fixed 2026-08-21 (external review of credit_spread_v1/iron_condor_v1):
+        # widened from ["close"] to ["high", "low", "close"] so this same
+        # already-fetched, already-refreshed (every 5 min) daily OHLC cache
+        # can also feed get_daily_atr_pct() below -- avoids standing up a
+        # separate daily-bar poller just for one new data point.
         for sym in self.symbols:
             token = self._tokens.get(sym)
             if not token:
@@ -207,7 +241,7 @@ class RSRanker:
                     token, from_date, to_date, "day", continuous=False, oi=False
                 )
                 if records:
-                    df = pd.DataFrame(records)[["close"]].dropna().reset_index(drop=True)
+                    df = pd.DataFrame(records)[["high", "low", "close"]].dropna().reset_index(drop=True)
                     if not df.empty:
                         self._cache[sym] = df
             except Exception as e:

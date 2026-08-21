@@ -992,6 +992,85 @@ Kept short — see git log / individual commit messages for full detail.
     assumptions (EMA-reversal exit scoped to VOLATILE only) were the exact
     behavior being intentionally generalized. 476 tests passing.
 
+- **credit_spread_v1 / iron_condor_v1 review, external PDF (2026-08-21), same
+  day.** A deeper code-level review of the two remaining strategies — and a
+  different verdict from the other two: 8.5/10 code quality and 8-8.5/10
+  design on both, "keep/refine," explicitly **not** "redesign" or "loosen."
+  The reviewer's own framing: *"I would NOT fix what's already working...
+  don't start changing 10 parameters."* Consistent with that, and with how
+  this session has already handled every other "test this before changing
+  it" recommendation, only concrete bugs and non-gating data-collection
+  additions were implemented — not the parameter changes the review itself
+  flags as needing real backtesting first.
+  - **Fixed — Credit Spread issue #1 / Iron Condor issue #1 (crowded-strike
+    delta drift):** the crowded-OI-strike-avoidance logic moved the short
+    strike exactly 1 interval further OTM with no check that the resulting
+    delta was still close to the original 20-delta target — could silently
+    drift to e.g. an actual 14-delta or 25-delta position depending on
+    strike interval/volatility surface. Now searches up to 3 further OTM
+    intervals via a new shared `_find_non_crowded_strike_within_delta_tolerance()`,
+    recalculating the real Black-Scholes delta at each candidate (reusing
+    `find_delta_strike()`'s own `bs_delta()`) and taking the first one both
+    non-crowded and within `±0.08` of the target — matching the review's own
+    suggested "0.16–0.22 acceptable band" almost exactly. Fails closed
+    (skips the entry) if no acceptable strike is found nearby, consistent
+    with this codebase's convention for explicitly-chosen entry-risk
+    parameters. Applied to both credit_spread_v1's single short leg and
+    iron_condor_v1's two independent short legs.
+  - **Fixed — Credit Spread issue #5 (GTT is asymmetric):** a GTT backstop
+    is placed on the short leg only; if it fires at the exchange while the
+    process is offline (crash/deploy/restart), the short leg closes for
+    real but the long hedge does not, and the engine's own model of the
+    structure stays wrong on restart (`_reconcile_broker_positions()`
+    correctly doesn't flag the surviving long leg as an "orphan," since
+    it's still in the tracked set — but the structure's exit-check logic
+    would keep computing P&L as if the short leg still existed). New
+    `_reconcile_partially_closed_multi_leg_legs()`, called right after the
+    existing orphan reconcile at startup, detects this exact divergence
+    (short leg's broker quantity is 0 while a paired long leg's isn't) and
+    force-flattens the entire structure, cancels the (already-fired) GTT,
+    releases capital, and removes it from tracking — live mode only
+    (PaperBroker has no GTT mechanism, so this can't occur there).
+  - **Data collection added (non-gating, per the review's own explicit "first
+    collect the data, don't gate on it yet"):**
+    - `daily_atr_pct` — a genuinely new daily-timeframe ATR14, addressing
+      the review's single biggest concern across both strategies: "you use
+      5-minute ATR as the primary volatility measure, but positions are
+      held for weeks (DTE≥21 at entry) — daily volatility is arguably more
+      relevant to a multi-week short option's probability of touching the
+      short strike." Reuses `RSRanker`'s existing daily-OHLC cache (already
+      fetched/refreshed every 5 min for RS scoring, just widened from
+      `["close"]` to `["high","low","close"]`) rather than standing up a
+      separate daily-bar poller.
+    - `credit_to_max_loss_pct` — "the critical number for a condor,"
+      recorded at entry for both strategies (₹800 credit / ₹4,000 max loss
+      reads very differently from ₹1,200 / ₹3,000 despite both passing the
+      same 20%-of-width gate).
+    - `wing_failed` (iron_condor_v1 only) — PUT / CALL / BOTH / NULL,
+      classified from each exit's own reason text (every put/call-specific
+      exit branch already says "Put ..."/"Call ..." or "put/call short
+      δ"; structural exits — DTE, regime shift — correctly classify as
+      neither). The review's own "wing failure analysis" ask; the
+      root-cause classification (breakout / IV expansion / gap / drift /
+      bad strike selection) it also asks for is a human analysis output
+      from this data, not something to hardcode.
+    - New `trade_journal` columns via migration `b006`.
+  - **Explicitly NOT done, and why — every one of these is something the
+    review itself says to test/measure first, not a firm recommendation:**
+    asymmetric CE/PE delta selection for iron_condor_v1 (needs a real
+    put-vs-call P&L attribution sample first); changing the 75% profit
+    target (review: "I'd backtest 50/60/65/70/75%"); changing the
+    regime-shift exit from next-day to same-day-persistent (review: "test
+    version A vs version B"); ATR-normalizing the "flat EMA" threshold
+    (review's own words: "a good candidate for v2, not an immediate bug
+    fix"); changing the 20%-of-wing-width R/R filter or the ₹350 minimum
+    credit (review: "don't automatically increase it... I wouldn't call
+    this a bug"); replacing the ATR-estimated delta exit with real
+    option-chain IV/Greeks (review: "P1, but not urgent if paper results
+    are good"); centralizing the strategy-class vs. engine exit-logic
+    duplication (review: "a maintenance risk," not a current bug, P2).
+  - 20 new regression tests. 496 tests passing.
+
 ---
 
-*Last updated: 2026-08-21, after the ema_crossover_v1 redesign (internal ADX gate, soft RVOL, asymmetric MTF, generalized EMA-reversal exit, underlying-based stop/target, candidate-pool re-weighting, signal audit).*
+*Last updated: 2026-08-21, after the credit_spread_v1/iron_condor_v1 review (crowded-strike delta verification, GTT-asymmetry reconciliation, daily-ATR/credit-max-loss/wing-failure data collection).*
