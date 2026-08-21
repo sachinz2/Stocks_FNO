@@ -13,6 +13,7 @@ scheduled job wiring in api/main.py). It's idempotent: once a period is
 closed it's never reprocessed, so calling this more than once a day (or
 after a restart) is always safe.
 """
+import asyncio
 import logging
 from datetime import date, datetime, time, timedelta
 from typing import Optional
@@ -24,6 +25,17 @@ from src.database.models.capital_period import CapitalPeriod
 from src.database.models.trade_journal import TradeJournal
 
 logger = logging.getLogger(__name__)
+
+# Guards rollover_if_needed()'s check-then-insert against concurrent
+# duplicate-period creation. _create_period() inserts unconditionally with
+# no unique constraint, so two near-simultaneous callers (e.g. a deploy's
+# startup call racing the 08:00 scheduled job tick) could both observe "no
+# active period" via get_active_period() and each insert a duplicate open
+# CapitalPeriod row. rollover_if_needed() is only ever called from within
+# this one process (api/main.py startup, and src/core/scheduler.py's
+# in-process APScheduler job -- both share the same event loop), so a plain
+# in-process asyncio.Lock is sufficient; no distributed lock is needed.
+_rollover_lock = asyncio.Lock()
 
 
 async def get_active_period(session_factory, today: Optional[date] = None) -> Optional[CapitalPeriod]:
@@ -111,18 +123,22 @@ async def rollover_if_needed(session_factory, default_capital: float, risk_manag
     """
     today = today or now_ist().date()
 
-    active = await get_active_period(session_factory, today)
-    if active is None:
-        period_start, period_end = get_capital_period_bounds(today)
-        active = await _create_period(session_factory, period_start, period_end, default_capital)
+    # Serialize the whole check-then-insert/close sequence against any other
+    # concurrent call in this process -- see _rollover_lock's module-level
+    # comment for why this matters (startup call racing the scheduled job).
+    async with _rollover_lock:
+        active = await get_active_period(session_factory, today)
+        if active is None:
+            period_start, period_end = get_capital_period_bounds(today)
+            active = await _create_period(session_factory, period_start, period_end, default_capital)
 
-    rolled = False
-    while active.period_end < today:
-        closed = await _close_period(session_factory, active)
-        next_start = closed.period_end + timedelta(days=1)
-        _, next_end = get_capital_period_bounds(next_start)
-        active = await _create_period(session_factory, next_start, next_end, float(closed.ending_capital))
-        rolled = True
+        rolled = False
+        while active.period_end < today:
+            closed = await _close_period(session_factory, active)
+            next_start = closed.period_end + timedelta(days=1)
+            _, next_end = get_capital_period_bounds(next_start)
+            active = await _create_period(session_factory, next_start, next_end, float(closed.ending_capital))
+            rolled = True
 
     if risk_manager is not None:
         risk_manager.set_capital(float(active.starting_capital))

@@ -37,6 +37,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from src.backtesting.walk_forward import (
+    StrategyNotSimulatableError,
+    _SIMULATABLE_REGISTRY_KEYS,
+    _INSTANCE_ID_TO_REGISTRY_KEY,
+)
+
 logger = logging.getLogger(__name__)
 
 # Verdict thresholds
@@ -91,6 +97,28 @@ class ParameterRobustnessAnalyzer:
         """
         import asyncio
         loop = asyncio.get_event_loop()
+
+        # Fixed 2026-08-21 (deep review): check resolvability BEFORE
+        # downloading any history -- credit_spread_v1/iron_condor_v1 (non-
+        # directional multi-leg options structures) can't be meaningfully
+        # simulated from underlying-only daily OHLCV. Returns an explicit
+        # "not supported" result, never a numeric verdict for a strategy
+        # this function didn't actually simulate -- see
+        # StrategyNotSimulatableError / _simulate().
+        if self._resolve_strategy_registry_key() is None:
+            reason = (
+                f"strategy_name={self.strategy_name!r} is not a directional single-leg "
+                f"strategy this daily-bar robustness simulator can drive "
+                f"({sorted(_SIMULATABLE_REGISTRY_KEYS)} only). credit_spread_v1/iron_condor_v1 "
+                "are non-directional multi-leg options structures -- robustness analysis for "
+                "them needs real historical option-chain data this tool doesn't fetch, and isn't "
+                "supported. No simulation was run; no verdict was computed."
+            )
+            logger.warning(f"RobustnessAnalyzer: {reason}")
+            return {
+                "strategy_name": self.strategy_name, "symbol": symbol,
+                "verdict": "NOT_SUPPORTED", "verdict_explanation": reason,
+            }
 
         df = await loop.run_in_executor(None, self._fetch_history, symbol, years)
         if df is None or df.empty:
@@ -180,9 +208,17 @@ class ParameterRobustnessAnalyzer:
 
     @staticmethod
     def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Fixed 2026-08-21 (deep review): added adx14/rvol/rvol_valid/
+        ohlc_bar_key/vwap -- same daily-bar approximations as
+        WalkForwardTester._add_indicators() (see its docstring for the
+        rationale), needed so a REAL strategy instance's generate_signal()/
+        manage_position() can drive _simulate() below.
+        """
         close = df["close"]
         high  = df["high"]
         low   = df["low"]
+        vol   = df["volume"]
         for span in range(15, 60):   # pre-compute all spans in range
             df[f"ema{span}"] = close.ewm(span=span, adjust=False).mean()
         tr = pd.concat([
@@ -191,7 +227,27 @@ class ParameterRobustnessAnalyzer:
             (low  - close.shift()).abs(),
         ], axis=1).max(axis=1)
         df["atr14"] = tr.rolling(14).mean()
-        return df.dropna()
+
+        up_move   = high.diff()
+        down_move = -low.diff()
+        plus_dm   = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+        minus_dm  = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+        atr_wilder = tr.ewm(alpha=1 / 14, adjust=False).mean()
+        plus_di  = 100 * plus_dm.ewm(alpha=1 / 14, adjust=False).mean() / atr_wilder.replace(0, np.nan)
+        minus_di = 100 * minus_dm.ewm(alpha=1 / 14, adjust=False).mean() / atr_wilder.replace(0, np.nan)
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+        df["adx14"] = dx.ewm(alpha=1 / 14, adjust=False).mean()
+
+        avg_vol_20 = vol.rolling(20).mean()
+        df["rvol"] = vol / avg_vol_20.replace(0, np.nan)
+        df["rvol_valid"] = avg_vol_20.notna()
+
+        df["ohlc_bar_key"] = df.index.astype(str)
+        df["session_vwap"] = (high + low + close) / 3
+        df["vwap"] = df["session_vwap"]
+
+        _warmup_cols = {"rvol", "rvol_valid"}
+        return df.dropna(subset=[c for c in df.columns if c not in _warmup_cols])
 
     def _param_combinations(self):
         keys   = list(self.param_grid.keys())
@@ -199,30 +255,91 @@ class ParameterRobustnessAnalyzer:
         for combo in itertools.product(*values):
             yield dict(zip(keys, combo))
 
+    def _resolve_strategy_registry_key(self) -> Optional[str]:
+        """Same resolution as WalkForwardTester -- see its docstring."""
+        from src.strategies.base import StrategyRegistry
+        name = self.strategy_name
+        candidates = [name, name.upper(), _INSTANCE_ID_TO_REGISTRY_KEY.get(name.lower(), "")]
+        for candidate in candidates:
+            if candidate in _SIMULATABLE_REGISTRY_KEYS and StrategyRegistry.get_strategy_class(candidate):
+                return candidate
+        return None
+
     def _simulate(self, df: pd.DataFrame, params: Dict) -> List[Dict]:
-        """EMA crossover simulation — same as WalkForwardTester._simulate."""
-        fast_col = f"ema{params.get('fast_period', 20)}"
-        slow_col = f"ema{params.get('slow_period', 50)}"
-        if fast_col not in df.columns or slow_col not in df.columns:
-            return []
+        """
+        Drives a REAL registered strategy instance, same fix and same
+        rationale as WalkForwardTester._simulate() -- see its docstring.
+        Raises StrategyNotSimulatableError for credit_spread_v1/
+        iron_condor_v1 or any unresolvable strategy_name.
+        """
+        from src.strategies.base import StrategyRegistry
 
-        trades = []
-        position = None
-        for i in range(1, len(df)):
-            prev = df.iloc[i - 1]
-            curr = df.iloc[i]
-            prev_cross = prev[fast_col] - prev[slow_col]
-            curr_cross = curr[fast_col] - curr[slow_col]
+        resolved = self._resolve_strategy_registry_key()
+        if resolved is None:
+            raise StrategyNotSimulatableError(
+                f"strategy_name={self.strategy_name!r} does not resolve to a directional "
+                f"single-leg strategy this daily-bar simulator can drive "
+                f"({sorted(_SIMULATABLE_REGISTRY_KEYS)} only)."
+            )
 
-            if prev_cross < 0 and curr_cross >= 0 and position is None:
-                position = {"entry": curr["close"]}
-            elif prev_cross >= 0 and curr_cross < 0 and position is not None:
-                trades.append({"pnl": curr["close"] - position["entry"]})
-                position = None
+        instance_id = f"_robustness_sim_{id(self)}_{resolved}"
+        strategy = StrategyRegistry.load_strategy(resolved, instance_id, dict(params))
+        try:
+            fast_col = f"ema{getattr(strategy, 'fast_period', params.get('fast_period', 20))}"
+            slow_col = f"ema{getattr(strategy, 'slow_period', params.get('slow_period', 50))}"
+            if fast_col not in df.columns or slow_col not in df.columns:
+                return []
 
-        if position is not None:
-            trades.append({"pnl": df.iloc[-1]["close"] - position["entry"]})
-        return trades
+            trades: List[Dict] = []
+            position: Optional[Dict] = None
+
+            for i in range(len(df)):
+                row = df.iloc[i]
+                current_price = float(row["close"])
+
+                if position is None:
+                    data = {
+                        "symbol": self.strategy_name,
+                        fast_col: row[fast_col], slow_col: row[slow_col],
+                        "adx14": row.get("adx14"), "ohlc_bar_key": row.get("ohlc_bar_key"),
+                        "close": current_price, "atr14": row.get("atr14"),
+                        "vwap": row.get("vwap"), "session_vwap": row.get("session_vwap"),
+                        "rvol": row.get("rvol"),
+                        "rvol_valid": bool(row.get("rvol_valid")),
+                    }
+                    signal = strategy.generate_signal(data)
+                    if signal in ("BUY", "SELL"):
+                        position = {
+                            "side": signal, "entry": current_price,
+                            "peak_premium": current_price, "entry_atr": row.get("atr14"),
+                        }
+                else:
+                    if position["side"] == "BUY":
+                        position["peak_premium"] = max(position["peak_premium"], current_price)
+                    else:
+                        position["peak_premium"] = min(position["peak_premium"], current_price)
+                    cur_pos = {
+                        "avg_price": position["entry"], "peak_premium": position["peak_premium"],
+                        "current_adx": row.get("adx14"), "current_close": current_price,
+                        "current_ema_fast": row[fast_col], "is_call": position["side"] == "BUY",
+                        "entry_underlying_price": position["entry"], "entry_atr": position["entry_atr"],
+                    }
+                    action = strategy.manage_position(cur_pos, current_price)
+                    if action == "EXIT":
+                        pnl = (current_price - position["entry"]) if position["side"] == "BUY" \
+                            else (position["entry"] - current_price)
+                        trades.append({"pnl": pnl})
+                        position = None
+
+            if position is not None:
+                current_price = float(df.iloc[-1]["close"])
+                pnl = (current_price - position["entry"]) if position["side"] == "BUY" \
+                    else (position["entry"] - current_price)
+                trades.append({"pnl": pnl})
+
+            return trades
+        finally:
+            StrategyRegistry.unload_strategy(instance_id)
 
     @staticmethod
     def _calc_metrics(trades: List[Dict]) -> dict:

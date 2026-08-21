@@ -135,6 +135,26 @@ def test_underlying_based_stop_target_skip_gracefully_when_absent():
     assert strat.manage_position(pos, 39.9) == "HOLD"
 
 
+def test_underlying_based_stop_checked_before_ema_reversal():
+    """Fixed 2026-08-21 (deep review): momentum_v1's docstring calls the
+    underlying-based stop/target the PRIMARY exit driver, checked first,
+    ahead of structural/EMA-reversal invalidation -- but ema_crossover_v1
+    had the opposite order (EMA reversal first). Reordered to match. Both
+    conditions are true here (EMA has reversed for a CE AND the underlying
+    stop is breached); pin that the underlying-based EXIT still fires
+    (same outcome either way -- this test exists to guard the ordering via
+    a future divergence, e.g. differing log messages or side effects, not
+    to catch a different result today)."""
+    strat = _ema()
+    pos = {
+        "avg_price": 40.0, "peak_premium": 40.0,
+        "is_call": True, "current_ema_fast": 99.0, "current_ema_slow": 100.0,  # reversed for a CE
+        "entry_underlying_price": 100.0, "entry_atr": 2.0,
+        "current_close": 97.0,  # underlying stop breached (100 - 1.0xATR(2.0) = 98)
+    }
+    assert strat.manage_position(pos, 39.5) == "EXIT"
+
+
 def test_underlying_based_stop_can_be_disabled():
     strat = _ema(underlying_stop_atr_mult=0)
     pos = {

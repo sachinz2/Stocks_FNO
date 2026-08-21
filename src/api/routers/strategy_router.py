@@ -1,7 +1,8 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from typing import List, Optional
 from pydantic import BaseModel
 
+from src.api.services.auth import require_admin_token
 from src.strategies.base import StrategyRegistry
 
 router = APIRouter(prefix="/strategies", tags=["Strategies"])
@@ -33,7 +34,7 @@ async def get_strategies():
     ]
 
 
-@router.post("/activate")
+@router.post("/activate", dependencies=[Depends(require_admin_token)])
 async def activate_strategy(request: StrategyActionRequest):
     ok = StrategyRegistry.resume_strategy(request.strategy_id)
     if not ok:
@@ -41,7 +42,7 @@ async def activate_strategy(request: StrategyActionRequest):
     return {"status": "activated", "strategy_id": request.strategy_id}
 
 
-@router.post("/deactivate")
+@router.post("/deactivate", dependencies=[Depends(require_admin_token)])
 async def deactivate_strategy(request: StrategyActionRequest):
     ok = StrategyRegistry.pause_strategy(request.strategy_id, reason="Manual pause via dashboard")
     if not ok:

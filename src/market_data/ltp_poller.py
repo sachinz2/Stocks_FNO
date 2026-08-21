@@ -261,9 +261,18 @@ class LTPPoller:
                     # Carry the live day-range + intraday-bar fields forward across this
                     # overwrite — otherwise bars_today would be wiped every 60s instead
                     # of accumulating through the day (see update_intraday_bar()).
+                    # cur_bar_volume/_last_cum_volume MUST be included here too: they're
+                    # exactly what update_intraday_bar() needs to keep accumulating real
+                    # per-tick volume into the still-forming bar. Dropping them made the
+                    # next WebSocket tick see _last_cum_volume=None (delta computed as 0)
+                    # and cur_bar_volume reset to 0, so most 5-min bars ended up recording
+                    # only the last <60s of volume before finalization instead of the true
+                    # 5-minute total -- silently corrupting RVOL (momentum_v1) and
+                    # session_vwap (credit_spread_v1). Fixed 2026-08-21.
                     for k in ("day_open", "day_high", "day_low", "day_range_date",
                               "bars_today", "cur_bar_key", "cur_bar_open",
-                              "cur_bar_high", "cur_bar_low", "cur_bar_close"):
+                              "cur_bar_high", "cur_bar_low", "cur_bar_close",
+                              "cur_bar_volume", "_last_cum_volume"):
                         if k in day_range:
                             tick[k] = day_range[k]
                 await self._redis.set(f"{REDIS_TICK_PREFIX}{symbol}", json.dumps(tick))

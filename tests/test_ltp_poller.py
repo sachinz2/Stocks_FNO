@@ -187,6 +187,91 @@ def test_enrich_day_prev_close_is_prior_trading_day_not_bar_to_bar():
     assert abs(tick["prev_close"] - 300.0) < 2.0  # bar-to-bar, from today's own series
 
 
+# ── poll()'s per-symbol tick overwrite must preserve volume fields (2026-08-21) ──
+#
+# Fixed 2026-08-21: poll()'s carry-forward list (the fields copied from the
+# tick read at the top of the cycle into the full redis.set() overwrite)
+# omitted cur_bar_volume and _last_cum_volume -- the two fields
+# update_intraday_bar() needs to keep accumulating real per-tick volume into
+# the still-forming bar. Dropping them every 60s made the next WebSocket
+# tick see _last_cum_volume=None (delta computed as 0) and reset
+# cur_bar_volume to 0, so most 5-min bars ended up recording only the last
+# <60s of volume instead of the true 5-minute total -- silently corrupting
+# RVOL (momentum_v1) and session_vwap (credit_spread_v1).
+
+class _FakeRedis:
+    """Minimal in-memory async Redis stand-in: get/set/delete on strings."""
+
+    def __init__(self):
+        self.store: dict = {}
+
+    async def get(self, key):
+        return self.store.get(key)
+
+    async def set(self, key, value, ex=None):
+        self.store[key] = value
+
+    async def delete(self, key):
+        self.store.pop(key, None)
+
+
+@pytest.mark.asyncio
+async def test_poll_preserves_cur_bar_volume_and_last_cum_volume_across_cycles(frozen_now, monkeypatch):
+    from src.core.utils import update_intraday_bar
+    import json as _json
+
+    # poll() imports is_market_open locally from src.core.utils on every call.
+    monkeypatch.setattr("src.core.utils.is_market_open", lambda: True)
+
+    redis = _FakeRedis()
+    poller = LTPPoller(redis, symbols=["TESTSTOCK"], kite=None, instrument_tokens={})
+
+    # Pre-populate the 5-min OHLC baseline directly (bypassing the kite fetch,
+    # which is skipped anyway since kite=None) so poll()'s `len(df) < 50`
+    # early-continue doesn't skip the symbol.
+    poller._history["TESTSTOCK"] = _make_hist_baseline("2026-07-20", n=60)
+    poller._history_loaded_at["TESTSTOCK"] = dt.datetime.now()
+    poller._history_15m_loaded_at["TESTSTOCK"] = dt.datetime.now()
+
+    # Seed Redis with a live tick as ZerodhaTicker/update_intraday_bar() would
+    # have already written it earlier in the session: a still-forming bar
+    # with real accumulated volume and a live cumulative-volume baseline.
+    today_str = frozen_now["t"].date().isoformat()
+    seed_tick = {
+        "symbol": "TESTSTOCK", "close": 100.0,
+        "day_open": 100.0, "day_high": 100.5, "day_low": 99.5,
+        "day_range_date": today_str,
+        "bars_today": [],
+        "cur_bar_key": frozen_now["t"].replace(minute=(frozen_now["t"].minute // 5) * 5, second=0, microsecond=0).isoformat(),
+        "cur_bar_open": 100.0, "cur_bar_high": 100.3, "cur_bar_low": 99.9, "cur_bar_close": 100.2,
+        "cur_bar_volume": 500,
+        "_last_cum_volume": 10_000,
+    }
+    await redis.set("tick:TESTSTOCK", _json.dumps(seed_tick))
+
+    await poller.poll()
+
+    written = _json.loads(redis.store["tick:TESTSTOCK"])
+    assert written["cur_bar_volume"] == 500, \
+        "cur_bar_volume must survive poll()'s tick overwrite, not be dropped"
+    assert written["_last_cum_volume"] == 10_000, \
+        "_last_cum_volume must survive poll()'s tick overwrite, not be dropped"
+
+    # Simulate a real WebSocket tick arriving between polls -- volume should
+    # keep accumulating on top of what poll() preserved, not restart from 0.
+    tick = written
+    update_intraday_bar(tick, 100.4, volume_traded=10_200)
+    assert tick["cur_bar_volume"] == 700, "volume must accumulate (500 preserved + 200 new delta)"
+    await redis.set("tick:TESTSTOCK", _json.dumps(tick))
+
+    # Second poll() cycle -- the now-larger cur_bar_volume must still survive.
+    await poller.poll()
+    written2 = _json.loads(redis.store["tick:TESTSTOCK"])
+    assert written2["cur_bar_volume"] == 700, \
+        "cur_bar_volume must keep accumulating across multiple poll() cycles, not reset to 0"
+    assert written2["_last_cum_volume"] == 10_200
+
+
 def test_enrich_multi_bar_series_beats_single_blob_bar_for_ema_flip(frozen_now):
     """
     Regression guard for the pre-2026-07-27 single-blob-bar approach: today's

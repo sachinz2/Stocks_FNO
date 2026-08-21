@@ -9,6 +9,7 @@ import pytest
 from unittest.mock import MagicMock
 import kiteconnect.exceptions as kite_exc
 from src.brokers.zerodha import ZerodhaBroker
+from src.core.exceptions import BrokerException
 
 
 def _bare_broker():
@@ -122,8 +123,14 @@ async def test_place_order_non_transient_exception_fails_fast_no_retry():
     broker = _bare_broker()
     broker.kite.place_order.side_effect = ValueError("insufficient margin -- will never succeed")
 
-    with pytest.raises(ValueError):
+    # Fixed 2026-08-21 (deep review): place_order() now classifies a
+    # non-retryable Kite failure into one of this codebase's structured
+    # exception types (src/core/exceptions.py) instead of letting the raw
+    # SDK/generic exception propagate untyped -- callers/logs get a real
+    # signal to branch on. The original exception is preserved as __cause__.
+    with pytest.raises(BrokerException) as exc_info:
         await broker.place_order("SBIN", "BUY", 100, 500.0)
+    assert isinstance(exc_info.value.__cause__, ValueError)
 
     assert broker.kite.place_order.call_count == 1
 

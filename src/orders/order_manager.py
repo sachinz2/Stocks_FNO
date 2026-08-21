@@ -263,6 +263,22 @@ class OrderManager:
             # 2026-07-30) — the two mechanisms stacked instead of one owning it.
             if side == "BUY" and strategy_name and not is_spread_leg:
                 self.risk_manager.add_deployed_capital(strategy_name, quantity * price)
+
+            # Fixed 2026-08-21 (deep review): risk_manager.current_open_positions
+            # was only refreshed from the broker once per cycle, BEFORE the
+            # entry loop starts -- so the sector-concentration and max-open-
+            # position checks (validate_trade() layers 4 and 6, both skipped
+            # for is_spread_leg=True legs, matching those checks' own scope)
+            # saw the same stale snapshot for every entry placed within that
+            # same cycle. If 3+ names from a 2-per-sector-capped sector
+            # ranked in the same cycle's candidates, each one's entry passed
+            # the "0 open positions in this sector" check, breaching the cap
+            # 2-3x within a single minute. Appending the just-opened
+            # position here (this is the single choke point every entry
+            # order passes through) makes the NEXT entry in the same cycle
+            # see it immediately, without an extra broker round trip.
+            if not is_exit_order and not is_spread_leg:
+                self.risk_manager.current_open_positions.append({"symbol": symbol, "quantity": quantity})
             return db_order
         except asyncio.TimeoutError:
             logger.error(f"Broker order timed out after {BROKER_TIMEOUT_SEC}s: {side} {quantity} {symbol}")
@@ -321,6 +337,15 @@ class OrderManager:
                     f"live at the broker (id={reconciled_id}) -- corrected to "
                     f"OPEN, not FAILED."
                 )
+                # Fixed 2026-08-21 (deep review): this branch sets the SAME
+                # terminal OPEN state the main success path above does, but
+                # skipped the matching add_deployed_capital() call -- a real,
+                # live position the risk manager's per-strategy budget never
+                # learned about, silently permitting more capital deployment
+                # than the strategy's cap allows. Mirrors the exact condition
+                # used at the main success path.
+                if side == "BUY" and strategy_name and not is_spread_leg:
+                    self.risk_manager.add_deployed_capital(strategy_name, quantity * price)
                 return db_order
             # Reaching here means _reconcile_after_timeout() genuinely
             # checked the broker's order list and found no matching tag --
@@ -431,6 +456,14 @@ class OrderManager:
                     f"PENDING_VERIFICATION retry: order {order.id} found live at "
                     f"the broker (id={reconciled_id}) -- corrected to OPEN."
                 )
+                # Fixed 2026-08-21 (deep review): same missing
+                # add_deployed_capital() call as _reconcile_after_timeout()'s
+                # inline branch in place_order() -- this loop runs on a LATER
+                # cycle with no access to the original call's local
+                # variables, so the retry-context lookup (not direct
+                # parameters) is used to reconstruct whether capital should
+                # have been added.
+                await self._add_capital_if_should_have_been_deployed(order)
             else:
                 await self.order_repo.update(order, {"order_status": "FAILED"})
                 await self._audit("ORDER_TIMEOUT", {"order_id": order.id, "symbol": order.symbol})
@@ -535,20 +568,42 @@ class OrderManager:
 
             ctx = await self._get_retry_context(order.id)
 
+            # Fixed 2026-08-21 (deep review): a stale order can be
+            # PARTIALLY filled at the broker (a resting LIMIT order stays
+            # OPEN while partially filled) -- sync_orders() above already
+            # picked up the latest known filled_quantity before this order
+            # was even fetched. Only the UNFILLED remainder's capital was
+            # ever "at risk of never happening"; the filled portion is a
+            # real position and must stay counted. Retrying (if eligible)
+            # must resubmit only the remainder too, not the original full
+            # quantity -- otherwise a 5-lot order that filled 1 lot and
+            # rests would silently re-buy the full 5 lots on retry,
+            # over-buying by the already-filled lot.
+            _filled = getattr(order, "filled_quantity", None) or 0
+            _remaining_qty = order.quantity - _filled
+            if _filled > 0:
+                logger.warning(
+                    f"Stale order {order.id} ({order.symbol}) was PARTIALLY filled "
+                    f"before expiry: {_filled}/{order.quantity}. Only the unfilled "
+                    f"remainder ({_remaining_qty}) is eligible for capital release/retry."
+                )
+
             # Release deployed capital tentatively added at submission — only
             # ever applies to the same case place_order() adds it for (BUY,
             # strategy_name set, not a spread/condor hedge leg). Independent
-            # of whether we go on to retry below.
+            # of whether we go on to retry below. Only the unfilled
+            # remainder's capital is released -- see comment above.
             if (
-                ctx and order.price is not None
+                _remaining_qty > 0 and ctx and order.price is not None
                 and order.side == "BUY" and ctx.get("strategy") and not ctx.get("is_spread_leg")
             ):
                 self.risk_manager.release_deployed_capital(
-                    ctx["strategy"], order.quantity * float(order.price)
+                    ctx["strategy"], _remaining_qty * float(order.price)
                 )
 
             eligible = (
-                ctx is not None
+                _remaining_qty > 0
+                and ctx is not None
                 and order.price is not None
                 and not ctx.get("is_spread_leg")
                 and not ctx.get("is_retry")
@@ -557,11 +612,11 @@ class OrderManager:
             if eligible:
                 retry_price = self._adjusted_retry_price(order.side, float(order.price))
                 logger.info(
-                    f"Retrying stale order {order.id}: {order.side} {order.quantity} "
+                    f"Retrying stale order {order.id}: {order.side} {_remaining_qty} "
                     f"{order.symbol} @ Rs{order.price} -> Rs{retry_price} (one attempt only)"
                 )
                 await self.place_order(
-                    order.symbol, order.side, order.quantity, retry_price,
+                    order.symbol, order.side, _remaining_qty, retry_price,
                     is_spread_leg=False,
                     is_exit_order=bool(ctx.get("is_exit_order")),
                     strategy_name=ctx.get("strategy"),
@@ -606,15 +661,25 @@ class OrderManager:
         both are needed: PaperBroker fills synchronously, but nothing
         forwarded that fill_price to the DB until sync_orders() ran later).
         """
-        if existing_fill_price is not None:
-            return {}
-        b_fill = b_order.get("fill_price") or b_order.get("average_price")
-        if not b_fill:
-            return {}
-        b_fill = float(b_fill)
-        updates: Dict[str, Any] = {"fill_price": b_fill}
-        if expected_price:
-            updates["slippage"] = round(b_fill - expected_price, 4)
+        updates: Dict[str, Any] = {}
+        if existing_fill_price is None:
+            b_fill = b_order.get("fill_price") or b_order.get("average_price")
+            if b_fill:
+                b_fill = float(b_fill)
+                updates["fill_price"] = b_fill
+                if expected_price:
+                    updates["slippage"] = round(b_fill - expected_price, 4)
+        # Fixed 2026-08-21 (deep review): filled_quantity tracked
+        # independently of fill_price above -- a partial fill's quantity
+        # can keep growing across later polls even after fill_price (the
+        # average price of whatever's filled so far) was already recorded
+        # once. Kite Connect reports this as "filled_quantity" on the order.
+        b_filled_qty = b_order.get("filled_quantity")
+        if b_filled_qty is not None:
+            try:
+                updates["filled_quantity"] = int(b_filled_qty)
+            except (TypeError, ValueError):
+                pass
         return updates
 
     async def sync_orders(self) -> None:
@@ -652,8 +717,68 @@ class OrderManager:
                         await self._audit("ORDER_STATUS_SYNC", {
                             "order_id": db_order.id, "new_status": new_status,
                         })
+                        # Fixed 2026-08-21 (deep review): deployed capital was
+                        # only ever released via expire_stale_orders()'s
+                        # EXPIRED path. An order that went OPEN (capital
+                        # added) and is discovered HERE to have actually been
+                        # REJECTED/CANCELLED at the broker -- an async RMS/
+                        # margin rejection arriving after our own OPEN write --
+                        # never re-enters the "order_status=OPEN" query this
+                        # method filters on again, so that capital stayed
+                        # permanently counted against the strategy's daily
+                        # budget for the rest of the session. Release it here,
+                        # the one place that actually observes this
+                        # transition, using the retry-context lookup
+                        # (order_received audit entry) to reconstruct whether
+                        # add_deployed_capital() would have fired for this
+                        # order in the first place -- same condition
+                        # place_order() itself uses.
+                        if new_status in ("REJECTED", "CANCELLED", "FAILED"):
+                            await self._release_capital_if_was_deployed(db_order)
         except Exception as e:
             logger.error(f"Failed to sync orders: {e}")
+
+    async def _release_capital_if_was_deployed(self, db_order: Order) -> None:
+        """
+        Release deployed capital for an order that add_deployed_capital()
+        added when it first went OPEN (side=="BUY", strategy_name set,
+        not a spread leg -- see place_order()'s own comment for why
+        is_spread_leg is excluded), now that it's been discovered to have
+        actually failed at the broker rather than filled. Looked up via the
+        ORDER_RECEIVED audit context rather than new columns, matching the
+        existing _get_retry_context() pattern.
+        """
+        if getattr(db_order, "side", None) != "BUY":
+            return
+        ctx = await self._get_retry_context(db_order.id)
+        if not ctx:
+            return
+        strategy_name = ctx.get("strategy")
+        is_spread_leg = ctx.get("is_spread_leg", False)
+        if strategy_name and not is_spread_leg:
+            price = float(db_order.price) if db_order.price else 0.0
+            self.risk_manager.release_deployed_capital(strategy_name, db_order.quantity * price)
+
+    async def _add_capital_if_should_have_been_deployed(self, db_order: Order) -> None:
+        """
+        Mirror of _release_capital_if_was_deployed() for the opposite
+        direction: an order that timed out client-side, was left
+        PENDING_VERIFICATION (outcome unknown), and is now confirmed to have
+        actually succeeded at the broker on a LATER cycle -- it never went
+        through place_order()'s normal add_deployed_capital() call at all,
+        since that call never got to run before the timeout. Same lookup
+        and same condition as the release side.
+        """
+        if getattr(db_order, "side", None) != "BUY":
+            return
+        ctx = await self._get_retry_context(db_order.id)
+        if not ctx:
+            return
+        strategy_name = ctx.get("strategy")
+        is_spread_leg = ctx.get("is_spread_leg", False)
+        if strategy_name and not is_spread_leg:
+            price = float(db_order.price) if db_order.price else 0.0
+            self.risk_manager.add_deployed_capital(strategy_name, db_order.quantity * price)
 
     @staticmethod
     def _map_broker_status(broker_status: str) -> str:

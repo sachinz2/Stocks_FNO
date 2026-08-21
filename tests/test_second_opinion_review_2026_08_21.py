@@ -288,7 +288,7 @@ def test_resolved_strike_delta_ok_rejects_a_strike_that_drifted_too_far():
 
 def test_credit_spread_reverifies_resolved_short_strike_delta():
     src = inspect.getsource(LiveTradingEngine._process_credit_spread)
-    idx = src.index("short_p, long_p = await get_entry_prices_for_spread")
+    idx = src.index("_entry_prices = await get_entry_prices_for_spread")
     block = src[:idx]
     assert "_resolved_strike_delta_ok" in block
 
@@ -296,6 +296,6 @@ def test_credit_spread_reverifies_resolved_short_strike_delta():
 def test_iron_condor_reverifies_both_resolved_short_strike_deltas():
     src = inspect.getsource(LiveTradingEngine._process_iron_condor)
     start = src.index('put_short_strike,  psc = _resolved_legs["put_short"]')
-    end = src.index("put_short_p, put_long_p = await get_entry_prices_for_spread")
+    end = src.index("_put_prices = await get_entry_prices_for_spread")
     block = src[start:end]
     assert block.count("self._resolved_strike_delta_ok(") == 2

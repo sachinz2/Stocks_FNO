@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from src.api.dto.schemas import OrderRequest, OrderResponse
-from src.api.dependencies import get_current_user
+from src.api.services.auth import require_admin_token
 from src.database.connection import AsyncSessionLocal
 from src.database.models.order import Order
 from src.database.models.audit import AuditLog
@@ -87,13 +87,12 @@ async def get_order(order_id: int):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
 
 
-@router.post("", response_model=OrderResponse)
+@router.post("", response_model=OrderResponse, dependencies=[Depends(require_admin_token)])
 async def place_order(
     order_request: OrderRequest,
     http_request: Request,
-    user: str = Depends(get_current_user),
 ):
-    """Place a new order — requires JWT auth."""
+    """Place a new order — requires the shared admin token (X-Admin-Token header)."""
     try:
         engine = getattr(http_request.app.state, "trading_engine", None)
         if engine is not None:
@@ -138,13 +137,12 @@ async def place_order(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
 
 
-@router.delete("/{order_id}")
+@router.delete("/{order_id}", dependencies=[Depends(require_admin_token)])
 async def cancel_order(
     order_id: int,
     http_request: Request,
-    user: str = Depends(get_current_user),
 ):
-    """Cancel an order — requires JWT auth."""
+    """Cancel an order — requires the shared admin token (X-Admin-Token header)."""
     try:
         om = _get_order_manager(http_request)
         success = await om.cancel_order(order_id)

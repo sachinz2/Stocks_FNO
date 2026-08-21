@@ -14,6 +14,14 @@ logger = logging.getLogger(__name__)
 
 _SMTP_HOST = "smtp.gmail.com"
 _SMTP_PORT = 587
+# Fixed 2026-08-21 (deep review): smtplib.SMTP() had no timeout and no
+# global socket timeout is set anywhere in this codebase, so a hung
+# connect/STARTTLS/login could block indefinitely. This call runs in a
+# thread executor, but several call sites in the live trading engine await
+# send() synchronously inside exit-check code paths (some inside the
+# exit-cycle lock) -- a hang here could stall exit monitoring system-wide.
+_SMTP_SOCKET_TIMEOUT_SEC = 10
+_SEND_OVERALL_TIMEOUT_SEC = 15
 
 
 class EmailNotifier:
@@ -38,7 +46,7 @@ class EmailNotifier:
         msg["From"] = self.sender
         msg["To"] = self.recipient
 
-        with smtplib.SMTP(_SMTP_HOST, _SMTP_PORT) as smtp:
+        with smtplib.SMTP(_SMTP_HOST, _SMTP_PORT, timeout=_SMTP_SOCKET_TIMEOUT_SEC) as smtp:
             smtp.starttls()
             smtp.login(self.sender, self.password)
             smtp.sendmail(self.sender, self.recipient, msg.as_string())
@@ -55,9 +63,21 @@ class EmailNotifier:
         body = "\n".join(lines)
         try:
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, self._send_blocking, subject, body)
+            # Fixed 2026-08-21 (deep review): the socket-level timeout above
+            # bounds each individual smtplib call, but wrapping the whole
+            # executor await in asyncio.wait_for() bounds the OPERATION as a
+            # whole (thread-pool scheduling delay included) -- so a hang
+            # here can never propagate as an unbounded stall to a caller
+            # awaiting send() synchronously.
+            await asyncio.wait_for(
+                loop.run_in_executor(None, self._send_blocking, subject, body),
+                timeout=_SEND_OVERALL_TIMEOUT_SEC,
+            )
             logger.info(f"Email sent: {subject}")
             return True
+        except asyncio.TimeoutError:
+            logger.error(f"Email send timed out after {_SEND_OVERALL_TIMEOUT_SEC}s: {subject}")
+            return False
         except Exception as exc:
             logger.error(f"Email send failed: {exc}")
             return False

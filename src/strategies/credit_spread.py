@@ -70,7 +70,17 @@ class CreditSpreadStrategy(StrategyBase):
         # `NaN >= threshold` is False in Python, so execution fell through
         # into the directional branch with genuinely unknown volatility
         # instead of returning HOLD.
-        if not fast_ema or not slow_ema or not close or atr is None or atr != atr:
+        # Fixed 2026-08-21 (deep review): the same gap existed for
+        # fast_ema/slow_ema/close -- `not float('nan')` is False (NaN is
+        # truthy), so a NaN EMA/close wasn't caught here either. Currently
+        # masked by luck (a NaN ema_spread_pct below fails the `>=` compare
+        # and falls through to HOLD anyway), but fixed explicitly for
+        # consistency and defense in depth rather than relying on that.
+        if (
+            not fast_ema or not slow_ema or not close
+            or fast_ema != fast_ema or slow_ema != slow_ema or close != close
+            or atr is None or atr != atr
+        ):
             return "HOLD"
 
         atr_pct = (atr / close * 100) if close > 0 else 0

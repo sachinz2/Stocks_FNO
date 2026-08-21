@@ -379,21 +379,31 @@ class EMACrossoverStrategy(StrategyBase):
                               skipped gracefully if either is missing.
 
         Exit conditions (in priority order):
-          1. EMA reversal (generalized 2026-08-21, external review sections
+          1. Underlying-based stop/target (added 2026-08-21) — mirrors
+                                momentum_v1's round-2 addition, and checked
+                                first for the same reason momentum_v1's own
+                                docstring gives it: "your stop should be
+                                based on the underlying's actual move, not
+                                option premium." Underlying's close has
+                                moved underlying_stop_atr_mult/
+                                underlying_target_atr_mult ATRs against/in
+                                favor of entry. Fixed 2026-08-21 (deep
+                                review): reordered ahead of the EMA reversal
+                                check below to match momentum_v1's ordering
+                                — both strategies check the underlying-based
+                                stop/target as the PRIMARY exit driver before
+                                structural/EMA-reversal invalidation;
+                                previously this strategy checked EMA
+                                reversal first, the opposite order.
+          2. EMA reversal (generalized 2026-08-21, external review sections
                                 16-18) — the underlying's EMA20/50
                                 relationship that justified entry has
                                 flipped back. Previously scoped only to
                                 VOLATILE-entered positions; the review's
                                 point stands generally: "the thesis that
                                 justified entry has reversed" isn't a
-                                VOLATILE-specific concept. Now the PRIMARY
-                                exit for every position. Toggle via
+                                VOLATILE-specific concept. Toggle via
                                 ema_reversal_exit.
-          2. Underlying-based stop/target (added 2026-08-21) — mirrors
-                                momentum_v1's round-2 addition: underlying's
-                                close has moved underlying_stop_atr_mult/
-                                underlying_target_atr_mult ATRs against/in
-                                favor of entry.
           3. Hard stop loss  — premium fell >= stop_loss_pct (default 50%) from entry
           4. Profit target   — premium rose >= target_pct (default 100%, i.e. 2×) from entry
           5. Trailing stop   — premium fell >= trailing_stop_pct (default 25%) from its peak
@@ -406,26 +416,7 @@ class EMACrossoverStrategy(StrategyBase):
 
         pnl_pct = (current_premium - entry_premium) / entry_premium
 
-        # 1. EMA reversal -- see docstring. Generalized 2026-08-21 from a
-        # VOLATILE-only check to the primary exit for every position;
-        # entry_regime is read only for the log line now, not to scope
-        # whether the check runs at all.
-        if self.ema_reversal_exit:
-            ema_fast = current_position.get("current_ema_fast")
-            ema_slow = current_position.get("current_ema_slow")
-            is_call  = current_position.get("is_call")
-            if ema_fast is not None and ema_slow is not None and is_call is not None:
-                reversed_ = (ema_fast <= ema_slow) if is_call else (ema_fast >= ema_slow)
-                if reversed_:
-                    logger.info(
-                        f"[{self.name}] EMA reversal exit: EMA20/50 relationship "
-                        f"flipped back (fast={ema_fast:.2f} slow={ema_slow:.2f}, "
-                        f"is_call={is_call}, entry_regime={current_position.get('entry_regime')}) "
-                        f"— exiting regardless of premium P&L ({pnl_pct:+.1%})."
-                    )
-                    return "EXIT"
-
-        # 2. Underlying-based stop/target (added 2026-08-21) -- see
+        # 1. Underlying-based stop/target (added 2026-08-21) -- see
         # docstring and momentum.py's identical pattern for the rationale.
         entry_underlying = current_position.get("entry_underlying_price")
         entry_atr        = current_position.get("entry_atr")
@@ -462,6 +453,25 @@ class EMACrossoverStrategy(StrategyBase):
                     f"ATR({entry_atr:.2f})) -- exiting."
                 )
                 return "EXIT"
+
+        # 2. EMA reversal -- see docstring. Generalized 2026-08-21 from a
+        # VOLATILE-only check to running for every position; entry_regime is
+        # read only for the log line now, not to scope whether the check
+        # runs at all.
+        if self.ema_reversal_exit:
+            ema_fast = current_position.get("current_ema_fast")
+            ema_slow = current_position.get("current_ema_slow")
+            is_call  = current_position.get("is_call")
+            if ema_fast is not None and ema_slow is not None and is_call is not None:
+                reversed_ = (ema_fast <= ema_slow) if is_call else (ema_fast >= ema_slow)
+                if reversed_:
+                    logger.info(
+                        f"[{self.name}] EMA reversal exit: EMA20/50 relationship "
+                        f"flipped back (fast={ema_fast:.2f} slow={ema_slow:.2f}, "
+                        f"is_call={is_call}, entry_regime={current_position.get('entry_regime')}) "
+                        f"— exiting regardless of premium P&L ({pnl_pct:+.1%})."
+                    )
+                    return "EXIT"
 
         # 3. Hard stop loss
         if pnl_pct <= -self.stop_loss_pct:

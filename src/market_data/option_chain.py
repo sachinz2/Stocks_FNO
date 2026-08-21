@@ -462,6 +462,7 @@ def find_delta_strike(
     dte: int,
     sigma: float,
     strike_interval: float = 50,
+    enforce_min_otm: bool = True,
 ) -> float:
     """
     Find the strike K whose Black-Scholes delta is closest to target_delta.
@@ -476,6 +477,16 @@ def find_delta_strike(
     result is NOT forced to int here (that used to silently truncate a real
     half-strike like 247.5 into a non-existent 247); build_option_symbol()
     formats the final value correctly either way.
+
+    enforce_min_otm: when True (default), the result is clamped to at least
+    1 strike interval OTM of the underlying -- correct for a short spread/
+    condor leg, where an ITM strike would be an immediate breach. Set False
+    for callers deliberately targeting an ITM strike (e.g. momentum_v1's
+    near-ITM single-leg entries via entry_option_delta) -- otherwise this
+    clamp silently pushes an intentional delta~0.60 fit back out to OTM,
+    since any delta above 0.50 is ITM by definition. Found 2026-08-21: this
+    was happening on every momentum_v1 entry, defeating its ITM-entry
+    redesign without any downstream check catching it.
     """
     T = max(dte, 1) / 365.0
     atm = round(underlying_price / strike_interval) * strike_interval
@@ -501,16 +512,19 @@ def find_delta_strike(
 
     # Enforce minimum 1-interval OTM distance — the short leg must never be
     # at or inside the current price (that would be an immediate breach).
-    if option_type == "PE":
-        # Put short strike must be strictly below the underlying
-        ceiling = round(underlying_price / strike_interval) * strike_interval - strike_interval
-        if best_strike > ceiling:
-            best_strike = ceiling
-    else:
-        # Call short strike must be strictly above the underlying
-        floor_ = round(underlying_price / strike_interval) * strike_interval + strike_interval
-        if best_strike < floor_:
-            best_strike = floor_
+    # Skipped entirely when the caller is deliberately targeting an ITM
+    # strike (enforce_min_otm=False) -- see docstring.
+    if enforce_min_otm:
+        if option_type == "PE":
+            # Put short strike must be strictly below the underlying
+            ceiling = round(underlying_price / strike_interval) * strike_interval - strike_interval
+            if best_strike > ceiling:
+                best_strike = ceiling
+        else:
+            # Call short strike must be strictly above the underlying
+            floor_ = round(underlying_price / strike_interval) * strike_interval + strike_interval
+            if best_strike < floor_:
+                best_strike = floor_
 
     return int(best_strike) if best_strike == int(best_strike) else best_strike
 
@@ -525,11 +539,25 @@ async def get_entry_prices_for_spread(
     dte: int,
     short_otm_intervals: int = 0,
     long_otm_intervals: int = 2,
-) -> Tuple[float, float]:
+) -> Optional[Tuple[float, float]]:
     """
     Get short + long leg prices.
-    Tries real Zerodha quotes first; falls back to ATR-based estimate.
-    Returns (short_price, long_price).
+    Tries real Zerodha quotes first; falls back to ATR-based estimate only
+    for a leg whose real quote is genuinely unavailable.
+    Returns (short_price, long_price), or None if the resulting prices are
+    inverted (short <= long) -- a real credit spread cannot have a negative
+    net credit, and this shape almost always means at least one quote is
+    stale/thin/unreliable rather than that the market is genuinely priced
+    that way.
+
+    Fixed 2026-08-21 (deep review): the inversion branch used to discard
+    BOTH legs' prices -- including a perfectly good real quote -- and
+    substitute fabricated ATR estimates for both, which the caller then
+    used directly as the real LIMIT order price. That contradicts the
+    fail-closed convention already established for the single-leg entry
+    path in the engine (skip the entry rather than place a LIMIT order on a
+    guessed price) -- extended here: an inversion now fails closed (returns
+    None, caller skips the entry) instead of fabricating a tradeable price.
     """
     from src.core.utils import estimate_option_premium
 
@@ -542,10 +570,9 @@ async def get_entry_prices_for_spread(
     # Sanity check: net credit must be positive
     if short_price <= long_price:
         logger.warning(
-            f"Spread prices inverted ({short_contract}=₹{short_price} < {long_contract}=₹{long_price}). "
-            "Falling back to ATR estimate."
+            f"Spread prices inverted ({short_contract}=₹{short_price} <= {long_contract}=₹{long_price}). "
+            "Fail-closed: not placing a LIMIT order on a guessed/unreliable price -- skipping entry."
         )
-        short_price = estimate_option_premium(atr, dte, short_otm_intervals)
-        long_price = estimate_option_premium(atr, dte, long_otm_intervals)
+        return None
 
     return round(short_price, 2), round(long_price, 2)

@@ -6,9 +6,10 @@ import logging
 import os
 import signal
 import time
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from sqlalchemy import text
 
+from src.api.services.auth import require_admin_token
 from src.database.connection import AsyncSessionLocal
 
 logger = logging.getLogger(__name__)
@@ -23,7 +24,7 @@ def _terminate_process_for_restart() -> None:
     os.kill(os.getpid(), signal.SIGTERM)
 
 
-@router.post("/restart-api")
+@router.post("/restart-api", dependencies=[Depends(require_admin_token)])
 async def restart_api(background_tasks: BackgroundTasks):
     """
     Gracefully restart the API process.
@@ -75,7 +76,7 @@ _ENGINE_REDIS_KEYS = [
 ]
 
 
-@router.post("/reset")
+@router.post("/reset", dependencies=[Depends(require_admin_token)])
 async def reset_all_data(request: Request):
     """
     Delete all trading history and reset in-memory engine state.
@@ -133,12 +134,15 @@ async def reset_all_data(request: Request):
             "note": "IV rank history also cleared — will rebuild correctly over ~30 trading days.",
         }
 
-    except Exception as e:
-        logger.error(f"Reset failed: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    except Exception:
+        logger.exception("Reset failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error during reset. See server logs for details.",
+        )
 
 
-@router.post("/email-alerts/pause")
+@router.post("/email-alerts/pause", dependencies=[Depends(require_admin_token)])
 async def pause_email_alerts(request: Request):
     """Pause all email notifications until resumed."""
     notifier = _get_notifier(request)
@@ -150,7 +154,7 @@ async def pause_email_alerts(request: Request):
     return {"status": "paused", "email_alerts": False}
 
 
-@router.post("/email-alerts/resume")
+@router.post("/email-alerts/resume", dependencies=[Depends(require_admin_token)])
 async def resume_email_alerts(request: Request):
     """Resume email notifications."""
     notifier = _get_notifier(request)
@@ -185,7 +189,7 @@ async def get_kill_switch_status(request: Request):
     return engine.risk_manager.get_kill_switch_status()
 
 
-@router.post("/kill-switch/reset")
+@router.post("/kill-switch/reset", dependencies=[Depends(require_admin_token)])
 async def reset_kill_switch(request: Request):
     """
     Clear a tripped kill switch so new entries can resume.
@@ -215,7 +219,7 @@ async def reset_kill_switch(request: Request):
     }
 
 
-@router.post("/reset-iv-history")
+@router.post("/reset-iv-history", dependencies=[Depends(require_admin_token)])
 async def reset_iv_history(request: Request):
     """
     Clear all IV rank history from Redis and restart accumulation with correct sigma.
@@ -248,7 +252,7 @@ async def reset_iv_history(request: Request):
     }
 
 
-@router.post("/positions/{contract}/close")
+@router.post("/positions/{contract}/close", dependencies=[Depends(require_admin_token)])
 async def close_single_leg_position(contract: str, reason: str, request: Request):
     """
     Manually force-close an open single-leg position (ema_crossover_v1 /

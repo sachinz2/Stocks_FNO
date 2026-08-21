@@ -25,11 +25,11 @@ def _mom(**overrides):
 
 
 def _bar(symbol="RELIANCE", ema20=105.0, ema50=100.0, adx=30.0, close=110.0,
-         atr=2.0, vwap=110.0, rvol=1.5, bar_key="live:t0"):
+         atr=2.0, vwap=110.0, rvol=1.5, rvol_valid=True, bar_key="live:t0"):
     return {
         "symbol": symbol, "ema20": ema20, "ema50": ema50, "adx14": adx,
         "close": close, "atr14": atr, "vwap": vwap, "rvol": rvol,
-        "ohlc_bar_key": bar_key,
+        "rvol_valid": rvol_valid, "ohlc_bar_key": bar_key,
     }
 
 
@@ -113,14 +113,90 @@ def test_two_tier_rvol_fires_at_breakout_rvol_min_after_a_genuine_contraction():
     assert signal == "BUY"
 
 
-def test_pullback_setup_expires_after_max_pullback_bars_without_breakout():
+def test_invalid_rvol_sentinel_does_not_register_as_a_contraction():
+    """Fixed 2026-08-21 (deep review): ltp_poller emits rvol=0.0 paired with
+    rvol_valid=False as an 'insufficient volume history' sentinel for
+    roughly the first 100 minutes of every session -- this must NOT be
+    treated as a genuine volume contraction (had_contraction=True). A
+    pullback that only ever saw rvol=0.0/rvol_valid=False bars must still
+    require the flat rvol_entry_threshold (not the lower post-contraction
+    breakout_rvol_min) to fire."""
+    strat = _mom(adx_rising_required=False, ema_slope_required=False,
+                 extension_atr_mult=0, vwap_extension_pct=0)
+    strat.generate_signal(_bar(close=110.0, rvol=0.0, rvol_valid=False, bar_key="live:t0"))
+    strat.generate_signal(_bar(close=112.0, rvol=0.0, rvol_valid=False, bar_key="live:t1"))  # extends, ref=112
+    # Pullback bar with the sentinel -- rvol=0.0 would look like a genuine
+    # contraction (< pullback_rvol_low=0.8) if rvol_valid weren't checked.
+    strat.generate_signal(_bar(close=111.0, rvol=0.0, rvol_valid=False, bar_key="live:t2"))
+    assert strat._rvol_history.get("RELIANCE") == []
+    # Breakout at RVOL=1.4 -- above breakout_rvol_min(1.3) but below the flat
+    # rvol_entry_threshold(1.5). Must be REJECTED since no genuine
+    # contraction was ever observed (the sentinel doesn't count).
+    signal = strat.generate_signal(_bar(close=113.0, rvol=1.4, bar_key="live:t3"))
+    assert signal == "HOLD"
+    assert strat._trend_state.get("RELIANCE") == "PULLBACK"
+    # A breakout clearing the full flat threshold still fires normally.
+    signal = strat.generate_signal(_bar(close=114.0, rvol=1.6, bar_key="live:t4"))
+    assert signal == "BUY"
+
+
+def test_invalid_rvol_on_the_breakout_bar_itself_does_not_satisfy_confirmation():
+    strat = _mom(adx_rising_required=False, ema_slope_required=False,
+                 extension_atr_mult=0, vwap_extension_pct=0)
+    strat.generate_signal(_bar(close=110.0, rvol=1.6, bar_key="live:t0"))
+    strat.generate_signal(_bar(close=112.0, rvol=1.6, bar_key="live:t1"))  # extends, ref=112
+    strat.generate_signal(_bar(close=111.0, rvol=0.5, bar_key="live:t2"))  # genuine contraction
+    # Breakout bar itself has an invalid RVOL reading (sentinel) -- even
+    # though a real contraction preceded it, this bar's own RVOL is unknown
+    # and must not satisfy breakout_rvol_min.
+    signal = strat.generate_signal(_bar(close=113.0, rvol=0.0, rvol_valid=False, bar_key="live:t3"))
+    assert signal == "HOLD"
+    assert strat._trend_state.get("RELIANCE") == "PULLBACK"
+
+
+def test_same_bar_key_direction_flip_does_not_reset_pullback_progress():
+    """Fixed 2026-08-21 (deep review): the fresh-qualification/direction-
+    flip reset branch ran unconditionally, before the is_new_bar check
+    further down -- so calling generate_signal twice with the SAME bar_key
+    but a flipped raw direction could wipe accumulated pullback progress
+    and reseed a new state mid-bar. It must now wait for a genuinely new
+    bar_key, same as every other transition in this state machine."""
+    strat = _mom(adx_rising_required=False, ema_slope_required=False,
+                 extension_atr_mult=0, vwap_extension_pct=0)
+    strat.generate_signal(_bar(close=110.0, ema20=105.0, ema50=100.0, rvol=1.6, bar_key="live:t0"))
+    strat.generate_signal(_bar(close=112.0, ema20=105.0, ema50=100.0, rvol=1.6, bar_key="live:t1"))
+    strat.generate_signal(_bar(close=111.0, ema20=105.0, ema50=100.0, rvol=1.0, bar_key="live:t2"))
+    assert strat._trend_state.get("RELIANCE") == "PULLBACK"
+    ref_before = strat._pullback_ref.get("RELIANCE")
+    # Same bar_key as the last processed cycle ("live:t2"), but a flipped
+    # direction (EMA20 now below EMA50 -- raw would be SELL). Must be a
+    # no-op: state, direction, and ref must all survive untouched.
+    signal = strat.generate_signal(_bar(close=111.0, ema20=95.0, ema50=100.0, rvol=1.0, bar_key="live:t2"))
+    assert signal == "HOLD"
+    assert strat._trend_state.get("RELIANCE") == "PULLBACK"
+    assert strat._trend_direction.get("RELIANCE") == "BUY"
+    assert strat._pullback_ref.get("RELIANCE") == ref_before
+    # A genuinely new bar_key with the flipped direction is still free to
+    # reset and start a fresh setup in the other direction.
+    signal = strat.generate_signal(_bar(close=111.0, ema20=95.0, ema50=100.0, rvol=1.0, bar_key="live:t3"))
+    assert signal == "HOLD"
+    assert strat._trend_state.get("RELIANCE") == "ESTABLISHED"
+    assert strat._trend_direction.get("RELIANCE") == "SELL"
+
+
+def test_pullback_setup_expires_after_exactly_max_pullback_bars_without_breakout():
+    """Fixed 2026-08-21 (deep review): _pullback_bars is seeded at 1 on
+    entering PULLBACK, so `> max_pullback_bars` previously let a setup
+    survive max_pullback_bars + 1 bars instead of the documented
+    max_pullback_bars. With max_pullback_bars=2, the setup must expire on
+    exactly the 2nd pullback bar, not the 3rd."""
     strat = _mom(adx_rising_required=False, ema_slope_required=False,
                  extension_atr_mult=0, vwap_extension_pct=0, max_pullback_bars=2)
     strat.generate_signal(_bar(close=110.0, rvol=1.6, bar_key="live:t0"))
     strat.generate_signal(_bar(close=112.0, rvol=1.6, bar_key="live:t1"))  # extends, ref=112
-    strat.generate_signal(_bar(close=111.0, rvol=1.0, bar_key="live:t2"))  # pullback bar 1
-    strat.generate_signal(_bar(close=110.5, rvol=1.0, bar_key="live:t3"))  # pullback bar 2
-    signal = strat.generate_signal(_bar(close=110.2, rvol=1.0, bar_key="live:t4"))  # pullback bar 3 -- expires
+    strat.generate_signal(_bar(close=111.0, rvol=1.0, bar_key="live:t2"))  # pullback bar 1 -- survives
+    assert strat._trend_state.get("RELIANCE") == "PULLBACK"
+    signal = strat.generate_signal(_bar(close=110.5, rvol=1.0, bar_key="live:t3"))  # pullback bar 2 -- expires
     assert signal == "HOLD"
     assert "RELIANCE" not in strat._trend_state
 

@@ -405,6 +405,42 @@ def test_credit_spread_still_fires_on_valid_low_atr():
     assert signal == "BULL_PUT_SPREAD"
 
 
+# ── 5b. NaN ema20/ema50/close must not bypass the guard either ──────────────
+# Fixed 2026-08-21 (deep review): the atr != atr NaN check above only ever
+# covered atr14 -- fast_ema/slow_ema/close could still be NaN and slip past
+# `not fast_ema` (NaN is truthy, so `not NaN` is False). In iron_condor.py
+# this then hit `... if slow_ema > 0 else 0` where `NaN > 0` is also False,
+# silently producing ema_spread_pct=0 -- exactly the flat-market entry
+# condition -- so a NaN EMA input produced a live IRON_CONDOR entry signal
+# instead of HOLD.
+
+def test_iron_condor_holds_on_nan_ema_inputs():
+    strat = IronCondorStrategy("iron_condor_v1", {})
+    strat.initialize()
+    signal = strat.generate_signal({
+        "ema20": _NAN, "ema50": _NAN, "close": 100.0, "atr14": 0.5,
+    })
+    assert signal == "HOLD"
+
+
+def test_iron_condor_holds_on_nan_close():
+    strat = IronCondorStrategy("iron_condor_v1", {})
+    strat.initialize()
+    signal = strat.generate_signal({
+        "ema20": 100.1, "ema50": 100.0, "close": _NAN, "atr14": 0.5,
+    })
+    assert signal == "HOLD"
+
+
+def test_credit_spread_holds_on_nan_ema_inputs():
+    strat = CreditSpreadStrategy("credit_spread_v1", {})
+    strat.initialize()
+    signal = strat.generate_signal({
+        "ema20": _NAN, "ema50": _NAN, "close": 500.0, "atr14": 2.0,
+    })
+    assert signal == "HOLD"
+
+
 # ── 6. StrategyMonitor must not crash (and must isolate) on pf=None ─────────
 
 @pytest.mark.asyncio

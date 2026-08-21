@@ -92,7 +92,7 @@ def test_skips_a_non_crowded_strike_whose_delta_has_drifted_too_far():
 
 def test_credit_spread_crowd_avoidance_uses_the_delta_verified_helper():
     src = inspect.getsource(LiveTradingEngine._process_credit_spread)
-    block = src[src.index("Avoid selling at crowded"):src.index("short_p, long_p = await get_entry_prices_for_spread")]
+    block = src[src.index("Avoid selling at crowded"):src.index("_entry_prices = await get_entry_prices_for_spread")]
     assert "_find_non_crowded_strike_within_delta_tolerance" in block
     assert "short_strike -= interval" not in block  # old unconditional move must be gone
     assert "short_strike += interval" not in block

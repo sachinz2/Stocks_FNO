@@ -33,11 +33,22 @@ async def _fetch_market_prices(contracts: list, kite, redis) -> dict:
     Priority:
       1. optltp:{contract} — 5-second Redis cache written by ZerodhaLTPPoller
       2. optq:{contract}   — 30-second on-demand Redis cache
-      3. kite.ltp()        — single batched REST call for all cache-miss contracts;
-                             result cached in optq: for 30 s
+      3. kite.quote()      — single batched REST call for all cache-miss contracts,
+                             resolved through resolve_reliable_option_price() (same
+                             staleness check steps 1-2's upstream writers already
+                             apply) so a stale last-traded price on a thin/illiquid
+                             leg isn't silently shown as current; result cached in
+                             optq: for 30 s
 
-    Batching all misses into one kite.ltp() call avoids N serial REST round-trips
+    Batching all misses into one kite.quote() call avoids N serial REST round-trips
     for N contracts (important for 4-leg condors × multiple positions).
+
+    Fixed 2026-08-21: this fallback used to call kite.ltp() and read last_price
+    directly with no staleness check, unlike steps 1-2 (which are staleness-aware
+    at their source -- see resolve_reliable_option_price()'s docstring). Now uses
+    kite.quote() + resolve_reliable_option_price(), matching the other 2 call
+    sites (ZerodhaLTPPoller's option refresh, option_chain.get_option_quote()'s
+    own step-3 fallback).
     """
     prices: dict = {}
     uncached: list = []
@@ -63,11 +74,12 @@ async def _fetch_market_prices(contracts: list, kite, redis) -> dict:
     if uncached and kite:
         try:
             import asyncio
+            from src.market_data.option_chain import resolve_reliable_option_price
             nfo_syms = [f"NFO:{c}" for c in uncached]
             loop = asyncio.get_running_loop()
-            data = await loop.run_in_executor(None, lambda: kite.ltp(nfo_syms))
+            data = await loop.run_in_executor(None, lambda: kite.quote(nfo_syms))
             for contract in uncached:
-                ltp = data.get(f"NFO:{contract}", {}).get("last_price")
+                ltp = resolve_reliable_option_price(data.get(f"NFO:{contract}", {}))
                 if ltp and float(ltp) > 0:
                     prices[contract] = round(float(ltp), 2)
                     if redis:

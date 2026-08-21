@@ -35,6 +35,33 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+# Registry keys this daily-bar simulator can actually drive -- directional,
+# single-leg strategies whose signal can be approximated from underlying
+# OHLCV alone. credit_spread_v1/iron_condor_v1 (registry keys CREDIT_SPREAD/
+# IRON_CONDOR) are non-directional, multi-leg options structures that can't
+# be meaningfully simulated without real historical option-chain data this
+# tool doesn't fetch -- see StrategyNotSimulatableError and _simulate().
+_SIMULATABLE_REGISTRY_KEYS = {"EMA_CROSSOVER", "MOMENTUM"}
+
+# Maps the live engine's instance-id naming convention (e.g. "momentum_v1",
+# as used in src/api/main.py's StrategyRegistry.load_strategy() calls) to
+# the registry key strategies actually register themselves under (e.g.
+# "MOMENTUM") -- the /walk-forward and /robustness API endpoints accept a
+# free-text strategy_name and have historically been called with either form.
+_INSTANCE_ID_TO_REGISTRY_KEY = {
+    "momentum_v1":      "MOMENTUM",
+    "ema_crossover_v1": "EMA_CROSSOVER",
+    "credit_spread_v1": "CREDIT_SPREAD",
+    "iron_condor_v1":   "IRON_CONDOR",
+}
+
+
+class StrategyNotSimulatableError(Exception):
+    """Raised by _simulate() when strategy_name doesn't resolve to a
+    directional single-leg strategy this daily-bar tool can actually drive.
+    Callers must surface this as an explicit "not supported" result, never
+    silently fall back to simulating a different strategy's logic."""
+
 
 @dataclass
 class WindowResult:
@@ -86,6 +113,11 @@ class WalkForwardTester:
         self.initial_capital  = initial_capital
         self._kite            = kite
         self._tokens          = instrument_tokens or {}
+        # Set by run() when strategy_name doesn't resolve to a strategy this
+        # daily-bar simulator can drive -- see StrategyNotSimulatableError.
+        # summary() checks this and returns an honest "not supported" verdict
+        # instead of a numeric one for a strategy that was never simulated.
+        self.not_supported_reason: Optional[str] = None
 
     # ── Public ────────────────────────────────────────────────────────────────
 
@@ -98,9 +130,24 @@ class WalkForwardTester:
         """
         Run full walk-forward analysis. Downloads history and iterates windows.
         Returns a list of WindowResult (both IS and OOS per window).
+        Returns [] immediately (self.not_supported_reason set) without
+        downloading any history if strategy_name isn't a strategy this
+        simulator can drive -- see _resolve_strategy_registry_key().
         """
         import asyncio
         loop = asyncio.get_event_loop()
+
+        if self._resolve_strategy_registry_key() is None:
+            self.not_supported_reason = (
+                f"strategy_name={self.strategy_name!r} is not a directional single-leg "
+                f"strategy this daily-bar walk-forward simulator can drive "
+                f"({sorted(_SIMULATABLE_REGISTRY_KEYS)} only). credit_spread_v1/iron_condor_v1 "
+                "are non-directional multi-leg options structures -- walk-forward analysis for "
+                "them needs real historical option-chain data this tool doesn't fetch, and isn't "
+                "supported. No simulation was run; no verdict was computed."
+            )
+            logger.warning(f"WalkForward: {self.not_supported_reason}")
+            return []
 
         logger.info(
             f"WalkForward: {self.strategy_name} / {symbol} "
@@ -200,7 +247,19 @@ class WalkForwardTester:
           OOS PF consistently above 1.0
           OOS Sharpe close to IS Sharpe (degradation ratio ≈ 0.7–1.0)
           OOS win rate not dramatically lower than IS win rate
+
+        Returns an honest NOT_SUPPORTED verdict (no numeric profit_factor/
+        degradation_ratio) if run() found strategy_name isn't simulatable --
+        never a numeric verdict for a strategy that was never actually run.
         """
+        if self.not_supported_reason:
+            return {
+                "strategy":  self.strategy_name,
+                "windows":   0,
+                "verdict":   "NOT_SUPPORTED",
+                "verdict_explanation": self.not_supported_reason,
+            }
+
         is_results  = [r for r in results if not r.is_oos]
         oos_results = [r for r in results if r.is_oos]
 
@@ -267,10 +326,25 @@ class WalkForwardTester:
 
     @staticmethod
     def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-        """Pre-compute all indicators used by any strategy."""
+        """
+        Pre-compute all indicators used by any strategy.
+
+        Fixed 2026-08-21 (deep review): added adx14/rvol/rvol_valid/
+        ohlc_bar_key/session_vwap so a REAL strategy instance's
+        generate_signal()/manage_position() can actually run here (see
+        _simulate()) instead of a hardcoded EMA-crossover proxy -- these are
+        daily-bar approximations of what the live 5-minute engine computes
+        (ADX via the standard Wilder's formula on daily bars; RVOL as
+        today's volume vs. its own trailing 20-day average; VWAP as a
+        rolling typical-price proxy, since real intraday VWAP needs
+        intraday data this daily-history fetch doesn't have). Documented
+        approximation, not a claim of full intraday fidelity -- see
+        _simulate()'s docstring for what this does and doesn't cover.
+        """
         close = df["close"]
         high  = df["high"]
         low   = df["low"]
+        vol   = df["volume"]
 
         # Multiple EMA spans for grid search
         for span in [18, 19, 20, 21, 22, 45, 48, 50, 52, 55]:
@@ -283,8 +357,41 @@ class WalkForwardTester:
         ], axis=1).max(axis=1)
         df["atr14"] = tr.rolling(14).mean()
 
+        # ADX14 (Wilder's smoothing), standard formula.
+        up_move   = high.diff()
+        down_move = -low.diff()
+        plus_dm   = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+        minus_dm  = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+        atr_wilder = tr.ewm(alpha=1 / 14, adjust=False).mean()
+        plus_di  = 100 * plus_dm.ewm(alpha=1 / 14, adjust=False).mean() / atr_wilder.replace(0, np.nan)
+        minus_di = 100 * minus_dm.ewm(alpha=1 / 14, adjust=False).mean() / atr_wilder.replace(0, np.nan)
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+        df["adx14"] = dx.ewm(alpha=1 / 14, adjust=False).mean()
+
+        # RVOL: today's volume vs. its own trailing 20-day average.
+        avg_vol_20 = vol.rolling(20).mean()
+        df["rvol"] = vol / avg_vol_20.replace(0, np.nan)
+        df["rvol_valid"] = avg_vol_20.notna()
+
+        # One distinct, identifiable bar_key per row -- satisfies the
+        # bar-key debounce logic (confirmation counters only advance on a
+        # genuinely new, different bar_key) the live strategies rely on.
+        df["ohlc_bar_key"] = df.index.strftime("%Y-%m-%d")
+
+        # VWAP proxy (typical price) -- these strategies degrade their VWAP-
+        # dependent filters gracefully when absent, so an approximation is
+        # an improvement over always-missing, not a hard requirement.
+        df["session_vwap"] = (high + low + close) / 3
+        df["vwap"] = df["session_vwap"]
+
         df["returns"] = close.pct_change()
-        return df.dropna()
+        # rvol/rvol_valid/adx14 legitimately start as NaN/False for their own
+        # warmup window (20 and 14 days respectively) -- excluded from the
+        # blanket dropna() below (which would otherwise drop them along with
+        # every other column) so rvol_valid can correctly read False for
+        # those early rows rather than the row being silently removed.
+        _warmup_cols = {"rvol", "rvol_valid"}
+        return df.dropna(subset=[c for c in df.columns if c not in _warmup_cols])
 
     def _make_windows(self, start_year: int, end_year: int):
         """Generate (window_start, train_end, window_end) tuples."""
@@ -334,46 +441,122 @@ class WalkForwardTester:
         for combo in itertools.product(*values):
             yield dict(zip(keys, combo))
 
+    def _resolve_strategy_registry_key(self) -> Optional[str]:
+        """Map self.strategy_name (registry key OR live instance-id form)
+        to a registry key this simulator supports, or None if it isn't one
+        of the directional single-leg strategies -- see
+        _SIMULATABLE_REGISTRY_KEYS's module-level docstring."""
+        from src.strategies.base import StrategyRegistry
+        name = self.strategy_name
+        candidates = [name, name.upper(), _INSTANCE_ID_TO_REGISTRY_KEY.get(name.lower(), "")]
+        for candidate in candidates:
+            if candidate in _SIMULATABLE_REGISTRY_KEYS and StrategyRegistry.get_strategy_class(candidate):
+                return candidate
+        return None
+
     def _simulate(self, df: pd.DataFrame, params: Dict) -> List[Dict]:
         """
-        Simple EMA crossover simulation on daily bars.
-        Extend this to support credit spread / condor if needed.
+        Drives a REAL registered strategy instance's generate_signal()/
+        manage_position() bar-by-bar on daily OHLCV -- not a hardcoded EMA
+        crossover proxy. Fixed 2026-08-21 (deep review): this used to
+        ignore self.strategy_name entirely and always run generic EMA(fast)/
+        EMA(slow) crossover math, so a walk-forward run against, say,
+        momentum_v1 to validate its ADX/RVOL/RS/MTF entry-quality redesign
+        never actually touched momentum_v1's logic at all -- an operator
+        could get back a "ROBUST" verdict for code this tool never ran.
+
+        Daily-bar approximation, not full intraday fidelity: the live
+        engine runs these strategies on 5-minute bars with RVOL/ADX/VWAP
+        computed from real intraday ticks; _add_indicators() approximates
+        those fields from daily OHLCV (see its own docstring). The
+        underlying's own price change stands in for option premium P&L
+        (this tool has no historical option-chain data) -- the same
+        simplification the previous hardcoded simulation already made.
+
+        Raises StrategyNotSimulatableError for credit_spread_v1/
+        iron_condor_v1 (or any unresolvable strategy_name) rather than
+        attempting to fake a multi-leg options simulation from
+        underlying-only OHLCV -- callers must surface that as an explicit
+        "not supported" result, never a numeric verdict for a strategy this
+        function didn't actually simulate.
         """
-        fast = params.get("fast_period", 20)
-        slow = params.get("slow_period", 50)
+        from src.strategies.base import StrategyRegistry
 
-        fast_col = f"ema{fast}"
-        slow_col = f"ema{slow}"
+        resolved = self._resolve_strategy_registry_key()
+        if resolved is None:
+            raise StrategyNotSimulatableError(
+                f"strategy_name={self.strategy_name!r} does not resolve to a directional "
+                f"single-leg strategy this daily-bar simulator can drive "
+                f"({sorted(_SIMULATABLE_REGISTRY_KEYS)} only -- credit_spread_v1/iron_condor_v1 "
+                "are non-directional multi-leg options structures that need real historical "
+                "option-chain data this tool doesn't fetch)."
+            )
 
-        if fast_col not in df.columns or slow_col not in df.columns:
-            return []
+        instance_id = f"_walkforward_sim_{id(self)}_{resolved}"
+        strategy = StrategyRegistry.load_strategy(resolved, instance_id, dict(params))
+        try:
+            fast_col = f"ema{getattr(strategy, 'fast_period', params.get('fast_period', 20))}"
+            slow_col = f"ema{getattr(strategy, 'slow_period', params.get('slow_period', 50))}"
+            if fast_col not in df.columns or slow_col not in df.columns:
+                return []
 
-        trades: List[Dict] = []
-        position = None
+            trades: List[Dict] = []
+            position: Optional[Dict] = None
 
-        for i in range(1, len(df)):
-            prev = df.iloc[i - 1]
-            curr = df.iloc[i]
+            for i in range(len(df)):
+                row = df.iloc[i]
+                current_price = float(row["close"])
 
-            prev_cross = prev[fast_col] - prev[slow_col]
-            curr_cross = curr[fast_col] - curr[slow_col]
+                if position is None:
+                    data = {
+                        "symbol": self.strategy_name,
+                        fast_col: row[fast_col], slow_col: row[slow_col],
+                        "adx14": row.get("adx14"), "ohlc_bar_key": row.get("ohlc_bar_key"),
+                        "close": current_price, "atr14": row.get("atr14"),
+                        "vwap": row.get("vwap"), "session_vwap": row.get("session_vwap"),
+                        "rvol": row.get("rvol"),
+                        "rvol_valid": bool(row.get("rvol_valid")),
+                    }
+                    signal = strategy.generate_signal(data)
+                    if signal in ("BUY", "SELL"):
+                        position = {
+                            "side": signal, "entry": current_price,
+                            "peak_premium": current_price, "entry_atr": row.get("atr14"),
+                        }
+                else:
+                    if position["side"] == "BUY":
+                        position["peak_premium"] = max(position["peak_premium"], current_price)
+                    else:
+                        position["peak_premium"] = min(position["peak_premium"], current_price)
+                    cur_pos = {
+                        "avg_price": position["entry"], "peak_premium": position["peak_premium"],
+                        "current_adx": row.get("adx14"), "current_close": current_price,
+                        "current_ema_fast": row[fast_col], "is_call": position["side"] == "BUY",
+                        "entry_underlying_price": position["entry"], "entry_atr": position["entry_atr"],
+                    }
+                    action = strategy.manage_position(cur_pos, current_price)
+                    if action == "EXIT":
+                        pnl = (current_price - position["entry"]) if position["side"] == "BUY" \
+                            else (position["entry"] - current_price)
+                        trades.append({"pnl": pnl, "entry": position["entry"], "exit": current_price})
+                        position = None
 
-            # Entry: EMA fast crosses above slow
-            if prev_cross < 0 and curr_cross >= 0 and position is None:
-                position = {"side": "BUY", "entry": curr["close"], "idx": i}
+            # Force close at end
+            if position is not None:
+                current_price = float(df.iloc[-1]["close"])
+                pnl = (current_price - position["entry"]) if position["side"] == "BUY" \
+                    else (position["entry"] - current_price)
+                trades.append({"pnl": pnl, "entry": position["entry"], "exit": current_price})
 
-            # Exit: EMA fast crosses below slow
-            elif prev_cross >= 0 and curr_cross < 0 and position is not None:
-                pnl = curr["close"] - position["entry"]
-                trades.append({"pnl": pnl, "entry": position["entry"], "exit": curr["close"]})
-                position = None
-
-        # Force close at end
-        if position is not None:
-            pnl = df.iloc[-1]["close"] - position["entry"]
-            trades.append({"pnl": pnl, "entry": position["entry"], "exit": df.iloc[-1]["close"]})
-
-        return trades
+            return trades
+        finally:
+            # Fixed 2026-08-21 (deep review): unregister the simulation
+            # instance from StrategyRegistry's GLOBAL _active_instances dict
+            # -- the same dict the live engine and risk/strategy_monitor
+            # iterate over via get_active_strategies(). Without this, a
+            # walk-forward/robustness run would leave a fake strategy
+            # permanently visible to live position/risk monitoring.
+            StrategyRegistry.unload_strategy(instance_id)
 
     @staticmethod
     def _calc_metrics(trades: List[Dict]) -> dict:

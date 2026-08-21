@@ -197,6 +197,7 @@ class PaperBroker(AbstractBroker):
             "quantity":     quantity,
             "price":        price,          # engine's expected price
             "fill_price":   fill_price,     # actual execution price (incl. slippage)
+            "filled_quantity": quantity,    # always fully filled -- synchronous, no partials
             "slippage":     slippage_ppu,   # fill_price - price per unit
             "fees":         fees,
             "status":       "COMPLETED",

@@ -181,6 +181,22 @@ class RiskManager:
                         momentum_v1) are unaffected.
         """
 
+        # ── -1. Quantity/price sanity check ───────────────────────────────────
+        # A non-positive quantity or price makes trade_value = quantity * price
+        # zero or negative, which trivially passes the max-exposure check
+        # (layer 7: trade_value > max_allowed) and the per-strategy budget
+        # check (layer 5: trade_value > 0 guards it, but a negative value
+        # slips under deployed + trade_value > budget too). Reject outright,
+        # before anything else runs — including the exit-order bypass below,
+        # since a negative-quantity "exit" is exactly as invalid as a
+        # negative-quantity entry.
+        if quantity <= 0 or price <= 0:
+            logger.error(
+                f"Risk: invalid trade — quantity={quantity}, price={price} "
+                f"(both must be > 0) for {side} {symbol}."
+            )
+            return False
+
         # ── 0. Exit orders bypass ALL checks ─────────────────────────────────────
         # An open position must always be closeable — kill switch, daily loss limit,
         # and every entry-only check are irrelevant when closing a position.

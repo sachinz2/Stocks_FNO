@@ -415,6 +415,7 @@ async def get_rs_ranks(request: Request, top: int = Query(10, le=40)):
 
 @router.post("/walk-forward")
 async def run_walk_forward(
+    request: Request,
     strategy_name: str = Query("EMA_CROSSOVER"),
     symbol:        str = Query("RELIANCE"),
     start_year:    int = Query(2021),
@@ -451,6 +452,13 @@ async def run_walk_forward(
         )
         results = await tester.run(symbol=symbol, start_year=start_year, end_year=end_year)
         if not results:
+            # Fixed 2026-08-21 (deep review): this used to catch BOTH
+            # "genuinely no data" and the new "strategy_name isn't
+            # simulatable" (credit_spread_v1/iron_condor_v1) cases with the
+            # same generic message, silently hiding the real reason from
+            # the caller. tester.not_supported_reason distinguishes them.
+            if tester.not_supported_reason:
+                return {"summary": tester.summary(results), "window_count": 0, "windows": []}
             return {"message": "No results — check symbol name or date range."}
         await tester.save(results)
         summary = tester.summary(results)
@@ -501,6 +509,7 @@ async def run_monte_carlo(
 
 @router.post("/robustness")
 async def run_robustness_check(
+    request: Request,
     strategy_name: str = Query("EMA_CROSSOVER"),
     symbol:        str = Query("RELIANCE"),
     years:         int = Query(3, ge=1, le=6),

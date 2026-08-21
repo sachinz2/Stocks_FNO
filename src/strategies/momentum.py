@@ -514,11 +514,19 @@ class MomentumStrategy(StrategyBase):
         """
         close = data.get("close")
         rvol  = data.get("rvol")
+        # Fixed 2026-08-21 (deep review): ltp_poller emits rvol=0.0 (with
+        # rvol_valid=False) as an "insufficient volume history" sentinel for
+        # roughly the first 100 minutes of every session -- treated as a
+        # real low RVOL reading here, that sentinel counted as a genuine
+        # volume contraction and could satisfy had_contraction below. Fail
+        # closed the same way the rest of the codebase treats rvol_valid:
+        # an invalid bar's RVOL is unknown, not a real reading.
+        rvol_valid = data.get("rvol_valid")
 
         is_new_bar = bar_key is not None and bar_key != self._pullback_bar_key.get(symbol)
         if is_new_bar:
             self._pullback_bar_key[symbol] = bar_key
-            if rvol is not None:
+            if rvol is not None and rvol_valid:
                 self._rvol_history.setdefault(symbol, []).append(rvol)
                 self._rvol_history[symbol] = self._rvol_history[symbol][-self.max_pullback_bars:]
 
@@ -532,7 +540,16 @@ class MomentumStrategy(StrategyBase):
         state     = self._trend_state.get(symbol)
         direction = self._trend_direction.get(symbol)
 
-        if state is None or direction != raw:
+        # Fixed 2026-08-21 (deep review): a direction flip (state is not
+        # None and direction != raw) must also wait for is_new_bar, same as
+        # every other transition in this function -- otherwise calling this
+        # twice with the SAME bar_key but a flipped raw direction wiped
+        # accumulated pullback progress and reseeded a new state mid-bar.
+        # A first-ever qualification (state is None) still seeds regardless
+        # of is_new_bar, since there's no existing progress to protect --
+        # bar_key-known-ness is handled below via the `bar_key is None`
+        # check instead.
+        if state is None or (direction != raw and is_new_bar):
             # Fresh qualification, or a direction flip mid-setup — start
             # over. Fixed 2026-08-21 (external review): only seed the
             # ESTABLISHED baseline once bar_key is actually known -- same
@@ -551,7 +568,7 @@ class MomentumStrategy(StrategyBase):
             self._trend_direction[symbol] = raw
             self._pullback_ref[symbol] = close
             self._pullback_bars[symbol] = 0
-            self._rvol_history[symbol] = [rvol] if rvol is not None else []
+            self._rvol_history[symbol] = [rvol] if rvol is not None and rvol_valid else []
             return "HOLD"
 
         if not is_new_bar:
@@ -573,7 +590,12 @@ class MomentumStrategy(StrategyBase):
         broke_out = (close > ref) if raw == "BUY" else (close < ref)
         if not broke_out:
             self._pullback_bars[symbol] = self._pullback_bars.get(symbol, 0) + 1
-            if self._pullback_bars[symbol] > self.max_pullback_bars:
+            # Fixed 2026-08-21 (deep review): _pullback_bars is seeded at 1
+            # on entering PULLBACK, so `> max_pullback_bars` let a setup
+            # survive max_pullback_bars + 1 bars instead of the documented
+            # max_pullback_bars. `>=` expires it after exactly the
+            # documented count.
+            if self._pullback_bars[symbol] >= self.max_pullback_bars:
                 logger.debug(
                     f"[{self.name}] {symbol} pullback setup expired after "
                     f"{self.max_pullback_bars} bars without a breakout"
@@ -582,10 +604,15 @@ class MomentumStrategy(StrategyBase):
             return "HOLD"
 
         # Breakout bar — two-tier RVOL confirmation (section 10).
+        # Fixed 2026-08-21 (deep review): rvol_valid gates both the history
+        # (appended above) and this bar's own rvol -- ltp_poller's rvol=0.0
+        # "insufficient history" sentinel must be treated as unknown, not a
+        # real low reading, same fail-closed convention used for rvol_valid
+        # elsewhere (e.g. live_trading_engine.py's RVOL entry gate).
         hist_rvol = self._rvol_history.get(symbol, [])
         had_contraction = any(v is not None and v < self.pullback_rvol_low for v in hist_rvol)
         rvol_ok = False
-        if rvol is not None:
+        if rvol is not None and rvol_valid:
             if had_contraction and rvol >= self.breakout_rvol_min:
                 rvol_ok = True
             elif rvol >= self.rvol_entry_threshold:
@@ -601,7 +628,7 @@ class MomentumStrategy(StrategyBase):
             # Give the setup another bar or two rather than discarding it
             # outright on one weak-volume breakout attempt.
             self._pullback_bars[symbol] = self._pullback_bars.get(symbol, 0) + 1
-            if self._pullback_bars[symbol] > self.max_pullback_bars:
+            if self._pullback_bars[symbol] >= self.max_pullback_bars:
                 self._reset_pullback_state(symbol)
             return "HOLD"
 

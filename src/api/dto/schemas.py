@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import datetime
 
@@ -78,8 +78,13 @@ class BacktestResultResponse(BaseModel):
 class OrderRequest(BaseModel):
     symbol: str
     side: str
-    quantity: int
-    price: float
+    # Fixed 2026-08-21 (deep review): RiskManager.validate_trade() didn't
+    # reject non-positive quantity/price either (fixed separately) -- a
+    # negative quantity makes trade_value = quantity * price negative,
+    # trivially passing the max-exposure check. Reject at the API boundary
+    # too, in addition to the server-side risk check (defense in depth).
+    quantity: int = Field(gt=0)
+    price: float = Field(gt=0)
 
 class OrderResponse(BaseModel):
     order_id: str

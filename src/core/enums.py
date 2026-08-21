@@ -21,6 +21,12 @@ class OrderStatus(str, Enum):
     REJECTED = "REJECTED"
     REJECTED_BY_RISK = "REJECTED_BY_RISK"
     FAILED = "FAILED"
+    # Added 2026-08-21: real, actively-used order_status string values written
+    # by src/orders/order_manager.py (the DB column itself is a plain string,
+    # not backed by this enum) that were missing here, making this reference
+    # incomplete/misleading.
+    PENDING_VERIFICATION = "PENDING_VERIFICATION"  # place_order() timed out; awaiting reconciliation retry
+    EXPIRED = "EXPIRED"  # reconciliation retries exhausted with no verifiable broker fill
 
 
 class TimeFrame(str, Enum):

@@ -59,7 +59,7 @@ async def lifespan(app: FastAPI):
     from src.database.repositories.base import BaseRepository
     from src.live_trading.live_trading_engine import LiveTradingEngine
     from src.market_data.ltp_poller import LTPPoller
-    from src.notifications.email_service import EmailNotifier
+    from src.notifications.combo_notifier import ComboNotifier
     from src.orders.order_manager import OrderManager
     from src.paper_trading.paper_broker import PaperBroker
     from src.portfolio.portfolio_manager import PortfolioManager
@@ -180,7 +180,17 @@ async def lifespan(app: FastAPI):
     # Constructed here (moved ahead of the broker-selection block below) so the
     # LIVE->PaperBroker silent-fallback case immediately below can actually
     # alert someone, not just log — see its 2026-08-20 fix note.
-    notifier = EmailNotifier()
+    #
+    # Fixed 2026-08-21 (deep review): this was a bare EmailNotifier() --
+    # TelegramNotifier is fully implemented and properly timeout-bounded
+    # (unlike the SMTP path, which had no timeout until this same round —
+    # see email_service.py's fix note) but was never actually instantiated
+    # in production, leaving a single, unbounded notification path with no
+    # redundancy. ComboNotifier sends to both channels via asyncio.gather
+    # (one failing/hanging doesn't block the other) and self-gates each
+    # channel independently on whether its own credentials are configured,
+    # so this is a safe drop-in replacement even with Telegram unconfigured.
+    notifier = ComboNotifier()
 
     # ── Order execution broker ─────────────────────────────────────────────────
     if mode == TradingMode.LIVE:

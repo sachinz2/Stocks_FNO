@@ -14,6 +14,13 @@ class Order(Base):
     symbol = Column(String(30), nullable=False)
     side = Column(String(10), nullable=False) # BUY, SELL
     quantity = Column(Integer, nullable=False)
+    # Actually-filled quantity, as reported by the broker -- distinct from
+    # `quantity` (the requested amount). NULL until a fill is confirmed.
+    # Added 2026-08-21 (deep review): a resting LIMIT order can be partially
+    # filled while still status=OPEN at Zerodha; without this, a stale-order
+    # retry had no way to know how much was already filled and resubmitted
+    # the full original quantity every time.
+    filled_quantity = Column(Integer, nullable=True)
     price = Column(Numeric(18, 4))            # expected price (engine estimate)
     fill_price = Column(Numeric(18, 4), nullable=True)  # actual fill after bid-ask slippage
     slippage = Column(Numeric(18, 4), nullable=True)    # fill_price - price (per unit)

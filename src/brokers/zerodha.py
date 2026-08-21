@@ -12,6 +12,7 @@ except ImportError:
 
 from src.brokers.base import AbstractBroker
 from src.core.constants import INTRADAY_PRODUCT_STRATEGIES
+from src.core.exceptions import BrokerException, InsufficientFundsError, OrderException as AppOrderException
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,44 @@ logger = logging.getLogger(__name__)
 _RETRYABLE_KITE_EXC = (
     (kite_exc.NetworkException, kite_exc.DataException) if kite_exc else Exception
 )
+
+
+def _kite_error_label(e: Exception) -> str:
+    """
+    "ClassName: message" for logging -- distinguishes e.g. kiteconnect's own
+    InputException/OrderException/TokenException/PermissionException/
+    GeneralException/NetworkException/DataException from each other and from
+    a non-Kite Exception, instead of every Kite SDK failure collapsing into
+    the same opaque string. Modest, additive: classification for logging (and
+    place_order's typed re-raise below), not a new retry-policy system --
+    retry eligibility is still governed solely by _RETRYABLE_KITE_EXC above.
+    """
+    return f"{type(e).__name__}: {e}"
+
+
+def _classify_kite_exception(e: Exception) -> Exception:
+    """
+    Wrap a raw Kite SDK exception from place_order() with one of this
+    codebase's existing structured exception types (src/core/exceptions.py)
+    so callers/logs get a real signal instead of a bare Exception:
+      - margin/RMS/fund-rejection-flavored kiteconnect.exceptions.InputException
+        -> InsufficientFundsError (order-quality rejection, not a network blip)
+      - any other kiteconnect InputException/OrderException (bad params,
+        invalid order, exchange rejection, etc.) -> OrderException
+      - anything else (including when kiteconnect isn't importable) -> BrokerException
+    The original exception's class name + message is preserved in the wrapped
+    exception's message (see _kite_error_label) and chained via `raise ... from e`,
+    so nothing about the original failure is lost -- this only adds structure.
+    """
+    label = _kite_error_label(e)
+    msg = str(e).lower()
+    if kite_exc and isinstance(e, kite_exc.InputException) and any(
+        kw in msg for kw in ("margin", "rms", "fund", "insufficient")
+    ):
+        return InsufficientFundsError(label)
+    if kite_exc and isinstance(e, (kite_exc.InputException, kite_exc.OrderException)):
+        return AppOrderException(label)
+    return BrokerException(label)
 
 
 class ZerodhaBroker(AbstractBroker):
@@ -200,12 +239,18 @@ class ZerodhaBroker(AbstractBroker):
                 return order_id
             except _RETRYABLE_KITE_EXC as e:
                 last_exc = e
-                logger.error(f"Zerodha: place_order attempt {attempt + 1}/3 failed: {e}")
+                logger.error(f"Zerodha: place_order attempt {attempt + 1}/3 failed [{_kite_error_label(e)}]")
                 if attempt < 2:
                     await asyncio.sleep(min(10, 2 ** attempt))
             except Exception as e:
-                logger.error(f"Zerodha: place_order failed: {e}")
-                raise
+                # Non-retryable (bad params, margin/RMS rejection, invalid
+                # order, auth, etc.) -- classify and re-raise typed so this
+                # is distinguishable from a network/data hiccup both in logs
+                # and to any caller that wants to branch on exception type
+                # (e.g. InsufficientFundsError vs a generic OrderException).
+                wrapped = _classify_kite_exception(e)
+                logger.error(f"Zerodha: place_order failed [{_kite_error_label(e)}]")
+                raise wrapped from e
         raise last_exc
 
     # cancel_order/modify_order must never raise — OrderManager.cancel_order()
@@ -238,7 +283,7 @@ class ZerodhaBroker(AbstractBroker):
             await asyncio.to_thread(self._cancel_order_call, order_id)
             return True
         except Exception as e:
-            logger.error(f"Zerodha: cancel_order failed: {e}")
+            logger.error(f"Zerodha: cancel_order failed [{_kite_error_label(e)}]")
             return False
 
     @retry(
@@ -261,7 +306,7 @@ class ZerodhaBroker(AbstractBroker):
             await asyncio.to_thread(self._modify_order_call, order_id, new_price, new_quantity)
             return True
         except Exception as e:
-            logger.error(f"Zerodha: modify_order failed: {e}")
+            logger.error(f"Zerodha: modify_order failed [{_kite_error_label(e)}]")
             return False
 
     # get_positions/get_orders already re-raise on failure (callers wrap them
@@ -284,7 +329,7 @@ class ZerodhaBroker(AbstractBroker):
             result = await asyncio.to_thread(self.kite.positions)
             return result.get("net", [])
         except Exception as e:
-            logger.error(f"Zerodha: get_positions failed: {e}")
+            logger.error(f"Zerodha: get_positions failed [{_kite_error_label(e)}]")
             raise
 
     @retry(
@@ -298,5 +343,5 @@ class ZerodhaBroker(AbstractBroker):
             # thread -- see get_positions()'s matching comment.
             return await asyncio.to_thread(self.kite.orders)
         except Exception as e:
-            logger.error(f"Zerodha: get_orders failed: {e}")
+            logger.error(f"Zerodha: get_orders failed [{_kite_error_label(e)}]")
             raise

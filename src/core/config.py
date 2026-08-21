@@ -55,6 +55,12 @@ class Settings(BaseSettings):
     # Logs API
     LOGS_API_TOKEN: str = ""   # set in .env — empty = logs endpoint disabled
 
+    # Admin / trading-control API (admin_router, strategy activate/deactivate,
+    # manual orders, manual signal generation) — shared secret checked via
+    # require_admin_token() in src/api/services/auth.py. Same fail-closed
+    # convention as LOGS_API_TOKEN: empty = endpoints disabled (403), not open.
+    ADMIN_API_TOKEN: str = ""
+
     # extra="ignore": a legacy/unrelated env var in .env (e.g. a leftover
     # REDIS_URL from an older config generation -- this class only ever
     # reads REDIS_HOST/PORT/PASSWORD and derives the URL itself via

@@ -31,6 +31,29 @@ class ComboNotifier:
         else:
             logger.warning("ComboNotifier: no notification channels configured.")
 
+    # Fixed 2026-08-21 (deep review): admin_router's /email-alerts/pause|
+    # resume and /email-alerts/status read/write notifier.paused and
+    # notifier.enabled directly (EmailNotifier's own attributes) -- wiring
+    # ComboNotifier in as the app's notifier (replacing a bare
+    # EmailNotifier(), so TelegramNotifier -- fully implemented, properly
+    # timeout-bounded, but never actually instantiated in production before
+    # this fix -- provides real redundancy against an email-side hang or
+    # outage) needs the same surface so those endpoints keep working.
+    # Pausing/enabled reflects EMAIL specifically, matching what those
+    # "email-alerts" endpoints are named and documented to control; the
+    # underlying pause doesn't affect Telegram delivery.
+    @property
+    def paused(self) -> bool:
+        return self.email.paused
+
+    @paused.setter
+    def paused(self, value: bool) -> None:
+        self.email.paused = value
+
+    @property
+    def enabled(self) -> bool:
+        return self.email.enabled or self.telegram.enabled
+
     async def send(self, message: str) -> bool:
         results = await asyncio.gather(
             self.email.send(message),

@@ -3,6 +3,7 @@ Log management endpoints — protected by a secret token.
 
 Pass the token as a query parameter:
   GET  /api/v1/logs/?token=<LOGS_API_TOKEN>
+  GET  /api/v1/logs/recent?token=<LOGS_API_TOKEN>
   GET  /api/v1/logs/tail?n=200&token=<LOGS_API_TOKEN>
   GET  /api/v1/logs/download/falcon.log?token=<LOGS_API_TOKEN>
 
@@ -49,12 +50,15 @@ async def list_logs(token: str = Query(..., description="LOGS_API_TOKEN from .en
 
 
 @router.get("/recent")
-async def recent_logs(n: int = Query(20, ge=5, le=100)):
+async def recent_logs(
+    n: int = Query(20, ge=5, le=100),
+    token: str = Query(..., description="LOGS_API_TOKEN from .env"),
+):
     """
     Return the last N log lines as structured JSON.
-    No token required — intended for the internal dashboard only.
     Each entry includes the raw text and a parsed severity level.
     """
+    _check_token(token)
     log_file = LOG_DIR / "falcon.log"
     if not log_file.exists():
         return {"lines": [], "count": 0, "log_file": "falcon.log",

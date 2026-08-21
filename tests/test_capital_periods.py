@@ -12,6 +12,7 @@ call", so a restart mid-period (no rollover due) silently left
 risk_manager's live limits on the static default forever, until the next
 real expiry.
 """
+import asyncio
 from datetime import date, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -136,3 +137,61 @@ async def test_catches_up_multiple_overdue_periods(monkeypatch):
 
     assert result is p3
     assert rm.set_capital_calls == [320_000.0]
+
+
+# ── concurrent-creation guard (2026-08-21) ───────────────────────────────────
+#
+# Fixed 2026-08-21: rollover_if_needed()'s check-then-insert (get_active_period
+# -> _create_period when none exists) had no atomicity guard -- two
+# near-simultaneous calls in the same process (e.g. a deploy's startup call
+# racing the 08:00 scheduled job tick) could both observe "no active period"
+# and each insert a duplicate open CapitalPeriod row. Guarded with an
+# in-process asyncio.Lock (rollover_if_needed is only ever called from within
+# one process -- see api/main.py startup and src/core/scheduler.py's
+# in-process APScheduler job).
+
+class _FakeDB:
+    """Minimal in-memory stand-in for the capital_periods table."""
+
+    def __init__(self):
+        self.periods: list = []
+
+
+async def _racy_get_active_period(db, today=None):
+    # Yield control here (simulating the real async DB round-trip) so a
+    # concurrent caller gets a chance to interleave right at the classic
+    # check-then-insert race window.
+    await asyncio.sleep(0)
+    for p in db.periods:
+        if not p.closed:
+            return p
+    return None
+
+
+async def _racy_create_period(db, period_start, period_end, starting_capital):
+    await asyncio.sleep(0)
+    row = _period(period_start, period_end, starting_capital)
+    db.periods.append(row)
+    return row
+
+
+@pytest.mark.asyncio
+async def test_concurrent_rollover_calls_create_only_one_active_period(monkeypatch):
+    monkeypatch.setattr(capital_periods, "get_active_period", _racy_get_active_period)
+    monkeypatch.setattr(capital_periods, "_create_period", _racy_create_period)
+    monkeypatch.setattr(capital_periods, "_close_period", AsyncMock())
+
+    db = _FakeDB()
+    results = await asyncio.gather(
+        capital_periods.rollover_if_needed(
+            session_factory=db, default_capital=300_000.0, today=date(2026, 8, 13),
+        ),
+        capital_periods.rollover_if_needed(
+            session_factory=db, default_capital=300_000.0, today=date(2026, 8, 13),
+        ),
+    )
+
+    active_periods = [p for p in db.periods if not p.closed]
+    assert len(active_periods) == 1, \
+        f"expected exactly one active period, got {len(active_periods)} -- concurrent calls raced past the guard"
+    assert results[0] is results[1] is active_periods[0]

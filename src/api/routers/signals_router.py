@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from src.api.dto.schemas import SignalGenerateRequest, SignalGenerateResponse
-from src.api.dependencies import get_current_user
+from src.api.services.auth import require_admin_token
 from src.database.connection import AsyncSessionLocal
 from src.database.models.signal import Signal
 from src.database.models.stock import Stock
@@ -68,12 +68,11 @@ async def get_signal(signal_id: int):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
 
 
-@router.post("/generate", response_model=SignalGenerateResponse)
+@router.post("/generate", response_model=SignalGenerateResponse, dependencies=[Depends(require_admin_token)])
 async def generate_signals(
     request: SignalGenerateRequest,
-    user: str = Depends(get_current_user),
 ):
-    """Manually trigger signal generation — requires JWT auth."""
+    """Manually trigger signal generation — requires the shared admin token (X-Admin-Token header)."""
     try:
         stock_repo = BaseRepository(Stock, AsyncSessionLocal)
         signal_repo = BaseRepository(Signal, AsyncSessionLocal)

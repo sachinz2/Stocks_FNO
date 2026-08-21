@@ -51,6 +51,7 @@ _5MIN_ATR_SCALE: float = FIVE_MIN_ATR_DAILY_SCALE
 _REDIS_ACTIVE_SPREADS  = "engine:active_spreads"
 _REDIS_ACTIVE_CONDORS  = "engine:active_condors"
 _REDIS_SINGLE_LEG_JRNL = "engine:single_leg_journals"
+_REDIS_PENDING_SINGLE_LEG_EXITS = "engine:pending_single_leg_exit_orders"
 _REDIS_EXITED_TODAY    = "engine:exited_today"
 _REDIS_PROFIT_CLOSED   = "engine:profit_closed_today"
 _REDIS_ORDER_COUNT     = "engine:order_count"
@@ -58,6 +59,25 @@ _REDIS_EMA_STATE       = "engine:ema_crossover_state"
 _REDIS_MOMENTUM_STATE  = "engine:momentum_state"
 _REDIS_PEAK_PREMIUMS   = "engine:peak_premiums"
 _REDIS_LAST_SIGNAL     = "engine:last_signal_date"
+
+
+def _pending_exits(engine) -> Dict[str, int]:
+    """
+    Lazily-initializing accessor for engine._pending_single_leg_exit_orders
+    -- real LiveTradingEngine instances always set it in __init__, but many
+    test doubles across this codebase (_FakeEngine and similar minimal
+    duck-typed stand-ins that bind individual unbound methods rather than
+    subclassing) only declare the specific attributes their own test needs.
+    A plain module-level function (not a method) so it works regardless of
+    which class `engine` actually is -- calling it as _pending_exits(self)
+    would fail to resolve on a stand-in class that was never given that
+    method, the same way a genuinely new engine method wouldn't be.
+    """
+    d = getattr(engine, "_pending_single_leg_exit_orders", None)
+    if d is None:
+        d = {}
+        engine._pending_single_leg_exit_orders = d
+    return d
 
 
 class LiveTradingEngine:
@@ -110,6 +130,17 @@ class LiveTradingEngine:
         # Maps option contract → {journal_id, underlying, strategy_name}
         # so _check_open_option_exits can write the exit to trade_journal.
         self._single_leg_journals:  Dict[str, Dict[str, Any]] = {}
+        # Maps option contract -> order id, for a single-leg exit order
+        # (_execute_single_leg_exit / reversal exit / exit-on-signal / EOD
+        # square-off) whose broker outcome is still PENDING_VERIFICATION.
+        # Fixed 2026-08-21 (deep review): every single-leg exit call site
+        # used to treat PENDING_VERIFICATION the same as a successful close.
+        # Checked/set via _resolve_pending_exit_order() -- see its docstring
+        # for why a naive resubmit on the next cycle risks a duplicate
+        # closing order at the broker. Kept as its own dict (not nested
+        # inside _single_leg_journals) because a reversal exit can close a
+        # legacy position with no journal entry at all.
+        self._pending_single_leg_exit_orders: Dict[str, int] = {}
         # strategy_id -> ISO date of the last non-HOLD signal it generated.
         # Fed to _check_signal_staleness() (component review, 2026-08-20) --
         # catches the same failure signature as the 2026-07-27..07-29
@@ -255,6 +286,12 @@ class LiveTradingEngine:
         await self._restore_state()
         await self._restore_ema_state()
         await self._restore_momentum_state()
+        # Fixed 2026-08-21 (deep review): rebuild deployed capital on every
+        # restart, not only at the next 09:15 on_market_open() -- see
+        # _rebuild_deployed_capital()'s docstring for why a mid-day restart
+        # otherwise left the per-strategy budget check silently permitting
+        # more capital deployment than intended for the rest of the session.
+        await self._rebuild_deployed_capital()
         logger.info(f"Trading engine STARTED — {self.mode.value.upper()} mode")
 
     async def stop(self) -> None:
@@ -264,22 +301,45 @@ class LiveTradingEngine:
 
     # ── Scheduler callbacks ───────────────────────────────────────────────────
 
-    async def on_market_open(self) -> None:
-        logger.info("Market OPEN — 09:15 IST")
-        self._today_order_count = 0
-        self._eod_notified_today = False
-        self.risk_manager.reset_daily_state()
+    async def _rebuild_deployed_capital(self) -> None:
+        """
+        Rebuild per-strategy deployed capital from currently-open positions
+        so the per-strategy budget check (risk layer 5) stays accurate.
+        Uses max loss (width - net credit) for spreads/condors, matching
+        add/release at entry/exit in _process_credit_spread /
+        _process_iron_condor / _check_spread_exits / _check_condor_exits —
+        not just the long/hedge legs' premium, which understates real
+        capital at risk (a wide spread's long leg can cost almost the same
+        regardless of width; real risk scales with width). Uses the
+        real-fill basis (short_premium/long_premium), matching those same
+        fixed call sites.
 
-        # Rebuild per-strategy deployed capital from overnight multi-day positions so
-        # the per-strategy budget check (risk layer 5) stays accurate next morning.
-        # Uses max loss (width - net credit), matching add/release at entry/exit in
-        # _process_credit_spread / _process_iron_condor / _check_spread_exits /
-        # _check_condor_exits — not just the long/hedge legs' premium, which
-        # understates real capital at risk (a wide spread's long leg can cost
-        # almost the same regardless of width; real risk scales with width).
+        Fixed 2026-08-21 (deep review): this used to run ONLY from
+        on_market_open()'s fixed 09:15 IST schedule, and ONLY covered
+        spreads/condors -- risk_manager._strategy_deployed is a pure
+        in-memory counter with no persistence of its own, so a mid-day
+        restart (after 09:15) left it at zero for the rest of the session
+        for every strategy with positions already open: single-leg
+        (ema_crossover_v1/momentum_v1) never had it rebuilt AT ALL, and
+        spread/condor positions opened or already open before an
+        intraday restart weren't covered until the NEXT calendar day's
+        09:15 job. Either way, validate_trade()'s per-strategy budget check
+        (layer 5) would silently permit deploying MORE capital than the
+        strategy's cap intends on top of what's already at risk. Now called
+        both from on_market_open() (unchanged daily behavior) and from
+        start() right after state restore, so a restart at any time of day
+        rebuilds an accurate counter before any new entry can be evaluated.
+
+        Single-leg capital is rebuilt from REAL broker positions (not
+        _single_leg_journals, which doesn't store the option's entry
+        price/quantity) -- quantity * avg_price, matching
+        order_manager.place_order()'s own add_deployed_capital() basis for
+        a BUY entry.
+        """
         for _sym, _s in self._active_spreads.items():
             _width = abs(_s.get("short_strike", 0) - _s.get("long_strike", 0))
-            _ml = (_width - _s.get("net_credit", 0)) * _s.get("lot_size", 0)
+            _fill_credit = _s.get("short_premium", 0) - _s.get("long_premium", 0)
+            _ml = (_width - _fill_credit) * _s.get("lot_size", 0)
             if _ml > 0:
                 self.risk_manager.add_deployed_capital(
                     _s.get("strategy_name", "credit_spread_v1"), _ml
@@ -287,11 +347,41 @@ class LiveTradingEngine:
         for _sym, _c in self._active_condors.items():
             _put_wing  = abs(_c.get("put_short_strike", 0)  - _c.get("put_long_strike", 0))
             _call_wing = abs(_c.get("call_short_strike", 0) - _c.get("call_long_strike", 0))
-            _ml = (max(_put_wing, _call_wing) - _c.get("net_credit", 0)) * _c.get("lot_size", 0)
+            _fill_credit = (
+                (_c.get("put_short_premium", 0) - _c.get("put_long_premium", 0))
+                + (_c.get("call_short_premium", 0) - _c.get("call_long_premium", 0))
+            )
+            _ml = (max(_put_wing, _call_wing) - _fill_credit) * _c.get("lot_size", 0)
             if _ml > 0:
                 self.risk_manager.add_deployed_capital(
                     _c.get("strategy_name", "iron_condor_v1"), _ml
                 )
+
+        if self._single_leg_journals:
+            try:
+                _positions = await self._safe_get_positions()
+            except Exception as exc:
+                logger.error(f"_rebuild_deployed_capital: could not fetch positions for single-leg rebuild: {exc}")
+                _positions = []
+            _pos_by_symbol = {p.get("symbol", ""): p for p in _positions}
+            for _contract, _info in self._single_leg_journals.items():
+                _pos = _pos_by_symbol.get(_contract)
+                if not _pos or _pos.get("quantity", 0) == 0:
+                    continue
+                _strategy_name = _info.get("strategy_name")
+                if not _strategy_name:
+                    continue
+                _qty = abs(_pos.get("quantity", 0))
+                _avg_price = float(_pos.get("avg_price") or 0)
+                if _qty > 0 and _avg_price > 0:
+                    self.risk_manager.add_deployed_capital(_strategy_name, _qty * _avg_price)
+
+    async def on_market_open(self) -> None:
+        logger.info("Market OPEN — 09:15 IST")
+        self._today_order_count = 0
+        self._eod_notified_today = False
+        self.risk_manager.reset_daily_state()
+        await self._rebuild_deployed_capital()
 
         # Auto-refresh event calendar every Monday so earnings/RBI dates stay current.
         if now_ist().weekday() == 0:  # 0 = Monday
@@ -358,11 +448,26 @@ class LiveTradingEngine:
         async with self._exit_cycle_lock:
             await self._check_spread_exits(active_strategies)
             await self._check_condor_exits(active_strategies)
+
+        # Fixed 2026-08-21 (deep review): re-fetch positions HERE, after the
+        # spread/condor exits above may have closed a structure and removed
+        # its long leg from _active_spreads/_active_condors tracking, and
+        # BEFORE _check_open_option_exits() below. That function's "already
+        # managed elsewhere, skip" set is built fresh from the (now-updated)
+        # tracking dicts, but used to be handed the STALE pre-exit
+        # `positions` snapshot from the top of this cycle -- which still
+        # showed a just-closed long leg's pre-close quantity and entry
+        # price. That stale leg then fell through to ordinary single-leg
+        # exit logic (a hard-stop meant for a genuinely open long option)
+        # and could fire a real SELL against a contract already flat at the
+        # broker -- opening an unintended naked short. Reusing this one
+        # fresh fetch for the risk-state refresh below too (previously a
+        # second, separate call) also removes a redundant broker round trip.
+        positions = await self._safe_get_positions()
         await self._check_open_option_exits(positions, active_strategies)
         await self._log_portfolio_delta()
 
         # Refresh risk state after exits so sector/position checks see current positions
-        positions = await self._safe_get_positions()
         await self._refresh_risk_state(positions)
 
         # Reconcile the OHLC poller's force-tracked underlyings against
@@ -617,6 +722,7 @@ class LiveTradingEngine:
             await redis.set(_REDIS_ACTIVE_SPREADS,  json.dumps(self._active_spreads))
             await redis.set(_REDIS_ACTIVE_CONDORS,  json.dumps(self._active_condors))
             await redis.set(_REDIS_SINGLE_LEG_JRNL, json.dumps(self._single_leg_journals))
+            await redis.set(_REDIS_PENDING_SINGLE_LEG_EXITS, json.dumps(getattr(self, "_pending_single_leg_exit_orders", {})))
             await redis.set(_REDIS_EXITED_TODAY,  json.dumps({"date": today, "symbols": list(self._exited_today)}))
             await redis.set(_REDIS_PROFIT_CLOSED, json.dumps({"date": today, "symbols": list(self._profit_closed_today)}))
             await redis.set(_REDIS_ORDER_COUNT,   json.dumps({"date": today, "count": self._today_order_count}))
@@ -857,6 +963,14 @@ class LiveTradingEngine:
                         f"on the first cycle: {stale_single_leg}"
                     )
                 logger.info(f"Restored {len(self._single_leg_journals)} single-leg journal(s) total")
+
+            pending_raw = await redis.get(_REDIS_PENDING_SINGLE_LEG_EXITS)
+            if pending_raw:
+                self._pending_single_leg_exit_orders = json.loads(pending_raw)
+                logger.info(
+                    f"Restored {len(self._pending_single_leg_exit_orders)} "
+                    "pending-verification single-leg exit order(s)"
+                )
 
             # Restore today-only state — discard if it's from a previous day
             exited_raw = await redis.get(_REDIS_EXITED_TODAY)
@@ -1226,9 +1340,13 @@ class LiveTradingEngine:
                 )
                 await _flatten(long_c)
                 await self._cancel_gtt(s.get("gtt_id"), short_c)
+                # Fixed 2026-08-21 (deep review): real-fill basis, matching
+                # the entry reservation and normal exit release -- was still
+                # using the stale quote-based net_credit here.
                 self.risk_manager.release_deployed_capital(
                     s.get("strategy_name", "credit_spread_v1"),
-                    (abs(s.get("short_strike", 0) - s.get("long_strike", 0)) - s.get("net_credit", 0))
+                    (abs(s.get("short_strike", 0) - s.get("long_strike", 0))
+                     - (s.get("short_premium", 0) - s.get("long_premium", 0)))
                     * s.get("lot_size", 0),
                 )
                 await self._log_trade_close(
@@ -1262,9 +1380,16 @@ class LiveTradingEngine:
             await self._cancel_gtt(c.get("call_short_gtt_id"), call_short)
             _put_wing  = abs(c.get("put_short_strike", 0)  - c.get("put_long_strike", 0))
             _call_wing = abs(c.get("call_short_strike", 0) - c.get("call_long_strike", 0))
+            # Fixed 2026-08-21 (deep review): real-fill basis, matching the
+            # entry reservation and normal exit release -- was still using
+            # the stale quote-based net_credit here.
+            _fill_credit = (
+                (c.get("put_short_premium", 0) - c.get("put_long_premium", 0))
+                + (c.get("call_short_premium", 0) - c.get("call_long_premium", 0))
+            )
             self.risk_manager.release_deployed_capital(
                 c.get("strategy_name", "iron_condor_v1"),
-                (max(_put_wing, _call_wing) - c.get("net_credit", 0)) * c.get("lot_size", 0),
+                (max(_put_wing, _call_wing) - _fill_credit) * c.get("lot_size", 0),
             )
             await self._log_trade_close(
                 journal_id=c.get("journal_id"), exit_price=0.0, pnl=0.0,
@@ -1728,9 +1853,33 @@ class LiveTradingEngine:
         # ZerodhaBroker._product_for()), so this needs the same
         # strategy_name the entry used, not just entries.
         _owner_strategy = self._single_leg_journals.get(contract, {}).get("strategy_name")
-        db_order = await self.order_manager.place_order(
-            contract, "SELL", abs(qty), current_p, is_exit_order=True, strategy_name=_owner_strategy,
-        )
+
+        # Fixed 2026-08-21 (deep review): check a prior cycle's still-
+        # unresolved PENDING_VERIFICATION order before resubmitting -- see
+        # _resolve_pending_exit_order()'s docstring for why a naive
+        # resubmit here risks a duplicate closing order at the broker.
+        db_order = None
+        _pending_id = _pending_exits(self).get(contract)
+        if _pending_id is not None:
+            state, pend_order = await self._resolve_pending_exit_order(_pending_id)
+            if state == "still_pending":
+                return False
+            _pending_exits(self).pop(contract, None)
+            await self._persist_state()
+            if state == "resolved_ok":
+                db_order = pend_order
+            # resolved_bad or none -> fall through, submit fresh below
+
+        if db_order is None:
+            db_order = await self.order_manager.place_order(
+                contract, "SELL", abs(qty), current_p, is_exit_order=True, strategy_name=_owner_strategy,
+            )
+            if db_order is not None and getattr(db_order, "order_status", "") == "PENDING_VERIFICATION":
+                _pending_exits(self)[contract] = db_order.id
+                await self._persist_state()
+                logger.warning(f"EXIT PENDING_VERIFICATION [{contract}]: outcome unknown — will re-check next cycle")
+                return False
+
         if not (db_order and db_order.order_status not in ("REJECTED_BY_RISK", "FAILED")):
             logger.error(f"EXIT FAILED [{contract}]: order rejected or failed — will retry next cycle")
             return False
@@ -2344,7 +2493,12 @@ class LiveTradingEngine:
             _atr_sigma = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, underlying_price)
             sigma  = await self._get_live_sigma(symbol, underlying_price, dte, strike_interval, expiry, _atr_sigma)
             target = _delta_target if option_type == "CE" else -_delta_target
-            strike = find_delta_strike(underlying_price, target, option_type, dte, sigma, strike_interval)
+            # enforce_min_otm=False: this path deliberately targets a
+            # near-ITM strike (see the comment above) -- the default OTM
+            # clamp (built for short spread/condor legs) would silently
+            # push a delta~0.60 fit back out to OTM every time, since any
+            # delta above 0.50 is ITM by definition. Fixed 2026-08-21.
+            strike = find_delta_strike(underlying_price, target, option_type, dte, sigma, strike_interval, enforce_min_otm=False)
         else:
             strike = get_atm_strike(underlying_price, symbol, interval=strike_interval)
         resolved = await self._resolve_contract(symbol, expiry, strike, option_type)
@@ -2503,15 +2657,40 @@ class LiveTradingEngine:
             entry_p = float(pos.get("avg_price") or 0)
             _live_p = await get_option_quote(contract, getattr(self, "_kite", None), getattr(self, "_redis", None))
             exit_p = _live_p if (_live_p and _live_p > 0) else (estimate_option_premium(atr, dte) if atr > 0 else entry_p)
-            _rev_order = await self.order_manager.place_order(
-                contract, "SELL", abs(qty), exit_p, is_exit_order=True, strategy_name=_owner,
-            )
+
+            # Fixed 2026-08-21 (deep review): check a prior cycle's still-
+            # unresolved PENDING_VERIFICATION order before resubmitting --
+            # see _resolve_pending_exit_order()'s docstring.
+            _rev_order = None
+            _pending_id = _pending_exits(self).get(contract)
+            if _pending_id is not None:
+                state, pend_order = await self._resolve_pending_exit_order(_pending_id)
+                if state == "still_pending":
+                    continue
+                _pending_exits(self).pop(contract, None)
+                await self._persist_state()
+                if state == "resolved_ok":
+                    _rev_order = pend_order
+                # resolved_bad or none -> fall through, submit fresh below
+
+            if _rev_order is None:
+                _rev_order = await self.order_manager.place_order(
+                    contract, "SELL", abs(qty), exit_p, is_exit_order=True, strategy_name=_owner,
+                )
+                if _rev_order is not None and getattr(_rev_order, "order_status", "") == "PENDING_VERIFICATION":
+                    _pending_exits(self)[contract] = _rev_order.id
+                    await self._persist_state()
+                    logger.warning(f"REVERSAL EXIT PENDING_VERIFICATION [{contract}]: outcome unknown — will re-check next cycle")
+                    continue
+
             # Fixed 2026-08-20 (deep review): this path used to treat the
             # position as closed unconditionally, even if the broker SELL
             # itself was rejected/failed -- fabricating a journal close and
             # releasing capital while the real position stayed open and
             # un-monitored. Mirrors the order_status check _execute_single_leg_exit
-            # already had (line ~1278).
+            # already had (line ~1278). Fixed 2026-08-21: PENDING_VERIFICATION
+            # (genuinely unknown outcome) is now handled above instead of
+            # being treated as a successful close by this check.
             if not (_rev_order and _rev_order.order_status not in ("REJECTED_BY_RISK", "FAILED")):
                 logger.error(f"REVERSAL EXIT FAILED [{contract}]: order rejected or failed — position left open, will retry next cycle")
                 continue
@@ -2655,10 +2834,13 @@ class LiveTradingEngine:
             )
             return
         atr        = float(market_data.get("atr14", underlying_price * 0.01))
-        iv_rank    = await self._get_iv_rank(symbol, underlying_price, atr, dte)
         interval   = await self._get_strike_interval(symbol, expiry)
         _atr_sigma = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, underlying_price)
         sigma      = await self._get_live_sigma(symbol, underlying_price, dte, interval, expiry, _atr_sigma)
+        # Fixed 2026-08-21 (deep review): moved after _get_live_sigma() so
+        # the real market IV (not the ATR-derived historical-vol proxy) can
+        # feed the IV-rank history/gate -- see _get_iv_rank()'s docstring.
+        iv_rank    = await self._get_iv_rank(symbol, underlying_price, atr, dte, live_sigma=sigma)
 
         # VIX + IV Rank gates — only sell premium when it is worth selling
         from src.market_data.option_chain import vix_allows_selling, iv_rank_allows_selling
@@ -2874,11 +3056,18 @@ class LiveTradingEngine:
             )
             return
 
-        short_p, long_p = await get_entry_prices_for_spread(
+        _entry_prices = await get_entry_prices_for_spread(
             symbol, short_contract, long_contract,
             kite=self._kite, redis=getattr(self, "_redis", None),
             atr=atr, dte=dte,
         )
+        if _entry_prices is None:
+            logger.warning(
+                f"[CreditSpread] {symbol} skipped — short/long leg quotes inverted or "
+                "unreliable (fail-closed, not placing a LIMIT order on a guessed price)."
+            )
+            return
+        short_p, long_p = _entry_prices
         net_credit = round(short_p - long_p, 2)
         total_credit = net_credit * lot_size
 
@@ -3140,6 +3329,48 @@ class LiveTradingEngine:
             f"VIX: {f'{vix:.1f}' if vix else 'N/A'}"
         )
 
+    async def _resolve_pending_exit_order(self, pending_order_id: Optional[int]):
+        """
+        Fixed 2026-08-21 (deep review): every exit call site used to treat
+        any order_status other than REJECTED/REJECTED_BY_RISK/CANCELLED/
+        FAILED as "closed successfully" -- including PENDING_VERIFICATION,
+        which order_manager.place_order() deliberately returns when a
+        client-side timeout occurs AND the broker-side reconciliation check
+        itself also fails to confirm anything (genuinely unknown outcome,
+        see place_order()'s own docstring). Treating that as a successful
+        close popped the position from tracking, released capital, and
+        journaled an exit at the pre-trade quote -- if the order later
+        actually failed at the broker, the real position stayed open,
+        unmonitored, with the journal showing a fictitious exit.
+
+        Not treating it as closed isn't enough on its own, though: naively
+        retrying (calling place_order() again next cycle) would submit a
+        genuinely NEW order with its own broker-side idempotency tag --
+        Zerodha has no way to dedupe that against the still-unresolved
+        PENDING_VERIFICATION order, risking two real closing orders for the
+        same leg if the first one actually did go through. So callers store
+        the PENDING_VERIFICATION order's id instead of resubmitting, and
+        pass it back in here on the next cycle to check whether
+        order_manager's own _retry_pending_verification_orders() (already
+        running every cycle via expire_stale_orders()) has since resolved
+        it -- resubmission only happens once the order is confirmed to have
+        genuinely failed, not merely because we're still waiting to find out.
+
+        Returns ("still_pending", order), ("resolved_ok", order),
+        ("resolved_bad", order), or ("none", None) if there was nothing to
+        check (no pending id, or the order row is gone).
+        """
+        if pending_order_id is None:
+            return "none", None
+        order = await self.order_manager.order_repo.get_by_id(pending_order_id)
+        if order is None:
+            return "none", None
+        if order.order_status == "PENDING_VERIFICATION":
+            return "still_pending", order
+        if order.order_status in ("REJECTED", "REJECTED_BY_RISK", "CANCELLED", "FAILED"):
+            return "resolved_bad", order
+        return "resolved_ok", order
+
     async def _check_spread_exits(self, active_strategies: Dict[str, Any]) -> None:
         if not self._active_spreads:
             return
@@ -3157,284 +3388,325 @@ class LiveTradingEngine:
         )
 
         for underlying, spread in self._active_spreads.items():
-            market_data = await self._get_market_data(underlying)
-            if not market_data:
-                continue
-
-            # Fixed 2026-08-20 (deep review): dte used to be the module-level
-            # near-month expiry's DTE for every spread, but a spread rolled to
-            # NEXT month at entry (get_entry_expiry(), when near-month DTE was
-            # already < entry_min_dte) has a real expiry that
-            # get_near_month_expiry() won't reflect for up to ~2 weeks (it
-            # only rolls forward once DTE < 7). For that whole window this
-            # spread's DTE floor, DTE-tiered profit thresholds, and delta
-            # calc's time-to-expiry were all computed off the wrong, too-small
-            # DTE -- risking force-closing a healthy position weeks early.
             try:
-                spread_expiry = datetime.fromisoformat(spread["expiry_date"])
-            except (KeyError, ValueError, TypeError):
-                spread_expiry = expiry
-            dte = (spread_expiry - now_ist().replace(tzinfo=None)).days
+                market_data = await self._get_market_data(underlying)
+                if not market_data:
+                    continue
 
-            current_price = float(market_data.get("close", 0))
-            atr = float(market_data.get("atr14", 0))
-            opt = spread["option_type"]
-
-            # Try real Kite LTP first (same source as entry pricing via get_entry_prices_for_spread).
-            # BS fallback uses 5-min ATR which underestimates annualised vol by ~8×, causing
-            # exits to show near-zero option prices and triggering fake "max profit" exits.
-            from src.market_data.option_chain import get_option_quote
-            kite  = getattr(self, "_kite",  None)
-            redis = getattr(self, "_redis", None)
-            short_ltp = await get_option_quote(spread["short_contract"], kite, redis)
-            long_ltp  = await get_option_quote(spread["long_contract"],  kite, redis)
-
-            if short_ltp and short_ltp > 0:
-                cur_short = short_ltp
-            elif current_price > 0:
-                cur_short = estimate_option_premium(atr, dte, underlying_price=current_price, strike=spread["short_strike"], option_type=opt)
-            else:
-                cur_short = spread["short_premium"]
-
-            if long_ltp and long_ltp > 0:
-                cur_long = long_ltp
-            elif current_price > 0:
-                cur_long = estimate_option_premium(atr, dte, underlying_price=current_price, strike=spread["long_strike"], option_type=opt)
-            else:
-                cur_long = spread["long_premium"]
-
-            min_dte     = getattr(cs_strategy, "min_dte", 7) if cs_strategy else 7
-            exit_reason: Optional[str] = None
-
-            # C: near-expiry restore — force close immediately on first cycle after restart
-            if underlying in self._close_on_first_cycle:
-                exit_reason = f"Near-expiry forced close (restored expiry={spread.get('expiry_date')})"
-            elif dte < min_dte:
-                exit_reason = f"DTE={dte} < {min_dte}"
-
-            if exit_reason is None and current_price > 0:
-                ss = spread["short_strike"]
-                if spread["spread_type"] == "BULL_PUT_SPREAD" and current_price < ss:
-                    exit_reason = f"Put breach: {underlying} Rs{current_price:.2f} < short Rs{ss}"
-                elif spread["spread_type"] == "BEAR_CALL_SPREAD" and current_price > ss:
-                    exit_reason = f"Call breach: {underlying} Rs{current_price:.2f} > short Rs{ss}"
-
-            # E: VIX spike → tighten thresholds before normal manage_position check.
-            # If VIX has risen 50%+ from entry, IV expansion works against short options —
-            # take 60% profit early and use 1.5× SL instead of waiting for full 2× SL.
-            if exit_reason is None:
-                _entry_vix = spread.get("entry_vix", 0.0)
-                if _entry_vix > 0:
-                    _cur_vix = await self._get_cached_vix()
-                    if _cur_vix and _cur_vix >= _entry_vix * 1.5:
-                        if cur_short >= spread["short_premium"] * 1.5:
-                            exit_reason = (
-                                f"VIX spike SL (entry {_entry_vix:.1f}→now {_cur_vix:.1f}): "
-                                f"short ₹{cur_short:.2f} ≥ 1.5× — exiting early"
-                            )
-                        elif cur_short <= spread["short_premium"] * 0.40:
-                            pnl_pct = (spread["short_premium"] - cur_short) / spread["short_premium"] * 100
-                            exit_reason = (
-                                f"VIX spike profit (entry {_entry_vix:.1f}→now {_cur_vix:.1f}): "
-                                f"60% captured ({pnl_pct:.1f}%) — exiting early"
-                            )
-
-            # DTE-tiered profit target — accept less profit as gamma risk rises near expiry.
-            # Base tier (DTE > 21) comes from the strategy's own profit_close_pct so tuning
-            # that parameter actually changes behavior (it previously didn't — the engine
-            # hardcoded 0.25 here, matching iron condor's already-correct pattern below).
-            # DTE 15–21: 65% profit; DTE 8–14: 55% profit; DTE ≤ 7 is caught by min_dte above.
-            if exit_reason is None:
-                _dte_profit_pct = getattr(cs_strategy, "profit_close_pct", 0.25) if cs_strategy else 0.25
-                if dte <= 14:
-                    _dte_profit_pct = max(_dte_profit_pct, 0.45)
-                elif dte <= 21:
-                    _dte_profit_pct = max(_dte_profit_pct, 0.35)
-                if cur_short <= spread["short_premium"] * _dte_profit_pct:
-                    _captured = round((1 - cur_short / spread["short_premium"]) * 100, 1)
-                    exit_reason = (
-                        f"DTE-tiered profit (DTE={dte}): "
-                        f"{_captured}% captured — target {100 - int(_dte_profit_pct * 100)}%"
-                    )
-
-            if exit_reason is None and cs_strategy:
-                result = cs_strategy.manage_position(
-                    {"short_premium": spread["short_premium"]}, cur_short
-                )
-                if result == "EXIT":
-                    pnl_pct = (spread["short_premium"] - cur_short) / spread["short_premium"] * 100
-                    exit_reason = (
-                        f"{cs_strategy.name} short Rs{spread['short_premium']:.2f} "
-                        f"-> Rs{cur_short:.2f} ({pnl_pct:+.1f}%)"
-                    )
-
-            # Delta-based exit — short leg delta > 0.40 signals the strike is under threat.
-            if exit_reason is None and atr > 0 and current_price > 0:
+                # Fixed 2026-08-20 (deep review): dte used to be the module-level
+                # near-month expiry's DTE for every spread, but a spread rolled to
+                # NEXT month at entry (get_entry_expiry(), when near-month DTE was
+                # already < entry_min_dte) has a real expiry that
+                # get_near_month_expiry() won't reflect for up to ~2 weeks (it
+                # only rolls forward once DTE < 7). For that whole window this
+                # spread's DTE floor, DTE-tiered profit thresholds, and delta
+                # calc's time-to-expiry were all computed off the wrong, too-small
+                # DTE -- risking force-closing a healthy position weeks early.
                 try:
-                    from src.market_data.option_chain import atr_to_annualised_vol, bs_delta
-                    _sig = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, current_price)
-                    if _sig > 0:
-                        _T = max(dte, 1) / 365.0
-                        _delta = bs_delta(
-                            current_price, spread["short_strike"], _T, _sig, spread["option_type"]
+                    spread_expiry = datetime.fromisoformat(spread["expiry_date"])
+                except (KeyError, ValueError, TypeError):
+                    spread_expiry = expiry
+                dte = (spread_expiry - now_ist().replace(tzinfo=None)).days
+
+                current_price = float(market_data.get("close", 0))
+                atr = float(market_data.get("atr14", 0))
+                opt = spread["option_type"]
+
+                # Try real Kite LTP first (same source as entry pricing via get_entry_prices_for_spread).
+                # BS fallback uses 5-min ATR which underestimates annualised vol by ~8×, causing
+                # exits to show near-zero option prices and triggering fake "max profit" exits.
+                from src.market_data.option_chain import get_option_quote
+                kite  = getattr(self, "_kite",  None)
+                redis = getattr(self, "_redis", None)
+                short_ltp = await get_option_quote(spread["short_contract"], kite, redis)
+                long_ltp  = await get_option_quote(spread["long_contract"],  kite, redis)
+
+                if short_ltp and short_ltp > 0:
+                    cur_short = short_ltp
+                elif current_price > 0:
+                    cur_short = estimate_option_premium(atr, dte, underlying_price=current_price, strike=spread["short_strike"], option_type=opt)
+                else:
+                    cur_short = spread["short_premium"]
+
+                if long_ltp and long_ltp > 0:
+                    cur_long = long_ltp
+                elif current_price > 0:
+                    cur_long = estimate_option_premium(atr, dte, underlying_price=current_price, strike=spread["long_strike"], option_type=opt)
+                else:
+                    cur_long = spread["long_premium"]
+
+                min_dte     = getattr(cs_strategy, "min_dte", 7) if cs_strategy else 7
+                exit_reason: Optional[str] = None
+
+                # C: near-expiry restore — force close immediately on first cycle after restart
+                if underlying in self._close_on_first_cycle:
+                    exit_reason = f"Near-expiry forced close (restored expiry={spread.get('expiry_date')})"
+                elif dte < min_dte:
+                    exit_reason = f"DTE={dte} < {min_dte}"
+
+                if exit_reason is None and current_price > 0:
+                    ss = spread["short_strike"]
+                    if spread["spread_type"] == "BULL_PUT_SPREAD" and current_price < ss:
+                        exit_reason = f"Put breach: {underlying} Rs{current_price:.2f} < short Rs{ss}"
+                    elif spread["spread_type"] == "BEAR_CALL_SPREAD" and current_price > ss:
+                        exit_reason = f"Call breach: {underlying} Rs{current_price:.2f} > short Rs{ss}"
+
+                # E: VIX spike → tighten thresholds before normal manage_position check.
+                # If VIX has risen 50%+ from entry, IV expansion works against short options —
+                # take 60% profit early and use 1.5× SL instead of waiting for full 2× SL.
+                if exit_reason is None:
+                    _entry_vix = spread.get("entry_vix", 0.0)
+                    if _entry_vix > 0:
+                        _cur_vix = await self._get_cached_vix()
+                        if _cur_vix and _cur_vix >= _entry_vix * 1.5:
+                            if cur_short >= spread["short_premium"] * 1.5:
+                                exit_reason = (
+                                    f"VIX spike SL (entry {_entry_vix:.1f}→now {_cur_vix:.1f}): "
+                                    f"short ₹{cur_short:.2f} ≥ 1.5× — exiting early"
+                                )
+                            elif cur_short <= spread["short_premium"] * 0.40:
+                                pnl_pct = (spread["short_premium"] - cur_short) / spread["short_premium"] * 100
+                                exit_reason = (
+                                    f"VIX spike profit (entry {_entry_vix:.1f}→now {_cur_vix:.1f}): "
+                                    f"60% captured ({pnl_pct:.1f}%) — exiting early"
+                                )
+
+                # DTE-tiered profit target — accept less profit as gamma risk rises near expiry.
+                # Base tier (DTE > 21) comes from the strategy's own profit_close_pct so tuning
+                # that parameter actually changes behavior (it previously didn't — the engine
+                # hardcoded 0.25 here, matching iron condor's already-correct pattern below).
+                # DTE 15–21: 65% profit; DTE 8–14: 55% profit; DTE ≤ 7 is caught by min_dte above.
+                if exit_reason is None:
+                    _dte_profit_pct = getattr(cs_strategy, "profit_close_pct", 0.25) if cs_strategy else 0.25
+                    if dte <= 14:
+                        _dte_profit_pct = max(_dte_profit_pct, 0.45)
+                    elif dte <= 21:
+                        _dte_profit_pct = max(_dte_profit_pct, 0.35)
+                    if cur_short <= spread["short_premium"] * _dte_profit_pct:
+                        _captured = round((1 - cur_short / spread["short_premium"]) * 100, 1)
+                        exit_reason = (
+                            f"DTE-tiered profit (DTE={dte}): "
+                            f"{_captured}% captured — target {100 - int(_dte_profit_pct * 100)}%"
                         )
-                        if _delta is not None and abs(_delta) > 0.40:
-                            exit_reason = (
-                                f"Delta breach: short δ={_delta:.2f} (|δ|>0.40, "
-                                f"strike {spread['short_strike']} at risk)"
-                            )
-                except Exception as _de:
-                    logger.debug(f"[DeltaExit] {underlying}: delta check error — {_de}")
 
-            if exit_reason is None:
-                continue
-
-            lot = spread["lot_size"]
-            # is_exit_order=True is required here, not just is_spread_leg=True --
-            # risk_manager.validate_trade() only bypasses the kill switch/circuit
-            # breaker for is_exit_order (layer 0); is_spread_leg alone still hits
-            # that check (intentional for entry hedge legs, wrong for a genuine
-            # exit). Without this, a tripped kill switch or daily-loss circuit
-            # breaker would block the system from closing an existing credit
-            # spread via its normal exit path -- exactly when it most needs to
-            # (found 2026-08-06).
-            #
-            # Fixed 2026-08-20 (deep review): a rejected sibling leg used to
-            # just `continue` (correctly not fabricating a close), but the
-            # NEXT retry re-sent orders for BOTH legs again -- including the
-            # one that already closed, which is now flat, so re-buying/
-            # re-selling it opened a brand-new unintended position instead of
-            # a no-op. _close_leg() remembers a leg that already closed
-            # (either this cycle or a previous partial attempt, via
-            # spread["_short_exit_fill"]/["_long_exit_fill"]) and never
-            # resubmits an order for it.
-            _leg_positions = await self._safe_get_positions()
-            # _safe_get_positions() fails OPEN to [] on a broker fetch error
-            # (see its own docstring/flag) -- an empty list there means
-            # "unknown", not "confirmed flat". Only trust the "already
-            # closed" shortcut below when the fetch actually succeeded;
-            # otherwise every leg would look flat and get silently skipped
-            # instead of retried, which is worse than the bug being fixed.
-            _pos_known = getattr(self, "_broker_position_state_known", True)
-            _pos_qty = {p.get("symbol", ""): p.get("quantity", 0) for p in _leg_positions}
-            _bad = {"REJECTED", "REJECTED_BY_RISK", "CANCELLED", "FAILED"}
-
-            async def _close_leg(contract: str, side: str, quote_price: float, fill_key: str):
-                stored = spread.get(fill_key)
-                if stored is not None:
-                    return stored, True
-                if _pos_known and _pos_qty.get(contract, 0) == 0:
-                    # Already flat at the broker (e.g. closed by the GTT
-                    # backstop or a manual admin close) -- nothing to submit.
-                    return quote_price, True
-                order = await self.order_manager.place_order(
-                    contract, side, lot, quote_price, is_spread_leg=True, is_exit_order=True,
-                )
-                if order is None or getattr(order, "order_status", "") in _bad:
-                    return None, False
-                return self._real_fill(order, quote_price), True
-
-            _short_fill, _short_ok = await _close_leg(spread["short_contract"], "BUY",  cur_short, "_short_exit_fill")
-            _long_fill,  _long_ok  = await _close_leg(spread["long_contract"],  "SELL", cur_long,  "_long_exit_fill")
-
-            if not (_short_ok and _long_ok):
-                if _short_ok:
-                    spread["_short_exit_fill"] = _short_fill
-                if _long_ok:
-                    spread["_long_exit_fill"] = _long_fill
-                if _short_ok or _long_ok:
-                    await self._persist_state()
-                logger.warning(
-                    f"[CreditSpread] Exit orders for {underlying} partially rejected — "
-                    f"keeping position in tracking to retry next cycle."
-                )
-                continue
-
-            spread.pop("_short_exit_fill", None)
-            spread.pop("_long_exit_fill", None)
-
-            # Fixed 2026-08-13: net_pnl/exit_price used to be computed from
-            # cur_short/cur_long -- the pre-trade QUOTE fed into place_order(),
-            # not the real fill. Confirmed live 2026-08-13: a real TITAN
-            # BULL_PUT_SPREAD closed with recorded pnl=Rs7,638.75 (quote-based)
-            # vs the real fill-based pnl of Rs7,390.25 -- a Rs248.50
-            # overstatement from slippage the record never reflected.
-            # _short_fill/_long_fill above are already real fills (from
-            # _close_leg -> _real_fill(), or a previous cycle's stored real
-            # fill) -- not the quote.
-            _slippage = abs(_short_fill - cur_short) + abs(_long_fill - cur_long)
-
-            net_pnl = (
-                (spread["short_premium"] - _short_fill)
-                - (spread["long_premium"]  - _long_fill)
-            ) * lot
-
-            # Must match the max-loss figure add_deployed_capital() used at entry
-            # (see _process_credit_spread) — not just the long leg's premium.
-            # Fixed 2026-08-21 (second-opinion review): uses the real-fill
-            # basis (short_premium/long_premium, the actual entry fills)
-            # instead of the quote-based net_credit -- matches entry's
-            # add_deployed_capital(), which now reserves against the same
-            # real-fill figure. Keeping add/release symmetric on the SAME
-            # basis is what matters here; using stale quote-based net_credit
-            # for release while entry now reserves fill-based would leak or
-            # over-release capital on every single trade.
-            _spread_width = abs(spread["short_strike"] - spread["long_strike"])
-            self.risk_manager.release_deployed_capital(
-                spread.get("strategy_name", "credit_spread_v1"),
-                (_spread_width - (spread["short_premium"] - spread["long_premium"])) * lot,
-            )
-
-            await self._log_trade_close(
-                journal_id=spread.get("journal_id"),
-                exit_price=round(_short_fill - _long_fill, 2),
-                pnl=net_pnl, exit_reason=exit_reason,
-                market_data=market_data,
-                total_slippage_pts=round(_slippage, 4) if _slippage > 0 else None,
-            )
-            if self._ltp_poller:
-                self._ltp_poller.unregister_option_contracts(
-                    [spread["short_contract"], spread["long_contract"]]
-                )
-            await self._notify(
-                f"CREDIT SPREAD CLOSED\n"
-                f"Underlying: {underlying}\nReason: {exit_reason}\n"
-                f"Short: sold Rs{spread['short_premium']:.2f}, closed Rs{_short_fill:.2f}\n"
-                f"Long:  paid Rs{spread['long_premium']:.2f}, sold Rs{_long_fill:.2f}\n"
-                f"Net PnL: Rs{net_pnl:,.2f}"
-            )
-
-            # D: increment SL frequency counter for adverse exits (circuit breaker)
-            _is_adverse = any(
-                kw in exit_reason for kw in ("breach", "Breach", "SL:", " SL ", "spike SL")
-            )
-            if _is_adverse:
-                _r = getattr(self, "_redis", None)
-                if _r:
-                    _sl_key   = f"sl_freq:{underlying}"
-                    _sl_count = int(await _r.incr(_sl_key))
-                    if _sl_count == 1:
-                        await _r.expire(_sl_key, 5 * 86400)
-                    logger.info(
-                        f"[CircuitBreaker] {underlying}: adverse exit #{_sl_count} "
-                        f"in 5-day window"
+                if exit_reason is None and cs_strategy:
+                    result = cs_strategy.manage_position(
+                        {"short_premium": spread["short_premium"]}, cur_short
                     )
+                    if result == "EXIT":
+                        pnl_pct = (spread["short_premium"] - cur_short) / spread["short_premium"] * 100
+                        exit_reason = (
+                            f"{cs_strategy.name} short Rs{spread['short_premium']:.2f} "
+                            f"-> Rs{cur_short:.2f} ({pnl_pct:+.1f}%)"
+                        )
 
-            # I: cancel GTT backstop now that position is closed normally
-            await self._cancel_gtt(spread.get("gtt_id"), spread.get("short_contract", ""))
+                # Delta-based exit — short leg delta > 0.40 signals the strike is under threat.
+                if exit_reason is None and atr > 0 and current_price > 0:
+                    try:
+                        from src.market_data.option_chain import atr_to_annualised_vol, bs_delta
+                        _sig = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, current_price)
+                        if _sig > 0:
+                            _T = max(dte, 1) / 365.0
+                            _delta = bs_delta(
+                                current_price, spread["short_strike"], _T, _sig, spread["option_type"]
+                            )
+                            if _delta is not None and abs(_delta) > 0.40:
+                                exit_reason = (
+                                    f"Delta breach: short δ={_delta:.2f} (|δ|>0.40, "
+                                    f"strike {spread['short_strike']} at risk)"
+                                )
+                    except Exception as _de:
+                        logger.debug(f"[DeltaExit] {underlying}: delta check error — {_de}")
 
-            # C: remove from near-expiry set
-            self._close_on_first_cycle.discard(underlying)
+                if exit_reason is None:
+                    continue
 
-            # Route to profit or adverse bucket for re-entry eligibility — by realized
-            # P&L, not by scanning exit_reason text. A plain DTE-floor timeout ("DTE=6
-            # < 7") matches no adverse keyword even when the position lost money, which
-            # previously let losing trades qualify for the lenient same-day re-entry
-            # floor meant for genuine wins.
-            if net_pnl < 0:
-                adverse_closes.append(underlying)
-            else:
-                profit_closes.append(underlying)
+                lot = spread["lot_size"]
+                # is_exit_order=True is required here, not just is_spread_leg=True --
+                # risk_manager.validate_trade() only bypasses the kill switch/circuit
+                # breaker for is_exit_order (layer 0); is_spread_leg alone still hits
+                # that check (intentional for entry hedge legs, wrong for a genuine
+                # exit). Without this, a tripped kill switch or daily-loss circuit
+                # breaker would block the system from closing an existing credit
+                # spread via its normal exit path -- exactly when it most needs to
+                # (found 2026-08-06).
+                #
+                # Fixed 2026-08-20 (deep review): a rejected sibling leg used to
+                # just `continue` (correctly not fabricating a close), but the
+                # NEXT retry re-sent orders for BOTH legs again -- including the
+                # one that already closed, which is now flat, so re-buying/
+                # re-selling it opened a brand-new unintended position instead of
+                # a no-op. _close_leg() remembers a leg that already closed
+                # (either this cycle or a previous partial attempt, via
+                # spread["_short_exit_fill"]/["_long_exit_fill"]) and never
+                # resubmits an order for it.
+                _leg_positions = await self._safe_get_positions()
+                # _safe_get_positions() fails OPEN to [] on a broker fetch error
+                # (see its own docstring/flag) -- an empty list there means
+                # "unknown", not "confirmed flat". Only trust the "already
+                # closed" shortcut below when the fetch actually succeeded;
+                # otherwise every leg would look flat and get silently skipped
+                # instead of retried, which is worse than the bug being fixed.
+                _pos_known = getattr(self, "_broker_position_state_known", True)
+                _pos_qty = {p.get("symbol", ""): p.get("quantity", 0) for p in _leg_positions}
+                _bad = {"REJECTED", "REJECTED_BY_RISK", "CANCELLED", "FAILED"}
+
+                async def _close_leg(contract: str, side: str, quote_price: float, fill_key: str, pending_key: str):
+                    stored = spread.get(fill_key)
+                    if stored is not None:
+                        return stored, True
+                    if _pos_known and _pos_qty.get(contract, 0) == 0:
+                        # Already flat at the broker (e.g. closed by the GTT
+                        # backstop or a manual admin close) -- nothing to submit.
+                        return quote_price, True
+                    # Fixed 2026-08-21 (deep review): a prior cycle's order for
+                    # this leg may still be PENDING_VERIFICATION -- check its
+                    # CURRENT resolved status instead of blindly resubmitting
+                    # (see _resolve_pending_exit_order()'s docstring for why a
+                    # naive resubmit here risks a duplicate closing order).
+                    _pending_id = spread.get(pending_key)
+                    if _pending_id is not None:
+                        state, pend_order = await self._resolve_pending_exit_order(_pending_id)
+                        if state == "still_pending":
+                            return None, False
+                        spread.pop(pending_key, None)
+                        if state == "resolved_ok":
+                            return self._real_fill(pend_order, quote_price), True
+                        # resolved_bad or none -> fall through, submit fresh below
+                    order = await self.order_manager.place_order(
+                        contract, side, lot, quote_price, is_spread_leg=True, is_exit_order=True,
+                    )
+                    if order is not None and getattr(order, "order_status", "") == "PENDING_VERIFICATION":
+                        spread[pending_key] = order.id
+                        return None, False
+                    if order is None or getattr(order, "order_status", "") in _bad:
+                        return None, False
+                    return self._real_fill(order, quote_price), True
+
+                _short_fill, _short_ok = await _close_leg(spread["short_contract"], "BUY",  cur_short, "_short_exit_fill", "_short_exit_pending_id")
+                _long_fill,  _long_ok  = await _close_leg(spread["long_contract"],  "SELL", cur_long,  "_long_exit_fill",  "_long_exit_pending_id")
+
+                if not (_short_ok and _long_ok):
+                    if _short_ok:
+                        spread["_short_exit_fill"] = _short_fill
+                    if _long_ok:
+                        spread["_long_exit_fill"] = _long_fill
+                    # Fixed 2026-08-21 (deep review): always persist here, not
+                    # only when a leg fill was stored -- a leg that just went
+                    # PENDING_VERIFICATION mutates spread[pending_key] in
+                    # place (see _close_leg) with neither _short_ok nor
+                    # _long_ok true, so the old `if _short_ok or _long_ok`
+                    # gate could skip persisting it; losing that id across a
+                    # restart would make the next cycle blindly resubmit
+                    # instead of checking the outstanding order first.
+                    await self._persist_state()
+                    logger.warning(
+                        f"[CreditSpread] Exit orders for {underlying} partially rejected — "
+                        f"keeping position in tracking to retry next cycle."
+                    )
+                    continue
+
+                spread.pop("_short_exit_fill", None)
+                spread.pop("_long_exit_fill", None)
+
+                # Fixed 2026-08-13: net_pnl/exit_price used to be computed from
+                # cur_short/cur_long -- the pre-trade QUOTE fed into place_order(),
+                # not the real fill. Confirmed live 2026-08-13: a real TITAN
+                # BULL_PUT_SPREAD closed with recorded pnl=Rs7,638.75 (quote-based)
+                # vs the real fill-based pnl of Rs7,390.25 -- a Rs248.50
+                # overstatement from slippage the record never reflected.
+                # _short_fill/_long_fill above are already real fills (from
+                # _close_leg -> _real_fill(), or a previous cycle's stored real
+                # fill) -- not the quote.
+                _slippage = abs(_short_fill - cur_short) + abs(_long_fill - cur_long)
+
+                net_pnl = (
+                    (spread["short_premium"] - _short_fill)
+                    - (spread["long_premium"]  - _long_fill)
+                ) * lot
+
+                # Must match the max-loss figure add_deployed_capital() used at entry
+                # (see _process_credit_spread) — not just the long leg's premium.
+                # Fixed 2026-08-21 (second-opinion review): uses the real-fill
+                # basis (short_premium/long_premium, the actual entry fills)
+                # instead of the quote-based net_credit -- matches entry's
+                # add_deployed_capital(), which now reserves against the same
+                # real-fill figure. Keeping add/release symmetric on the SAME
+                # basis is what matters here; using stale quote-based net_credit
+                # for release while entry now reserves fill-based would leak or
+                # over-release capital on every single trade.
+                _spread_width = abs(spread["short_strike"] - spread["long_strike"])
+                self.risk_manager.release_deployed_capital(
+                    spread.get("strategy_name", "credit_spread_v1"),
+                    (_spread_width - (spread["short_premium"] - spread["long_premium"])) * lot,
+                )
+
+                await self._log_trade_close(
+                    journal_id=spread.get("journal_id"),
+                    exit_price=round(_short_fill - _long_fill, 2),
+                    pnl=net_pnl, exit_reason=exit_reason,
+                    market_data=market_data,
+                    total_slippage_pts=round(_slippage, 4) if _slippage > 0 else None,
+                )
+                if self._ltp_poller:
+                    self._ltp_poller.unregister_option_contracts(
+                        [spread["short_contract"], spread["long_contract"]]
+                    )
+                await self._notify(
+                    f"CREDIT SPREAD CLOSED\n"
+                    f"Underlying: {underlying}\nReason: {exit_reason}\n"
+                    f"Short: sold Rs{spread['short_premium']:.2f}, closed Rs{_short_fill:.2f}\n"
+                    f"Long:  paid Rs{spread['long_premium']:.2f}, sold Rs{_long_fill:.2f}\n"
+                    f"Net PnL: Rs{net_pnl:,.2f}"
+                )
+
+                # D: increment SL frequency counter for adverse exits (circuit breaker)
+                _is_adverse = any(
+                    kw in exit_reason for kw in ("breach", "Breach", "SL:", " SL ", "spike SL")
+                )
+                if _is_adverse:
+                    _r = getattr(self, "_redis", None)
+                    if _r:
+                        _sl_key   = f"sl_freq:{underlying}"
+                        _sl_count = int(await _r.incr(_sl_key))
+                        if _sl_count == 1:
+                            await _r.expire(_sl_key, 5 * 86400)
+                        logger.info(
+                            f"[CircuitBreaker] {underlying}: adverse exit #{_sl_count} "
+                            f"in 5-day window"
+                        )
+
+                # I: cancel GTT backstop now that position is closed normally
+                await self._cancel_gtt(spread.get("gtt_id"), spread.get("short_contract", ""))
+
+                # C: remove from near-expiry set
+                self._close_on_first_cycle.discard(underlying)
+
+                # Route to profit or adverse bucket for re-entry eligibility — by realized
+                # P&L, not by scanning exit_reason text. A plain DTE-floor timeout ("DTE=6
+                # < 7") matches no adverse keyword even when the position lost money, which
+                # previously let losing trades qualify for the lenient same-day re-entry
+                # floor meant for genuine wins.
+                if net_pnl < 0:
+                    adverse_closes.append(underlying)
+                else:
+                    profit_closes.append(underlying)
+            except Exception as exc:
+                # Fixed 2026-08-21 (deep review): this loop had no per-
+                # underlying exception isolation, unlike every other
+                # iteration loop in this file (entry loop, single-leg exit
+                # loop) -- an unexpected exception while processing ONE
+                # spread (a bad quote, an order-placement call raising
+                # instead of returning) used to propagate out of the whole
+                # loop, silently skipping the SL/target/breach check for
+                # every OTHER open spread this cycle -- and since this is
+                # called from three sites including the 10-second fast-exit
+                # job, a deterministically-failing symbol could repeat this
+                # every cycle indefinitely: total, silent loss of exit
+                # monitoring across every open spread.
+                logger.error(f"[CreditSpread] Exit check failed for {underlying} -- "
+                             f"continuing with other spreads: {exc}")
+                continue
 
         for sym in adverse_closes:
             del self._active_spreads[sym]
@@ -3551,10 +3823,13 @@ class LiveTradingEngine:
             )
             return
         atr        = float(market_data.get("atr14", underlying_price * 0.01))
-        iv_rank    = await self._get_iv_rank(symbol, underlying_price, atr, dte)
         interval   = await self._get_strike_interval(symbol, expiry)
         _atr_sigma = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, underlying_price)
         sigma      = await self._get_live_sigma(symbol, underlying_price, dte, interval, expiry, _atr_sigma)
+        # Fixed 2026-08-21 (deep review): moved after _get_live_sigma() so
+        # the real market IV (not the ATR-derived historical-vol proxy) can
+        # feed the IV-rank history/gate -- see _get_iv_rank()'s docstring.
+        iv_rank    = await self._get_iv_rank(symbol, underlying_price, atr, dte, live_sigma=sigma)
 
         # VIX + IV Rank gates — only sell premium when it is worth selling
         from src.market_data.option_chain import vix_allows_selling, iv_rank_allows_selling
@@ -3742,14 +4017,22 @@ class LiveTradingEngine:
         from src.market_data.option_chain import get_entry_prices_for_spread
         _kite  = getattr(self, "_kite",  None)
         _redis = getattr(self, "_redis", None)
-        put_short_p, put_long_p = await get_entry_prices_for_spread(
+        _put_prices = await get_entry_prices_for_spread(
             symbol, psc, plc, _kite, _redis, atr, dte,
             short_otm_intervals=1, long_otm_intervals=3,
         )
-        call_short_p, call_long_p = await get_entry_prices_for_spread(
+        _call_prices = await get_entry_prices_for_spread(
             symbol, csc, clc, _kite, _redis, atr, dte,
             short_otm_intervals=1, long_otm_intervals=3,
         )
+        if _put_prices is None or _call_prices is None:
+            logger.warning(
+                f"[IronCondor] {symbol} skipped — put or call wing quotes inverted or "
+                "unreliable (fail-closed, not placing a LIMIT order on a guessed price)."
+            )
+            return
+        put_short_p, put_long_p = _put_prices
+        call_short_p, call_long_p = _call_prices
         net_credit   = round((put_short_p - put_long_p) + (call_short_p - call_long_p), 2)
         total_credit = net_credit * lot_size
 
@@ -3969,313 +4252,343 @@ class LiveTradingEngine:
         )
 
         for underlying, c in self._active_condors.items():
-            market_data = await self._get_market_data(underlying)
-            if not market_data:
-                continue
-
             try:
-                condor_expiry = datetime.fromisoformat(c["expiry_date"])
-            except (KeyError, ValueError, TypeError):
-                condor_expiry = expiry
-            dte = (condor_expiry - now_ist().replace(tzinfo=None)).days
+                market_data = await self._get_market_data(underlying)
+                if not market_data:
+                    continue
 
-            current_price = float(market_data.get("close", 0))
-            atr = float(market_data.get("atr14", 0))
-
-            # Try real Kite LTPs first — same fix as _check_spread_exits.
-            from src.market_data.option_chain import get_option_quote
-            kite  = getattr(self, "_kite",  None)
-            redis = getattr(self, "_redis", None)
-
-            def _leg_price(ltp, bs_fallback_kwargs, entry_p):
-                if ltp and ltp > 0:
-                    return ltp
-                if current_price > 0:
-                    return estimate_option_premium(atr, dte, **bs_fallback_kwargs)
-                return entry_p
-
-            ps_ltp = await get_option_quote(c["put_short_contract"],  kite, redis)
-            pl_ltp = await get_option_quote(c["put_long_contract"],   kite, redis)
-            cs_ltp = await get_option_quote(c["call_short_contract"], kite, redis)
-            cl_ltp = await get_option_quote(c["call_long_contract"],  kite, redis)
-
-            cur_ps = _leg_price(ps_ltp, {"underlying_price": current_price, "strike": c["put_short_strike"],  "option_type": "PE"}, c["put_short_premium"])
-            cur_pl = _leg_price(pl_ltp, {"underlying_price": current_price, "strike": c["put_long_strike"],   "option_type": "PE"}, c["put_long_premium"])
-            cur_cs = _leg_price(cs_ltp, {"underlying_price": current_price, "strike": c["call_short_strike"], "option_type": "CE"}, c["call_short_premium"])
-            cur_cl = _leg_price(cl_ltp, {"underlying_price": current_price, "strike": c["call_long_strike"],  "option_type": "CE"}, c["call_long_premium"])
-
-            min_dte    = getattr(ic_strategy, "min_dte",            7)   if ic_strategy else 7
-            profit_pct = getattr(ic_strategy, "profit_close_pct",  0.25) if ic_strategy else 0.25
-            sl_mult    = getattr(ic_strategy, "stop_loss_multiple", 2.0)  if ic_strategy else 2.0
-
-            # E: VIX spike — tighten condor thresholds dynamically.
-            # If VIX has risen 50%+ from entry, IV expansion inflates option prices
-            # and the range-bound thesis is weakening. Exit earlier.
-            _entry_vix_c = c.get("entry_vix", 0.0)
-            if _entry_vix_c > 0:
-                _cur_vix_c = await self._get_cached_vix()
-                if _cur_vix_c and _cur_vix_c >= _entry_vix_c * 1.5:
-                    profit_pct = max(profit_pct, 0.40)   # take 60% profit early
-                    sl_mult    = min(sl_mult,    1.5)     # tighter SL during IV expansion
-                    logger.debug(
-                        f"[IronCondor] {underlying}: VIX {_entry_vix_c:.1f}→{_cur_vix_c:.1f} "
-                        f"(+{(_cur_vix_c/_entry_vix_c - 1)*100:.0f}%) — thresholds tightened"
-                    )
-
-            # DTE-tiered profit target — lower the hurdle as expiry approaches.
-            # DTE > 21: 75% profit (0.25); DTE 15–21: 65% (0.35); DTE ≤ 14: 55% (0.45).
-            if dte <= 14:
-                profit_pct = max(profit_pct, 0.45)
-            elif dte <= 21:
-                profit_pct = max(profit_pct, 0.35)
-
-            exit_reason: Optional[str] = None
-
-            # C: near-expiry restore — force close on first cycle after restart
-            if underlying in self._close_on_first_cycle:
-                exit_reason = f"Near-expiry forced close (restored expiry={c.get('expiry_date')})"
-            elif dte < min_dte:
-                exit_reason = f"DTE={dte} < {min_dte}"
-
-            if exit_reason is None and current_price > 0:
-                if current_price < c["put_short_strike"]:
-                    exit_reason = f"Put breach: Rs{current_price:.2f} < Rs{c['put_short_strike']}"
-                elif current_price > c["call_short_strike"]:
-                    exit_reason = f"Call breach: Rs{current_price:.2f} > Rs{c['call_short_strike']}"
-            if exit_reason is None:
-                if cur_ps >= c["put_short_premium"] * sl_mult:
-                    exit_reason = f"Put SL: Rs{c['put_short_premium']:.2f} -> Rs{cur_ps:.2f}"
-                elif cur_cs >= c["call_short_premium"] * sl_mult:
-                    exit_reason = f"Call SL: Rs{c['call_short_premium']:.2f} -> Rs{cur_cs:.2f}"
-            if exit_reason is None:
-                _put_hit  = cur_ps <= c["put_short_premium"]  * profit_pct
-                _call_hit = cur_cs <= c["call_short_premium"] * profit_pct
-                if _put_hit or _call_hit:
-                    # Close entire condor when EITHER short decays to target.
-                    # If one wing is at 75% profit the stock has moved toward that wing's
-                    # short strike — keeping the trade open exposes the OTHER wing to breach.
-                    _which = "put" if _put_hit else "call"
-                    profit_label = "75%+" if profit_pct <= 0.25 else "60%+ (VIX spike early exit)"
-                    exit_reason = f"{_which.capitalize()} wing at {profit_label} profit — closing condor"
-
-            # G: Regime shift post-entry — iron condors need RANGE_BOUND/LOW_VOL.
-            # If regime has shifted to TRENDING or VOLATILE after entry, the neutrality
-            # thesis is broken. Exit after holding at least 1 day (avoids same-day noise).
-            if exit_reason is None:
-                _r = getattr(self, "_redis", None)
-                if _r:
-                    try:
-                        _regime_raw = await _r.get("market:regime")
-                        if _regime_raw:
-                            _regime = json.loads(_regime_raw).get("regime", "")
-                            if _regime in ("TRENDING", "VOLATILE"):
-                                _entry_date = c.get("entry_date", "")
-                                _today_str  = now_ist().replace(tzinfo=None).date().isoformat()
-                                if _entry_date and _entry_date < _today_str:
-                                    exit_reason = (
-                                        f"Regime shift: {_regime} post-entry — "
-                                        "condor range assumption broken, exiting"
-                                    )
-                    except Exception as exc:
-                        # Fixed 2026-08-14 (external review, checklist A4): this used
-                        # to silently no-op on any Redis/JSON error -- a real fail-open
-                        # gap for this specific exit check. Bounded impact (SL/profit-
-                        # target/DTE/delta checks above and below still run
-                        # independently for the same position), but a miss here was
-                        # previously invisible. Log it so it's at least visible; other
-                        # exit rules for this condor continue to run either way.
-                        logger.warning(f"Regime-shift exit check failed for condor on {underlying}: {exc}")
-
-            # Delta-based exit — if either short leg delta exceeds 0.40, that wing is in danger.
-            if exit_reason is None and atr > 0 and current_price > 0:
                 try:
-                    from src.market_data.option_chain import atr_to_annualised_vol, bs_delta
-                    _sig_c = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, current_price)
-                    if _sig_c > 0:
-                        _T_c   = max(dte, 1) / 365.0
-                        _ps_d  = bs_delta(current_price, c["put_short_strike"],  _T_c, _sig_c, "PE")
-                        _cs_d  = bs_delta(current_price, c["call_short_strike"], _T_c, _sig_c, "CE")
-                        if _ps_d is not None and abs(_ps_d) > 0.40:
-                            exit_reason = (
-                                f"Delta breach: put short δ={_ps_d:.2f} (|δ|>0.40, "
-                                f"put strike {c['put_short_strike']} at risk)"
-                            )
-                        elif _cs_d is not None and abs(_cs_d) > 0.40:
-                            exit_reason = (
-                                f"Delta breach: call short δ={_cs_d:.2f} (|δ|>0.40, "
-                                f"call strike {c['call_short_strike']} at risk)"
-                            )
-                except Exception as _de:
-                    logger.debug(f"[DeltaExit] {underlying}: condor delta check error — {_de}")
+                    condor_expiry = datetime.fromisoformat(c["expiry_date"])
+                except (KeyError, ValueError, TypeError):
+                    condor_expiry = expiry
+                dte = (condor_expiry - now_ist().replace(tzinfo=None)).days
 
-            if exit_reason is None:
-                continue
+                current_price = float(market_data.get("close", 0))
+                atr = float(market_data.get("atr14", 0))
 
-            lot = c["lot_size"]
-            # is_exit_order=True required -- same fix and rationale as
-            # _check_spread_exits (found 2026-08-06): is_spread_leg alone still
-            # hits the kill-switch/circuit-breaker check in
-            # risk_manager.validate_trade(), which would block closing an
-            # existing iron condor exactly when a tripped kill switch makes
-            # that most urgent.
-            # Fixed 2026-08-20 (deep review): same partial-exit-retry bug as
-            # _check_spread_exits -- a rejected leg used to `continue`
-            # correctly, but the next retry re-sent orders for ALL 4 legs,
-            # including any that already closed (now flat), opening 1-3
-            # accidental new positions depending on how many legs succeeded
-            # before the first rejection. _close_leg() remembers each leg
-            # that already closed (this cycle or a previous partial attempt,
-            # via c["_ps_exit_fill"]/["_pl_exit_fill"]/["_cs_exit_fill"]/
-            # ["_cl_exit_fill"]) and never resubmits an order for it.
-            _leg_positions = await self._safe_get_positions()
-            # See _check_spread_exits' matching comment: an empty list here
-            # can mean "confirmed flat" OR "fetch failed" -- only trust the
-            # shortcut below when _safe_get_positions() actually succeeded.
-            _pos_known = getattr(self, "_broker_position_state_known", True)
-            _pos_qty = {p.get("symbol", ""): p.get("quantity", 0) for p in _leg_positions}
-            _bad = {"REJECTED", "REJECTED_BY_RISK", "CANCELLED", "FAILED"}
+                # Try real Kite LTPs first — same fix as _check_spread_exits.
+                from src.market_data.option_chain import get_option_quote
+                kite  = getattr(self, "_kite",  None)
+                redis = getattr(self, "_redis", None)
 
-            async def _close_leg(contract: str, side: str, quote_price: float, fill_key: str):
-                stored = c.get(fill_key)
-                if stored is not None:
-                    return stored, True
-                if _pos_known and _pos_qty.get(contract, 0) == 0:
-                    return quote_price, True
-                order = await self.order_manager.place_order(
-                    contract, side, lot, quote_price, is_spread_leg=True, is_exit_order=True,
-                )
-                if order is None or getattr(order, "order_status", "") in _bad:
-                    return None, False
-                return self._real_fill(order, quote_price), True
+                def _leg_price(ltp, bs_fallback_kwargs, entry_p):
+                    if ltp and ltp > 0:
+                        return ltp
+                    if current_price > 0:
+                        return estimate_option_premium(atr, dte, **bs_fallback_kwargs)
+                    return entry_p
 
-            _ps_fill, _ps_ok = await _close_leg(c["put_short_contract"],  "BUY",  cur_ps, "_ps_exit_fill")
-            _pl_fill, _pl_ok = await _close_leg(c["put_long_contract"],   "SELL", cur_pl, "_pl_exit_fill")
-            _cs_fill, _cs_ok = await _close_leg(c["call_short_contract"], "BUY",  cur_cs, "_cs_exit_fill")
-            _cl_fill, _cl_ok = await _close_leg(c["call_long_contract"],  "SELL", cur_cl, "_cl_exit_fill")
+                ps_ltp = await get_option_quote(c["put_short_contract"],  kite, redis)
+                pl_ltp = await get_option_quote(c["put_long_contract"],   kite, redis)
+                cs_ltp = await get_option_quote(c["call_short_contract"], kite, redis)
+                cl_ltp = await get_option_quote(c["call_long_contract"],  kite, redis)
 
-            if not (_ps_ok and _pl_ok and _cs_ok and _cl_ok):
-                if _ps_ok:
-                    c["_ps_exit_fill"] = _ps_fill
-                if _pl_ok:
-                    c["_pl_exit_fill"] = _pl_fill
-                if _cs_ok:
-                    c["_cs_exit_fill"] = _cs_fill
-                if _cl_ok:
-                    c["_cl_exit_fill"] = _cl_fill
-                if _ps_ok or _pl_ok or _cs_ok or _cl_ok:
-                    await self._persist_state()
-                logger.warning(
-                    f"[IronCondor] Exit orders for {underlying} partially rejected — "
-                    f"keeping position in tracking to retry next cycle."
-                )
-                continue
+                cur_ps = _leg_price(ps_ltp, {"underlying_price": current_price, "strike": c["put_short_strike"],  "option_type": "PE"}, c["put_short_premium"])
+                cur_pl = _leg_price(pl_ltp, {"underlying_price": current_price, "strike": c["put_long_strike"],   "option_type": "PE"}, c["put_long_premium"])
+                cur_cs = _leg_price(cs_ltp, {"underlying_price": current_price, "strike": c["call_short_strike"], "option_type": "CE"}, c["call_short_premium"])
+                cur_cl = _leg_price(cl_ltp, {"underlying_price": current_price, "strike": c["call_long_strike"],  "option_type": "CE"}, c["call_long_premium"])
 
-            c.pop("_ps_exit_fill", None)
-            c.pop("_pl_exit_fill", None)
-            c.pop("_cs_exit_fill", None)
-            c.pop("_cl_exit_fill", None)
+                min_dte    = getattr(ic_strategy, "min_dte",            7)   if ic_strategy else 7
+                profit_pct = getattr(ic_strategy, "profit_close_pct",  0.25) if ic_strategy else 0.25
+                sl_mult    = getattr(ic_strategy, "stop_loss_multiple", 2.0)  if ic_strategy else 2.0
 
-            # Fixed 2026-08-13: net_pnl/exit_price used to be computed from
-            # the pre-trade QUOTEs (cur_ps/cur_pl/cur_cs/cur_cl), not the real
-            # fills -- same bug just fixed in the matching credit-spread exit
-            # above. _ps_fill/_pl_fill/_cs_fill/_cl_fill above are already
-            # real fills (from _close_leg -> _real_fill(), or a previous
-            # cycle's stored real fill) -- not the quote.
-            _slippage = (abs(_ps_fill - cur_ps) + abs(_pl_fill - cur_pl)
-                         + abs(_cs_fill - cur_cs) + abs(_cl_fill - cur_cl))
+                # E: VIX spike — tighten condor thresholds dynamically.
+                # If VIX has risen 50%+ from entry, IV expansion inflates option prices
+                # and the range-bound thesis is weakening. Exit earlier.
+                _entry_vix_c = c.get("entry_vix", 0.0)
+                if _entry_vix_c > 0:
+                    _cur_vix_c = await self._get_cached_vix()
+                    if _cur_vix_c and _cur_vix_c >= _entry_vix_c * 1.5:
+                        profit_pct = max(profit_pct, 0.40)   # take 60% profit early
+                        sl_mult    = min(sl_mult,    1.5)     # tighter SL during IV expansion
+                        logger.debug(
+                            f"[IronCondor] {underlying}: VIX {_entry_vix_c:.1f}→{_cur_vix_c:.1f} "
+                            f"(+{(_cur_vix_c/_entry_vix_c - 1)*100:.0f}%) — thresholds tightened"
+                        )
 
-            net_pnl = (
-                (c["put_short_premium"]  - _ps_fill)
-                + (c["call_short_premium"] - _cs_fill)
-                - (c["put_long_premium"]   - _pl_fill)
-                - (c["call_long_premium"]  - _cl_fill)
-            ) * lot
+                # DTE-tiered profit target — lower the hurdle as expiry approaches.
+                # DTE > 21: 75% profit (0.25); DTE 15–21: 65% (0.35); DTE ≤ 14: 55% (0.45).
+                if dte <= 14:
+                    profit_pct = max(profit_pct, 0.45)
+                elif dte <= 21:
+                    profit_pct = max(profit_pct, 0.35)
 
-            # Must match the max-loss figure add_deployed_capital() used at entry
-            # (see _process_iron_condor) — not just the long legs' premium.
-            # Fixed 2026-08-21 (second-opinion review): uses the real-fill
-            # basis (put/call short/long premium, the actual entry fills)
-            # instead of quote-based net_credit -- see _process_iron_condor's
-            # matching fix note for why add/release must stay on the same
-            # (now fill-based) basis.
-            _put_wing  = abs(c["put_short_strike"]  - c["put_long_strike"])
-            _call_wing = abs(c["call_short_strike"] - c["call_long_strike"])
-            _fill_net_credit = (
-                (c["put_short_premium"] - c["put_long_premium"])
-                + (c["call_short_premium"] - c["call_long_premium"])
-            )
-            self.risk_manager.release_deployed_capital(
-                c.get("strategy_name", "iron_condor_v1"),
-                (max(_put_wing, _call_wing) - _fill_net_credit) * lot,
-            )
+                exit_reason: Optional[str] = None
 
-            # Added 2026-08-21 (external review): "wing failure analysis" --
-            # classify which wing's exit condition actually fired, derived
-            # from exit_reason's own wording (every put/call-specific branch
-            # above says "Put ..."/"Call ..." or "put short δ"/"call short
-            # δ"; structural exits -- DTE, near-expiry, regime shift -- don't
-            # mention either and correctly classify as neither wing).
-            _reason_lower = exit_reason.lower()
-            _put_failed  = "put" in _reason_lower
-            _call_failed = "call" in _reason_lower
-            wing_failed = (
-                "BOTH" if _put_failed and _call_failed
-                else "PUT" if _put_failed
-                else "CALL" if _call_failed
-                else None
-            )
+                # C: near-expiry restore — force close on first cycle after restart
+                if underlying in self._close_on_first_cycle:
+                    exit_reason = f"Near-expiry forced close (restored expiry={c.get('expiry_date')})"
+                elif dte < min_dte:
+                    exit_reason = f"DTE={dte} < {min_dte}"
 
-            await self._log_trade_close(
-                journal_id=c.get("journal_id"),
-                exit_price=round(_ps_fill + _cs_fill - _pl_fill - _cl_fill, 2),
-                pnl=net_pnl, exit_reason=exit_reason,
-                market_data=market_data,
-                total_slippage_pts=round(_slippage, 4) if _slippage > 0 else None,
-                wing_failed=wing_failed,
-            )
-            if self._ltp_poller:
-                self._ltp_poller.unregister_option_contracts([
-                    c["put_short_contract"], c["put_long_contract"],
-                    c["call_short_contract"], c["call_long_contract"],
-                ])
-            await self._notify(
-                f"IRON CONDOR CLOSED\n"
-                f"Underlying: {underlying}\nReason: {exit_reason}\n"
-                f"Put short:  Rs{c['put_short_premium']:.2f} -> Rs{_ps_fill:.2f}\n"
-                f"Call short: Rs{c['call_short_premium']:.2f} -> Rs{_cs_fill:.2f}\n"
-                f"Net PnL: Rs{net_pnl:,.2f}"
-            )
+                if exit_reason is None and current_price > 0:
+                    if current_price < c["put_short_strike"]:
+                        exit_reason = f"Put breach: Rs{current_price:.2f} < Rs{c['put_short_strike']}"
+                    elif current_price > c["call_short_strike"]:
+                        exit_reason = f"Call breach: Rs{current_price:.2f} > Rs{c['call_short_strike']}"
+                if exit_reason is None:
+                    if cur_ps >= c["put_short_premium"] * sl_mult:
+                        exit_reason = f"Put SL: Rs{c['put_short_premium']:.2f} -> Rs{cur_ps:.2f}"
+                    elif cur_cs >= c["call_short_premium"] * sl_mult:
+                        exit_reason = f"Call SL: Rs{c['call_short_premium']:.2f} -> Rs{cur_cs:.2f}"
+                if exit_reason is None:
+                    _put_hit  = cur_ps <= c["put_short_premium"]  * profit_pct
+                    _call_hit = cur_cs <= c["call_short_premium"] * profit_pct
+                    if _put_hit or _call_hit:
+                        # Close entire condor when EITHER short decays to target.
+                        # If one wing is at 75% profit the stock has moved toward that wing's
+                        # short strike — keeping the trade open exposes the OTHER wing to breach.
+                        _which = "put" if _put_hit else "call"
+                        profit_label = "75%+" if profit_pct <= 0.25 else "60%+ (VIX spike early exit)"
+                        exit_reason = f"{_which.capitalize()} wing at {profit_label} profit — closing condor"
 
-            # D: increment SL frequency counter for adverse exits (circuit breaker)
-            _is_adverse_c = any(
-                kw in exit_reason for kw in ("breach", "Breach", "SL:", " SL ", "spike SL")
-            )
-            if _is_adverse_c:
-                _r_c = getattr(self, "_redis", None)
-                if _r_c:
-                    _sl_key_c   = f"sl_freq:{underlying}"
-                    _sl_count_c = int(await _r_c.incr(_sl_key_c))
-                    if _sl_count_c == 1:
-                        await _r_c.expire(_sl_key_c, 5 * 86400)
-                    logger.info(
-                        f"[CircuitBreaker] {underlying}: adverse exit #{_sl_count_c} "
-                        f"in 5-day window"
+                # G: Regime shift post-entry — iron condors need RANGE_BOUND/LOW_VOL.
+                # If regime has shifted to TRENDING or VOLATILE after entry, the neutrality
+                # thesis is broken. Exit after holding at least 1 day (avoids same-day noise).
+                if exit_reason is None:
+                    _r = getattr(self, "_redis", None)
+                    if _r:
+                        try:
+                            _regime_raw = await _r.get("market:regime")
+                            if _regime_raw:
+                                _regime = json.loads(_regime_raw).get("regime", "")
+                                if _regime in ("TRENDING", "VOLATILE"):
+                                    _entry_date = c.get("entry_date", "")
+                                    _today_str  = now_ist().replace(tzinfo=None).date().isoformat()
+                                    if _entry_date and _entry_date < _today_str:
+                                        exit_reason = (
+                                            f"Regime shift: {_regime} post-entry — "
+                                            "condor range assumption broken, exiting"
+                                        )
+                        except Exception as exc:
+                            # Fixed 2026-08-14 (external review, checklist A4): this used
+                            # to silently no-op on any Redis/JSON error -- a real fail-open
+                            # gap for this specific exit check. Bounded impact (SL/profit-
+                            # target/DTE/delta checks above and below still run
+                            # independently for the same position), but a miss here was
+                            # previously invisible. Log it so it's at least visible; other
+                            # exit rules for this condor continue to run either way.
+                            logger.warning(f"Regime-shift exit check failed for condor on {underlying}: {exc}")
+
+                # Delta-based exit — if either short leg delta exceeds 0.40, that wing is in danger.
+                if exit_reason is None and atr > 0 and current_price > 0:
+                    try:
+                        from src.market_data.option_chain import atr_to_annualised_vol, bs_delta
+                        _sig_c = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, current_price)
+                        if _sig_c > 0:
+                            _T_c   = max(dte, 1) / 365.0
+                            _ps_d  = bs_delta(current_price, c["put_short_strike"],  _T_c, _sig_c, "PE")
+                            _cs_d  = bs_delta(current_price, c["call_short_strike"], _T_c, _sig_c, "CE")
+                            if _ps_d is not None and abs(_ps_d) > 0.40:
+                                exit_reason = (
+                                    f"Delta breach: put short δ={_ps_d:.2f} (|δ|>0.40, "
+                                    f"put strike {c['put_short_strike']} at risk)"
+                                )
+                            elif _cs_d is not None and abs(_cs_d) > 0.40:
+                                exit_reason = (
+                                    f"Delta breach: call short δ={_cs_d:.2f} (|δ|>0.40, "
+                                    f"call strike {c['call_short_strike']} at risk)"
+                                )
+                    except Exception as _de:
+                        logger.debug(f"[DeltaExit] {underlying}: condor delta check error — {_de}")
+
+                if exit_reason is None:
+                    continue
+
+                lot = c["lot_size"]
+                # is_exit_order=True required -- same fix and rationale as
+                # _check_spread_exits (found 2026-08-06): is_spread_leg alone still
+                # hits the kill-switch/circuit-breaker check in
+                # risk_manager.validate_trade(), which would block closing an
+                # existing iron condor exactly when a tripped kill switch makes
+                # that most urgent.
+                # Fixed 2026-08-20 (deep review): same partial-exit-retry bug as
+                # _check_spread_exits -- a rejected leg used to `continue`
+                # correctly, but the next retry re-sent orders for ALL 4 legs,
+                # including any that already closed (now flat), opening 1-3
+                # accidental new positions depending on how many legs succeeded
+                # before the first rejection. _close_leg() remembers each leg
+                # that already closed (this cycle or a previous partial attempt,
+                # via c["_ps_exit_fill"]/["_pl_exit_fill"]/["_cs_exit_fill"]/
+                # ["_cl_exit_fill"]) and never resubmits an order for it.
+                _leg_positions = await self._safe_get_positions()
+                # See _check_spread_exits' matching comment: an empty list here
+                # can mean "confirmed flat" OR "fetch failed" -- only trust the
+                # shortcut below when _safe_get_positions() actually succeeded.
+                _pos_known = getattr(self, "_broker_position_state_known", True)
+                _pos_qty = {p.get("symbol", ""): p.get("quantity", 0) for p in _leg_positions}
+                _bad = {"REJECTED", "REJECTED_BY_RISK", "CANCELLED", "FAILED"}
+
+                async def _close_leg(contract: str, side: str, quote_price: float, fill_key: str, pending_key: str):
+                    stored = c.get(fill_key)
+                    if stored is not None:
+                        return stored, True
+                    if _pos_known and _pos_qty.get(contract, 0) == 0:
+                        return quote_price, True
+                    # Fixed 2026-08-21 (deep review): same fix as
+                    # _check_spread_exits -- check a prior cycle's
+                    # PENDING_VERIFICATION order's CURRENT resolved status
+                    # instead of blindly resubmitting (see
+                    # _resolve_pending_exit_order()'s docstring).
+                    _pending_id = c.get(pending_key)
+                    if _pending_id is not None:
+                        state, pend_order = await self._resolve_pending_exit_order(_pending_id)
+                        if state == "still_pending":
+                            return None, False
+                        c.pop(pending_key, None)
+                        if state == "resolved_ok":
+                            return self._real_fill(pend_order, quote_price), True
+                        # resolved_bad or none -> fall through, submit fresh below
+                    order = await self.order_manager.place_order(
+                        contract, side, lot, quote_price, is_spread_leg=True, is_exit_order=True,
                     )
+                    if order is not None and getattr(order, "order_status", "") == "PENDING_VERIFICATION":
+                        c[pending_key] = order.id
+                        return None, False
+                    if order is None or getattr(order, "order_status", "") in _bad:
+                        return None, False
+                    return self._real_fill(order, quote_price), True
 
-            # I: cancel GTT backstops on both short legs
-            await self._cancel_gtt(c.get("put_short_gtt_id"),  c.get("put_short_contract", ""))
-            await self._cancel_gtt(c.get("call_short_gtt_id"), c.get("call_short_contract", ""))
+                _ps_fill, _ps_ok = await _close_leg(c["put_short_contract"],  "BUY",  cur_ps, "_ps_exit_fill", "_ps_exit_pending_id")
+                _pl_fill, _pl_ok = await _close_leg(c["put_long_contract"],   "SELL", cur_pl, "_pl_exit_fill", "_pl_exit_pending_id")
+                _cs_fill, _cs_ok = await _close_leg(c["call_short_contract"], "BUY",  cur_cs, "_cs_exit_fill", "_cs_exit_pending_id")
+                _cl_fill, _cl_ok = await _close_leg(c["call_long_contract"],  "SELL", cur_cl, "_cl_exit_fill", "_cl_exit_pending_id")
 
-            # C: remove from near-expiry set
-            self._close_on_first_cycle.discard(underlying)
+                if not (_ps_ok and _pl_ok and _cs_ok and _cl_ok):
+                    if _ps_ok:
+                        c["_ps_exit_fill"] = _ps_fill
+                    if _pl_ok:
+                        c["_pl_exit_fill"] = _pl_fill
+                    if _cs_ok:
+                        c["_cs_exit_fill"] = _cs_fill
+                    if _cl_ok:
+                        c["_cl_exit_fill"] = _cl_fill
+                    # Fixed 2026-08-21 (deep review): always persist, not only
+                    # when a leg fill was stored -- see matching fix/comment
+                    # in _check_spread_exits for why the old conditional gate
+                    # could drop an in-flight PENDING_VERIFICATION order id.
+                    await self._persist_state()
+                    logger.warning(
+                        f"[IronCondor] Exit orders for {underlying} partially rejected — "
+                        f"keeping position in tracking to retry next cycle."
+                    )
+                    continue
 
-            # Route to profit or adverse bucket for re-entry eligibility — by realized
-            # P&L (see matching comment in _check_spread_exits for why text-matching
-            # the exit reason was wrong).
-            if net_pnl < 0:
-                to_close_adverse_c.append(underlying)
-            else:
-                to_close_profit_c.append(underlying)
+                c.pop("_ps_exit_fill", None)
+                c.pop("_pl_exit_fill", None)
+                c.pop("_cs_exit_fill", None)
+                c.pop("_cl_exit_fill", None)
+
+                # Fixed 2026-08-13: net_pnl/exit_price used to be computed from
+                # the pre-trade QUOTEs (cur_ps/cur_pl/cur_cs/cur_cl), not the real
+                # fills -- same bug just fixed in the matching credit-spread exit
+                # above. _ps_fill/_pl_fill/_cs_fill/_cl_fill above are already
+                # real fills (from _close_leg -> _real_fill(), or a previous
+                # cycle's stored real fill) -- not the quote.
+                _slippage = (abs(_ps_fill - cur_ps) + abs(_pl_fill - cur_pl)
+                             + abs(_cs_fill - cur_cs) + abs(_cl_fill - cur_cl))
+
+                net_pnl = (
+                    (c["put_short_premium"]  - _ps_fill)
+                    + (c["call_short_premium"] - _cs_fill)
+                    - (c["put_long_premium"]   - _pl_fill)
+                    - (c["call_long_premium"]  - _cl_fill)
+                ) * lot
+
+                # Must match the max-loss figure add_deployed_capital() used at entry
+                # (see _process_iron_condor) — not just the long legs' premium.
+                # Fixed 2026-08-21 (second-opinion review): uses the real-fill
+                # basis (put/call short/long premium, the actual entry fills)
+                # instead of quote-based net_credit -- see _process_iron_condor's
+                # matching fix note for why add/release must stay on the same
+                # (now fill-based) basis.
+                _put_wing  = abs(c["put_short_strike"]  - c["put_long_strike"])
+                _call_wing = abs(c["call_short_strike"] - c["call_long_strike"])
+                _fill_net_credit = (
+                    (c["put_short_premium"] - c["put_long_premium"])
+                    + (c["call_short_premium"] - c["call_long_premium"])
+                )
+                self.risk_manager.release_deployed_capital(
+                    c.get("strategy_name", "iron_condor_v1"),
+                    (max(_put_wing, _call_wing) - _fill_net_credit) * lot,
+                )
+
+                # Added 2026-08-21 (external review): "wing failure analysis" --
+                # classify which wing's exit condition actually fired, derived
+                # from exit_reason's own wording (every put/call-specific branch
+                # above says "Put ..."/"Call ..." or "put short δ"/"call short
+                # δ"; structural exits -- DTE, near-expiry, regime shift -- don't
+                # mention either and correctly classify as neither wing).
+                _reason_lower = exit_reason.lower()
+                _put_failed  = "put" in _reason_lower
+                _call_failed = "call" in _reason_lower
+                wing_failed = (
+                    "BOTH" if _put_failed and _call_failed
+                    else "PUT" if _put_failed
+                    else "CALL" if _call_failed
+                    else None
+                )
+
+                await self._log_trade_close(
+                    journal_id=c.get("journal_id"),
+                    exit_price=round(_ps_fill + _cs_fill - _pl_fill - _cl_fill, 2),
+                    pnl=net_pnl, exit_reason=exit_reason,
+                    market_data=market_data,
+                    total_slippage_pts=round(_slippage, 4) if _slippage > 0 else None,
+                    wing_failed=wing_failed,
+                )
+                if self._ltp_poller:
+                    self._ltp_poller.unregister_option_contracts([
+                        c["put_short_contract"], c["put_long_contract"],
+                        c["call_short_contract"], c["call_long_contract"],
+                    ])
+                await self._notify(
+                    f"IRON CONDOR CLOSED\n"
+                    f"Underlying: {underlying}\nReason: {exit_reason}\n"
+                    f"Put short:  Rs{c['put_short_premium']:.2f} -> Rs{_ps_fill:.2f}\n"
+                    f"Call short: Rs{c['call_short_premium']:.2f} -> Rs{_cs_fill:.2f}\n"
+                    f"Net PnL: Rs{net_pnl:,.2f}"
+                )
+
+                # D: increment SL frequency counter for adverse exits (circuit breaker)
+                _is_adverse_c = any(
+                    kw in exit_reason for kw in ("breach", "Breach", "SL:", " SL ", "spike SL")
+                )
+                if _is_adverse_c:
+                    _r_c = getattr(self, "_redis", None)
+                    if _r_c:
+                        _sl_key_c   = f"sl_freq:{underlying}"
+                        _sl_count_c = int(await _r_c.incr(_sl_key_c))
+                        if _sl_count_c == 1:
+                            await _r_c.expire(_sl_key_c, 5 * 86400)
+                        logger.info(
+                            f"[CircuitBreaker] {underlying}: adverse exit #{_sl_count_c} "
+                            f"in 5-day window"
+                        )
+
+                # I: cancel GTT backstops on both short legs
+                await self._cancel_gtt(c.get("put_short_gtt_id"),  c.get("put_short_contract", ""))
+                await self._cancel_gtt(c.get("call_short_gtt_id"), c.get("call_short_contract", ""))
+
+                # C: remove from near-expiry set
+                self._close_on_first_cycle.discard(underlying)
+
+                # Route to profit or adverse bucket for re-entry eligibility — by realized
+                # P&L (see matching comment in _check_spread_exits for why text-matching
+                # the exit reason was wrong).
+                if net_pnl < 0:
+                    to_close_adverse_c.append(underlying)
+                else:
+                    to_close_profit_c.append(underlying)
+            except Exception as exc:
+                # Fixed 2026-08-21 (deep review): same fix as
+                # _check_spread_exits -- this loop had no per-underlying
+                # exception isolation, so one bad condor could silently
+                # stop exit monitoring for every OTHER open condor this
+                # cycle (and, deterministically, every cycle after).
+                logger.error(f"[IronCondor] Exit check failed for {underlying} -- "
+                             f"continuing with other condors: {exc}")
+                continue
 
         for sym in to_close_adverse_c:
             del self._active_condors[sym]
@@ -4327,13 +4640,38 @@ class LiveTradingEngine:
             # product type must match the ORIGINAL position's at Zerodha
             # (see ZerodhaBroker._product_for()).
             _ex_owner_strategy = self._single_leg_journals.get(contract, {}).get("strategy_name")
-            _ex_order = await self.order_manager.place_order(
-                contract, "SELL", abs(pos["quantity"]), exit_p,
-                is_exit_order=True, strategy_name=_ex_owner_strategy,
-            )
+
+            # Fixed 2026-08-21 (deep review): check a prior cycle's still-
+            # unresolved PENDING_VERIFICATION order before resubmitting --
+            # see _resolve_pending_exit_order()'s docstring.
+            _ex_order = None
+            _pending_id = _pending_exits(self).get(contract)
+            if _pending_id is not None:
+                state, pend_order = await self._resolve_pending_exit_order(_pending_id)
+                if state == "still_pending":
+                    continue
+                _pending_exits(self).pop(contract, None)
+                await self._persist_state()
+                if state == "resolved_ok":
+                    _ex_order = pend_order
+                # resolved_bad or none -> fall through, submit fresh below
+
+            if _ex_order is None:
+                _ex_order = await self.order_manager.place_order(
+                    contract, "SELL", abs(pos["quantity"]), exit_p,
+                    is_exit_order=True, strategy_name=_ex_owner_strategy,
+                )
+                if _ex_order is not None and getattr(_ex_order, "order_status", "") == "PENDING_VERIFICATION":
+                    _pending_exits(self)[contract] = _ex_order.id
+                    await self._persist_state()
+                    logger.warning(f"EXIT-SIGNAL CLOSE PENDING_VERIFICATION [{contract}]: outcome unknown — will re-check next cycle")
+                    continue
+
             # Fixed 2026-08-20 (deep review): same missing order_status check
             # as the other exit paths -- a rejected/failed SELL used to be
-            # journaled as a successful close anyway.
+            # journaled as a successful close anyway. Fixed 2026-08-21:
+            # PENDING_VERIFICATION is now handled above instead of being
+            # treated as a successful close by this check.
             if not (_ex_order and _ex_order.order_status not in ("REJECTED_BY_RISK", "FAILED")):
                 logger.error(f"EXIT-SIGNAL CLOSE FAILED [{contract}]: order rejected or failed — position left open, will retry next cycle")
                 continue
@@ -4446,14 +4784,39 @@ class LiveTradingEngine:
                 # is EMA/momentum-only), which correctly resolves to the
                 # default NRML they were actually entered under.
                 _sq_owner_strategy = self._single_leg_journals.get(contract, {}).get("strategy_name")
-                _sq_order = await self.order_manager.place_order(
-                    contract, side, abs(qty), exit_p, is_exit_order=True, strategy_name=_sq_owner_strategy,
-                )
+
+                # Fixed 2026-08-21 (deep review): check a prior cycle's still-
+                # unresolved PENDING_VERIFICATION order before resubmitting --
+                # see _resolve_pending_exit_order()'s docstring.
+                _sq_order = None
+                _pending_id = _pending_exits(self).get(contract)
+                if _pending_id is not None:
+                    state, pend_order = await self._resolve_pending_exit_order(_pending_id)
+                    if state == "still_pending":
+                        continue
+                    _pending_exits(self).pop(contract, None)
+                    await self._persist_state()
+                    if state == "resolved_ok":
+                        _sq_order = pend_order
+                    # resolved_bad or none -> fall through, submit fresh below
+
+                if _sq_order is None:
+                    _sq_order = await self.order_manager.place_order(
+                        contract, side, abs(qty), exit_p, is_exit_order=True, strategy_name=_sq_owner_strategy,
+                    )
+                    if _sq_order is not None and getattr(_sq_order, "order_status", "") == "PENDING_VERIFICATION":
+                        _pending_exits(self)[contract] = _sq_order.id
+                        await self._persist_state()
+                        logger.warning(f"SQUARE-OFF PENDING_VERIFICATION [{contract}]: outcome unknown — will re-check next cycle")
+                        continue
+
                 # Fixed 2026-08-20 (deep review): EOD square-off used to treat
                 # a rejected/failed close order as a successful close anyway --
                 # fabricating the journal exit and releasing capital while the
                 # real position (this method's own docstring: "ALWAYS close",
-                # overnight gap risk) stayed open overnight untracked.
+                # overnight gap risk) stayed open overnight untracked. Fixed
+                # 2026-08-21: PENDING_VERIFICATION is now handled above
+                # instead of being treated as a successful close here.
                 if not (_sq_order and _sq_order.order_status not in ("REJECTED_BY_RISK", "FAILED")):
                     logger.error(f"SQUARE-OFF FAILED [{contract}]: order rejected or failed — position left open overnight, will retry next cycle")
                     continue
@@ -4587,9 +4950,13 @@ class LiveTradingEngine:
                     _lot     = _s.get("lot_size", 0)
                     _net     = ((_s.get("short_premium", 0) - _short_x) - (_s.get("long_premium", 0) - _long_x)) * _lot
                     _width   = abs(_s.get("short_strike", 0) - _s.get("long_strike", 0))
+                    # Fixed 2026-08-21 (deep review): real-fill basis
+                    # (matching entry reservation / normal exit release),
+                    # was still using the stale quote-based net_credit here.
+                    _fill_credit = _s.get("short_premium", 0) - _s.get("long_premium", 0)
                     self.risk_manager.release_deployed_capital(
                         _s.get("strategy_name", "credit_spread_v1"),
-                        (_width - _s.get("net_credit", 0)) * _lot,
+                        (_width - _fill_credit) * _lot,
                     )
                     await self._log_trade_close(
                         journal_id=_s.get("journal_id"),
@@ -4641,9 +5008,16 @@ class LiveTradingEngine:
                     ) * _lot_c
                     _put_wing_x  = abs(_c.get("put_short_strike", 0)  - _c.get("put_long_strike", 0))
                     _call_wing_x = abs(_c.get("call_short_strike", 0) - _c.get("call_long_strike", 0))
+                    # Fixed 2026-08-21 (deep review): real-fill basis
+                    # (matching entry reservation / normal exit release),
+                    # was still using the stale quote-based net_credit here.
+                    _fill_credit_c = (
+                        (_c.get("put_short_premium", 0) - _c.get("put_long_premium", 0))
+                        + (_c.get("call_short_premium", 0) - _c.get("call_long_premium", 0))
+                    )
                     self.risk_manager.release_deployed_capital(
                         _c.get("strategy_name", "iron_condor_v1"),
-                        (max(_put_wing_x, _call_wing_x) - _c.get("net_credit", 0)) * _lot_c,
+                        (max(_put_wing_x, _call_wing_x) - _fill_credit_c) * _lot_c,
                     )
                     await self._log_trade_close(
                         journal_id=_c.get("journal_id"),
@@ -4934,8 +5308,25 @@ class LiveTradingEngine:
         return vix
 
     async def _get_iv_rank(
-        self, symbol: str, underlying_price: float, atr: float, dte: int
+        self, symbol: str, underlying_price: float, atr: float, dte: int,
+        live_sigma: Optional[float] = None,
     ) -> Optional[float]:
+        """
+        live_sigma: real market-implied volatility (ATM CE/PE average, from
+        _get_live_sigma()) -- when provided, this is what's fed into the IV
+        history/rank, since that's what "IV Rank" is actually supposed to
+        measure: how rich the OPTION premium is relative to its own recent
+        history. Fixed 2026-08-21 (deep review): without it, this fed
+        ATR-derived HISTORICAL/REALIZED volatility of the underlying into a
+        gate (iv_rank_allows_selling(), credit_spread_v1/iron_condor_v1's
+        premium-selling check) that never once touched a real option price
+        -- a realized-vol-percentile gate mislabeled and used as an
+        IV-richness gate, which could block a genuinely rich-premium entry
+        (elevated market IV, moderate ATR) or wrongly allow one (ATR spiked
+        without options actually getting richer). Falls back to the
+        ATR-derived proxy only when no live sigma is available (e.g. paper
+        mode / pre-login), same degraded behavior as before this fix.
+        """
         from src.market_data.option_chain import (
             atr_to_annualised_vol, update_iv_history, get_iv_rank
         )
@@ -4943,7 +5334,7 @@ class LiveTradingEngine:
         if not redis:
             return None
         try:
-            sigma = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, underlying_price)
+            sigma = live_sigma if live_sigma and live_sigma > 0 else atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, underlying_price)
             await update_iv_history(symbol, sigma, redis)
             return await get_iv_rank(symbol, redis)
         except Exception:

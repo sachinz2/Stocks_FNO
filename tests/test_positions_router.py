@@ -161,6 +161,71 @@ async def test_condor_legs_share_a_group_id_distinct_from_spread(positions_route
     assert group_ids == {"condor:TITAN"}
 
 
+# ── _fetch_market_prices() kite.ltp() fallback staleness check (2026-08-21) ──
+#
+# Fixed 2026-08-21: steps 1-2 (Redis cache) are staleness-aware at their
+# source (resolve_reliable_option_price(), used by ZerodhaLTPPoller/
+# option_chain.get_option_quote()), but step 3 (cache miss -> batched Kite
+# call) used to call kite.ltp() and trust last_price directly with no
+# staleness check at all -- a stale last-traded price on a thin/illiquid
+# leg could be silently shown as current on the dashboard/analytics. Now
+# uses kite.quote() + resolve_reliable_option_price(), matching the other
+# 2 call sites of that function.
+
+class _FakeKiteQuote:
+    """Stands in for kite.quote() -- batched, keyed by "NFO:{contract}"."""
+
+    def __init__(self, responses: dict):
+        self._responses = responses
+        self.calls = []
+
+    def quote(self, nfo_syms):
+        self.calls.append(list(nfo_syms))
+        return {sym: self._responses[sym] for sym in nfo_syms if sym in self._responses}
+
+    def ltp(self, nfo_syms):
+        raise AssertionError("kite.ltp() must not be called -- the fallback now uses kite.quote()")
+
+
+@pytest.mark.asyncio
+async def test_fetch_market_prices_fallback_uses_staleness_resolver_for_stale_quote(positions_router):
+    import datetime as dt
+
+    # TITAN26SEP4650PE: stale last_price (last traded 2 weeks ago), but has
+    # live order-book depth -- resolve_reliable_option_price() must fall back
+    # to the bid/ask midpoint instead of trusting the stale last_price.
+    stale_quote = {
+        "last_price": 82.0,
+        "last_trade_time": dt.datetime(2026, 7, 29, 10, 0, 0),  # not today
+        "depth": {
+            "buy":  [{"price": 34.0, "quantity": 50}],
+            "sell": [{"price": 35.6, "quantity": 50}],
+        },
+    }
+    kite = _FakeKiteQuote({"NFO:TITAN26SEP4650PE": stale_quote})
+
+    prices = await positions_router._fetch_market_prices(["TITAN26SEP4650PE"], kite, redis=None)
+
+    assert prices["TITAN26SEP4650PE"] == 34.8, \
+        "stale last_price (Rs82) must not be used -- expected the bid/ask midpoint from resolve_reliable_option_price()"
+
+
+@pytest.mark.asyncio
+async def test_fetch_market_prices_fallback_trusts_price_traded_today(positions_router):
+    from src.core.utils import now_ist
+
+    today_quote = {
+        "last_price": 46.55,
+        "last_trade_time": now_ist().replace(tzinfo=None),
+        "depth": {"buy": [], "sell": []},
+    }
+    kite = _FakeKiteQuote({"NFO:BAJFINANCE26SEP1160CE": today_quote})
+
+    prices = await positions_router._fetch_market_prices(["BAJFINANCE26SEP1160CE"], kite, redis=None)
+
+    assert prices["BAJFINANCE26SEP1160CE"] == 46.55
+
+
 @pytest.mark.asyncio
 async def test_standalone_single_leg_on_same_underlying_as_spread_is_not_grouped(positions_router):
     # The regression this was built to catch: BAJFINANCE has BOTH an active

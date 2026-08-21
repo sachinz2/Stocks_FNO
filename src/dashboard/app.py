@@ -5,6 +5,7 @@ import streamlit as st
 import requests
 import pandas as pd
 from datetime import datetime, date
+from urllib.parse import quote_plus
 
 from src.core.constants import FNO_SYMBOLS
 
@@ -13,8 +14,26 @@ st.set_page_config(page_title="Falcon Quant Platform", layout="wide", page_icon=
 API_BASE_URL = os.environ.get("API_BASE_URL", "http://api:8000/api/v1")
 _DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "admin123")
 INITIAL_CAPITAL = float(os.environ.get("INITIAL_CAPITAL", "300000"))
-MAX_DAILY_LOSS_PCT = 0.05   # 5% — matches RiskManager
-MAX_OPEN_POSITIONS = 25     # matches RiskManager
+# Fixed 2026-08-21 (deep review): was a hardcoded 0.05 literal, disconnected
+# from settings.MAX_DAILY_LOSS_PCT (.env) which RiskManager actually reads --
+# tightening the real limit via .env silently left this dashboard figure
+# showing the stale default, understating how close the account actually is
+# to the real kill-switch threshold. Same env var, same pattern as
+# INITIAL_CAPITAL above.
+MAX_DAILY_LOSS_PCT = float(os.environ.get("MAX_DAILY_LOSS_PCT", "0.05"))
+MAX_OPEN_POSITIONS = 25     # matches RiskManager (intentionally not .env-driven -- see risk_manager.py's own comment on why MAX_OPEN_POSITIONS isn't wired to this)
+
+# Shared secret required by every mutating API call (admin_router,
+# strategies/activate|deactivate, orders POST/DELETE, signals/generate) --
+# same env var the API side reads via require_admin_token() in
+# src/api/services/auth.py, so a single ADMIN_API_TOKEN in .env configures
+# both. Empty here just means every mutating call gets a 403 from the API
+# (fail closed), same as an unset ADMIN_API_TOKEN disables the API side.
+_ADMIN_API_TOKEN = os.environ.get("ADMIN_API_TOKEN", "")
+_ADMIN_AUTH_HEADERS = {"X-Admin-Token": _ADMIN_API_TOKEN}
+
+# Read-only /logs/recent token — same var the API's logs_router reads.
+_LOGS_API_TOKEN = os.environ.get("LOGS_API_TOKEN", "")
 
 
 def check_password():
@@ -67,7 +86,7 @@ def fetch(endpoint: str):
 
 def post(endpoint: str, timeout: int = 10):
     try:
-        r = requests.post(f"{API_BASE_URL}/{endpoint}", timeout=timeout)
+        r = requests.post(f"{API_BASE_URL}/{endpoint}", headers=_ADMIN_AUTH_HEADERS, timeout=timeout)
         if r.status_code == 200:
             return r.json()
         st.error(f"API returned {r.status_code}: {r.text}")
@@ -88,6 +107,40 @@ def pnl_color(val: float) -> str:
     return "gray"
 
 
+def _estimate_capital_deployed(positions: list) -> float:
+    """
+    Fixed 2026-08-21 (deep review): summing abs(quantity) * avg_price
+    across EVERY leg double-counts credit spreads/iron condors -- it adds
+    both the short leg's premium RECEIVED and the long leg's premium PAID
+    as if both were capital blocked, when the real risk-based figure is
+    (wing width - net credit) * lot_size, overstating utilization for every
+    multi-leg structure. This positions list doesn't carry strike prices
+    (only symbol/quantity/avg_price/group_id/structure_type), so the exact
+    width-based figure the live engine itself uses isn't computable here
+    without re-parsing strikes out of contract symbols -- a real gap, not
+    fully closed by this fix. What IS fixed: grouped legs (group_id set,
+    i.e. spread/condor) are now netted by their SIGNED quantity (short legs
+    carry a negative quantity, long legs positive -- see
+    positions_router.py's _positions_from_engine_uncached) instead of
+    summed as unsigned notional, so a paired credit spread/condor no longer
+    shows roughly double its real net premium exposure. Standalone
+    (group_id=None) single-leg positions are unaffected -- abs(qty)*avg_price
+    is already the real premium paid for those.
+    """
+    ungrouped_total = sum(
+        abs(p.get("quantity", 0)) * p.get("avg_price", 0)
+        for p in positions if not p.get("group_id")
+    )
+    grouped: dict = {}
+    for p in positions:
+        gid = p.get("group_id")
+        if gid:
+            grouped.setdefault(gid, 0.0)
+            grouped[gid] += p.get("quantity", 0) * p.get("avg_price", 0)
+    grouped_total = sum(abs(v) for v in grouped.values())
+    return ungrouped_total + grouped_total
+
+
 # ── Pages ─────────────────────────────────────────────────────────────────────
 
 if page == "Home":
@@ -100,7 +153,7 @@ if page == "Home":
 
     net_pnl = pnl_data.get("total_pnl", 0)
     open_positions = len([p for p in positions if p.get("quantity", 0) != 0])
-    capital_deployed = sum(abs(p.get("quantity", 0)) * p.get("avg_price", 0) for p in positions)
+    capital_deployed = _estimate_capital_deployed(positions)
     capital_pct = (capital_deployed / INITIAL_CAPITAL) * 100 if capital_deployed else 0
 
     from src.core.utils import now_ist
@@ -438,11 +491,19 @@ elif page == "Strategies":
 
                 act_col, deact_col, _ = st.columns([1, 1, 5])
                 if act_col.button("Activate", key=f"act_{sid}", disabled=is_active):
-                    r = requests.post(f"{API_BASE_URL}/strategies/activate", json={"strategy_id": sid})
+                    r = requests.post(
+                        f"{API_BASE_URL}/strategies/activate",
+                        json={"strategy_id": sid},
+                        headers=_ADMIN_AUTH_HEADERS,
+                    )
                     st.success("Activated." if r.ok else r.text)
                     st.rerun()
                 if deact_col.button("Pause", key=f"deact_{sid}", disabled=not is_active):
-                    r = requests.post(f"{API_BASE_URL}/strategies/deactivate", json={"strategy_id": sid})
+                    r = requests.post(
+                        f"{API_BASE_URL}/strategies/deactivate",
+                        json={"strategy_id": sid},
+                        headers=_ADMIN_AUTH_HEADERS,
+                    )
                     st.success("Paused." if r.ok else r.text)
                     st.rerun()
 
@@ -559,7 +620,7 @@ elif page == "Risk & PnL":
     st.subheader("Risk Limits")
 
     open_pos = len([p for p in positions if p.get("quantity", 0) != 0])
-    capital_deployed = sum(abs(p.get("quantity", 0)) * p.get("avg_price", 0) for p in positions)
+    capital_deployed = _estimate_capital_deployed(positions)
     capital_left = capital - capital_deployed
 
     c1, c2, c3 = st.columns(3)
@@ -837,7 +898,7 @@ elif page == "System Health":
         if st.button("Refresh", key="refresh_logs"):
             st.rerun()
 
-    log_data = fetch("logs/recent?n=20") or {}
+    log_data = fetch(f"logs/recent?n=20&token={quote_plus(_LOGS_API_TOKEN)}") or {}
     log_lines = log_data.get("lines", [])
     log_note  = log_data.get("note", "")
 

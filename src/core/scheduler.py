@@ -73,6 +73,16 @@ def schedule_trading_jobs(engine) -> None:
         misfire_grace_time=15,
     )
 
+    # Fixed 2026-08-21 (deep review): the cron-triggered jobs below had no
+    # explicit misfire_grace_time, unlike the interval jobs above which all
+    # set one -- APScheduler's own default is 1 SECOND, so a briefly-busy
+    # event loop at exactly the trigger moment could silently coalesce/skip
+    # a job that only fires once a day, with nothing beyond an internal
+    # scheduler log line to notice. A few minutes' grace doesn't matter for
+    # daily jobs like these (missing the exact second is harmless; missing
+    # the whole run for the day is not).
+    _DAILY_JOB_MISFIRE_GRACE_SEC = 300
+
     # Market open — 9:15 IST, Mon–Fri
     scheduler.add_job(
         engine.on_market_open,
@@ -80,6 +90,7 @@ def schedule_trading_jobs(engine) -> None:
         id=JOB_MARKET_OPEN,
         name="Market Open",
         replace_existing=True,
+        misfire_grace_time=_DAILY_JOB_MISFIRE_GRACE_SEC,
     )
 
     # A: Gap check — 09:16:30 IST, Mon–Fri.
@@ -92,6 +103,7 @@ def schedule_trading_jobs(engine) -> None:
         id="gap_check",
         name="Gap Check (09:16:30 IST)",
         replace_existing=True,
+        misfire_grace_time=_DAILY_JOB_MISFIRE_GRACE_SEC,
     )
 
     # Market close — 15:30 IST, Mon–Fri
@@ -101,6 +113,7 @@ def schedule_trading_jobs(engine) -> None:
         id=JOB_MARKET_CLOSE,
         name="Market Close",
         replace_existing=True,
+        misfire_grace_time=_DAILY_JOB_MISFIRE_GRACE_SEC,
     )
 
     # Daily PnL report — 15:45 IST, Mon–Fri
@@ -110,6 +123,7 @@ def schedule_trading_jobs(engine) -> None:
         id=JOB_DAILY_PNL,
         name="Daily PnL Report",
         replace_existing=True,
+        misfire_grace_time=_DAILY_JOB_MISFIRE_GRACE_SEC,
     )
 
     # Capital period rollover — 08:00 IST, Mon–Fri (before market open at 09:15
@@ -124,6 +138,7 @@ def schedule_trading_jobs(engine) -> None:
         name="Capital Period Rollover",
         replace_existing=True,
         kwargs={"risk_manager": engine.risk_manager},
+        misfire_grace_time=_DAILY_JOB_MISFIRE_GRACE_SEC,
     )
 
     logger.info("All trading jobs scheduled.")
@@ -149,5 +164,6 @@ def schedule_zerodha_auth():
         id="zerodha_daily_auth",
         name="Zerodha Daily Auth",
         replace_existing=True,
+        misfire_grace_time=300,
     )
     logger.info("Zerodha daily auth scheduled at 08:30 IST.")

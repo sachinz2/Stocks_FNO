@@ -44,7 +44,7 @@ async def test_manual_order_blocked_when_underlying_has_active_spread():
     order_request = OrderRequest(symbol="BAJFINANCE26SEP1190CE", side="BUY", quantity=1, price=100.0)
 
     with pytest.raises(HTTPException) as exc_info:
-        await place_order(order_request, _make_request(engine), user="tester")
+        await place_order(order_request, _make_request(engine))
 
     assert exc_info.value.status_code == 409
     engine.order_manager.place_order.assert_not_called()
@@ -56,7 +56,7 @@ async def test_manual_order_allowed_when_no_collision():
     engine.order_manager.place_order.return_value = SimpleNamespace(id=1)
     order_request = OrderRequest(symbol="RELIANCE26SEP2500CE", side="BUY", quantity=1, price=100.0)
 
-    result = await place_order(order_request, _make_request(engine), user="tester")
+    result = await place_order(order_request, _make_request(engine))
 
     engine.order_manager.place_order.assert_called_once()
     assert result.order_id == "1"
@@ -70,7 +70,7 @@ async def test_manual_order_allowed_when_underlying_unresolvable():
     engine.order_manager.place_order.return_value = SimpleNamespace(id=2)
     order_request = OrderRequest(symbol="SOMETHING_UNKNOWN", side="BUY", quantity=1, price=100.0)
 
-    result = await place_order(order_request, _make_request(engine), user="tester")
+    result = await place_order(order_request, _make_request(engine))
 
     engine.order_manager.place_order.assert_called_once()
     assert result.order_id == "2"
@@ -81,6 +81,6 @@ async def test_manual_order_still_fails_closed_when_engine_not_ready():
     order_request = OrderRequest(symbol="RELIANCE26SEP2500CE", side="BUY", quantity=1, price=100.0)
 
     with pytest.raises(HTTPException) as exc_info:
-        await place_order(order_request, _make_request(None), user="tester")
+        await place_order(order_request, _make_request(None))
 
     assert exc_info.value.status_code == 503

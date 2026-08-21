@@ -78,7 +78,17 @@ class IronCondorStrategy(StrategyBase):
 
         # Fixed 2026-08-20 (deep review): same NaN/None atr14 bypass fixed in
         # credit_spread.py -- see its comment for the failure scenario.
-        if not fast_ema or not slow_ema or not close or atr is None or atr != atr:
+        # Fixed 2026-08-21 (deep review): the atr != atr NaN check above
+        # didn't cover fast_ema/slow_ema -- `not float('nan')` is False (NaN
+        # is truthy), so a NaN EMA slipped past this guard and then hit
+        # `... if slow_ema > 0 else 0` below, where `NaN > 0` is also False,
+        # silently producing ema_spread_pct=0 -- exactly the flat-market
+        # entry condition -- instead of HOLD.
+        if (
+            not fast_ema or not slow_ema or not close
+            or fast_ema != fast_ema or slow_ema != slow_ema or close != close
+            or atr is None or atr != atr
+        ):
             return "HOLD"
 
         atr_pct = (atr / close * 100) if close > 0 else 0
