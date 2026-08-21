@@ -391,6 +391,11 @@ elif page == "Strategies":
     health_data  = fetch("analytics/strategy-health") or {}
     perf_data    = fetch("analytics/strategy-performance") or {}
     regime_data  = fetch("analytics/market-regime") or {}
+    # Added 2026-08-21 -- the "signal audit" gate-by-gate funnel (external
+    # review of ema_crossover_v1, its own top recommendation: "how many
+    # signals reached each gate, and how many passed" instead of guessing).
+    # In-memory on the engine, resets on restart -- see get_signal_audit_report().
+    audit_data   = fetch("analytics/signal-audit") or {}
 
     current_regime = regime_data.get("regime", "—")
     regime_ts      = regime_data.get("timestamp", "")[:16].replace("T", " ")
@@ -440,6 +445,33 @@ elif page == "Strategies":
                     r = requests.post(f"{API_BASE_URL}/strategies/deactivate", json={"strategy_id": sid})
                     st.success("Paused." if r.ok else r.text)
                     st.rerun()
+
+                # Signal audit funnel: how many candidate signals reached
+                # each entry gate, in the order they're actually checked in
+                # LiveTradingEngine._process_signal. Only single-leg
+                # strategies (ema_crossover_v1/momentum_v1) go through this
+                # gate sequence -- credit_spread_v1/iron_condor_v1 have their
+                # own separate, much longer precondition chains not yet
+                # instrumented this way.
+                gates = audit_data.get(sid)
+                if gates:
+                    with st.expander(f"Signal audit — {sid}"):
+                        _gate_order = [
+                            "signal_generated", "dte_passed", "rvol_passed", "adx_passed",
+                            "rs_passed", "mtf_passed", "lot_passed", "contract_resolved",
+                            "trade_placed",
+                        ]
+                        _rows = [
+                            {"Gate": g.replace("_", " ").title(), "Reached": gates[g]}
+                            for g in _gate_order if g in gates
+                        ]
+                        if _rows:
+                            st.dataframe(pd.DataFrame(_rows), use_container_width=True, hide_index=True)
+                            st.caption(
+                                "In-memory since last restart — a big drop between two "
+                                "consecutive gates is the specific filter rejecting most "
+                                "candidates right now."
+                            )
 
             st.markdown("---")
 
@@ -655,12 +687,30 @@ elif page == "Analytics":
 
         # ── Trade log ──────────────────────────────────────────────────────
         st.subheader("Closed Trade Log")
+        # Added 2026-08-21 -- the entry-context/MFE-MAE/daily-ATR/credit-max-
+        # loss/wing-failure columns (three external-review rounds, same day)
+        # exist in trade_journal and are now returned by /analytics/trades,
+        # but cramming all ~12 of them into the default table would bury the
+        # core P&L columns most sessions actually need. Off by default.
+        show_detail = st.checkbox(
+            "Show entry-context & MFE/MAE detail",
+            help="Per-trade attribution data added 2026-08-21: ADX/RVOL/delta/DTE at "
+                 "entry, running MFE/MAE, daily ATR%, credit/max-loss%, and (iron "
+                 "condor) which wing failed.",
+        )
         df_t = pd.DataFrame(trades)
-        show_cols = [c for c in [
+        base_cols = [
             "entry_time", "underlying", "strategy", "structure_type",
             "entry_price", "exit_price", "pnl", "hold_days",
             "iv_rank", "vix_at_entry", "exit_reason",
-        ] if c in df_t.columns]
+        ]
+        detail_cols = [
+            "adx_at_entry", "rvol_at_entry", "delta_at_entry", "dte_at_entry",
+            "daily_atr_pct", "credit_to_max_loss_pct",
+            "underlying_mfe_pct", "underlying_mae_pct",
+            "option_mfe_pct", "option_mae_pct", "wing_failed",
+        ]
+        show_cols = [c for c in base_cols + (detail_cols if show_detail else []) if c in df_t.columns]
         df_t = df_t[show_cols]
         df_t.columns = [c.replace("_", " ").title() for c in show_cols]
 
@@ -668,7 +718,13 @@ elif page == "Analytics":
         # null (e.g. iv_rank before ~30 days of history has accumulated)
         # don't come through as object dtype, which .style.format() can't
         # apply a numeric spec to (TypeError on None).
-        for _c in ["Entry Price", "Exit Price", "Pnl", "Iv Rank", "Vix At Entry", "Hold Days"]:
+        _numeric_candidates = [
+            "Entry Price", "Exit Price", "Pnl", "Iv Rank", "Vix At Entry", "Hold Days",
+            "Adx At Entry", "Rvol At Entry", "Delta At Entry", "Dte At Entry",
+            "Daily Atr Pct", "Credit To Max Loss Pct",
+            "Underlying Mfe Pct", "Underlying Mae Pct", "Option Mfe Pct", "Option Mae Pct",
+        ]
+        for _c in _numeric_candidates:
             if _c in df_t.columns:
                 df_t[_c] = pd.to_numeric(df_t[_c], errors="coerce")
 
@@ -682,13 +738,36 @@ elif page == "Analytics":
         # Same raw-float display issue as Orders & Trades' trade table --
         # DB Numeric(18,4)/float columns render as e.g. "8.250000" without
         # an explicit format.
-        _num_fmt = {c: "{:,.2f}" for c in ["Entry Price", "Exit Price", "Pnl", "Iv Rank", "Vix At Entry"] if c in df_t.columns}
-        if "Hold Days" in df_t.columns:
-            _num_fmt["Hold Days"] = "{:,.0f}"
+        _num_fmt = {c: "{:,.2f}" for c in [
+            "Entry Price", "Exit Price", "Pnl", "Iv Rank", "Vix At Entry",
+            "Adx At Entry", "Rvol At Entry", "Delta At Entry",
+            "Daily Atr Pct", "Credit To Max Loss Pct",
+            "Underlying Mfe Pct", "Underlying Mae Pct", "Option Mfe Pct", "Option Mae Pct",
+        ] if c in df_t.columns}
+        for _c in ["Hold Days", "Dte At Entry"]:
+            if _c in df_t.columns:
+                _num_fmt[_c] = "{:,.0f}"
         st.dataframe(
             df_t.style.format(_num_fmt, na_rep="—").apply(_highlight_pnl, axis=1),
             use_container_width=True, hide_index=True,
         )
+
+        # ── Iron condor wing-failure breakdown ───────────────────────────────
+        # Added 2026-08-21 (external review of iron_condor_v1's own explicit
+        # ask: "I want a wing failure analysis"). Which wing's exit condition
+        # actually fired, across closed condors -- the root-cause
+        # classification the review also asked for (breakout / IV expansion /
+        # gap / drift / bad strike) is a human analysis output from this
+        # count, not something derivable automatically yet.
+        _condor_trades = [t for t in trades if t.get("structure_type") == "IRON_CONDOR" and t.get("wing_failed")]
+        if _condor_trades:
+            st.markdown("---")
+            st.subheader("Iron Condor — Wing Failure Breakdown")
+            _wf_counts = pd.Series([t["wing_failed"] for t in _condor_trades]).value_counts()
+            wf1, wf2, wf3 = st.columns(3)
+            wf1.metric("Put wing failed",  int(_wf_counts.get("PUT", 0)))
+            wf2.metric("Call wing failed", int(_wf_counts.get("CALL", 0)))
+            wf3.metric("Both wings failed", int(_wf_counts.get("BOTH", 0)))
 
 
 elif page == "System Health":

@@ -49,6 +49,25 @@ def _trade_to_dict(t: TradeJournal) -> Dict[str, Any]:
         "regime_label":       t.regime_label,
         "total_slippage_pts": t.total_slippage_pts,
         "slippage":           t.slippage,
+        # Fixed 2026-08-21: these columns were added across three external-
+        # review rounds the same day (momentum_v1/ema_crossover_v1 entry-
+        # context + MFE/MAE, credit_spread_v1/iron_condor_v1 daily-ATR/
+        # credit-max-loss/wing-failure) but never wired into this response --
+        # the data was being written to trade_journal and then silently
+        # dropped here, invisible to the dashboard or anyone else calling
+        # this endpoint.
+        "underlying_price_at_entry": t.underlying_price_at_entry,
+        "rvol_at_entry":             t.rvol_at_entry,
+        "adx_at_entry":              t.adx_at_entry,
+        "dte_at_entry":              t.dte_at_entry,
+        "delta_at_entry":            t.delta_at_entry,
+        "underlying_mfe_pct":        t.underlying_mfe_pct,
+        "underlying_mae_pct":        t.underlying_mae_pct,
+        "option_mfe_pct":            t.option_mfe_pct,
+        "option_mae_pct":            t.option_mae_pct,
+        "daily_atr_pct":             t.daily_atr_pct,
+        "credit_to_max_loss_pct":    t.credit_to_max_loss_pct,
+        "wing_failed":               t.wing_failed,
     }
 
 
