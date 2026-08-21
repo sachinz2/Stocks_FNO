@@ -2210,7 +2210,19 @@ class LiveTradingEngine:
         # the filter. Trade-off: BUY entries for both strategies are delayed
         # by however long RSRanker's first cycle takes each morning, same as
         # the existing RVOL-unavailable behavior already accepts.
-        if signal_str == "BUY" and self.rs_ranker:
+        # Fixed 2026-08-21 (external review, section 11 -- "make ADX/RVOL/
+        # RS/MTF requirements strategy-specific rather than globally
+        # enforced"): RS was the one remaining shared-engine gate with no
+        # per-strategy override, unlike RVOL (rvol_hard_gate) and MTF
+        # (mtf_strict), which already got this treatment during
+        # ema_crossover_v1's redesign the same week. require_rs defaults to
+        # True (unchanged behavior for anything that doesn't opt out, e.g.
+        # momentum_v1) -- ema_crossover_v1 sets it False, matching its
+        # established "early trend transition, don't over-filter"
+        # philosophy: an early crossover shouldn't need the stock to
+        # ALREADY be a top-10 RS leader, which is itself a lagging
+        # confirmation.
+        if signal_str == "BUY" and self.rs_ranker and getattr(strategy, "require_rs", True):
             try:
                 _rs_ranks = await self.rs_ranker.get_ranks()
             except Exception as _rs_exc:
@@ -3011,6 +3023,28 @@ class LiveTradingEngine:
         )
         _daily_atr = self.rs_ranker.get_daily_atr_pct(symbol) if getattr(self, "rs_ranker", None) else None
 
+        # Added 2026-08-21 (second-opinion review, P1 #8): actual entry
+        # Greeks/IV/wing width, computed from the FINAL resolved strikes
+        # and real fills -- pure data collection for later analysis, not a
+        # gate. Single-sided (credit_spread_v1 only trades one side) --
+        # populates the PE columns for a BULL_PUT_SPREAD or the CE columns
+        # for a BEAR_CALL_SPREAD, leaving the other side NULL.
+        from src.market_data.option_chain import bs_delta, implied_vol as _implied_vol_fn
+        _T_entry = max(dte, 1) / 365.0
+        _short_delta_val = bs_delta(underlying_price, short_strike, _T_entry, sigma, opt)
+        _long_delta_val  = bs_delta(underlying_price, long_strike,  _T_entry, sigma, opt)
+        _short_iv_val = _implied_vol_fn(short_fill, underlying_price, short_strike, _T_entry, opt)
+        _greeks_kwargs = dict(put_wing_width=None, call_wing_width=None,
+                              put_short_delta=None, call_short_delta=None,
+                              put_long_delta=None, call_long_delta=None,
+                              put_iv=None, call_iv=None)
+        if opt == "PE":
+            _greeks_kwargs.update(put_short_delta=_short_delta_val, put_long_delta=_long_delta_val,
+                                   put_iv=_short_iv_val, put_wing_width=spread_width)
+        else:
+            _greeks_kwargs.update(call_short_delta=_short_delta_val, call_long_delta=_long_delta_val,
+                                   call_iv=_short_iv_val, call_wing_width=spread_width)
+
         journal_id = await self._log_trade_open(
             strategy=strategy.name, underlying=symbol,
             structure_type=spread_type,
@@ -3018,6 +3052,7 @@ class LiveTradingEngine:
             entry_price=round(short_fill - long_fill, 2), quantity=lot_size,
             market_data=market_data, iv_rank=iv_rank, vix=vix,
             daily_atr_pct=_daily_atr, credit_to_max_loss_pct=_credit_to_max_loss,
+            **_greeks_kwargs,
         )
         # Track deployed capital by actual max loss (width - net credit), not just
         # the long/hedge leg's premium — found this was previously never called at
@@ -3027,10 +3062,43 @@ class LiveTradingEngine:
         # same-day credit spread entry. Max loss is also a far more accurate risk
         # figure than hedge-leg premium: a wide spread's long leg can cost almost
         # the same regardless of width, while the real capital at risk scales
-        # directly with width. Reuses _capital_at_risk computed before the short
-        # leg above (same max-loss figure already passed as the risk-layer-5
-        # budget check).
-        self.risk_manager.add_deployed_capital(strategy.name, _capital_at_risk)
+        # directly with width.
+        #
+        # Fixed 2026-08-21 (second-opinion review): _capital_at_risk (used
+        # for the PRE-TRADE risk_manager.validate_trade() gate a few lines
+        # above, via capital_at_risk=_capital_at_risk) is necessarily
+        # quote-based -- fills don't exist yet at that point. But the
+        # RESERVATION booked here happens AFTER short_fill/long_fill are
+        # known, so there's no reason to keep using the pre-trade estimate
+        # for it -- recompute from the real fills so the deployed-capital
+        # figure reflects actual economic risk, not entry-slippage-skewed
+        # quotes. _check_spread_exits' matching release_deployed_capital
+        # call now uses the same real-fill basis (spread["short_premium"] -
+        # spread["long_premium"], which already store short_fill/long_fill)
+        # so add/release stay symmetric.
+        _capital_at_risk_actual = (spread_width - (short_fill - long_fill)) * lot_size
+        self.risk_manager.add_deployed_capital(strategy.name, _capital_at_risk_actual)
+
+        # I: place exchange-level GTT backstop on the short leg (live mode only).
+        # If server crashes entirely, this fires at Zerodha when price hits 2.5× entry.
+        # Uses the real fill (see short_fill above), not the quote, so the
+        # trigger level reflects what was actually paid.
+        #
+        # Fixed 2026-08-21 (external review): this used to run AFTER
+        # publishing to _active_spreads (with gtt_id=None, updated
+        # afterward) -- that ordering left a real async-timing gap. A
+        # CONCURRENT exit-check cycle (_check_spread_exits, on its own
+        # independent timer) could see the newly-registered spread mid-GTT-
+        # placement, run a normal exit for it, and call
+        # _cancel_gtt(gtt_id=None, ...) -- a no-op, since the id didn't
+        # exist yet -- so the real GTT placed moments later at Zerodha
+        # would be left orphaned: uncancelled, for a position the engine no
+        # longer tracks. If that stray GTT later triggered, it would place
+        # a real, completely unexpected BUY order. Placing the GTT FIRST
+        # and publishing the complete dict (gtt_id already resolved) in one
+        # atomic assignment closes this window entirely.
+        _gtt_id = await self._place_gtt_backstop(short_contract, lot_size, short_fill)
+
         # Fixed 2026-08-20 (deep review): inserting a new key here used to run
         # unlocked, while the independently-scheduled 10-second exit-only job
         # iterates this exact dict under _exit_cycle_lock. If that iteration
@@ -3052,18 +3120,10 @@ class LiveTradingEngine:
                 "expiry_date":    expiry.isoformat(),
                 "entry_date":     now_ist().replace(tzinfo=None).date().isoformat(),
                 "entry_vix":      vix or 0.0,    # E: stored for VIX spike threshold adjustment
-                "gtt_id":         None,           # I: filled below after GTT placement
+                "gtt_id":         _gtt_id,
             }
         if self._ltp_poller:
             self._ltp_poller.register_option_contracts([short_contract, long_contract])
-
-        # I: place exchange-level GTT backstop on the short leg (live mode only).
-        # If server crashes entirely, this fires at Zerodha when price hits 2.5× entry.
-        # Uses the real fill (see short_fill above), not the quote, so the
-        # trigger level reflects what was actually paid.
-        _gtt_id = await self._place_gtt_backstop(short_contract, lot_size, short_fill)
-        if _gtt_id:
-            self._active_spreads[symbol]["gtt_id"] = _gtt_id
 
         await self._persist_state()
 
@@ -3311,10 +3371,18 @@ class LiveTradingEngine:
 
             # Must match the max-loss figure add_deployed_capital() used at entry
             # (see _process_credit_spread) — not just the long leg's premium.
+            # Fixed 2026-08-21 (second-opinion review): uses the real-fill
+            # basis (short_premium/long_premium, the actual entry fills)
+            # instead of the quote-based net_credit -- matches entry's
+            # add_deployed_capital(), which now reserves against the same
+            # real-fill figure. Keeping add/release symmetric on the SAME
+            # basis is what matters here; using stale quote-based net_credit
+            # for release while entry now reserves fill-based would leak or
+            # over-release capital on every single trade.
             _spread_width = abs(spread["short_strike"] - spread["long_strike"])
             self.risk_manager.release_deployed_capital(
                 spread.get("strategy_name", "credit_spread_v1"),
-                (_spread_width - spread["net_credit"]) * lot,
+                (_spread_width - (spread["short_premium"] - spread["long_premium"])) * lot,
             )
 
             await self._log_trade_close(
@@ -3793,6 +3861,19 @@ class LiveTradingEngine:
         )
         _daily_atr = self.rs_ranker.get_daily_atr_pct(symbol) if getattr(self, "rs_ranker", None) else None
 
+        # Added 2026-08-21 (second-opinion review, P1 #8): actual entry
+        # Greeks/IV/wing width for BOTH wings independently -- iron_condor_v1
+        # trades both sides, unlike credit_spread_v1. Computed from the
+        # FINAL resolved strikes and real fills.
+        from src.market_data.option_chain import bs_delta, implied_vol as _implied_vol_fn
+        _T_entry = max(dte, 1) / 365.0
+        _put_short_delta_val  = bs_delta(underlying_price, put_short_strike,  _T_entry, sigma, "PE")
+        _put_long_delta_val   = bs_delta(underlying_price, put_long_strike,   _T_entry, sigma, "PE")
+        _call_short_delta_val = bs_delta(underlying_price, call_short_strike, _T_entry, sigma, "CE")
+        _call_long_delta_val  = bs_delta(underlying_price, call_long_strike,  _T_entry, sigma, "CE")
+        _put_iv_val  = _implied_vol_fn(put_short_fill,  underlying_price, put_short_strike,  _T_entry, "PE")
+        _call_iv_val = _implied_vol_fn(call_short_fill, underlying_price, call_short_strike, _T_entry, "CE")
+
         journal_id  = await self._log_trade_open(
             strategy=strategy.name, underlying=symbol,
             structure_type="IRON_CONDOR", contracts=[psc, plc, csc, clc],
@@ -3800,15 +3881,42 @@ class LiveTradingEngine:
             quantity=lot_size,
             market_data=market_data, iv_rank=iv_rank, vix=vix,
             daily_atr_pct=_daily_atr, credit_to_max_loss_pct=_credit_to_max_loss,
+            put_short_delta=_put_short_delta_val, call_short_delta=_call_short_delta_val,
+            put_long_delta=_put_long_delta_val, call_long_delta=_call_long_delta_val,
+            put_iv=_put_iv_val, call_iv=_call_iv_val,
+            put_wing_width=put_wing_width, call_wing_width=call_wing_width,
         )
         # Track deployed capital by actual max loss, not just the long/hedge legs'
         # premium — same fix and rationale as _process_credit_spread. Max loss for
         # an iron condor is bounded by whichever wing is wider (price can't be
         # simultaneously above the call strikes and below the put strikes, so only
         # one wing is ever actually breached), minus total net credit collected.
-        # Reuses _capital_at_risk computed before the legs loop above (same
-        # max-loss figure already passed as the risk-layer-5 budget check).
-        self.risk_manager.add_deployed_capital(strategy.name, _capital_at_risk)
+        #
+        # Fixed 2026-08-21 (second-opinion review): same fix as
+        # _process_credit_spread -- _capital_at_risk (used for the
+        # PRE-TRADE risk gate above) is necessarily quote-based, but this
+        # reservation happens AFTER all 4 fills are known, so recompute
+        # from the real fills. _check_condor_exits' matching
+        # release_deployed_capital call uses the same real-fill basis so
+        # add/release stay symmetric.
+        _fill_net_credit = (put_short_fill - put_long_fill) + (call_short_fill - call_long_fill)
+        _capital_at_risk_actual = (wing_spread - _fill_net_credit) * lot_size
+        self.risk_manager.add_deployed_capital(strategy.name, _capital_at_risk_actual)
+
+        # I: GTT backstops on both short legs (live mode only) -- real fills,
+        # not quotes.
+        #
+        # Fixed 2026-08-21 (external review): moved BEFORE publishing to
+        # _active_condors -- same race and fix as _process_credit_spread's
+        # matching change. Publishing first (gtt_id=None, filled in
+        # afterward) left a window where a concurrent _check_condor_exits
+        # cycle could see the newly-registered condor and run a normal exit
+        # with _cancel_gtt(gtt_id=None, ...) -- a no-op -- orphaning the
+        # real GTT placed moments later at Zerodha for a position the
+        # engine no longer tracks.
+        _put_gtt  = await self._place_gtt_backstop(psc, lot_size, put_short_fill)
+        _call_gtt = await self._place_gtt_backstop(csc, lot_size, call_short_fill)
+
         # Fixed 2026-08-20 (deep review): same entry/exit dict-mutation race
         # fixed in _process_credit_spread -- see its comment above.
         async with self._exit_cycle_lock:
@@ -3825,19 +3933,11 @@ class LiveTradingEngine:
                 "expiry_date":         expiry.isoformat(),
                 "entry_date":          now_ist().replace(tzinfo=None).date().isoformat(),
                 "entry_vix":           vix or 0.0,  # E: stored for VIX spike threshold adjustment
-                "put_short_gtt_id":    None,         # I: filled below
-                "call_short_gtt_id":   None,         # I: filled below
+                "put_short_gtt_id":    _put_gtt,
+                "call_short_gtt_id":   _call_gtt,
             }
         if self._ltp_poller:
             self._ltp_poller.register_option_contracts([psc, plc, csc, clc])
-
-        # I: GTT backstops on both short legs (live mode only) -- real fills, not quotes.
-        _put_gtt  = await self._place_gtt_backstop(psc, lot_size, put_short_fill)
-        _call_gtt = await self._place_gtt_backstop(csc, lot_size, call_short_fill)
-        if _put_gtt:
-            self._active_condors[symbol]["put_short_gtt_id"]  = _put_gtt
-        if _call_gtt:
-            self._active_condors[symbol]["call_short_gtt_id"] = _call_gtt
 
         await self._persist_state()
 
@@ -4093,11 +4193,20 @@ class LiveTradingEngine:
 
             # Must match the max-loss figure add_deployed_capital() used at entry
             # (see _process_iron_condor) — not just the long legs' premium.
+            # Fixed 2026-08-21 (second-opinion review): uses the real-fill
+            # basis (put/call short/long premium, the actual entry fills)
+            # instead of quote-based net_credit -- see _process_iron_condor's
+            # matching fix note for why add/release must stay on the same
+            # (now fill-based) basis.
             _put_wing  = abs(c["put_short_strike"]  - c["put_long_strike"])
             _call_wing = abs(c["call_short_strike"] - c["call_long_strike"])
+            _fill_net_credit = (
+                (c["put_short_premium"] - c["put_long_premium"])
+                + (c["call_short_premium"] - c["call_long_premium"])
+            )
             self.risk_manager.release_deployed_capital(
                 c.get("strategy_name", "iron_condor_v1"),
-                (max(_put_wing, _call_wing) - c["net_credit"]) * lot,
+                (max(_put_wing, _call_wing) - _fill_net_credit) * lot,
             )
 
             # Added 2026-08-21 (external review): "wing failure analysis" --
@@ -4609,6 +4718,10 @@ class LiveTradingEngine:
         entry_option_delta: Optional[float] = None,
         daily_atr_pct: Optional[float] = None,
         credit_to_max_loss_pct: Optional[float] = None,
+        put_short_delta: Optional[float] = None, call_short_delta: Optional[float] = None,
+        put_long_delta: Optional[float] = None, call_long_delta: Optional[float] = None,
+        put_iv: Optional[float] = None, call_iv: Optional[float] = None,
+        put_wing_width: Optional[float] = None, call_wing_width: Optional[float] = None,
     ) -> Optional[int]:
         try:
             from src.database.connection import AsyncSessionLocal
@@ -4653,6 +4766,10 @@ class LiveTradingEngine:
                 "option_mae_pct":     0.0,
                 "daily_atr_pct":            daily_atr_pct,
                 "credit_to_max_loss_pct":   credit_to_max_loss_pct,
+                "put_short_delta": put_short_delta, "call_short_delta": call_short_delta,
+                "put_long_delta":  put_long_delta,  "call_long_delta":  call_long_delta,
+                "put_iv": put_iv, "call_iv": call_iv,
+                "put_wing_width": put_wing_width, "call_wing_width": call_wing_width,
             })
             return row.id
         except Exception as e:

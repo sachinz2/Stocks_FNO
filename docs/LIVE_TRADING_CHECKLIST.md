@@ -1200,6 +1200,64 @@ Kept short — see git log / individual commit messages for full detail.
      iron_condor_v1. Fails closed (skips the entry) if drifted too far.
   - 18 new regression tests. 524 tests passing.
 
+- **Third review pass (2026-08-21), same day, covering code touched twice
+  already.** Several claims (momentum/EMA bar_key=None edge case, the
+  pullback/breakout model being "not yet implemented", OI-bump delta
+  revalidation, order-timeout FAILED fallback, entry-price estimate
+  fallback) were verified against the current code and found **stale** —
+  all already fixed in the two prior rounds the same day; the review
+  appears to describe an earlier snapshot of the code (its bar_key code
+  excerpt matches the pre-fix structure verbatim). Only the genuinely new
+  findings were implemented:
+  - **RS made strategy-specific.** RS (top-10 vs NIFTY) was the one
+    remaining shared-engine entry filter with no per-strategy override,
+    unlike RVOL (`rvol_hard_gate`) and MTF (`mtf_strict`), which already
+    got this treatment during `ema_crossover_v1`'s redesign. New
+    `require_rs`, defaulting `True` (unchanged for anything that doesn't
+    opt out, e.g. `momentum_v1`) — `ema_crossover_v1` sets it `False`,
+    matching its "early trend transition, don't over-filter" philosophy.
+  - **GTT placement no longer races with active-structure publication.**
+    Both `_process_credit_spread` and `_process_iron_condor` used to
+    publish to `_active_spreads`/`_active_condors` (with `gtt_id=None`)
+    *before* placing the GTT, then patch the id in afterward. A concurrent
+    exit-check cycle could see the newly-registered structure during that
+    async gap, run a normal exit, and call `_cancel_gtt(gtt_id=None, ...)`
+    — a no-op, since the id didn't exist yet — orphaning the real GTT
+    placed moments later at Zerodha for a position the engine no longer
+    tracks. If that stray GTT later triggered, it would place a real,
+    completely unexpected order. Fixed by placing the GTT(s) first and
+    publishing the complete dict (id already resolved) in one atomic
+    assignment — closes the window entirely rather than narrowing it.
+  - **Entry Greeks/IV/wing width stored** for `credit_spread_v1`/
+    `iron_condor_v1` (`put_short_delta`, `call_short_delta`,
+    `put_long_delta`, `call_long_delta`, `put_iv`, `call_iv`,
+    `put_wing_width`, `call_wing_width` — migration `b007`), computed from
+    the final, actually-resolved strikes and real fills. Credit spread
+    populates only the traded side (PE or CE), leaving the other `NULL`.
+    Wired into `/analytics/trades` immediately this time, not left as a
+    follow-up gap like the round-2 fields were.
+  - **Capital reservation now uses real fills, not pre-trade quotes.**
+    `add_deployed_capital`/`release_deployed_capital` used the quote-based
+    `net_credit` (necessary for the *pre-trade* risk gate, which runs
+    before fills exist) for the *post-trade* reservation too, letting
+    reserved risk diverge from real economic risk by however much entry
+    slippage occurred, on every single trade. The reservation is now
+    recomputed from the real fills right after they're known; the matching
+    exit-side release uses the same real-fill basis so add/release stay
+    symmetric.
+  - **Explicitly not implemented** (all correctly deferred): the pullback
+    model refinements needing real backtesting (min_ema_spread_pct
+    threshold, structural-invalidation-exit sensitivity — noted for future
+    log-based analysis, not changed); centralizing
+    credit_spread/condor exit logic into the strategy classes (P2,
+    architectural, not a bug); replacing ATR-derived delta with real
+    option-chain Greeks (still "not urgent if paper results are good," per
+    the review's own words); a full `ENTRY_DECISION` structured-logging
+    schema (the review's own "biggest ask," but a genuinely large addition
+    better scoped as its own future task, not appended to an already-large
+    third round).
+  - 20 new regression tests. 544 tests passing.
+
 ---
 
-*Last updated: 2026-08-21, after the second-opinion review fixes (bar_key first-real-transition edge case, order-timeout PENDING_VERIFICATION status, entry quote fail-closed, resolved-strike delta re-verification).*
+*Last updated: 2026-08-21, after the third review pass (require_rs, GTT/active-structure race fix, entry Greeks storage, fill-based capital reservation).*

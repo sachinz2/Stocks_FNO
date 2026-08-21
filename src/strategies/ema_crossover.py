@@ -102,6 +102,13 @@ class EMACrossoverStrategy(StrategyBase):
         self.mtf_strict = self.parameters.get("mtf_strict", False)
         self.mtf_strong_opposition_pct = self.parameters.get("mtf_strong_opposition_pct", 0.3)
 
+        # Fixed 2026-08-21 (external review, section 11): RS (top-10 vs
+        # NIFTY) demoted from a hard, engine-level gate to opt-in -- an
+        # early crossover shouldn't need the stock to ALREADY be a top-10
+        # RS leader, itself a lagging confirmation. False here; momentum_v1
+        # doesn't set this and keeps the shared default (True, unchanged).
+        self.require_rs = self.parameters.get("require_rs", False)
+
         # Fixed 2026-08-21 (external review, sections 15-18): the EMA-
         # reversal exit, previously scoped only to VOLATILE-entered
         # positions, is now the PRIMARY exit for every position (see
@@ -160,7 +167,7 @@ class EMACrossoverStrategy(StrategyBase):
         logger.info(
             f"Initialized EMA Crossover '{self.name}' ({self.fast_period}/{self.slow_period}) | "
             f"ADX entry>={self.adx_entry_threshold} (OR rising) | "
-            f"RVOL hard_gate={self.rvol_hard_gate} | "
+            f"RVOL hard_gate={self.rvol_hard_gate} | require_RS={self.require_rs} | "
             f"MTF strict={self.mtf_strict} strong_opposition>={self.mtf_strong_opposition_pct}% | "
             f"delta_target={self.entry_option_delta or 'ATM'} | "
             f"SL={self.stop_loss_pct:.0%} TP={self.target_pct:.0%} Trail={self.trailing_stop_pct:.0%} "

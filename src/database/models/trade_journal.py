@@ -73,5 +73,22 @@ class TradeJournal(Base):
     credit_to_max_loss_pct  = Column(Float, nullable=True)   # net_credit / max_loss * 100, at entry -- the review's "critical number for a condor"
     wing_failed             = Column(String(10), nullable=True)  # iron_condor_v1 only: PUT / CALL / BOTH / NULL (not wing-related)
 
+    # Added 2026-08-21 (second-opinion review, P1 #8 -- "store actual entry
+    # Greeks/IV/wing widths"): credit_spread_v1/iron_condor_v1 only. For
+    # credit_spread_v1 (single-sided), only the PE columns populate for a
+    # BULL_PUT_SPREAD or only the CE columns for a BEAR_CALL_SPREAD -- the
+    # other side stays NULL. For iron_condor_v1, both sides populate. All
+    # computed from the FINAL, actually-resolved strikes/fills (not the
+    # pre-resolution targets), same convention as the delta re-verification
+    # added the same day.
+    put_short_delta  = Column(Float, nullable=True)
+    call_short_delta = Column(Float, nullable=True)
+    put_long_delta   = Column(Float, nullable=True)
+    call_long_delta  = Column(Float, nullable=True)
+    put_iv           = Column(Float, nullable=True)   # implied vol backed out from the real short-leg fill
+    call_iv          = Column(Float, nullable=True)
+    put_wing_width   = Column(Float, nullable=True)
+    call_wing_width  = Column(Float, nullable=True)
+
     created_at = Column(TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
     updated_at = Column(TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"))

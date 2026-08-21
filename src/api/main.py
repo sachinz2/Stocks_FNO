@@ -234,6 +234,7 @@ async def lifespan(app: FastAPI):
         # left out of this dict.
         "rvol_hard_gate": False,
         "mtf_strict": False, "mtf_strong_opposition_pct": 0.3,
+        "require_rs": False,
         "ema_reversal_exit": True,
         "underlying_stop_atr_mult": 1.0, "underlying_target_atr_mult": 2.0,
         "entry_option_delta": None,

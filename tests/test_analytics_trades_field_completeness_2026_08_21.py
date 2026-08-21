@@ -27,6 +27,9 @@ def _fake_trade_journal_row(**overrides):
         underlying_mfe_pct=2.1, underlying_mae_pct=-0.5,
         option_mfe_pct=15.0, option_mae_pct=-8.0,
         daily_atr_pct=1.8, credit_to_max_loss_pct=25.0, wing_failed=None,
+        put_short_delta=None, call_short_delta=None,
+        put_long_delta=None, call_long_delta=None,
+        put_iv=None, call_iv=None, put_wing_width=None, call_wing_width=None,
     )
     base.update(overrides)
     return SimpleNamespace(**base)

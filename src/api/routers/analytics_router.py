@@ -68,6 +68,12 @@ def _trade_to_dict(t: TradeJournal) -> Dict[str, Any]:
         "daily_atr_pct":             t.daily_atr_pct,
         "credit_to_max_loss_pct":    t.credit_to_max_loss_pct,
         "wing_failed":               t.wing_failed,
+        # Added 2026-08-21 (second-opinion review, P1 #8) -- wired in
+        # immediately this time, not left as a follow-up gap.
+        "put_short_delta":  t.put_short_delta,  "call_short_delta": t.call_short_delta,
+        "put_long_delta":   t.put_long_delta,   "call_long_delta":  t.call_long_delta,
+        "put_iv":            t.put_iv,           "call_iv":          t.call_iv,
+        "put_wing_width":    t.put_wing_width,   "call_wing_width":  t.call_wing_width,
     }
 
 
