@@ -844,6 +844,67 @@ Kept short — see git log / individual commit messages for full detail.
     static+runtime invariant checks pass; API/DB/Redis healthy; no errors
     in post-deploy logs).
 
+- **momentum_v1 entry-quality redesign, round 2 (2026-08-21).** User re-sent
+  the identical PDF and asked directly: "Have we exactly implemented all
+  recommendations in the attached pdf, if not please implement." A precise
+  re-check against the full document found several sections still
+  unimplemented from round 1 — implemented here:
+  - **Pullback+breakout EVENT-based confirmation model** (sections 8/9/13,
+    the review's own preferred design — "confirm an event, not a state").
+    Replaces the flat N-consecutive-bars debounce as the new default
+    (`use_pullback_continuation_model=True`): tracks TREND ESTABLISHED →
+    PULLBACK → BREAKOUT per symbol and fires only when price genuinely
+    breaks back through the pullback's reference level, not merely when the
+    quality gate has stayed true for N bars. The pre-round-2 debounce is
+    kept as an exact rollback path (`use_pullback_continuation_model=False`)
+    — round-1's own regression tests were pinned to it explicitly, since
+    they test the quality-gate filters in isolation, not the confirmation
+    model.
+  - **Two-tier RVOL breakout confirmation** (section 10): a genuine volume
+    contraction during the pullback (RVOL < `pullback_rvol_low`=0.8) followed
+    by expansion on the breakout bar (RVOL ≥ `breakout_rvol_min`=1.3,
+    deliberately lower than the flat `rvol_entry_threshold`=1.5) is treated
+    as a stronger signal than a flat RVOL floor alone. Required threading a
+    new `rvol_checked_internally` flag into `live_trading_engine.py`'s RVOL
+    gate — without it, the engine's own flat re-check would silently reject
+    breakouts that legitimately passed at a lower RVOL after a contraction,
+    while the strategy's pullback state had already fired with no retry.
+  - **Underlying-based stop AND target as the PRIMARY exit driver** (sections
+    20-21, `underlying_stop_atr_mult`=1.0 / `underlying_target_atr_mult`=2.0),
+    checked first in `manage_position()`, ahead of the premium-based
+    stop/target which remain as a backstop. Required the engine to capture
+    `entry_underlying_price`/`entry_atr` at entry (in `_single_leg_journals`)
+    and thread them into every `manage_position()` call.
+  - **momentum_v1 removed from VOLATILE** (the review's "For now I would
+    actually disable VOLATILE for Momentum") — a trend-continuation thesis
+    is a specifically bad fit for a regime defined by imminent violent
+    reversal, regardless of the PE-only/tightened-exit guardrails that still
+    justify keeping `ema_crossover_v1` active there. `momentum_v1` now only
+    runs in TRENDING.
+  - **Entry-context snapshot + running MFE/MAE** (sections 22-23), added to
+    `trade_journal` via migration `b005`: `underlying_price_at_entry`,
+    `rvol_at_entry`, `adx_at_entry`, `dte_at_entry`, `delta_at_entry`,
+    `underlying_mfe_pct`/`mae_pct`, `option_mfe_pct`/`mae_pct`. A practical
+    approximation of the review's proposed schema — MFE/MAE are a running
+    best/worst excursion since entry (updated every exit-check cycle),
+    **not** the review's exact fixed 5m/15m/30m snapshots, which would need
+    a separate timed-sampling job. Threaded through every single-leg exit
+    path (normal exit-check, EXIT-signal close, EOD/expiry square-off);
+    credit_spread_v1/iron_condor_v1 structures leave these NULL (not
+    tracked — different journal shape).
+  - **Explicitly still NOT done, and why:**
+    - DTE range A/B test (10-25 vs 20-35, section 19) — the review's own
+      framing is "test both," and no live A/B-testing infrastructure exists
+      to do that without guessing at an answer instead of measuring one.
+    - Exact fixed 5m/15m/30m MFE/MAE snapshots (section 23) — approximated
+      by the running since-entry MFE/MAE above instead (see reasoning there).
+  - 20 new regression tests, plus fixes to 4 pre-existing round-1 tests whose
+    assumptions (fire after N bars of the same condition) conflicted with the
+    new default confirmation model — pinned to
+    `use_pullback_continuation_model=False` since they were actually testing
+    the quality-gate filters in isolation, not the confirmation timing.
+    454 tests passing.
+
 ---
 
-*Last updated: 2026-08-20, after the momentum_v1 entry-quality redesign and its post-deploy override fix.*
+*Last updated: 2026-08-21, after the momentum_v1 entry-quality redesign round 2 (pullback+breakout model, two-tier RVOL, underlying-based stop/target, VOLATILE exclusion, entry-context/MFE-MAE data collection).*

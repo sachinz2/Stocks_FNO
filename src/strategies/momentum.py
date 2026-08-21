@@ -43,12 +43,32 @@ class MomentumStrategy(StrategyBase):
     vwap_extension_pct -- see initialize()), a lower ADX floor paired with
     the rising requirement (25 vs. the old static 35), a raised RVOL floor,
     delta-based (near-ITM) instead of ATM strike selection, and a new
-    underlying-based structural-invalidation exit in manage_position()
-    (see its docstring). NOT done: a full pullback-then-breakout event
-    model (the review's own preferred design) or changing the premium-
-    based stop/target parameters themselves -- the real trade data showed
-    the win/loss size RATIO was already healthier than assumed, so the
-    entry timing looked like the more likely lever, not the exit sizing.
+    underlying-based structural-invalidation exit in manage_position().
+
+    Round 2 (2026-08-21, same review -- remaining recommendations): the
+    user asked for a precise accounting of what from the review was still
+    unimplemented and to implement it. Added here:
+    - A real pullback-then-breakout EVENT-based confirmation model
+      (use_pullback_continuation_model, see generate_signal() and
+      _pullback_continuation_signal()) -- the review's own preferred
+      design ("confirm an event, not a state"), replacing the flat
+      N-consecutive-bars debounce as the default path. The old debounce
+      logic is kept, selectable via the same toggle, for rollback safety.
+    - A two-tier RVOL breakout confirmation (pullback_rvol_low /
+      breakout_rvol_min) -- a genuine volume contraction during the
+      pullback followed by expansion on the breakout bar is treated as a
+      stronger signal than a flat RVOL floor alone.
+    - Underlying-based stop AND target as the PRIMARY exit driver
+      (underlying_stop_atr_mult / underlying_target_atr_mult), checked
+      first in manage_position(), ahead of the premium-based stop/target
+      which remain as a backstop.
+    NOT done (see docs/LIVE_TRADING_CHECKLIST.md for the full reasoning):
+    DTE range A/B testing (10-25 vs 20-35) -- the review itself frames this
+    as "test both," and no live A/B-testing infrastructure exists to do
+    that without guessing; the full 5m/15m/30m MFE/MAE snapshot schema is
+    approximated instead by a simpler running-since-entry MFE/MAE (see
+    live_trading_engine.py's _single_leg_journals tracking and
+    trade_journal's new columns) rather than fixed-offset snapshots.
     """
 
     def initialize(self):
@@ -153,11 +173,59 @@ class MomentumStrategy(StrategyBase):
         # noise in practice.
         self.underlying_invalidation_exit = self.parameters.get("underlying_invalidation_exit", True)
 
+        # Fixed 2026-08-21 (external review, round 2 -- sections 20-21):
+        # underlying-based stop AND target, checked FIRST in
+        # manage_position() (primary exit driver) -- "your stop should be
+        # based on the underlying's actual move, not option premium," since
+        # premium reacts to IV/theta/gamma noise on top of the underlying's
+        # real move. 0/None disables either independently. Requires
+        # entry_underlying_price/entry_atr (captured by the engine at entry
+        # -- see live_trading_engine.py's _single_leg_journals) and skips
+        # gracefully, like the structural-invalidation exit above, if
+        # either is missing (e.g. an older restored position).
+        self.underlying_stop_atr_mult   = self.parameters.get("underlying_stop_atr_mult", 1.0)
+        self.underlying_target_atr_mult = self.parameters.get("underlying_target_atr_mult", 2.0)
+
         # Signal confirmation: the ADX/EMA-spread condition must hold for this
         # many distinct 5-min bars before firing — same debouncing principle as
         # EMACrossoverStrategy's signal_confirm_bars, needed because ADX/EMA
         # spread can transiently spike without the trend actually continuing.
+        # Only used when use_pullback_continuation_model is False (legacy
+        # path) -- see that parameter below.
         self.signal_confirm_bars: int = self.parameters.get("signal_confirm_bars", 2)
+
+        # Fixed 2026-08-21 (external review, round 2 -- sections 8/9/13): a
+        # real pullback-then-breakout EVENT-based confirmation model, the
+        # review's own preferred design over the flat N-bar debounce above
+        # ("confirm an event, not a state"). Once the ADX/EMA-spread/rising/
+        # slope/extension quality gate above qualifies a symbol+direction,
+        # this tracks TREND ESTABLISHED -> PULLBACK -> BREAKOUT rather than
+        # just requiring the same state to repeat for N bars: it waits for
+        # price to pull back off its local high/low (a real consolidation,
+        # not just "still qualifies"), then fires only once price actually
+        # breaks back through that pullback's reference level -- an event,
+        # not a static condition. See _pullback_continuation_signal().
+        # True is the new default; set False to fall back to the exact
+        # pre-2026-08-21 signal_confirm_bars debounce (rollback path).
+        self.use_pullback_continuation_model = self.parameters.get("use_pullback_continuation_model", True)
+        # How many distinct bars a pullback may persist without breaking out
+        # before the setup is abandoned (avoid waiting indefinitely for a
+        # breakout that may never come).
+        self.max_pullback_bars = self.parameters.get("max_pullback_bars", 6)
+        # Two-tier RVOL breakout confirmation (section 10): a genuine volume
+        # CONTRACTION during the pullback (RVOL below pullback_rvol_low at
+        # any point while pulling back) followed by EXPANSION on the
+        # breakout bar (RVOL >= breakout_rvol_min, deliberately lower than
+        # the flat rvol_entry_threshold) is treated as a stronger signal
+        # than a flat RVOL floor alone -- "the crowd stepped away, then
+        # rushed back in on the resumption," vs. rvol_entry_threshold's
+        # "volume was already elevated the whole time" (which can mean the
+        # move is late, not fresh -- the same critique the review made of
+        # the original flat ADX threshold). If no contraction was ever
+        # observed during the pullback, the breakout still needs to clear
+        # the higher flat rvol_entry_threshold.
+        self.pullback_rvol_low  = self.parameters.get("pullback_rvol_low", 0.8)
+        self.breakout_rvol_min  = self.parameters.get("breakout_rvol_min", 1.3)
         self.min_dte: int = self.parameters.get("min_dte", 10)
         # Fixed 2026-08-20: 25 left a structural monthly dead zone -- see
         # EMACrossoverStrategy.initialize()'s matching comment for the full
@@ -183,6 +251,27 @@ class MomentumStrategy(StrategyBase):
         self._ema_history: Dict[str, list] = {}
         self._history_bar_key: Dict[str, str] = {}
 
+        # Fixed 2026-08-21 (external review, round 2): state for the
+        # pullback+breakout event model, keyed by symbol for the same
+        # reason as the dicts above (one strategy instance, many symbols).
+        self._trend_state:      Dict[str, str] = {}    # "ESTABLISHED" | "PULLBACK"
+        self._trend_direction:  Dict[str, str] = {}    # "BUY" | "SELL"
+        self._pullback_ref:     Dict[str, float] = {}  # reference swing level to break
+        self._pullback_bars:    Dict[str, int] = {}    # bars spent in PULLBACK so far
+        self._pullback_bar_key: Dict[str, str] = {}
+        self._rvol_history:     Dict[str, list] = {}   # bar-aligned, feeds the two-tier RVOL check
+
+        # Read by live_trading_engine.py's RVOL entry gate: when the pullback
+        # model is active, _pullback_continuation_signal() already makes a
+        # richer, history-aware RVOL decision (two-tier pattern) internally
+        # as part of firing the breakout signal -- the engine's own flat
+        # rvol_entry_threshold re-check must NOT also run afterwards, or a
+        # breakout that passed the two-tier check at RVOL>=breakout_rvol_min
+        # (which can be below rvol_entry_threshold) would get silently
+        # rejected downstream while this strategy's own pullback state has
+        # already been consumed (fired), losing the setup with no retry.
+        self.rvol_checked_internally = self.use_pullback_continuation_model
+
         logger.info(
             f"Initialized Momentum '{self.name}' ({self.fast_period}/{self.slow_period}) | "
             f"ADX entry>={self.adx_entry_threshold} (rising={self.adx_rising_required}) "
@@ -193,8 +282,13 @@ class MomentumStrategy(StrategyBase):
             f"SL={self.stop_loss_pct:.0%} WeakeningSL={self.weakening_stop_loss_pct:.0%} "
             f"TP={self.target_pct:.0%} Trail={self.trailing_stop_pct:.0%} "
             f"Breakeven activates at +{self.breakeven_activation_pct:.0%} | "
-            f"UnderlyingInvalidation={self.underlying_invalidation_exit} | "
-            f"ConfirmBars={self.signal_confirm_bars}"
+            f"UnderlyingInvalidation={self.underlying_invalidation_exit} "
+            f"UnderlyingStop={self.underlying_stop_atr_mult}xATR "
+            f"UnderlyingTarget={self.underlying_target_atr_mult}xATR | "
+            f"PullbackModel={self.use_pullback_continuation_model} "
+            f"(max_bars={self.max_pullback_bars}, breakout_RVOL>={self.breakout_rvol_min} "
+            f"after contraction<{self.pullback_rvol_low}) | "
+            f"ConfirmBars={self.signal_confirm_bars} (legacy path only)"
         )
 
     def generate_signal(self, data: Dict[str, Any]) -> Optional[str]:
@@ -292,6 +386,19 @@ class MomentumStrategy(StrategyBase):
                         )
                         raw = None
 
+        if self.use_pullback_continuation_model:
+            return self._pullback_continuation_signal(symbol, raw, data, bar_key)
+        return self._legacy_confirm_bars_signal(symbol, raw, adx, ema_spread_pct, bar_key)
+
+    def _legacy_confirm_bars_signal(
+        self, symbol: str, raw: Optional[str], adx: float, ema_spread_pct: float, bar_key: Optional[str],
+    ) -> str:
+        """
+        Pre-2026-08-21 signal model: fires once the quality-gated `raw`
+        direction has held for signal_confirm_bars distinct 5-min bars.
+        Kept as a rollback path via use_pullback_continuation_model=False --
+        see _pullback_continuation_signal() for the current default.
+        """
         signal = "HOLD"
         if raw is not None:
             if raw != self._pending_signal.get(symbol):
@@ -337,6 +444,134 @@ class MomentumStrategy(StrategyBase):
 
         return signal
 
+    def _reset_pullback_state(self, symbol: str) -> None:
+        self._trend_state.pop(symbol, None)
+        self._trend_direction.pop(symbol, None)
+        self._pullback_ref.pop(symbol, None)
+        self._pullback_bars.pop(symbol, None)
+
+    def _pullback_continuation_signal(
+        self, symbol: str, raw: Optional[str], data: Dict[str, Any], bar_key: Optional[str],
+    ) -> str:
+        """
+        Event-based confirmation (external review, round 2, sections 8/9/13):
+        TREND ESTABLISHED -> PULLBACK -> BREAKOUT, firing only on the
+        breakout EVENT rather than "the quality gate has stayed true for N
+        bars." `raw` is this bar's fully quality-gated candidate direction
+        (ADX rising, EMA sloping, not extended -- see generate_signal()) or
+        None if that gate doesn't currently hold.
+
+        State machine per symbol (only advances on a genuinely new,
+        identifiable bar_key -- same debounce convention as the ADX/EMA
+        history tracking above, to avoid the bar_key=None class of bug):
+          None/absent -> ESTABLISHED: first bar the quality gate qualifies.
+              _pullback_ref is seeded at this bar's close and kept rising
+              (BUY) / falling (SELL) each subsequent bar the trend keeps
+              extending without pulling back.
+          ESTABLISHED -> PULLBACK: the first bar that qualifies but does NOT
+              extend past the current reference (a genuine dip/consolidation
+              off the local high/low) locks in _pullback_ref as the level
+              that must be broken to confirm resumption.
+          PULLBACK -> fires: a later bar's close breaks back through
+              _pullback_ref in the trend's direction, with RVOL confirmation
+              (see the two-tier check below) -- this is the actual "event."
+          PULLBACK -> reset: quality gate drops out, direction flips, or the
+              pullback persists longer than max_pullback_bars without a
+              qualifying breakout.
+        Fully resets (both directions) whenever `raw` is None, matching the
+        legacy model's behavior of clearing state the moment the trend
+        condition itself is no longer met.
+        """
+        close = data.get("close")
+        rvol  = data.get("rvol")
+
+        is_new_bar = bar_key is not None and bar_key != self._pullback_bar_key.get(symbol)
+        if is_new_bar:
+            self._pullback_bar_key[symbol] = bar_key
+            if rvol is not None:
+                self._rvol_history.setdefault(symbol, []).append(rvol)
+                self._rvol_history[symbol] = self._rvol_history[symbol][-self.max_pullback_bars:]
+
+        if raw is None or close is None:
+            if self._trend_state.get(symbol):
+                logger.debug(f"[{self.name}] {symbol} pullback setup cleared — quality gate no longer met")
+            self._reset_pullback_state(symbol)
+            self._rvol_history.pop(symbol, None)
+            return "HOLD"
+
+        state     = self._trend_state.get(symbol)
+        direction = self._trend_direction.get(symbol)
+
+        if state is None or direction != raw:
+            # Fresh qualification, or a direction flip mid-setup — start over.
+            self._trend_state[symbol] = "ESTABLISHED"
+            self._trend_direction[symbol] = raw
+            self._pullback_ref[symbol] = close
+            self._pullback_bars[symbol] = 0
+            self._rvol_history[symbol] = [rvol] if rvol is not None else []
+            return "HOLD"
+
+        if not is_new_bar:
+            return "HOLD"  # nothing new to evaluate this cycle
+
+        ref = self._pullback_ref.get(symbol, close)
+
+        if state == "ESTABLISHED":
+            extending = (close > ref) if raw == "BUY" else (close < ref)
+            if extending:
+                self._pullback_ref[symbol] = close
+                return "HOLD"
+            self._trend_state[symbol] = "PULLBACK"
+            self._pullback_bars[symbol] = 1
+            logger.debug(f"[{self.name}] {symbol} {raw} pullback started, ref={ref:.2f}")
+            return "HOLD"
+
+        # state == "PULLBACK"
+        broke_out = (close > ref) if raw == "BUY" else (close < ref)
+        if not broke_out:
+            self._pullback_bars[symbol] = self._pullback_bars.get(symbol, 0) + 1
+            if self._pullback_bars[symbol] > self.max_pullback_bars:
+                logger.debug(
+                    f"[{self.name}] {symbol} pullback setup expired after "
+                    f"{self.max_pullback_bars} bars without a breakout"
+                )
+                self._reset_pullback_state(symbol)
+            return "HOLD"
+
+        # Breakout bar — two-tier RVOL confirmation (section 10).
+        hist_rvol = self._rvol_history.get(symbol, [])
+        had_contraction = any(v is not None and v < self.pullback_rvol_low for v in hist_rvol)
+        rvol_ok = False
+        if rvol is not None:
+            if had_contraction and rvol >= self.breakout_rvol_min:
+                rvol_ok = True
+            elif rvol >= self.rvol_entry_threshold:
+                rvol_ok = True
+
+        if not rvol_ok:
+            logger.info(
+                f"[{self.name}] {symbol} {raw} breakout rejected — RVOL="
+                f"{rvol if rvol is not None else 'n/a'} insufficient (needs "
+                f">={self.breakout_rvol_min} after a contraction <{self.pullback_rvol_low}, "
+                f"or >={self.rvol_entry_threshold} flat)"
+            )
+            # Give the setup another bar or two rather than discarding it
+            # outright on one weak-volume breakout attempt.
+            self._pullback_bars[symbol] = self._pullback_bars.get(symbol, 0) + 1
+            if self._pullback_bars[symbol] > self.max_pullback_bars:
+                self._reset_pullback_state(symbol)
+            return "HOLD"
+
+        logger.info(
+            f"[{self.name}] {symbol} {raw} pullback+breakout confirmed — "
+            f"close={close:.2f} broke ref={ref:.2f} after "
+            f"{self._pullback_bars.get(symbol, 0)} pullback bar(s), "
+            f"RVOL={rvol:.2f}{' (post-contraction)' if had_contraction else ''} — firing."
+        )
+        self._reset_pullback_state(symbol)
+        self._rvol_history.pop(symbol, None)
+        return raw
+
     def manage_position(self, current_position: Dict[str, Any], current_premium: float) -> Optional[str]:
         """
         Options position management based on option premium movement, plus a
@@ -351,10 +586,25 @@ class MomentumStrategy(StrategyBase):
                               structural-invalidation exit added 2026-08-20;
                               that check is skipped (not fail-closed) if
                               missing.
+          - entry_underlying_price, entry_atr : optional, feed the
+                              underlying-based stop/target added 2026-08-21
+                              (round 2); skipped (not fail-closed) if either
+                              is missing.
 
         Exit conditions (in priority order):
-          1. Hard stop loss     — premium fell >= stop_loss_pct from entry
-          2. Weakening-trend stop — premium fell >= weakening_stop_loss_pct
+          1. Underlying-based stop/target (added 2026-08-21, round 2) — the
+                                  PRIMARY exit driver per the external
+                                  review: underlying's close has moved
+                                  underlying_stop_atr_mult/
+                                  underlying_target_atr_mult ATRs against/in
+                                  favor of entry, in the underlying's own
+                                  terms rather than option premium (which
+                                  carries IV/theta/gamma noise on top of the
+                                  underlying's real move). Checked first,
+                                  ahead of every premium-based check below,
+                                  which remain as a backstop.
+          2. Hard stop loss     — premium fell >= stop_loss_pct from entry
+          3. Weakening-trend stop — premium fell >= weakening_stop_loss_pct
                                   from entry AND ADX has already dropped below
                                   adx_entry_threshold (the trend no longer
                                   reconfirms this position's own entry
@@ -362,17 +612,17 @@ class MomentumStrategy(StrategyBase):
                                   since a trend that's stopped reconfirming
                                   itself shouldn't get the full drawdown
                                   before being cut loose — see initialize().
-          3. Structural invalidation (added 2026-08-20) — underlying's close
+          4. Structural invalidation (added 2026-08-20) — underlying's close
                                   crossed back to the wrong side of EMA20,
                                   breaking the trend-participation thesis the
                                   position was entered on, regardless of
                                   premium P&L. Toggle via
                                   underlying_invalidation_exit.
-          4. Profit target      — premium rose >= target_pct from entry
-          5. Trailing stop      — premium fell >= trailing_stop_pct from its peak
-          6. Breakeven stop     — once up >= breakeven_activation_pct from entry,
+          5. Profit target      — premium rose >= target_pct from entry
+          6. Trailing stop      — premium fell >= trailing_stop_pct from its peak
+          7. Breakeven stop     — once up >= breakeven_activation_pct from entry,
                                   never allow a close below entry (see below)
-          7. Trend exhaustion   — ADX has dropped below adx_exit_threshold, i.e.
+          8. Trend exhaustion   — ADX has dropped below adx_exit_threshold, i.e.
                                   the established trend that justified entry has
                                   since weakened. Unlike EMA crossover (which
                                   waits for premium-based signals only), this
@@ -387,6 +637,48 @@ class MomentumStrategy(StrategyBase):
 
         pnl_pct = (current_premium - entry_premium) / entry_premium
         current_adx = current_position.get("current_adx")
+
+        # Fixed 2026-08-21 (external review, round 2 -- sections 20-21):
+        # underlying-based stop/target, the PRIMARY exit driver per the
+        # review -- checked first, ahead of every premium-based check below.
+        # Skips gracefully (not fail-closed) if entry_underlying_price/
+        # entry_atr weren't captured at entry (e.g. a position restored from
+        # before this field existed).
+        entry_underlying = current_position.get("entry_underlying_price")
+        entry_atr        = current_position.get("entry_atr")
+        current_close     = current_position.get("current_close")
+        is_call           = current_position.get("is_call")
+        if (
+            (self.underlying_stop_atr_mult > 0 or self.underlying_target_atr_mult > 0)
+            and entry_underlying and entry_atr and current_close
+            and entry_underlying > 0 and entry_atr > 0 and is_call is not None
+        ):
+            if is_call:
+                stop_level   = entry_underlying - self.underlying_stop_atr_mult * entry_atr
+                target_level = entry_underlying + self.underlying_target_atr_mult * entry_atr
+                hit_stop     = self.underlying_stop_atr_mult > 0 and current_close <= stop_level
+                hit_target   = self.underlying_target_atr_mult > 0 and current_close >= target_level
+            else:
+                stop_level   = entry_underlying + self.underlying_stop_atr_mult * entry_atr
+                target_level = entry_underlying - self.underlying_target_atr_mult * entry_atr
+                hit_stop     = self.underlying_stop_atr_mult > 0 and current_close >= stop_level
+                hit_target   = self.underlying_target_atr_mult > 0 and current_close <= target_level
+            if hit_stop:
+                logger.info(
+                    f"[{self.name}] Underlying-based stop: close={current_close:.2f} "
+                    f"past {stop_level:.2f} (entry {entry_underlying:.2f} "
+                    f"{'-' if is_call else '+'} {self.underlying_stop_atr_mult}x "
+                    f"ATR({entry_atr:.2f})) -- exiting."
+                )
+                return "EXIT"
+            if hit_target:
+                logger.info(
+                    f"[{self.name}] Underlying-based target: close={current_close:.2f} "
+                    f"past {target_level:.2f} (entry {entry_underlying:.2f} "
+                    f"{'+' if is_call else '-'} {self.underlying_target_atr_mult}x "
+                    f"ATR({entry_atr:.2f})) -- exiting."
+                )
+                return "EXIT"
 
         if pnl_pct <= -self.stop_loss_pct:
             logger.info(
@@ -532,6 +824,16 @@ class MomentumStrategy(StrategyBase):
         self._adx_history.clear()
         self._ema_history.clear()
         self._history_bar_key.clear()
+        # Fixed 2026-08-21 (external review, round 2): same staleness risk
+        # for the pullback+breakout state machine -- a pullback/reference
+        # level observed before the pause shouldn't be trusted against bars
+        # that occurred while paused.
+        self._trend_state.clear()
+        self._trend_direction.clear()
+        self._pullback_ref.clear()
+        self._pullback_bars.clear()
+        self._pullback_bar_key.clear()
+        self._rvol_history.clear()
 
     def shutdown(self):
         pass

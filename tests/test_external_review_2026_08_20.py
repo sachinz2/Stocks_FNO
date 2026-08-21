@@ -49,6 +49,11 @@ def test_momentum_bar_key_none_does_not_fast_track_confirmation():
         "signal_confirm_bars": 2,
         "adx_rising_required": False, "ema_slope_required": False,
         "extension_atr_mult": 0, "vwap_extension_pct": 0,
+        # Fixed 2026-08-21 (external review, round 2): this test asserts
+        # directly on _pending_count, the legacy debounce's own state --
+        # the new pullback+breakout model (now the default) doesn't use it
+        # at all, so this must pin the legacy path explicitly.
+        "use_pullback_continuation_model": False,
     })
     strat.initialize()
 

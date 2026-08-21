@@ -78,24 +78,39 @@ STRATEGY_MOMENTUM  = "momentum_v1"
 # is an already-strong, established trend (high ADX), which by definition isn't
 # present in RANGE_BOUND/LOW_VOL.
 #
-# EMA crossover / Momentum now also run in VOLATILE (added 2026-07-31 — were
-# excluded entirely before). India VIX is a fear/uncertainty gauge, not a
-# directional one — VIX>20 empirically correlates with sharp SELLOFFS, not
-# bull sprints (confirmed: this system's own ~4-week history never saw VIX
-# above 15.03, so a genuine spike has never been observed live here — this is
-# a deliberate risk decision, not something validated against this system's
-# own data yet). live_trading_engine.py._process_signal() restricts entries
-# to PE (bearish) only while VOLATILE is active — no CE/long-call entries —
-# and both strategies get a tightened, VOLATILE-specific reversal exit (see
-# EMACrossoverStrategy.manage_position()'s EMA-reversal check and
-# MomentumStrategy's adx_exit_threshold_volatile) so a position opened to
-# catch a crash gets closed fast if the move V-reverses, rather than riding
-# out the same slower thresholds used in a normal trending market.
+# EMA crossover ran in VOLATILE (added 2026-07-31 — was excluded entirely
+# before). India VIX is a fear/uncertainty gauge, not a directional one —
+# VIX>20 empirically correlates with sharp SELLOFFS, not bull sprints
+# (confirmed: this system's own ~4-week history never saw VIX above 15.03, so
+# a genuine spike has never been observed live here — this is a deliberate
+# risk decision, not something validated against this system's own data yet).
+# live_trading_engine.py._process_signal() restricts entries to PE (bearish)
+# only while VOLATILE is active — no CE/long-call entries — and gets a
+# tightened, VOLATILE-specific reversal exit (see
+# EMACrossoverStrategy.manage_position()'s EMA-reversal check) so a position
+# opened to catch a crash gets closed fast if the move V-reverses, rather
+# than riding out the same slower thresholds used in a normal trending market.
+#
+# Fixed 2026-08-21 (external PDF review, momentum_v1 redesign round 2):
+# momentum_v1 was ALSO enabled in VOLATILE alongside EMA crossover, but the
+# review argued a momentum-continuation strategy is a specifically bad fit
+# for VOLATILE regardless of the PE-only/tightened-exit guardrails — VIX
+# spikes are exactly the environment where "the trend that already ran is
+# about to violently reverse" is most likely, the opposite of momentum_v1's
+# entire thesis ("this trend will continue"). credit_spread_v1's short-premium
+# structure profits from richer VIX premium regardless of direction, and
+# EMA crossover's PE-only + reversal-exit guardrails were judged by the
+# review as adequate for a moment-of-crossing signal; a trend-continuation
+# strategy on an already-extended move was not. momentum_v1 is removed from
+# VOLATILE entirely — it now only runs in TRENDING.
 REGIME_STRATEGY_MAP: Dict[str, list] = {
     "TRENDING":    [STRATEGY_EMA, STRATEGY_SPREAD, STRATEGY_MOMENTUM],  # spread aligned with trend = low breach risk
     "RANGE_BOUND": [STRATEGY_CONDOR, STRATEGY_SPREAD],   # both premium sellers thrive in flat market
-    "VOLATILE":    [STRATEGY_SPREAD, STRATEGY_EMA, STRATEGY_MOMENTUM],  # high IV = rich premium for spreads;
-                                                                          # EMA/Momentum PE-only, crash-catching
+    "VOLATILE":    [STRATEGY_SPREAD, STRATEGY_EMA],      # high IV = rich premium for spreads;
+                                                           # EMA is PE-only, crash-catching. momentum_v1
+                                                           # excluded (see comment above) -- a trend-
+                                                           # continuation thesis is the wrong bet on a
+                                                           # regime defined by imminent violent reversal.
     "LOW_VOL":     [STRATEGY_SPREAD, STRATEGY_CONDOR],   # quiet market = premium seller heaven
 }
 

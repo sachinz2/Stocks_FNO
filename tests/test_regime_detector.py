@@ -56,9 +56,16 @@ def test_hysteresis_low_vix_alone_does_not_exit_trending():
     assert MRD._classify(vix=11.5, atr_pct=mid_atr, ema_spread_pct=0.3, prev_regime=None) == "LOW_VOL"
 
 
-def test_volatile_regime_includes_ema_and_momentum_crash_catching():
+def test_volatile_regime_includes_ema_crash_catching_excludes_momentum():
     assert STRATEGY_EMA in REGIME_STRATEGY_MAP["VOLATILE"]
-    assert STRATEGY_MOMENTUM in REGIME_STRATEGY_MAP["VOLATILE"]
     assert STRATEGY_SPREAD in REGIME_STRATEGY_MAP["VOLATILE"]
     # Iron condor wings still blow through in a panic -- deliberately excluded.
     assert STRATEGY_CONDOR not in REGIME_STRATEGY_MAP["VOLATILE"]
+    # Fixed 2026-08-21 (external review, round 2): momentum_v1 was ALSO
+    # enabled here until this fix -- removed because a trend-continuation
+    # thesis is a specifically bad fit for a regime defined by imminent
+    # violent reversal, regardless of the PE-only/tightened-exit guardrails
+    # that still justify keeping EMA crossover active. See
+    # regime_detector.py's REGIME_STRATEGY_MAP comment for the full reasoning.
+    assert STRATEGY_MOMENTUM not in REGIME_STRATEGY_MAP["VOLATILE"]
+    assert STRATEGY_MOMENTUM in REGIME_STRATEGY_MAP["TRENDING"]

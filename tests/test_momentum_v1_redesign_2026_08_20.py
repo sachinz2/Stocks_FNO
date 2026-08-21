@@ -19,6 +19,16 @@ from src.live_trading.live_trading_engine import LiveTradingEngine
 
 
 def _mom(**overrides):
+    # Fixed 2026-08-21 (external review, round 2): use_pullback_continuation_model
+    # now defaults to True, replacing the flat signal_confirm_bars debounce
+    # these tests were written against with a pullback+breakout event model
+    # (see test_momentum_v1_redesign_round2_2026_08_21.py for its own
+    # coverage). These tests isolate the QUALITY-GATE filters (ADX
+    # rising/EMA slope/extension/VWAP) via the legacy 2-bar debounce, not
+    # the confirmation model itself -- pin the legacy model unless a test
+    # explicitly overrides it, so their original intent is unaffected by
+    # the new default.
+    overrides.setdefault("use_pullback_continuation_model", False)
     strat = MomentumStrategy("momentum_v1", overrides)
     strat.initialize()
     return strat

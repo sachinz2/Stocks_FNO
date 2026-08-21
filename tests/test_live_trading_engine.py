@@ -219,7 +219,7 @@ class _FakeEngine:
     async def _safe_get_positions(self):
         return [{"symbol": "TITAN26AUG4975CE", "quantity": 175, "avg_price": 46.59}]
 
-    async def _log_trade_close(self, journal_id, exit_price, pnl, exit_reason, market_data, total_slippage_pts):
+    async def _log_trade_close(self, journal_id, exit_price, pnl, exit_reason, market_data, total_slippage_pts, **_kw):
         self._closed_journals.append((journal_id, exit_price, pnl, exit_reason))
 
     async def _persist_state(self):
@@ -550,7 +550,7 @@ class _FakeSquareOffEngine:
     def _get_underlying_from_contract(self, contract):
         return "TITAN"
 
-    async def _log_trade_close(self, journal_id, exit_price, pnl, exit_reason):
+    async def _log_trade_close(self, journal_id, exit_price, pnl, exit_reason, **_kw):
         self._closed_journals.append((journal_id, exit_price, pnl, exit_reason))
 
     async def _persist_state(self):
@@ -664,7 +664,7 @@ class _FakeMultiSquareOffEngine:
     def _get_underlying_from_contract(self, contract):
         return "TITAN" if "TITAN" in contract else "RELIANCE"
 
-    async def _log_trade_close(self, journal_id, exit_price, pnl, exit_reason):
+    async def _log_trade_close(self, journal_id, exit_price, pnl, exit_reason, **_kw):
         self._closed_journals.append((journal_id, exit_price, pnl, exit_reason))
 
     async def _persist_state(self):
@@ -765,7 +765,7 @@ class _FakeExpiryJournalFailEngine:
     def _get_underlying_from_contract(self, contract):
         return contract[:7]
 
-    async def _log_trade_close(self, journal_id, exit_price, pnl, exit_reason):
+    async def _log_trade_close(self, journal_id, exit_price, pnl, exit_reason, **_kw):
         if journal_id == 301:  # BADSPR
             raise RuntimeError("simulated DB write failure")
         self._closed_journals.append((journal_id, exit_price, pnl, exit_reason))
@@ -859,7 +859,7 @@ class _FakeExitAllEngine:
     async def _get_market_data(self, symbol):
         return {"atr14": 3.0}
 
-    async def _log_trade_close(self, journal_id, exit_price, pnl, exit_reason, market_data=None, total_slippage_pts=None):
+    async def _log_trade_close(self, journal_id, exit_price, pnl, exit_reason, market_data=None, total_slippage_pts=None, **_kw):
         self._closed_journals.append((journal_id, exit_price, pnl, exit_reason))
 
     async def _persist_state(self):
@@ -1113,7 +1113,7 @@ class _FakeSpreadExitEngine:
     async def _get_cached_vix(self):
         return None
 
-    async def _log_trade_close(self, journal_id, exit_price, pnl, exit_reason, market_data, total_slippage_pts):
+    async def _log_trade_close(self, journal_id, exit_price, pnl, exit_reason, market_data, total_slippage_pts, **_kw):
         self._closed_journals.append((journal_id, exit_price, pnl, exit_reason))
 
     async def _persist_state(self):
@@ -1236,7 +1236,7 @@ class _FakeCondorExitEngine:
     async def _get_cached_vix(self):
         return None
 
-    async def _log_trade_close(self, journal_id, exit_price, pnl, exit_reason, market_data, total_slippage_pts):
+    async def _log_trade_close(self, journal_id, exit_price, pnl, exit_reason, market_data, total_slippage_pts, **_kw):
         self._closed_journals.append((journal_id, exit_price, pnl, exit_reason))
 
     async def _persist_state(self):

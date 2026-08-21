@@ -47,5 +47,23 @@ class TradeJournal(Base):
     total_slippage_pts  = Column(Float,      nullable=True)   # sum |slippage| across all legs × lot
     slippage            = Column(Float,      nullable=True)   # legacy alias (kept for compatibility)
 
+    # Entry-context snapshot + running MFE/MAE (added 2026-08-21, external
+    # review round 2 -- sections 22-23). A practical approximation of the
+    # review's proposed schema: rather than fixed 5m/15m/30m snapshots (which
+    # would need a separate timed-sampling job), MFE/MAE below are the
+    # highest/lowest excursion observed at any point between entry and exit,
+    # updated every exit-check cycle. Nullable -- structures other than
+    # single-leg momentum/EMA entries (credit spreads, condors) don't
+    # populate these; NULL, not 0, means "not tracked for this trade."
+    underlying_price_at_entry = Column(Float, nullable=True)
+    rvol_at_entry             = Column(Float, nullable=True)
+    adx_at_entry              = Column(Float, nullable=True)
+    dte_at_entry              = Column(Integer, nullable=True)
+    delta_at_entry            = Column(Float, nullable=True)   # target delta used for strike selection, if any (else ATM)
+    underlying_mfe_pct        = Column(Float, nullable=True)   # best favorable underlying move since entry, %
+    underlying_mae_pct        = Column(Float, nullable=True)   # worst adverse underlying move since entry, %
+    option_mfe_pct            = Column(Float, nullable=True)   # best favorable option premium move since entry, %
+    option_mae_pct            = Column(Float, nullable=True)   # worst adverse option premium move since entry, %
+
     created_at = Column(TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
     updated_at = Column(TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"))

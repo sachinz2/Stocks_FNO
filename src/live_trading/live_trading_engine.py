@@ -1446,6 +1446,25 @@ class LiveTradingEngine:
                          if s.__class__.__name__ == "EMACrossoverStrategy"), None
                     )
 
+                # Fixed 2026-08-21 (external review, round 2 -- sections
+                # 22-23): running MFE/MAE, mutated in place on owner_info
+                # (the same dict object stored in _single_leg_journals, so
+                # this update persists without a separate write-back) and
+                # written to trade_journal at exit. Runs regardless of
+                # exit_reason -- a position being force-closed this cycle
+                # should still get its final excursion recorded.
+                _is_call = contract.endswith("CE")
+                _entry_u = owner_info.get("entry_underlying_price")
+                _u_now   = market_data.get("close")
+                if _entry_u and _u_now:
+                    _u_move_pct = (_u_now - _entry_u) / _entry_u * 100
+                    _u_fav_pct  = _u_move_pct if _is_call else -_u_move_pct
+                    owner_info["mfe_underlying_pct"] = max(owner_info.get("mfe_underlying_pct", 0.0) or 0.0, _u_fav_pct)
+                    owner_info["mae_underlying_pct"] = min(owner_info.get("mae_underlying_pct", 0.0) or 0.0, _u_fav_pct)
+                _opt_move_pct = (current_p - entry_p) / entry_p * 100
+                owner_info["mfe_option_pct"] = max(owner_info.get("mfe_option_pct", 0.0) or 0.0, _opt_move_pct)
+                owner_info["mae_option_pct"] = min(owner_info.get("mae_option_pct", 0.0) or 0.0, _opt_move_pct)
+
                 if exit_reason is None and owner_strategy is not None:
                     result = owner_strategy.manage_position(
                         {
@@ -1466,6 +1485,12 @@ class LiveTradingEngine:
                             "current_close":    market_data.get("close"),
                             "is_call":          contract.endswith("CE"),
                             "entry_regime":     owner_info.get("entry_regime"),
+                            # Added 2026-08-21 (external review, round 2) --
+                            # feeds MomentumStrategy's underlying-based
+                            # stop/target; unused (no-op) by strategies that
+                            # don't check them.
+                            "entry_underlying_price": owner_info.get("entry_underlying_price"),
+                            "entry_atr":              owner_info.get("entry_atr"),
                         },
                         current_p,
                     )
@@ -1541,6 +1566,10 @@ class LiveTradingEngine:
                 exit_reason=exit_reason,
                 market_data=md,
                 total_slippage_pts=round(_slip, 4) if _slip > 0 else None,
+                underlying_mfe_pct=info.get("mfe_underlying_pct"),
+                underlying_mae_pct=info.get("mae_underlying_pct"),
+                option_mfe_pct=info.get("mfe_option_pct"),
+                option_mae_pct=info.get("mae_option_pct"),
             )
             self.risk_manager.release_deployed_capital(
                 info.get("strategy_name", "ema_crossover_v1"), entry_p * abs(qty),
@@ -1800,13 +1829,26 @@ class LiveTradingEngine:
         # and its docstring for why: a bare RVOL>1.3 confirms a move is
         # ALREADY underway, "everybody's rushing in," which is more useful as
         # a late-entry warning than an edge).
-        _rvol_threshold = getattr(strategy, "rvol_entry_threshold", 1.3)
-        if _rvol < _rvol_threshold:
-            logger.info(
-                f"[{strategy.name}] {symbol} skipped — RVOL={_rvol:.2f} < {_rvol_threshold} "
-                "(below-average volume; weak breakout confirmation)"
-            )
-            return
+        #
+        # Fixed 2026-08-21 (external review, round 2): momentum_v1's
+        # pullback+breakout model (see momentum.py's
+        # _pullback_continuation_signal) already makes a richer, history-
+        # aware two-tier RVOL decision internally as part of firing the
+        # breakout signal -- a re-check here using a single flat threshold
+        # would silently reject breakouts that legitimately passed at a
+        # LOWER RVOL after a genuine volume contraction, while the
+        # strategy's own pullback state has already been consumed (fired)
+        # with no way to retry. Strategies that set rvol_checked_internally
+        # skip this second gate entirely; everything else (ema_crossover_v1,
+        # momentum_v1 with the legacy confirm-bars model) is unaffected.
+        if not getattr(strategy, "rvol_checked_internally", False):
+            _rvol_threshold = getattr(strategy, "rvol_entry_threshold", 1.3)
+            if _rvol < _rvol_threshold:
+                logger.info(
+                    f"[{strategy.name}] {symbol} skipped — RVOL={_rvol:.2f} < {_rvol_threshold} "
+                    "(below-average volume; weak breakout confirmation)"
+                )
+                return
 
         # ADX filter — require strong trend (ADX > 25) for EMA crossover momentum plays.
         # A crossover in a low-ADX environment is likely noise rather than a trend change.
@@ -1989,6 +2031,7 @@ class LiveTradingEngine:
                 structure_type="SINGLE_LEG", contracts=[contract],
                 entry_price=_entry_fill, quantity=lot_size,
                 market_data=market_data, iv_rank=iv_rank, vix=vix,
+                dte=dte, entry_option_delta=_delta_target,
             )
             if journal_id:
                 self._single_leg_journals[contract] = {
@@ -2002,6 +2045,19 @@ class LiveTradingEngine:
                     # reversal exit for its whole life even if VIX later calms
                     # down mid-day.
                     "entry_regime":  regime,
+                    # Fixed 2026-08-21 (external review, round 2 -- sections
+                    # 20-21): feeds MomentumStrategy's underlying-based
+                    # stop/target in manage_position(); a no-op for
+                    # strategies that don't check these fields.
+                    "entry_underlying_price": underlying_price,
+                    "entry_atr":              atr,
+                    # Running MFE/MAE (external review, round 2 -- sections
+                    # 22-23), updated every exit-check cycle below and
+                    # written to trade_journal at exit.
+                    "mfe_underlying_pct": 0.0,
+                    "mae_underlying_pct": 0.0,
+                    "mfe_option_pct":     0.0,
+                    "mae_option_pct":     0.0,
                 }
                 if self._ltp_poller:
                     self._ltp_poller.register_option_contracts([contract])
@@ -3696,6 +3752,10 @@ class LiveTradingEngine:
                     pnl=_pnl,
                     exit_reason=f"{_jrnl_info.get('strategy_name', 'unknown')} EXIT signal",
                     market_data=md,
+                    underlying_mfe_pct=_jrnl_info.get("mfe_underlying_pct"),
+                    underlying_mae_pct=_jrnl_info.get("mae_underlying_pct"),
+                    option_mfe_pct=_jrnl_info.get("mfe_option_pct"),
+                    option_mae_pct=_jrnl_info.get("mae_option_pct"),
                 )
                 self.risk_manager.release_deployed_capital(
                     _jrnl_info.get("strategy_name", "ema_crossover_v1"), entry_p * abs(pos["quantity"]),
@@ -3827,6 +3887,10 @@ class LiveTradingEngine:
                         exit_price=_sq_fill_p,
                         pnl=_pnl,
                         exit_reason=_reason,
+                        underlying_mfe_pct=_jrnl_info.get("mfe_underlying_pct"),
+                        underlying_mae_pct=_jrnl_info.get("mae_underlying_pct"),
+                        option_mfe_pct=_jrnl_info.get("mfe_option_pct"),
+                        option_mae_pct=_jrnl_info.get("mae_option_pct"),
                     )
                     self.risk_manager.release_deployed_capital(
                         _jrnl_info.get("strategy_name", "ema_crossover_v1"),
@@ -4052,6 +4116,8 @@ class LiveTradingEngine:
         market_data: Dict,
         iv_rank: Optional[float],
         vix: Optional[float],
+        dte: Optional[int] = None,
+        entry_option_delta: Optional[float] = None,
     ) -> Optional[int]:
         try:
             from src.database.connection import AsyncSessionLocal
@@ -4064,6 +4130,13 @@ class LiveTradingEngine:
             )
             ema_sp   = float(market_data.get("ema_spread_pct", 0))
             entry_ts = now_ist().replace(tzinfo=None)
+            # Added 2026-08-21 (external review, round 2 -- sections 22-23):
+            # entry-context snapshot for per-trade attribution analysis.
+            # Only populated when the underlying data was actually present
+            # in market_data (single-leg entries) -- None for anything else.
+            _rvol_e = market_data.get("rvol")
+            _adx_e  = market_data.get("adx14")
+            _close_e = market_data.get("close")
             row = await repo.create({
                 "strategy_name":  strategy,
                 "underlying":     underlying,
@@ -4078,6 +4151,15 @@ class LiveTradingEngine:
                 "vix_at_entry":   vix,
                 "day_of_week":    entry_ts.weekday(),   # 0=Mon … 4=Fri
                 "hour_of_day":    entry_ts.hour,        # IST hour
+                "underlying_price_at_entry": float(_close_e) if _close_e else None,
+                "rvol_at_entry":  float(_rvol_e) if _rvol_e is not None else None,
+                "adx_at_entry":   float(_adx_e) if _adx_e is not None else None,
+                "dte_at_entry":   dte,
+                "delta_at_entry": entry_option_delta,
+                "underlying_mfe_pct": 0.0 if _close_e else None,
+                "underlying_mae_pct": 0.0 if _close_e else None,
+                "option_mfe_pct":     0.0,
+                "option_mae_pct":     0.0,
             })
             return row.id
         except Exception as e:
@@ -4092,6 +4174,10 @@ class LiveTradingEngine:
         exit_reason: str,
         market_data: Optional[Dict] = None,
         total_slippage_pts: Optional[float] = None,
+        underlying_mfe_pct: Optional[float] = None,
+        underlying_mae_pct: Optional[float] = None,
+        option_mfe_pct: Optional[float] = None,
+        option_mae_pct: Optional[float] = None,
     ) -> None:
         if not journal_id:
             return
@@ -4136,6 +4222,18 @@ class LiveTradingEngine:
                 "total_slippage_pts": round(total_slippage_pts, 4) if total_slippage_pts is not None else None,
                 "slippage":           round(total_slippage_pts, 4) if total_slippage_pts is not None else None,
             }
+            # Added 2026-08-21 (external review, round 2 -- sections 22-23):
+            # only overwrite the entry-time-seeded 0.0 defaults when the
+            # caller actually tracked these (single-leg exits) -- None means
+            # "not applicable to this structure_type," left untouched.
+            if underlying_mfe_pct is not None:
+                updates["underlying_mfe_pct"] = round(underlying_mfe_pct, 4)
+            if underlying_mae_pct is not None:
+                updates["underlying_mae_pct"] = round(underlying_mae_pct, 4)
+            if option_mfe_pct is not None:
+                updates["option_mfe_pct"] = round(option_mfe_pct, 4)
+            if option_mae_pct is not None:
+                updates["option_mae_pct"] = round(option_mae_pct, 4)
             await repo.update(row, updates)
         except Exception as e:
             logger.error(f"TradeJournal close log failed: {e}")

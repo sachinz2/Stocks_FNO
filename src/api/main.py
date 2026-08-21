@@ -252,6 +252,12 @@ async def lifespan(app: FastAPI):
         "underlying_invalidation_exit": True,
         "min_ema_spread_pct": 0.30,
         "stop_loss_pct": 0.50, "target_pct": 1.50, "trailing_stop_pct": 0.30,
+        # Round 2 (2026-08-21, same review, same "list everything explicitly"
+        # convention -- see the comment above).
+        "use_pullback_continuation_model": True,
+        "max_pullback_bars": 6,
+        "pullback_rvol_low": 0.8, "breakout_rvol_min": 1.3,
+        "underlying_stop_atr_mult": 1.0, "underlying_target_atr_mult": 2.0,
     })
 
     trade_journal_repo = BaseRepository(TradeJournal, AsyncSessionLocal)
