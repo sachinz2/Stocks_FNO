@@ -429,7 +429,7 @@ class MomentumStrategy(StrategyBase):
             # multi-bar tracked state to protect, so it keeps the original
             # every-cycle behavior unchanged.
             extension_ok = True
-            if self.extension_atr_mult > 0:
+            if raw is not None and self.extension_atr_mult > 0:
                 close = data.get("close")
                 atr = data.get("atr14")
                 if close and atr and atr > 0 and abs(close - fast_ema) / atr > self.extension_atr_mult:
@@ -441,7 +441,7 @@ class MomentumStrategy(StrategyBase):
                     extension_ok = False
 
             vwap_ok = True
-            if self.vwap_extension_pct > 0:
+            if raw is not None and self.vwap_extension_pct > 0:
                 close = data.get("close")
                 vwap = data.get("vwap") or data.get("session_vwap")
                 if close and vwap and vwap > 0:

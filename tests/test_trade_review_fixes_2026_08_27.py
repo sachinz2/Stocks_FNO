@@ -412,6 +412,27 @@ def test_vwap_extension_crossing_the_cap_mid_setup_also_does_not_wipe_progress()
     assert strat._trend_state.get("RELIANCE") == "ESTABLISHED"
 
 
+def test_extension_check_is_skipped_entirely_once_raw_already_none_from_an_earlier_gate(caplog):
+    """Live bug caught via production logs right after deploying the fix
+    above: 'SOLARINDS None candidate too extended' -- the extension/VWAP
+    checks ran even after `raw` was already None from
+    adx_rising_required/ema_slope_required failing earlier in the same
+    function, producing a nonsensical log line (and wasted computation).
+    Restored the `raw is not None and` guard both blocks had before the
+    restructure -- must not evaluate or log at all once raw is already
+    None."""
+    strat = _mom(adx_rising_required=True, ema_slope_required=False,
+                 extension_atr_mult=1.0, vwap_extension_pct=0)
+    strat.generate_signal(_mbar(adx=35.0, close=108.0, bar_key="live:t0"))
+    with caplog.at_level("INFO"):
+        # ADX declining (35 -> 30) -- adx_rising_required fails, raw becomes
+        # None BEFORE the extension check runs. Price is genuinely far from
+        # EMA20 (close=200, ema20=105, atr=3 -> 31.7x ATR) but that must
+        # never be evaluated or logged since raw is already None.
+        strat.generate_signal(_mbar(adx=30.0, close=200.0, atr=3.0, bar_key="live:t1"))
+    assert not any("too extended" in r.message for r in caplog.records)
+
+
 # ── main.py wiring ───────────────────────────────────────────────────────
 
 def test_main_py_wires_all_four_fixes_for_ema_crossover():
