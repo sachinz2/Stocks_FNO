@@ -433,6 +433,31 @@ def test_extension_check_is_skipped_entirely_once_raw_already_none_from_an_earli
     assert not any("too extended" in r.message for r in caplog.records)
 
 
+def test_pullback_expiry_via_repeated_rvol_rejected_breakouts_is_logged_and_resets(caplog):
+    """Live incident, round 2: a setup that keeps genuinely breaking out
+    (price crosses ref every attempt) but never clears the RVOL bar hits
+    max_pullback_bars via a DIFFERENT code path than the 'never broke out
+    at all' expiry already covered above -- this one reset with NO log line
+    at all, confirmed live (BDL disappeared and reappeared as a brand-new
+    'trend established' one cycle later with nothing explaining the gap).
+    Must now log and actually clear state after exactly max_pullback_bars
+    failed attempts."""
+    strat = _mom(adx_rising_required=False, ema_slope_required=False,
+                 extension_atr_mult=0, vwap_extension_pct=0, max_pullback_bars=3)
+    strat.generate_signal(_mbar(close=108.0, bar_key="live:t0"))            # ESTABLISHED, ref=108
+    strat.generate_signal(_mbar(close=107.0, rvol=1.0, bar_key="live:t1"))  # PULLBACK, ref=108, bars=1
+    strat.generate_signal(_mbar(close=109.0, rvol=0.1, bar_key="live:t2"))  # breaks ref, RVOL fails, bars=2
+    assert strat._trend_state.get("RELIANCE") == "PULLBACK"
+    with caplog.at_level("INFO"):
+        signal = strat.generate_signal(_mbar(close=109.0, rvol=0.1, bar_key="live:t3"))  # bars=3 -> expires
+    assert signal == "HOLD"
+    assert "RELIANCE" not in strat._trend_state
+    assert any(
+        "pullback setup expired" in r.message and "breakout attempts" in r.message
+        for r in caplog.records
+    )
+
+
 # ── main.py wiring ───────────────────────────────────────────────────────
 
 def test_main_py_wires_all_four_fixes_for_ema_crossover():

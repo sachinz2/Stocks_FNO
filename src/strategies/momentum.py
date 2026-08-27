@@ -725,6 +725,19 @@ class MomentumStrategy(StrategyBase):
             # outright on one weak-volume breakout attempt.
             self._pullback_bars[symbol] = self._pullback_bars.get(symbol, 0) + 1
             if self._pullback_bars[symbol] >= self.max_pullback_bars:
+                # Fixed 2026-08-27 (live incident, monitoring gap round 2):
+                # this second expiry path (repeated RVOL-rejected breakout
+                # attempts, as opposed to the "never broke out at all" path
+                # above) reset silently -- confirmed live: BDL hit this
+                # exact path, disappeared with no log line, and reappeared
+                # one cycle later as a brand-new "trend established" with
+                # no visible link between the two. Same fix as the other
+                # expiry path.
+                logger.info(
+                    f"[{self.name}] {symbol} pullback setup expired after "
+                    f"{self.max_pullback_bars} bars of breakout attempts, "
+                    "never confirmed by volume"
+                )
                 self._reset_pullback_state(symbol)
             return "HOLD"
 
