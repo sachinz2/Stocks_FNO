@@ -62,13 +62,26 @@ def _init_nse_holiday_checker():
     Falls back to the hardcoded _NSE_HOLIDAYS_FALLBACK set if the package is absent.
 
     Returns a callable:  is_nse_holiday(d: date) -> bool
+
+    Fixed 2026-08-27 (live incident): "XNSE" does not exist in the installed
+    exchange_calendars version (4.13.2) -- confirmed via
+    ecals.get_calendar_names(), which lists "BSE"/"XBSE" but no NSE code at
+    all. This silently failed init every single day (never a transient
+    blip) and fell back to the hardcoded _NSE_HOLIDAYS_FALLBACK list below,
+    which incorrectly flagged 2026-08-27 as an NSE holiday ("Janmashtami")
+    -- verified wrong against XBSE's real calendar (is_session return True
+    for that date) -- silently blocking every signal cycle all day on a
+    genuine trading day, with zero trades and zero error output (holiday
+    is a normal, quiet no-op path). NSE and BSE observe the same national
+    trading holidays in India, so XBSE is a safe dynamic substitute for the
+    missing XNSE code.
     """
     try:
         import exchange_calendars as ecals
         import pandas as pd
 
-        cal = ecals.get_calendar("XNSE")
-        logger.info("NSE holiday calendar loaded from exchange_calendars (dynamic)")
+        cal = ecals.get_calendar("XBSE")
+        logger.info("NSE holiday calendar loaded from exchange_calendars (dynamic, via XBSE)")
 
         def _check(d: date) -> bool:
             try:
