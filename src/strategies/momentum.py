@@ -404,32 +404,64 @@ class MomentumStrategy(StrategyBase):
                     logger.debug(f"[{self.name}] {symbol} SELL candidate rejected — EMA20 not sloping down")
                     raw = None
 
-            if raw is not None and self.extension_atr_mult > 0:
+            # Fixed 2026-08-27 (live incident): extension_atr_mult/
+            # vwap_extension_pct answer "is this a FRESH, not-already-
+            # blown-out entry point" -- a question about distance from a
+            # reference level, not about whether the trend itself is still
+            # real (that's what adx_rising_required/ema_slope_required
+            # just checked, above). Confirmed live: on a genuinely strong
+            # trending day (2026-08-27, TRENDING regime) these two filters
+            # rejected 100% of candidates for hours even AFTER the same-day
+            # extension_atr_mult widening (1.5->2.5x) -- real observed
+            # values ran 2.66x-5.11x, because EMA20 lags price and a
+            # sustained trend mechanically keeps extending further from it
+            # the longer it runs. Recomputing this gate every cycle and
+            # feeding straight into `raw` (as ADX/slope still do above) was
+            # wiping an already-tracked pullback+breakout setup the moment
+            # a maturing trend crossed the extension line, even though the
+            # pullback model's own reference-level mechanism (_pullback_ref
+            # below) already independently protects against chasing an
+            # exhausted move. These two checks now only gate the FRESH-
+            # qualification moment (starting to track a new setup) inside
+            # _pullback_continuation_signal(), not every re-evaluation of
+            # an already-tracked one -- see entry_extension_ok below. The
+            # legacy (non-pullback) confirmation path has no comparable
+            # multi-bar tracked state to protect, so it keeps the original
+            # every-cycle behavior unchanged.
+            extension_ok = True
+            if self.extension_atr_mult > 0:
                 close = data.get("close")
                 atr = data.get("atr14")
                 if close and atr and atr > 0 and abs(close - fast_ema) / atr > self.extension_atr_mult:
                     logger.info(
-                        f"[{self.name}] {symbol} {raw} candidate rejected — "
+                        f"[{self.name}] {symbol} {raw} candidate too extended — "
                         f"price {abs(close - fast_ema) / atr:.2f}x ATR from EMA20 "
-                        f"(> {self.extension_atr_mult}x, too extended)"
+                        f"(> {self.extension_atr_mult}x)"
                     )
-                    raw = None
+                    extension_ok = False
 
-            if raw is not None and self.vwap_extension_pct > 0:
+            vwap_ok = True
+            if self.vwap_extension_pct > 0:
                 close = data.get("close")
                 vwap = data.get("vwap") or data.get("session_vwap")
                 if close and vwap and vwap > 0:
                     _vwap_dist_pct = abs(close - vwap) / vwap * 100
                     if _vwap_dist_pct > self.vwap_extension_pct:
                         logger.info(
-                            f"[{self.name}] {symbol} {raw} candidate rejected — "
-                            f"{_vwap_dist_pct:.2f}% from VWAP (> {self.vwap_extension_pct}%, too extended)"
+                            f"[{self.name}] {symbol} {raw} candidate too extended — "
+                            f"{_vwap_dist_pct:.2f}% from VWAP (> {self.vwap_extension_pct}%)"
                         )
-                        raw = None
+                        vwap_ok = False
+        else:
+            extension_ok = True
+            vwap_ok = True
 
         if self.use_pullback_continuation_model:
-            return self._pullback_continuation_signal(symbol, raw, data, bar_key)
-        return self._legacy_confirm_bars_signal(symbol, raw, adx, ema_spread_pct, bar_key)
+            return self._pullback_continuation_signal(
+                symbol, raw, data, bar_key, entry_extension_ok=(extension_ok and vwap_ok),
+            )
+        legacy_raw = raw if (extension_ok and vwap_ok) else None
+        return self._legacy_confirm_bars_signal(symbol, legacy_raw, adx, ema_spread_pct, bar_key)
 
     def _legacy_confirm_bars_signal(
         self, symbol: str, raw: Optional[str], adx: float, ema_spread_pct: float, bar_key: Optional[str],
@@ -512,22 +544,26 @@ class MomentumStrategy(StrategyBase):
 
     def _pullback_continuation_signal(
         self, symbol: str, raw: Optional[str], data: Dict[str, Any], bar_key: Optional[str],
+        entry_extension_ok: bool = True,
     ) -> str:
         """
         Event-based confirmation (external review, round 2, sections 8/9/13):
         TREND ESTABLISHED -> PULLBACK -> BREAKOUT, firing only on the
         breakout EVENT rather than "the quality gate has stayed true for N
-        bars." `raw` is this bar's fully quality-gated candidate direction
-        (ADX rising, EMA sloping, not extended -- see generate_signal()) or
-        None if that gate doesn't currently hold.
+        bars." `raw` is this bar's core trend-quality candidate direction
+        (ADX rising, EMA sloping -- see generate_signal()) or None if that
+        gate doesn't currently hold. `entry_extension_ok` is separate: it
+        answers "is price still close enough to EMA20/VWAP to treat a FIRST
+        qualification as a fresh entry point" -- see the fix note below.
 
         State machine per symbol (only advances on a genuinely new,
         identifiable bar_key -- same debounce convention as the ADX/EMA
         history tracking above, to avoid the bar_key=None class of bug):
-          None/absent -> ESTABLISHED: first bar the quality gate qualifies.
-              _pullback_ref is seeded at this bar's close and kept rising
-              (BUY) / falling (SELL) each subsequent bar the trend keeps
-              extending without pulling back.
+          None/absent -> ESTABLISHED: first bar the quality gate qualifies
+              AND entry_extension_ok is True (see fix note). _pullback_ref
+              is seeded at this bar's close and kept rising (BUY) / falling
+              (SELL) each subsequent bar the trend keeps extending without
+              pulling back.
           ESTABLISHED -> PULLBACK: the first bar that qualifies but does NOT
               extend past the current reference (a genuine dip/consolidation
               off the local high/low) locks in _pullback_ref as the level
@@ -541,6 +577,20 @@ class MomentumStrategy(StrategyBase):
         Fully resets (both directions) whenever `raw` is None, matching the
         legacy model's behavior of clearing state the moment the trend
         condition itself is no longer met.
+
+        Fixed 2026-08-27 (live incident): entry_extension_ok used to be
+        folded into `raw` itself (generate_signal() set raw=None whenever
+        price was too extended from EMA20/VWAP), so it was re-checked and
+        could wipe an ALREADY-TRACKED setup every single cycle -- confirmed
+        live on a genuinely strong trending day: extension ran 2.66x-5.11x
+        ATR for hours (well past the 2.5x floor), continuously resetting
+        ESTABLISHED/PULLBACK state the moment a maturing trend crossed the
+        line, even though the pullback+breakout mechanism itself (tracking
+        _pullback_ref) already independently guards against chasing an
+        exhausted move -- that's the model's whole point. Now
+        entry_extension_ok only gates the FRESH-qualification moment
+        (starting to track a new setup); once already tracking, further
+        extension no longer resets progress on its own.
         """
         close = data.get("close")
         rvol  = data.get("rvol")
@@ -593,6 +643,15 @@ class MomentumStrategy(StrategyBase):
             # mismatched lingers either way.
             self._reset_pullback_state(symbol)
             if bar_key is None:
+                return "HOLD"
+            # Fixed 2026-08-27 (live incident): entry_extension_ok is
+            # checked ONLY here, at the moment a NEW setup would start being
+            # tracked -- not on later cycles once a setup is already
+            # ESTABLISHED/PULLBACK (see the class docstring fix note
+            # above). Price already too far from EMA20/VWAP right now just
+            # means this isn't a fresh entry point yet; don't start
+            # tracking it, but don't otherwise treat it as invalidated.
+            if not entry_extension_ok:
                 return "HOLD"
             self._trend_state[symbol] = "ESTABLISHED"
             self._trend_direction[symbol] = raw

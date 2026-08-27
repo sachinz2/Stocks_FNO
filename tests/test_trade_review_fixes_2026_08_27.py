@@ -329,6 +329,89 @@ def test_main_py_wires_momentum_extension_and_vwap_fixes():
     assert '"vwap_extension_pct": 2.5' in block
 
 
+# ── momentum_v1: extension no longer wipes an already-tracked pullback ─────
+# Live incident, same day: even after the 1.5x->2.5x widening above, a
+# genuinely strong trending day (2026-08-27) produced 105 extension
+# rejections, ALL above 2.5x (observed 2.66x-5.11x) -- the pullback+breakout
+# model's tracked state was being wiped every cycle the moment a maturing
+# trend crossed the extension line, even though the model's own reference-
+# level mechanism already protects against chasing an exhausted move.
+# Fixed: extension/VWAP now only gate the FRESH-qualification moment
+# (starting to track a NEW setup), not every re-evaluation of an
+# already-tracked one.
+
+def _mbar(symbol="RELIANCE", ema20=105.0, ema50=100.0, adx=30.0, close=108.0,
+          atr=3.0, vwap=None, rvol=1.6, rvol_valid=True, bar_key="live:t0"):
+    return {
+        "symbol": symbol, "ema20": ema20, "ema50": ema50, "adx14": adx,
+        "close": close, "atr14": atr, "vwap": vwap if vwap is not None else close,
+        "rvol": rvol, "rvol_valid": rvol_valid, "ohlc_bar_key": bar_key,
+    }
+
+
+def test_extension_blocks_a_brand_new_setup_from_ever_starting_to_track():
+    """First qualifying bar is already too extended -- must NOT start
+    tracking (unchanged from the old per-cycle behavior for a fresh
+    setup)."""
+    strat = _mom(adx_rising_required=False, ema_slope_required=False,
+                 extension_atr_mult=2.0, vwap_extension_pct=0)
+    # ema20=105, close=120, atr=3.0 -> 5.0x ATR, over the 2.0x cap from bar 0.
+    signal = strat.generate_signal(_mbar(close=120.0, bar_key="live:t0"))
+    assert signal == "HOLD"
+    assert "RELIANCE" not in strat._trend_state
+
+
+def test_extension_crossing_the_cap_mid_setup_no_longer_wipes_tracked_progress():
+    """Reproduces the live incident: a setup starts within the extension
+    cap, then a later bar crosses it (as a maturing trend naturally pulls
+    price further from EMA20) -- progress must survive, not reset."""
+    strat = _mom(adx_rising_required=False, ema_slope_required=False,
+                 extension_atr_mult=2.0, vwap_extension_pct=0)
+    # Bar 0: ema20=105, close=108, atr=3.0 -> 1.0x ATR, within the 2.0x cap.
+    strat.generate_signal(_mbar(close=108.0, bar_key="live:t0"))
+    assert strat._trend_state["RELIANCE"] == "ESTABLISHED"
+    # Bar 1: close=113 -> (113-105)/3 = 2.67x ATR, OVER the 2.0x cap. Under
+    # the old behavior this would wipe tracking entirely; now it must not,
+    # since RELIANCE is already tracked and this isn't a fresh qualification.
+    signal = strat.generate_signal(_mbar(close=113.0, bar_key="live:t1"))
+    assert signal == "HOLD"
+    assert strat._trend_state.get("RELIANCE") == "ESTABLISHED", (
+        "an already-tracked setup must not be reset just because a "
+        "maturing trend crossed the extension line on a later bar"
+    )
+    assert strat._pullback_ref["RELIANCE"] == 113.0  # kept extending, ref raised
+
+
+def test_full_pullback_and_breakout_still_fires_despite_extension_staying_over_cap():
+    """End-to-end: extension crosses the cap at bar 1 and STAYS crossed for
+    the rest of the setup (2.33x-3.0x, all over the 2.0x cap) -- the
+    pullback+breakout sequence must still complete and fire, matching what
+    the live incident showed was structurally broken before this fix."""
+    strat = _mom(adx_rising_required=False, ema_slope_required=False,
+                 extension_atr_mult=2.0, vwap_extension_pct=0)
+    strat.generate_signal(_mbar(close=108.0, bar_key="live:t0"))          # ESTABLISHED, ref=108, 1.0x
+    strat.generate_signal(_mbar(close=113.0, bar_key="live:t1"))          # extends, ref=113, 2.67x (over cap)
+    signal = strat.generate_signal(_mbar(close=112.0, rvol=1.0, bar_key="live:t2"))  # pulls back, 2.33x (over cap)
+    assert signal == "HOLD"
+    assert strat._trend_state["RELIANCE"] == "PULLBACK"
+    # Breaks back above ref=113, flat RVOL >= rvol_entry_threshold (1.5) -- fires.
+    signal = strat.generate_signal(_mbar(close=114.0, rvol=1.6, bar_key="live:t3"))  # 3.0x, still over cap
+    assert signal == "BUY"
+    assert "RELIANCE" not in strat._trend_state
+
+
+def test_vwap_extension_crossing_the_cap_mid_setup_also_does_not_wipe_progress():
+    strat = _mom(adx_rising_required=False, ema_slope_required=False,
+                 extension_atr_mult=0, vwap_extension_pct=1.0)
+    # Bar 0: close == vwap -> 0% away, within the 1.0% cap.
+    strat.generate_signal(_mbar(close=108.0, vwap=108.0, bar_key="live:t0"))
+    assert strat._trend_state["RELIANCE"] == "ESTABLISHED"
+    # Bar 1: close=113, vwap=108 -> 4.6% away, over the 1.0% cap.
+    signal = strat.generate_signal(_mbar(close=113.0, vwap=108.0, bar_key="live:t1"))
+    assert signal == "HOLD"
+    assert strat._trend_state.get("RELIANCE") == "ESTABLISHED"
+
+
 # ── main.py wiring ───────────────────────────────────────────────────────
 
 def test_main_py_wires_all_four_fixes_for_ema_crossover():
