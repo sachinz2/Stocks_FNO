@@ -477,3 +477,27 @@ def test_engine_passes_contract_and_bar_key_into_manage_position():
     block = src[idx:idx + 2300]
     assert '"contract":     contract' in block
     assert '"ohlc_bar_key": market_data.get("ohlc_bar_key")' in block
+
+
+# ── 14:30 entry cutoff logging: DEBUG -> INFO (live monitoring gap) ────────
+# Confirmed live 2026-08-27: with these at DEBUG (invisible at the server's
+# LOG_LEVEL=INFO), credit_spread_v1/iron_condor_v1 kept firing real
+# candidates every cycle after 14:30 IST with zero visible explanation for
+# why nothing ever happened downstream -- indistinguishable from a genuine
+# bug without reading the code directly. Correct, intended behavior (a
+# deliberate pre-EOD entry cutoff), but needed to be observable.
+
+def test_credit_spread_entry_cutoff_is_logged_at_info_not_debug():
+    src = inspect.getsource(LiveTradingEngine._process_credit_spread)
+    idx = src.index("past entry cutoff 14:30 IST")
+    block = src[max(0, idx - 120):idx]
+    assert "logger.info(" in block
+    assert "logger.debug(" not in block
+
+
+def test_iron_condor_entry_cutoff_is_logged_at_info_not_debug():
+    src = inspect.getsource(LiveTradingEngine._process_iron_condor)
+    idx = src.index("past entry cutoff 14:30 IST")
+    block = src[max(0, idx - 120):idx]
+    assert "logger.info(" in block
+    assert "logger.debug(" not in block

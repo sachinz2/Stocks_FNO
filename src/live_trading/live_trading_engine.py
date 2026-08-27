@@ -2801,9 +2801,17 @@ class LiveTradingEngine:
 
         # No new entries after 14:30 IST — at least one exit-check cycle before
         # the 15:20 EOD window, and avoids rushed afternoon entries.
+        #
+        # Fixed 2026-08-27 (live monitoring gap): this used to be DEBUG --
+        # invisible with the server's LOG_LEVEL=INFO. Confirmed live: with
+        # this silent, candidates kept firing every cycle from
+        # generate_signal() with zero visible explanation for why nothing
+        # ever happened downstream, indistinguishable from a genuine bug
+        # without reading the code directly. Correct, intended behavior,
+        # but needs to be observable.
         _ENTRY_CUTOFF_HOUR, _ENTRY_CUTOFF_MIN = 14, 30
         if (now.replace(tzinfo=None).hour, now.replace(tzinfo=None).minute) >= (_ENTRY_CUTOFF_HOUR, _ENTRY_CUTOFF_MIN):
-            logger.debug(f"[CreditSpread] {symbol} skipped — past entry cutoff 14:30 IST.")
+            logger.info(f"[CreditSpread] {symbol} skipped — past entry cutoff 14:30 IST.")
             return
 
         # D: SL frequency circuit breaker — block re-entry after 2+ adverse exits in 5 days.
@@ -3792,9 +3800,14 @@ class LiveTradingEngine:
 
         # No new entries after 14:30 IST — at least one exit-check cycle before
         # the 15:20 EOD window, and avoids rushed afternoon entries.
+        #
+        # Fixed 2026-08-27 (live monitoring gap): same fix as
+        # _process_credit_spread's identical cutoff -- was DEBUG, invisible
+        # at LOG_LEVEL=INFO, made correct/intended behavior indistinguishable
+        # from a genuine bug during live monitoring.
         _ENTRY_CUTOFF_HOUR, _ENTRY_CUTOFF_MIN = 14, 30
         if (now.replace(tzinfo=None).hour, now.replace(tzinfo=None).minute) >= (_ENTRY_CUTOFF_HOUR, _ENTRY_CUTOFF_MIN):
-            logger.debug(f"[IronCondor] {symbol} skipped — past entry cutoff 14:30 IST.")
+            logger.info(f"[IronCondor] {symbol} skipped — past entry cutoff 14:30 IST.")
             return
 
         # D: SL frequency circuit breaker
