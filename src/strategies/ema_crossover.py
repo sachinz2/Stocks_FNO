@@ -79,7 +79,7 @@ class EMACrossoverStrategy(StrategyBase):
         # adx_rising_required), matching the review's own "ADX>=18 OR ADX
         # rising" diagram box. adx_checked_internally=True tells the engine
         # to skip its own now-redundant flat gate for this strategy.
-        self.adx_entry_threshold = self.parameters.get("adx_entry_threshold", 18)
+        self.adx_entry_threshold = self.parameters.get("adx_entry_threshold", 22)
         self.adx_checked_internally = True
         self._HISTORY_LEN = 3
 
@@ -117,12 +117,39 @@ class EMACrossoverStrategy(StrategyBase):
         # momentum_v1's structural-invalidation exit.
         self.ema_reversal_exit = self.parameters.get("ema_reversal_exit", True)
 
+        # Fixed 2026-08-27 (trade review, Aug 24-26): confirmed live that
+        # "too twitchy against normal EMA20/50 noise" wasn't hypothetical --
+        # 12 of 27 exits over 3 days were this check firing on an EMA20/50
+        # gap of a few hundredths of a point (once literally equal), each
+        # one an automatic loss regardless of how the position was
+        # otherwise doing. Two independent fixes, mirroring how the ENTRY
+        # side already guards against exactly this kind of noise:
+        #   - ema_reversal_min_gap_pct: the flipped relationship must be by
+        #     at least this fraction of the slow EMA, not any sign flip --
+        #     a literal tie or a hundredth-of-a-point cross no longer counts.
+        #   - ema_reversal_confirm_bars: the (gap-qualified) reversal must
+        #     hold across this many genuinely distinct bars before it
+        #     fires, via the same bar_key debounce pattern generate_signal()
+        #     already uses for entries -- so a one-tick flicker back across
+        #     the line doesn't exit a position that's still fine a bar
+        #     later. The entry side already required 2 confirming bars;
+        #     the exit side required none, which was the actual asymmetry.
+        self.ema_reversal_min_gap_pct  = self.parameters.get("ema_reversal_min_gap_pct", 0.001)
+        self.ema_reversal_confirm_bars = self.parameters.get("ema_reversal_confirm_bars", 2)
+        self._reversal_pending_count:   Dict[str, int] = {}
+        self._reversal_pending_bar_key: Dict[str, str] = {}
+
         # Fixed 2026-08-21 (external review, sections 16-18): underlying-
         # based stop AND target, mirroring momentum_v1's round-2 addition --
         # uses entry_underlying_price/entry_atr, already captured by the
         # engine for every single-leg entry regardless of strategy. See
         # manage_position(). 0 disables either independently.
-        self.underlying_stop_atr_mult   = self.parameters.get("underlying_stop_atr_mult", 1.0)
+        #
+        # Fixed 2026-08-27 (trade review): stop raised from 1.0x to 1.4x ATR
+        # -- 8 of 27 exits over Aug 24-26 were this stop, and 1.0x ATR is
+        # tight enough that normal intraday noise (not a genuine thesis
+        # invalidation) was plausibly tripping a meaningful share of those.
+        self.underlying_stop_atr_mult   = self.parameters.get("underlying_stop_atr_mult", 1.4)
         self.underlying_target_atr_mult = self.parameters.get("underlying_target_atr_mult", 2.0)
 
         # Fixed 2026-08-21 (external review, section 14): expose the same
@@ -174,7 +201,9 @@ class EMACrossoverStrategy(StrategyBase):
             f"Breakeven activates at +{self.breakeven_activation_pct:.0%} | "
             f"UnderlyingStop={self.underlying_stop_atr_mult}xATR "
             f"UnderlyingTarget={self.underlying_target_atr_mult}xATR | "
-            f"ConfirmBars={self.signal_confirm_bars}"
+            f"ConfirmBars={self.signal_confirm_bars} | "
+            f"EMAReversalExit={self.ema_reversal_exit} "
+            f"(min_gap={self.ema_reversal_min_gap_pct:.2%}, confirm_bars={self.ema_reversal_confirm_bars})"
         )
 
     def generate_signal(self, data: Dict[str, Any]) -> Optional[str]:
@@ -458,20 +487,84 @@ class EMACrossoverStrategy(StrategyBase):
         # VOLATILE-only check to running for every position; entry_regime is
         # read only for the log line now, not to scope whether the check
         # runs at all.
+        #
+        # Fixed 2026-08-27 (trade review, Aug 24-26): two independent noise
+        # guards, both mirroring how the ENTRY side already treats a
+        # crossover -- confirmed live that without them, 12 of 27 exits
+        # over 3 days were this check firing on an EMA20/50 gap of a few
+        # hundredths of a point (once literally equal), each one an
+        # automatic loss regardless of how the position was otherwise
+        # doing:
+        #   - min gap (ema_reversal_min_gap_pct): a literal tie or a
+        #     hundredth-of-a-point cross no longer counts as "reversed."
+        #   - bar-count confirmation (ema_reversal_confirm_bars): the gap-
+        #     qualified reversal must hold across this many genuinely
+        #     distinct bars (same bar_key debounce as generate_signal()'s
+        #     entry confirmation) before it actually exits -- the entry
+        #     side already required 2 confirming bars; the exit side
+        #     required none, which was the real asymmetry.
         if self.ema_reversal_exit:
             ema_fast = current_position.get("current_ema_fast")
             ema_slow = current_position.get("current_ema_slow")
             is_call  = current_position.get("is_call")
-            if ema_fast is not None and ema_slow is not None and is_call is not None:
-                reversed_ = (ema_fast <= ema_slow) if is_call else (ema_fast >= ema_slow)
-                if reversed_:
-                    logger.info(
-                        f"[{self.name}] EMA reversal exit: EMA20/50 relationship "
-                        f"flipped back (fast={ema_fast:.2f} slow={ema_slow:.2f}, "
-                        f"is_call={is_call}, entry_regime={current_position.get('entry_regime')}) "
-                        f"— exiting regardless of premium P&L ({pnl_pct:+.1%})."
-                    )
-                    return "EXIT"
+            contract = current_position.get("contract")
+            bar_key  = current_position.get("ohlc_bar_key")
+            if ema_fast is not None and ema_slow is not None and is_call is not None and ema_slow:
+                raw_reversed = (ema_fast <= ema_slow) if is_call else (ema_fast >= ema_slow)
+                gap_pct = abs(ema_fast - ema_slow) / abs(ema_slow)
+                qualifies = raw_reversed and gap_pct >= self.ema_reversal_min_gap_pct
+
+                if contract is None:
+                    # No position identifier to track confirmation state
+                    # against (e.g. a caller/test that doesn't pass one) --
+                    # degrade to gap-filtered-only rather than silently
+                    # never firing.
+                    if qualifies:
+                        logger.info(
+                            f"[{self.name}] EMA reversal exit: EMA20/50 relationship "
+                            f"flipped back by {gap_pct:.3%} (fast={ema_fast:.2f} slow={ema_slow:.2f}, "
+                            f"is_call={is_call}, entry_regime={current_position.get('entry_regime')}) "
+                            f"— exiting regardless of premium P&L ({pnl_pct:+.1%})."
+                        )
+                        return "EXIT"
+                elif qualifies:
+                    if (
+                        bar_key is not None
+                        and self._reversal_pending_bar_key.get(contract) is not None
+                        and bar_key != self._reversal_pending_bar_key.get(contract)
+                    ):
+                        self._reversal_pending_count[contract] = self._reversal_pending_count.get(contract, 0) + 1
+                        self._reversal_pending_bar_key[contract] = bar_key
+                    elif contract not in self._reversal_pending_count:
+                        # First qualifying bar -- seed unconditionally (even
+                        # if bar_key is unknown) so confirm_bars=1 would
+                        # still fire on the qualifying bar itself, same
+                        # convention as the entry side's fresh-crossover seed.
+                        self._reversal_pending_count[contract] = 1
+                        self._reversal_pending_bar_key[contract] = bar_key
+                    elif bar_key is not None and self._reversal_pending_bar_key.get(contract) is None:
+                        self._reversal_pending_bar_key[contract] = bar_key
+                    # else: same bar as last cycle, or bar still unknown -- don't double-count
+
+                    if self._reversal_pending_count.get(contract, 0) >= self.ema_reversal_confirm_bars:
+                        logger.info(
+                            f"[{self.name}] EMA reversal exit: EMA20/50 relationship flipped "
+                            f"back by {gap_pct:.3%}, confirmed over "
+                            f"{self._reversal_pending_count[contract]} bar(s) "
+                            f"(fast={ema_fast:.2f} slow={ema_slow:.2f}, is_call={is_call}, "
+                            f"entry_regime={current_position.get('entry_regime')}) "
+                            f"— exiting regardless of premium P&L ({pnl_pct:+.1%})."
+                        )
+                        self._reversal_pending_count.pop(contract, None)
+                        self._reversal_pending_bar_key.pop(contract, None)
+                        return "EXIT"
+                else:
+                    # Gap closed back up, or relationship un-reversed --
+                    # clear any partial confirmation so a later, genuinely
+                    # fresh reversal starts counting from zero instead of
+                    # inheriting stale progress.
+                    self._reversal_pending_count.pop(contract, None)
+                    self._reversal_pending_bar_key.pop(contract, None)
 
         # 3. Hard stop loss
         if pnl_pct <= -self.stop_loss_pct:

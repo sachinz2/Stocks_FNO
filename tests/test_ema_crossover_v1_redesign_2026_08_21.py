@@ -32,25 +32,31 @@ def _bar(symbol="RELIANCE", fast=101.0, slow=100.0, adx=20.0, bar_key="live:t0")
 
 # ── Internal ADX gate (>=threshold OR rising) ────────────────────────────────
 
-def test_adx_defaults_to_18_and_checked_internally():
+def test_adx_defaults_to_22_and_checked_internally():
+    # Fixed 2026-08-27 (trade review): raised from 18 -- ADX>=18 is inside
+    # conventional "no trend" territory, and combined with the other
+    # loosened gates let through enough marginal crossovers to produce a
+    # 17.9% win rate over 28 trades (Aug 24-26). 22 keeps most of this
+    # redesign's "don't require an already-strong trend" intent while
+    # screening out the weakest setups.
     strat = _ema()
-    assert strat.adx_entry_threshold == 18
+    assert strat.adx_entry_threshold == 22
     assert strat.adx_checked_internally is True
 
 
 def test_crossover_fires_when_adx_already_above_threshold():
     strat = _ema(signal_confirm_bars=1)
     # Bar 1: bearish baseline.
-    strat.generate_signal(_bar(fast=99.0, slow=100.0, adx=20.0, bar_key="live:t0"))
-    # Bar 2: fresh cross, ADX=20 >= 18 -- fires immediately.
-    signal = strat.generate_signal(_bar(fast=101.0, slow=100.0, adx=20.0, bar_key="live:t1"))
+    strat.generate_signal(_bar(fast=99.0, slow=100.0, adx=24.0, bar_key="live:t0"))
+    # Bar 2: fresh cross, ADX=24 >= 22 -- fires immediately.
+    signal = strat.generate_signal(_bar(fast=101.0, slow=100.0, adx=24.0, bar_key="live:t1"))
     assert signal == "BUY"
 
 
 def test_crossover_confirmed_but_low_adx_holds_pending_not_discarded():
     strat = _ema(signal_confirm_bars=1)
     strat.generate_signal(_bar(fast=99.0, slow=100.0, adx=10.0, bar_key="live:t0"))
-    # Fresh cross confirmed (signal_confirm_bars=1), but ADX=10 < 18 and no
+    # Fresh cross confirmed (signal_confirm_bars=1), but ADX=10 < 22 and no
     # history yet to check "rising" -- holds, doesn't fire, doesn't discard.
     signal = strat.generate_signal(_bar(fast=101.0, slow=100.0, adx=10.0, bar_key="live:t1"))
     assert signal == "HOLD"
@@ -60,10 +66,10 @@ def test_crossover_confirmed_but_low_adx_holds_pending_not_discarded():
 def test_low_but_rising_adx_still_fires_once_confirmed():
     strat = _ema(signal_confirm_bars=1)
     strat.generate_signal(_bar(fast=99.0, slow=100.0, adx=10.0, bar_key="live:t0"))
-    # Cross confirms with ADX=10 (below 18, no history) -- holds.
+    # Cross confirms with ADX=10 (below 22, no history) -- holds.
     signal = strat.generate_signal(_bar(fast=101.0, slow=100.0, adx=10.0, bar_key="live:t1"))
     assert signal == "HOLD"
-    # Next bar: ADX rising 10 -> 14 (still < 18) -- now has 2 points of
+    # Next bar: ADX rising 10 -> 14 (still < 22) -- now has 2 points of
     # history and is rising, so it fires without needing a fresh crossover.
     signal = strat.generate_signal(_bar(fast=101.0, slow=100.0, adx=14.0, bar_key="live:t2"))
     assert signal == "BUY"
@@ -107,12 +113,14 @@ def test_on_pause_clears_adx_history():
 # these focus on the new underlying-based stop/target addition.)
 
 def test_underlying_based_stop_fires_for_a_call():
+    # Fixed 2026-08-27 (trade review): underlying_stop_atr_mult raised from
+    # 1.0 to 1.4 -- stop level is now 100 - 1.4xATR(2.0) = 97.2.
     strat = _ema()
     pos = {
         "avg_price": 40.0, "peak_premium": 40.0,
         "is_call": True, "current_ema_fast": 105.0, "current_ema_slow": 100.0,  # thesis still intact
         "entry_underlying_price": 100.0, "entry_atr": 2.0,
-        "current_close": 97.9,  # 100 - 1.0xATR(2.0) = 98 -- breached
+        "current_close": 97.0,  # 100 - 1.4xATR(2.0) = 97.2 -- breached
     }
     assert strat.manage_position(pos, 39.5) == "EXIT"
 
@@ -272,9 +280,12 @@ def test_main_py_wires_up_ema_crossover_v1_round2_params():
     from src.api import main as main_module
     src = inspect.getsource(main_module)
     idx = src.index('StrategyRegistry.load_strategy("EMA_CROSSOVER"')
-    block = src[idx:idx + 1400]
-    assert '"adx_entry_threshold": 18' in block
+    block = src[idx:idx + 2400]
+    # Fixed 2026-08-27 (trade review): adx_entry_threshold raised 18->22,
+    # underlying_stop_atr_mult raised 1.0->1.4 -- see ema_crossover.py's
+    # matching comments for why.
+    assert '"adx_entry_threshold": 22' in block
     assert '"rvol_hard_gate": False' in block
     assert '"mtf_strict": False' in block
     assert '"ema_reversal_exit": True' in block
-    assert '"underlying_stop_atr_mult": 1.0' in block
+    assert '"underlying_stop_atr_mult": 1.4' in block

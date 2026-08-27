@@ -237,7 +237,15 @@ async def lifespan(app: FastAPI):
         # config dict (see its comment below): a strategy's class defaults
         # can silently drift from what's actually wired here if this dict
         # isn't kept in sync, already caught once for momentum_v1.
-        "adx_entry_threshold": 18,
+        # Fixed 2026-08-27 (trade review, Aug 24-26): raised from 18 --
+        # ADX>=18 is inside conventional "no trend" territory, and combined
+        # with the loosened RVOL/MTF/RS gates below let through enough
+        # weak/marginal crossovers to produce a 17.9% win rate over 28
+        # trades. 22 keeps most of the redesign's "don't require an
+        # already-strong trend" intent (still well below the old flat-25
+        # gate this strategy had before the 2026-08-21 redesign) while
+        # screening out the weakest setups.
+        "adx_entry_threshold": 22,
         # adx_checked_internally is hardcoded True in ema_crossover.py's
         # initialize() (not parameter-driven, unlike everything else here)
         # -- listing it would silently be a no-op, so it's intentionally
@@ -246,7 +254,15 @@ async def lifespan(app: FastAPI):
         "mtf_strict": False, "mtf_strong_opposition_pct": 0.3,
         "require_rs": False,
         "ema_reversal_exit": True,
-        "underlying_stop_atr_mult": 1.0, "underlying_target_atr_mult": 2.0,
+        # Fixed 2026-08-27 (trade review): 44% of all exits over Aug 24-26
+        # were EMA-reversal exits, ALL losses, many firing on an EMA20/50
+        # gap of a few hundredths of a point (pure noise, not a real trend
+        # change) -- see ema_reversal_min_gap_pct/ema_reversal_confirm_bars
+        # below, which fix the actual mechanism. underlying_stop_atr_mult
+        # raised from 1.0 to 1.4 alongside that -- 1.0x ATR is tight enough
+        # that normal intraday noise was accounting for 30% of exits too.
+        "underlying_stop_atr_mult": 1.4, "underlying_target_atr_mult": 2.0,
+        "ema_reversal_min_gap_pct": 0.001, "ema_reversal_confirm_bars": 2,
         "entry_option_delta": None,
     })
     StrategyRegistry.load_strategy("CREDIT_SPREAD", "credit_spread_v1", {

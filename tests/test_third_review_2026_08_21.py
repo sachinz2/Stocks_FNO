@@ -64,7 +64,7 @@ def test_main_py_wires_require_rs_false_for_ema_crossover():
     from src.api import main as main_module
     src = inspect.getsource(main_module)
     idx = src.index('StrategyRegistry.load_strategy("EMA_CROSSOVER"')
-    block = src[idx:idx + 1400]
+    block = src[idx:idx + 2400]
     assert '"require_rs": False' in block
 
 

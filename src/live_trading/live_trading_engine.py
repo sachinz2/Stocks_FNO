@@ -1819,6 +1819,13 @@ class LiveTradingEngine:
                             # don't check them.
                             "entry_underlying_price": owner_info.get("entry_underlying_price"),
                             "entry_atr":              owner_info.get("entry_atr"),
+                            # Added 2026-08-27 (trade review) -- lets
+                            # EMACrossoverStrategy.manage_position() track its
+                            # EMA-reversal bar-confirmation state per open
+                            # position; unused (no-op) by strategies that
+                            # don't check them.
+                            "contract":     contract,
+                            "ohlc_bar_key": market_data.get("ohlc_bar_key"),
                         },
                         current_p,
                     )
