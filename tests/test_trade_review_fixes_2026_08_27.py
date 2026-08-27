@@ -193,6 +193,63 @@ def test_crossover_at_adx_20_no_longer_fires_without_rising():
     assert signal == "HOLD"
 
 
+# ── Entry-side follow-up: minimum EMA gap required to fire at all ──────────
+# (2026-08-27, after user feedback that the exit-side fix alone doesn't
+# address why entries themselves were frequently poor -- ADX/RVOL at entry
+# were checked against the real 28-trade sample and neither discriminates
+# winners from losers, but the EMA gap itself was never checked on the entry
+# side even though the exit side now requires one. Mirrors
+# ema_reversal_min_gap_pct, checked once at fire time alongside adx_ok.)
+
+def test_entry_min_gap_default_is_0_001():
+    strat = _ema()
+    assert strat.entry_min_gap_pct == 0.001
+
+
+def test_crossover_with_tiny_gap_does_not_fire_even_with_adx_and_bars_confirmed():
+    strat = _ema(signal_confirm_bars=1)
+    strat.generate_signal({"symbol": "X", "ema20": 99.0, "ema50": 100.0, "adx14": 25.0, "ohlc_bar_key": "live:t0"})
+    # 0.05% gap -- ADX and bar-confirmation both pass, but the gap doesn't.
+    signal = strat.generate_signal({"symbol": "X", "ema20": 100.05, "ema50": 100.0, "adx14": 25.0, "ohlc_bar_key": "live:t1"})
+    assert signal == "HOLD"
+
+
+def test_crossover_with_gap_past_the_floor_fires():
+    strat = _ema(signal_confirm_bars=1)
+    strat.generate_signal({"symbol": "X", "ema20": 99.0, "ema50": 100.0, "adx14": 25.0, "ohlc_bar_key": "live:t0"})
+    # 0.5% gap, well past the 0.1% default floor.
+    signal = strat.generate_signal({"symbol": "X", "ema20": 100.5, "ema50": 100.0, "adx14": 25.0, "ohlc_bar_key": "live:t1"})
+    assert signal == "BUY"
+
+
+def test_entry_min_gap_is_configurable():
+    strat = _ema(signal_confirm_bars=1, entry_min_gap_pct=0.02)  # 2% floor, deliberately high
+    strat.generate_signal({"symbol": "X", "ema20": 99.0, "ema50": 100.0, "adx14": 25.0, "ohlc_bar_key": "live:t0"})
+    # 0.5% gap -- below this strategy instance's (unusually high) 2% floor.
+    signal = strat.generate_signal({"symbol": "X", "ema20": 100.5, "ema50": 100.0, "adx14": 25.0, "ohlc_bar_key": "live:t1"})
+    assert signal == "HOLD"
+
+
+def test_thin_gap_holds_pending_state_for_a_later_bar_once_it_widens():
+    """A crossover that starts thin but widens on the very next confirming
+    bar must still fire without needing a brand-new crossover to restart --
+    same "hold, don't clear" behavior already established for adx_ok."""
+    strat = _ema(signal_confirm_bars=1)
+    strat.generate_signal({"symbol": "X", "ema20": 99.0, "ema50": 100.0, "adx14": 25.0, "ohlc_bar_key": "live:t0"})
+    r1 = strat.generate_signal({"symbol": "X", "ema20": 100.05, "ema50": 100.0, "adx14": 25.0, "ohlc_bar_key": "live:t1"})
+    assert r1 == "HOLD"
+    r2 = strat.generate_signal({"symbol": "X", "ema20": 100.5, "ema50": 100.0, "adx14": 25.0, "ohlc_bar_key": "live:t2"})
+    assert r2 == "BUY"
+
+
+def test_main_py_wires_entry_min_gap_pct():
+    from src.api import main as main_module
+    src = inspect.getsource(main_module)
+    idx = src.index('StrategyRegistry.load_strategy("EMA_CROSSOVER"')
+    block = src[idx:idx + 3000]
+    assert '"entry_min_gap_pct": 0.001' in block
+
+
 # ── main.py wiring ───────────────────────────────────────────────────────
 
 def test_main_py_wires_all_four_fixes_for_ema_crossover():

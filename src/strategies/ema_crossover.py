@@ -139,6 +139,22 @@ class EMACrossoverStrategy(StrategyBase):
         self._reversal_pending_count:   Dict[str, int] = {}
         self._reversal_pending_bar_key: Dict[str, str] = {}
 
+        # Fixed 2026-08-27 (trade review, entry-side follow-up): ADX/RVOL at
+        # entry were checked against the 28 Aug 24-26 trades and neither one
+        # discriminates winners from losers (e.g. GRASIM lost at ADX 34.05,
+        # PATANJALI won at ADX 34.89 the same window; KAYNES's worst loss
+        # fired at ADX 35.2). What the entry side never checked, unlike the
+        # exit side above, is the EMA20/50 gap itself -- signal_confirm_bars
+        # only requires the sign to hold for 2 bars, not that the two EMAs
+        # have actually separated by a meaningful amount, so a crossover
+        # sitting a few hundredths of a point apart for 2 bars fires exactly
+        # like a clean, well-separated one. Mirrors ema_reversal_min_gap_pct
+        # on the exit side; checked once, at the point the signal actually
+        # fires (same point adx_ok is checked), not on every pending bar --
+        # an early-stage crossover is expected to start with a small gap
+        # that should be allowed to widen across the confirmation window.
+        self.entry_min_gap_pct = self.parameters.get("entry_min_gap_pct", 0.001)
+
         # Fixed 2026-08-21 (external review, sections 16-18): underlying-
         # based stop AND target, mirroring momentum_v1's round-2 addition --
         # uses entry_underlying_price/entry_atr, already captured by the
@@ -203,7 +219,8 @@ class EMACrossoverStrategy(StrategyBase):
             f"UnderlyingTarget={self.underlying_target_atr_mult}xATR | "
             f"ConfirmBars={self.signal_confirm_bars} | "
             f"EMAReversalExit={self.ema_reversal_exit} "
-            f"(min_gap={self.ema_reversal_min_gap_pct:.2%}, confirm_bars={self.ema_reversal_confirm_bars})"
+            f"(min_gap={self.ema_reversal_min_gap_pct:.2%}, confirm_bars={self.ema_reversal_confirm_bars}) | "
+            f"EntryMinGap={self.entry_min_gap_pct:.2%}"
         )
 
     def generate_signal(self, data: Dict[str, Any]) -> Optional[str]:
@@ -363,23 +380,34 @@ class EMACrossoverStrategy(StrategyBase):
                 hist_adx = self._adx_history.get(symbol, [])
                 adx_ok = adx >= self.adx_entry_threshold or (len(hist_adx) >= 2 and adx > hist_adx[-2])
 
-            if adx_ok:
+            # Fixed 2026-08-27 (trade review, entry-side follow-up): require
+            # the EMA20/50 gap to have actually separated by a meaningful
+            # amount by the time the signal fires -- see entry_min_gap_pct
+            # above for why (ADX/RVOL don't discriminate winners from
+            # losers; the gap itself was never checked on the entry side).
+            gap_pct = abs(fast_ema - slow_ema) / abs(slow_ema) if slow_ema else 0.0
+            gap_ok = gap_pct >= self.entry_min_gap_pct
+
+            if adx_ok and gap_ok:
                 logger.info(
                     f"[{self.name}] {symbol} {current_dir} confirmed after "
-                    f"{self._pending_count[symbol]} bars (ADX={adx}) — firing."
+                    f"{self._pending_count[symbol]} bars (ADX={adx}, gap={gap_pct:.3%}) — firing."
                 )
                 signal = current_dir
                 self._pending_signal.pop(symbol, None)
                 self._pending_count.pop(symbol, None)
                 self._pending_bar_key.pop(symbol, None)
             else:
-                # Crossover confirmed but ADX hasn't caught up yet -- leave
-                # the pending state intact (don't clear it) so a later bar
-                # can still fire without needing a brand new crossover to
-                # restart the confirmation count.
+                # Crossover confirmed but ADX hasn't caught up yet and/or the
+                # EMA gap is still too thin -- leave the pending state intact
+                # (don't clear it) so a later bar can still fire without
+                # needing a brand new crossover to restart the confirmation
+                # count. A genuine trend's gap should widen across the next
+                # bar or two; one that doesn't never fires at all.
                 logger.debug(
-                    f"[{self.name}] {symbol} {current_dir} confirmed but ADX={adx} "
-                    f"< {self.adx_entry_threshold} and not rising — holding, not firing yet."
+                    f"[{self.name}] {symbol} {current_dir} confirmed but "
+                    f"ADX_ok={adx_ok} (ADX={adx}) gap_ok={gap_ok} (gap={gap_pct:.3%} "
+                    f"< {self.entry_min_gap_pct:.3%}) — holding, not firing yet."
                 )
         elif current_dir is not None and symbol in self._pending_signal:
             logger.debug(

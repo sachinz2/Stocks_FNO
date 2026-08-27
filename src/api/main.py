@@ -263,6 +263,11 @@ async def lifespan(app: FastAPI):
         # that normal intraday noise was accounting for 30% of exits too.
         "underlying_stop_atr_mult": 1.4, "underlying_target_atr_mult": 2.0,
         "ema_reversal_min_gap_pct": 0.001, "ema_reversal_confirm_bars": 2,
+        # Fixed 2026-08-27 (trade review, entry-side follow-up): ADX/RVOL at
+        # entry don't discriminate winners from losers in the Aug 24-26
+        # sample -- the gap itself was never checked. Same 0.1% floor as the
+        # exit side's ema_reversal_min_gap_pct, checked once at fire time.
+        "entry_min_gap_pct": 0.001,
         "entry_option_delta": None,
     })
     StrategyRegistry.load_strategy("CREDIT_SPREAD", "credit_spread_v1", {
