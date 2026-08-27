@@ -612,7 +612,7 @@ class MomentumStrategy(StrategyBase):
 
         if raw is None or close is None:
             if self._trend_state.get(symbol):
-                logger.debug(f"[{self.name}] {symbol} pullback setup cleared — quality gate no longer met")
+                logger.info(f"[{self.name}] {symbol} pullback setup cleared — quality gate no longer met")
             self._reset_pullback_state(symbol)
             self._rvol_history.pop(symbol, None)
             return "HOLD"
@@ -658,6 +658,13 @@ class MomentumStrategy(StrategyBase):
             self._pullback_ref[symbol] = close
             self._pullback_bars[symbol] = 0
             self._rvol_history[symbol] = [rvol] if rvol is not None and rvol_valid else []
+            # Fixed 2026-08-27 (live incident, monitoring gap): promoted
+            # from no log at all to INFO -- with LOG_LEVEL=INFO in
+            # production, there was no way to observe whether the strategy
+            # was ever actually starting to track a setup, only the (much
+            # noisier) per-cycle rejection lines. This is a rare,
+            # meaningful event, not a firehose.
+            logger.info(f"[{self.name}] {symbol} {raw} trend established, tracking for a pullback (ref={close:.2f})")
             return "HOLD"
 
         if not is_new_bar:
@@ -672,7 +679,7 @@ class MomentumStrategy(StrategyBase):
                 return "HOLD"
             self._trend_state[symbol] = "PULLBACK"
             self._pullback_bars[symbol] = 1
-            logger.debug(f"[{self.name}] {symbol} {raw} pullback started, ref={ref:.2f}")
+            logger.info(f"[{self.name}] {symbol} {raw} pullback started, ref={ref:.2f}")
             return "HOLD"
 
         # state == "PULLBACK"
@@ -685,7 +692,7 @@ class MomentumStrategy(StrategyBase):
             # max_pullback_bars. `>=` expires it after exactly the
             # documented count.
             if self._pullback_bars[symbol] >= self.max_pullback_bars:
-                logger.debug(
+                logger.info(
                     f"[{self.name}] {symbol} pullback setup expired after "
                     f"{self.max_pullback_bars} bars without a breakout"
                 )
