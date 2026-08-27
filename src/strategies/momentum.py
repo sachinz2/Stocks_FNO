@@ -108,11 +108,41 @@ class MomentumStrategy(StrategyBase):
         # extension_atr_mult: reject entries where price is already this many
         # ATRs away from EMA20 -- "yes the trend is strong, but the move is
         # already too extended." The review's own "simplest improvement."
-        self.extension_atr_mult = self.parameters.get("extension_atr_mult", 1.5)
+        #
+        # Fixed 2026-08-27 (trade review): confirmed live that 1.5x was
+        # miscalibrated for actual NSE F&O intraday behavior, not just
+        # occasionally tight -- zero momentum_v1 trades fired over 3 full
+        # trading days (Aug 24-26), and grepping every one of the 1,449
+        # "too extended" rejections logged in that window showed a MEDIAN
+        # extension of 2.69x ATR among candidates that had already passed
+        # every other gate (ADX>=25 rising, EMA20/50 spread, EMA20 sloping)
+        # -- only 15% were even under 2.0x. By the time a setup takes
+        # several bars to build enough ADX/spread/slope to qualify, price
+        # has typically already moved well past 1.5x ATR from EMA20 in this
+        # market; the filter was rejecting the qualifying population
+        # almost entirely, not screening out its extreme tail. Not one
+        # single candidate reached the pullback+breakout state machine
+        # below in any of the 3 days -- the strategy's actual entry logic
+        # never got a chance to run. Raised to 2.5x, just above the
+        # observed p25 (2.2x) -- still screens out the genuinely
+        # blown-out top quartile+ (p75 was 3.26x) while letting normal
+        # trending-day setups through to the pullback model, which already
+        # provides its own protection against chasing an exhausted move by
+        # requiring a real pullback-then-breakout event rather than an
+        # immediate entry.
+        self.extension_atr_mult = self.parameters.get("extension_atr_mult", 2.5)
         # vwap_extension_pct: reject entries this far (%) from session VWAP,
         # for the same reason -- price already run too far from the day's
         # volume-weighted average to be a fresh continuation entry.
-        self.vwap_extension_pct = self.parameters.get("vwap_extension_pct", 1.5)
+        #
+        # Fixed 2026-08-27 (trade review): same miscalibration as
+        # extension_atr_mult above, same evidence window -- the (much
+        # smaller, since extension_atr_mult already rejected most
+        # candidates first) sample of VWAP rejections that did occur had a
+        # median of 2.33%, well past the old 1.5% floor. Raised to 2.5% to
+        # stop compounding the extension fix's effect with a second filter
+        # tuned against the same wrong assumption.
+        self.vwap_extension_pct = self.parameters.get("vwap_extension_pct", 2.5)
         # How many distinct-bar observations of ADX/EMA20 to keep per symbol
         # for the rising/slope checks above -- only needs enough to compare
         # "now" against "2 bars ago".

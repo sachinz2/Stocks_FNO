@@ -294,7 +294,12 @@ async def lifespan(app: FastAPI):
         # against momentum.py to know.
         "adx_entry_threshold": 25, "adx_exit_threshold": 22,
         "adx_rising_required": True, "ema_slope_required": True,
-        "extension_atr_mult": 1.5, "vwap_extension_pct": 1.5,
+        # Fixed 2026-08-27 (trade review): raised from 1.5/1.5 -- zero
+        # momentum_v1 trades over Aug 24-26 despite hundreds of candidates
+        # that passed every other gate, because virtually all of them
+        # (median 2.69x ATR) were already past the old 1.5x extension
+        # floor -- see momentum.py's initialize() for the full evidence.
+        "extension_atr_mult": 2.5, "vwap_extension_pct": 2.5,
         "rvol_entry_threshold": 1.5, "entry_option_delta": 0.60,
         "underlying_invalidation_exit": True,
         "min_ema_spread_pct": 0.30,

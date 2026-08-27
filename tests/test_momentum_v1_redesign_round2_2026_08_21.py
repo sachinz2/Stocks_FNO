@@ -352,7 +352,7 @@ def test_main_py_wires_up_the_round2_pullback_and_underlying_stop_params():
     from src.api import main as main_module
     src = inspect.getsource(main_module)
     idx = src.index('StrategyRegistry.load_strategy("MOMENTUM"')
-    block = src[idx:idx + 1800]
+    block = src[idx:idx + 2400]
     assert '"use_pullback_continuation_model": True' in block
     assert '"underlying_stop_atr_mult": 1.0' in block
     assert '"underlying_target_atr_mult": 2.0' in block

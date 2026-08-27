@@ -20,10 +20,26 @@ Four fixes, all in ema_crossover.py + its src/api/main.py wiring:
      debounce as generate_signal()'s entry confirmation) before it exits.
   3. underlying_stop_atr_mult raised 1.0 -> 1.4.
   4. adx_entry_threshold raised 18 -> 22.
+
+A follow-up entry-quality check (same review) found ADX/RVOL at entry don't
+discriminate winners from losers in the same 28-trade sample, but the entry
+side never checked the EMA20/50 gap itself the way the exit-side fix above
+now does -- entry_min_gap_pct (default 0.1%) added, checked once at fire
+time alongside the existing ADX gate.
+
+A second follow-up (same review) diagnosed momentum_v1's zero trades over
+the same 3 days: grepping all 3 archived daily logs found 1,449 "too
+extended" rejections (median 2.69x ATR from EMA20 among candidates that had
+already passed every other gate) against the old extension_atr_mult=1.5
+floor, and zero -- not one -- "pullback started"/"breakout confirmed" log
+lines in any of the 3 days, meaning the strategy's actual pullback+breakout
+entry logic never once got a chance to run. extension_atr_mult raised
+1.5 -> 2.5, vwap_extension_pct raised 1.5 -> 2.5 for the same reason.
 """
 import inspect
 
 from src.strategies.ema_crossover import EMACrossoverStrategy
+from src.strategies.momentum import MomentumStrategy
 from src.live_trading.live_trading_engine import LiveTradingEngine
 
 
@@ -248,6 +264,69 @@ def test_main_py_wires_entry_min_gap_pct():
     idx = src.index('StrategyRegistry.load_strategy("EMA_CROSSOVER"')
     block = src[idx:idx + 3000]
     assert '"entry_min_gap_pct": 0.001' in block
+
+
+# ── momentum_v1: extension/VWAP filters widened, zero trades Aug 24-26 ──────
+
+def _mom(**overrides):
+    strat = MomentumStrategy("momentum_v1", overrides)
+    strat.initialize()
+    return strat
+
+
+def test_momentum_extension_atr_mult_default_is_2_5():
+    strat = _mom()
+    assert strat.extension_atr_mult == 2.5
+
+
+def test_momentum_vwap_extension_pct_default_is_2_5():
+    strat = _mom()
+    assert strat.vwap_extension_pct == 2.5
+
+
+def test_momentum_extension_at_old_1_5x_no_longer_blocks_the_entry():
+    """A candidate that would have tripped the old 1.5x ATR extension floor
+    (real median observed in production was 2.69x among otherwise-qualifying
+    candidates) must now pass."""
+    strat = _mom(signal_confirm_bars=1, use_pullback_continuation_model=False,
+                 adx_rising_required=False, ema_slope_required=False, vwap_extension_pct=0)
+    strat.generate_signal({
+        "symbol": "X", "ema20": 105.0, "ema50": 100.0, "adx14": 30.0,
+        "close": 105.0, "atr14": 20.0, "ohlc_bar_key": "live:t0",
+    })
+    # close is 40 away from ema20=105 -> 2.0x ATR: over the old 1.5x cap,
+    # under the new 2.5x cap.
+    signal = strat.generate_signal({
+        "symbol": "X", "ema20": 105.0, "ema50": 100.0, "adx14": 30.0,
+        "close": 145.0, "atr14": 20.0, "ohlc_bar_key": "live:t1",
+    })
+    assert signal == "BUY"
+
+
+def test_momentum_extension_still_blocks_a_genuinely_blown_out_move():
+    """The widened floor isn't a no-op -- a move well past even the new 2.5x
+    cap must still be rejected."""
+    strat = _mom(signal_confirm_bars=1, use_pullback_continuation_model=False,
+                 adx_rising_required=False, ema_slope_required=False, vwap_extension_pct=0)
+    strat.generate_signal({
+        "symbol": "X", "ema20": 105.0, "ema50": 100.0, "adx14": 30.0,
+        "close": 105.0, "atr14": 20.0, "ohlc_bar_key": "live:t0",
+    })
+    # close is 80 away from ema20=105 -> 4.0x ATR: over the new 2.5x cap too.
+    signal = strat.generate_signal({
+        "symbol": "X", "ema20": 105.0, "ema50": 100.0, "adx14": 30.0,
+        "close": 185.0, "atr14": 20.0, "ohlc_bar_key": "live:t1",
+    })
+    assert signal == "HOLD"
+
+
+def test_main_py_wires_momentum_extension_and_vwap_fixes():
+    from src.api import main as main_module
+    src = inspect.getsource(main_module)
+    idx = src.index('StrategyRegistry.load_strategy("MOMENTUM"')
+    block = src[idx:idx + 2000]
+    assert '"extension_atr_mult": 2.5' in block
+    assert '"vwap_extension_pct": 2.5' in block
 
 
 # ── main.py wiring ───────────────────────────────────────────────────────
