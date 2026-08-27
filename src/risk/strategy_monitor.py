@@ -81,8 +81,38 @@ class StrategyMonitor:
         self._pause_reasons: Dict[str, Optional[str]] = {}
         # strategy_id → ISO timestamp of last auto-pause
         self._paused_at: Dict[str, Optional[str]] = {}
+        # Fixed 2026-08-27 (trade review follow-up): strategy_id → datetime
+        # of the last MANUAL resume, if any. Without this, a manual resume
+        # was immediately undone -- evaluate_all() re-reads the same last-30
+        # rolling window on the very next cycle, still dominated by
+        # whatever pre-resume disaster triggered the pause, and re-pauses
+        # before the strategy could ever close a single new trade to start
+        # displacing that window. See _filtered_trades().
+        self._resumed_at: Dict[str, datetime] = {}
 
     # ── Public API ────────────────────────────────────────────────────────────
+
+    def mark_resumed(self, strategy_id: str) -> None:
+        """
+        Call this whenever an operator manually resumes a strategy (see
+        strategy_router.py's /activate endpoint) -- NOT on the initial
+        load_strategy() at startup, which should still be judged against
+        full history immediately if it already has 30+ trades.
+
+        Grants a grace window: only trades that closed AFTER this moment
+        count toward the next auto-pause evaluation, so a strategy just
+        given a deliberate second chance (e.g. after a fix) gets to
+        accumulate its own fresh track record instead of being re-judged
+        on the exact trades that got it paused in the first place.
+        """
+        self._resumed_at[strategy_id] = now_ist().replace(tzinfo=None)
+        self._pause_reasons[strategy_id] = None
+        self._paused_at[strategy_id] = None
+        logger.info(
+            f"StrategyMonitor: {strategy_id} manually resumed -- auto-pause "
+            f"evaluation now scoped to trades closed after this point until "
+            f"{self.rolling_window} fresh ones have accumulated."
+        )
 
     async def evaluate_all(self) -> None:
         """
@@ -113,10 +143,11 @@ class StrategyMonitor:
         active = StrategyRegistry.get_active_strategies()
         report: Dict[str, dict] = {}
         for strategy_id, instance in active.items():
-            trades = await self._load_recent_trades(strategy_id)
+            trades = await self._filtered_trades(strategy_id)
             pf     = self._profit_factor(trades)
             dd     = self._rolling_drawdown(trades)
             exp_dd = self.expected_drawdown.get(strategy_id, DEFAULT_EXPECTED_DRAWDOWN.get(strategy_id, 0))
+            resumed_at = self._resumed_at.get(strategy_id)
             report[strategy_id] = {
                 "is_active":        instance.is_active,
                 "trades_in_window": len(trades),
@@ -127,13 +158,31 @@ class StrategyMonitor:
                 "dd_threshold":     round(exp_dd * self.dd_multiplier, 2),
                 "paused_reason":    self._pause_reasons.get(strategy_id),
                 "paused_at":        self._paused_at.get(strategy_id),
+                "resumed_at":       resumed_at.isoformat() if resumed_at else None,
             }
         return report
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
-    async def _evaluate_strategy(self, strategy_id: str) -> None:
+    async def _filtered_trades(self, strategy_id: str) -> list:
+        """
+        Trades this strategy's next auto-pause decision should be judged
+        against: the last `rolling_window` closed trades, EXCEPT that if the
+        strategy was manually resumed (see mark_resumed()), anything that
+        closed before that resume is excluded -- a deliberate second chance
+        shouldn't be immediately revoked by the exact trades that justified
+        the pause it's recovering from. Once enough genuinely fresh trades
+        accumulate this converges back to the plain rolling window on its
+        own (no special-casing needed to "turn it off").
+        """
         trades = await self._load_recent_trades(strategy_id)
+        resumed_at = self._resumed_at.get(strategy_id)
+        if resumed_at is not None:
+            trades = [t for t in trades if t["exit_time"] is not None and t["exit_time"] > resumed_at]
+        return trades
+
+    async def _evaluate_strategy(self, strategy_id: str) -> None:
+        trades = await self._filtered_trades(strategy_id)
 
         if len(trades) < MIN_TRADES_REQUIRED:
             return  # not enough history to make a call
@@ -208,7 +257,9 @@ class StrategyMonitor:
     async def _load_recent_trades(self, strategy_id: str):
         """
         Fetch the last `rolling_window` CLOSED trades for this strategy.
-        Returns a list of dicts with at least {'pnl': float}.
+        Returns a list of dicts with {'pnl': float, 'exit_time': datetime}
+        -- exit_time is carried through so _filtered_trades() can exclude
+        anything that closed before a manual resume (see mark_resumed()).
         """
         try:
             rows = await self.trade_journal_repo.filter(
@@ -217,7 +268,7 @@ class StrategyMonitor:
                 order_by="exit_time DESC",
             )
             return [
-                {"pnl": float(r.pnl)}
+                {"pnl": float(r.pnl), "exit_time": r.exit_time}
                 for r in rows
                 if r.pnl is not None
             ]
