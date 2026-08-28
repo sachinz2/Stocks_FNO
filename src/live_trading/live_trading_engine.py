@@ -2898,7 +2898,7 @@ class LiveTradingEngine:
         # broader-market proxies. oi_data itself is still fetched -- also used
         # by the crowded-strike check further down.
         redis = getattr(self, "_redis", None)
-        oi_data = await get_oi_data(symbol, redis) if redis else None
+        oi_data = await get_oi_data(symbol, redis, kite=self._kite) if redis else None
         if oi_data and not pcr_allows_spread(oi_data.get("pcr"), spread_type):
             logger.debug(
                 f"[CreditSpread] {symbol} PCR={oi_data['pcr']:.2f} opposes {spread_type} "
@@ -3244,21 +3244,38 @@ class LiveTradingEngine:
         # gate. Single-sided (credit_spread_v1 only trades one side) --
         # populates the PE columns for a BULL_PUT_SPREAD or the CE columns
         # for a BEAR_CALL_SPREAD, leaving the other side NULL.
-        from src.market_data.option_chain import bs_delta, implied_vol as _implied_vol_fn
-        _T_entry = max(dte, 1) / 365.0
-        _short_delta_val = bs_delta(underlying_price, short_strike, _T_entry, sigma, opt)
-        _long_delta_val  = bs_delta(underlying_price, long_strike,  _T_entry, sigma, opt)
-        _short_iv_val = _implied_vol_fn(short_fill, underlying_price, short_strike, _T_entry, opt)
+        #
+        # Fixed 2026-08-28 (metrics-calculation audit): this had no
+        # try/except, unlike almost everywhere else in this file -- and it
+        # runs AFTER both legs are already filled at the broker. An
+        # exception here (bs_delta/implied_vol are pure math but not
+        # exception-proof against a degenerate strike/price) would have
+        # propagated up and skipped _log_trade_open() below entirely --
+        # a real, live position with no journal entry, no deployed-capital
+        # tracking, and no GTT backstop. This is analytics data collection,
+        # not a trade decision, so it fails open to None/unpopulated
+        # Greeks rather than risking the position itself going untracked.
         _greeks_kwargs = dict(put_wing_width=None, call_wing_width=None,
                               put_short_delta=None, call_short_delta=None,
                               put_long_delta=None, call_long_delta=None,
                               put_iv=None, call_iv=None)
-        if opt == "PE":
-            _greeks_kwargs.update(put_short_delta=_short_delta_val, put_long_delta=_long_delta_val,
-                                   put_iv=_short_iv_val, put_wing_width=spread_width)
-        else:
-            _greeks_kwargs.update(call_short_delta=_short_delta_val, call_long_delta=_long_delta_val,
-                                   call_iv=_short_iv_val, call_wing_width=spread_width)
+        try:
+            from src.market_data.option_chain import bs_delta, implied_vol as _implied_vol_fn
+            _T_entry = max(dte, 1) / 365.0
+            _short_delta_val = bs_delta(underlying_price, short_strike, _T_entry, sigma, opt)
+            _long_delta_val  = bs_delta(underlying_price, long_strike,  _T_entry, sigma, opt)
+            _short_iv_val = _implied_vol_fn(short_fill, underlying_price, short_strike, _T_entry, opt)
+            if opt == "PE":
+                _greeks_kwargs.update(put_short_delta=_short_delta_val, put_long_delta=_long_delta_val,
+                                       put_iv=_short_iv_val, put_wing_width=spread_width)
+            else:
+                _greeks_kwargs.update(call_short_delta=_short_delta_val, call_long_delta=_long_delta_val,
+                                       call_iv=_short_iv_val, call_wing_width=spread_width)
+        except Exception as _greeks_exc:
+            logger.warning(
+                f"[CreditSpread] {symbol}: entry Greeks/IV computation failed "
+                f"(position already filled, journaling continues without them) — {_greeks_exc}"
+            )
 
         journal_id = await self._log_trade_open(
             strategy=strategy.name, underlying=symbol,
@@ -3527,10 +3544,20 @@ class LiveTradingEngine:
                         )
 
                 # Delta-based exit — short leg delta > 0.40 signals the strike is under threat.
-                if exit_reason is None and atr > 0 and current_price > 0:
+                # Fixed 2026-08-28 (metrics-calculation audit): this used to always price
+                # delta off the ATR-derived historical-vol proxy, even though the ENTRY
+                # side was upgraded 2026-08-21 to prefer live market IV (_get_live_sigma())
+                # specifically because the ATR proxy was found unsuitable for IV-labeled
+                # gates. A real vol skew/spike between entry and now (exactly the scenario
+                # this exit check exists to catch) was invisible to it. Same fail-open
+                # pattern as _get_live_sigma() itself: real market IV when available, ATR
+                # proxy as the fallback, never silently skipped.
+                if exit_reason is None and current_price > 0:
                     try:
                         from src.market_data.option_chain import atr_to_annualised_vol, bs_delta
-                        _sig = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, current_price)
+                        _atr_sig = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, current_price) if atr > 0 else 0.0
+                        _interval = await self._get_strike_interval(underlying, spread_expiry)
+                        _sig = await self._get_live_sigma(underlying, current_price, dte, _interval, spread_expiry, _atr_sig)
                         if _sig > 0:
                             _T = max(dte, 1) / 365.0
                             _delta = bs_delta(
@@ -3911,7 +3938,7 @@ class LiveTradingEngine:
         # live evidence (zero iron_condor_v1 trades in 3+ weeks).
         from src.market_data.nse_oi import get_oi_data, is_strike_crowded
         redis = getattr(self, "_redis", None)
-        oi_data = await get_oi_data(symbol, redis) if redis else None
+        oi_data = await get_oi_data(symbol, redis, kite=self._kite) if redis else None
         pcr = market_data.get("pcr") or (oi_data.get("pcr") if oi_data else None)
         if pcr is not None and (pcr < 0.7 or pcr > 1.4):
             logger.info(
@@ -4218,14 +4245,29 @@ class LiveTradingEngine:
         # Greeks/IV/wing width for BOTH wings independently -- iron_condor_v1
         # trades both sides, unlike credit_spread_v1. Computed from the
         # FINAL resolved strikes and real fills.
-        from src.market_data.option_chain import bs_delta, implied_vol as _implied_vol_fn
-        _T_entry = max(dte, 1) / 365.0
-        _put_short_delta_val  = bs_delta(underlying_price, put_short_strike,  _T_entry, sigma, "PE")
-        _put_long_delta_val   = bs_delta(underlying_price, put_long_strike,   _T_entry, sigma, "PE")
-        _call_short_delta_val = bs_delta(underlying_price, call_short_strike, _T_entry, sigma, "CE")
-        _call_long_delta_val  = bs_delta(underlying_price, call_long_strike,  _T_entry, sigma, "CE")
-        _put_iv_val  = _implied_vol_fn(put_short_fill,  underlying_price, put_short_strike,  _T_entry, "PE")
-        _call_iv_val = _implied_vol_fn(call_short_fill, underlying_price, call_short_strike, _T_entry, "CE")
+        #
+        # Fixed 2026-08-28 (metrics-calculation audit): same missing-
+        # try/except fix as _process_credit_spread's matching block above --
+        # see its comment for the full reasoning. Fails open to None/
+        # unpopulated Greeks rather than risking all 4 already-filled legs
+        # going unjournaled.
+        _put_short_delta_val = _put_long_delta_val = None
+        _call_short_delta_val = _call_long_delta_val = None
+        _put_iv_val = _call_iv_val = None
+        try:
+            from src.market_data.option_chain import bs_delta, implied_vol as _implied_vol_fn
+            _T_entry = max(dte, 1) / 365.0
+            _put_short_delta_val  = bs_delta(underlying_price, put_short_strike,  _T_entry, sigma, "PE")
+            _put_long_delta_val   = bs_delta(underlying_price, put_long_strike,   _T_entry, sigma, "PE")
+            _call_short_delta_val = bs_delta(underlying_price, call_short_strike, _T_entry, sigma, "CE")
+            _call_long_delta_val  = bs_delta(underlying_price, call_long_strike,  _T_entry, sigma, "CE")
+            _put_iv_val  = _implied_vol_fn(put_short_fill,  underlying_price, put_short_strike,  _T_entry, "PE")
+            _call_iv_val = _implied_vol_fn(call_short_fill, underlying_price, call_short_strike, _T_entry, "CE")
+        except Exception as _greeks_exc_c:
+            logger.warning(
+                f"[IronCondor] {symbol}: entry Greeks/IV computation failed "
+                f"(position already filled, journaling continues without them) — {_greeks_exc_c}"
+            )
 
         journal_id  = await self._log_trade_open(
             strategy=strategy.name, underlying=symbol,
@@ -4441,10 +4483,15 @@ class LiveTradingEngine:
                             logger.warning(f"Regime-shift exit check failed for condor on {underlying}: {exc}")
 
                 # Delta-based exit — if either short leg delta exceeds 0.40, that wing is in danger.
-                if exit_reason is None and atr > 0 and current_price > 0:
+                # Fixed 2026-08-28 (metrics-calculation audit): same live-IV-over-ATR-proxy
+                # fix as _check_spread_exits()'s delta check -- see its comment for the
+                # full reasoning.
+                if exit_reason is None and current_price > 0:
                     try:
                         from src.market_data.option_chain import atr_to_annualised_vol, bs_delta
-                        _sig_c = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, current_price)
+                        _atr_sig_c = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, current_price) if atr > 0 else 0.0
+                        _interval_c = await self._get_strike_interval(underlying, condor_expiry)
+                        _sig_c = await self._get_live_sigma(underlying, current_price, dte, _interval_c, condor_expiry, _atr_sig_c)
                         if _sig_c > 0:
                             _T_c   = max(dte, 1) / 365.0
                             _ps_d  = bs_delta(current_price, c["put_short_strike"],  _T_c, _sig_c, "PE")

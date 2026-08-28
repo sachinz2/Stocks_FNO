@@ -1,10 +1,17 @@
 """
-NSE Option Chain — OI, PCR, Max Pain (free, no auth needed).
+Option Chain OI, PCR, Max Pain.
 
-Uses NSE's public option chain API. NSE requires a session cookie
-obtained by first visiting the homepage, so we maintain a requests.Session.
+Fixed 2026-08-28 (metrics-calculation audit): the ONLY source used to be a
+scrape of NSE's public option-chain website (nseindia.com), even though
+Zerodha's own kite.quote() already returns real, live `oi` for the exact
+same option contracts elsewhere in this codebase (zerodha_ltp_poller.py,
+option_chain.py, positions_router.py) -- currently read and discarded for
+this purpose. Zerodha is now the PRIMARY source (real-time, same broker
+session already authenticated for everything else); the NSE scrape is kept
+as a fallback for when Zerodha/Redis is unavailable, not removed outright.
 
-Data refreshed every 15 minutes and cached in Redis.
+Data refreshed every 15 minutes and cached in Redis (same cadence for both
+sources, to bound kite.quote() call volume).
 
 Key outputs per symbol:
   - pcr       : Put-Call Ratio (total put OI / total call OI)
@@ -100,6 +107,18 @@ def _parse_option_chain(records: Dict) -> Dict:
         if pe and pe.get("expiryDate") == expiry:
             put_oi_by_strike[strike]  = int(pe.get("openInterest", 0))
 
+    return _build_chain_summary(call_oi_by_strike, put_oi_by_strike, expiry, source="nse")
+
+
+def _build_chain_summary(
+    call_oi_by_strike: Dict[int, int], put_oi_by_strike: Dict[int, int],
+    expiry_date: str, source: str,
+) -> Dict:
+    """
+    Shared PCR/max-pain/crowded-strike summary builder — used by both the
+    NSE-scrape parser and the Zerodha kite.quote() parser (added 2026-08-28)
+    so both sources produce an identical downstream shape.
+    """
     total_call_oi = sum(call_oi_by_strike.values())
     total_put_oi  = sum(put_oi_by_strike.values())
     pcr = round(total_put_oi / total_call_oi, 3) if total_call_oi > 0 else 1.0
@@ -118,12 +137,107 @@ def _parse_option_chain(records: Dict) -> Dict:
         "crowded_put_strikes":   sorted(crowded_puts),
         "total_call_oi":         total_call_oi,
         "total_put_oi":          total_put_oi,
-        "expiry_date":           expiry,
+        "expiry_date":           expiry_date,
+        "source":                source,
         # OI change fields — populated by get_oi_data() on subsequent calls
         "call_oi_change":        0,
         "put_oi_change":         0,
         "oi_signal":             "NEUTRAL",   # see oi_price_signal()
     }
+
+
+def _fetch_zerodha_option_chain_blocking(instruments: List[str], kite) -> Optional[Dict]:
+    """Synchronous kite.quote() call. Run in thread executor, mirrors every
+    other kite.quote() call site in this codebase (e.g.
+    zerodha_ltp_poller.py, positions_router.py)."""
+    try:
+        return kite.quote(instruments)
+    except Exception as e:
+        logger.warning(f"Zerodha OI fetch failed: {e}")
+        return None
+
+
+async def _fetch_zerodha_option_chain(symbol: str, redis, kite) -> Optional[Dict]:
+    """
+    Real OI for symbol's nearest-expiry option chain, sourced directly from
+    Zerodha via kite.quote() -- added 2026-08-28 (metrics-calculation audit)
+    to replace the NSE-website scrape as the primary OI source.
+
+    Uses the daily-refreshed real-contract cache (REDIS_CONTRACT_PREFIX,
+    populated by scripts/zerodha_auto_auth.py's fetch_and_cache_real_contracts())
+    to get the real, currently-listed tradingsymbols for every strike of
+    this symbol's nearest expiry -- the same cache get_real_contract()/
+    get_real_strike_interval() already trust for entry-time strike
+    resolution, so this can never drift from what's actually tradeable.
+
+    Only ONE symbol's nearest-expiry chain is fetched per call (bounded to
+    that symbol's real listed strikes, typically well under kite.quote()'s
+    500-instrument cap) -- called on-demand per credit_spread_v1/
+    iron_condor_v1 entry/exit candidate, exactly like every other bounded
+    kite.quote() call in this codebase, never proactively for the whole
+    132-symbol universe (that would risk the API's rate limit).
+
+    Returns None (falls back to NSE) on any cache miss, kite failure, or
+    when Zerodha returns no usable oi for this chain.
+    """
+    if redis is None or kite is None:
+        return None
+    try:
+        from src.core.constants import REDIS_CONTRACT_PREFIX
+        raw = await redis.get(f"{REDIS_CONTRACT_PREFIX}{symbol}")
+        if not raw:
+            return None
+        data = json.loads(raw)
+        if not data:
+            return None
+        nearest_expiry = sorted(data.keys())[0]
+        strikes_for_expiry = data[nearest_expiry]
+        if not strikes_for_expiry:
+            return None
+
+        instrument_of_key: Dict[str, Tuple[float, str]] = {}
+        for strike_key, legs in strikes_for_expiry.items():
+            try:
+                strike = float(strike_key)
+            except ValueError:
+                continue
+            for opt_type in ("CE", "PE"):
+                tsym = legs.get(opt_type)
+                if tsym:
+                    instrument_of_key[f"NFO:{tsym}"] = (strike, opt_type)
+
+        if not instrument_of_key:
+            return None
+
+        loop = asyncio.get_running_loop()
+        quotes = await loop.run_in_executor(
+            None, _fetch_zerodha_option_chain_blocking, list(instrument_of_key), kite,
+        )
+        if not quotes:
+            return None
+
+        call_oi_by_strike: Dict[int, int] = {}
+        put_oi_by_strike:  Dict[int, int] = {}
+        for key, (strike, opt_type) in instrument_of_key.items():
+            q = quotes.get(key)
+            if not q:
+                continue
+            oi = q.get("oi")
+            if oi is None:
+                continue
+            strike_int = int(strike) if float(strike) == int(strike) else strike
+            if opt_type == "CE":
+                call_oi_by_strike[strike_int] = int(oi)
+            else:
+                put_oi_by_strike[strike_int] = int(oi)
+
+        if not call_oi_by_strike and not put_oi_by_strike:
+            return None
+
+        return _build_chain_summary(call_oi_by_strike, put_oi_by_strike, nearest_expiry, source="zerodha")
+    except Exception as e:
+        logger.debug(f"Zerodha OI fetch failed [{symbol}]: {e}")
+        return None
 
 
 def _calculate_max_pain(
@@ -159,11 +273,14 @@ def _calculate_max_pain(
 
 # ── Public async API ──────────────────────────────────────────────────────────
 
-async def get_oi_data(symbol: str, redis) -> Optional[Dict]:
+async def get_oi_data(symbol: str, redis, kite=None) -> Optional[Dict]:
     """
     Return cached OI data for a symbol.
-    Refreshes from NSE if cache is stale (> 15 minutes).
-    Returns None if NSE is unreachable.
+    Refreshes on cache miss (> 15 minutes stale): tries Zerodha first
+    (real, live OI for the same contracts already traded -- see
+    _fetch_zerodha_option_chain()'s docstring, added 2026-08-28), falls
+    back to the NSE website scrape if Zerodha is unavailable or `kite`
+    wasn't passed. Returns None only if BOTH sources fail.
     """
     cache_key = _CACHE_KEY.format(symbol=symbol)
     try:
@@ -173,13 +290,14 @@ async def get_oi_data(symbol: str, redis) -> Optional[Dict]:
     except Exception:
         pass
 
-    # Cache miss — fetch from NSE in a thread
-    loop = asyncio.get_running_loop()
-    records = await loop.run_in_executor(None, _fetch_option_chain_blocking, symbol)
-    if not records:
-        return None
-
-    parsed = _parse_option_chain(records)
+    # Cache miss — try Zerodha first, NSE scrape as fallback.
+    parsed = await _fetch_zerodha_option_chain(symbol, redis, kite)
+    if parsed is None:
+        loop = asyncio.get_running_loop()
+        records = await loop.run_in_executor(None, _fetch_option_chain_blocking, symbol)
+        if not records:
+            return None
+        parsed = _parse_option_chain(records)
 
     # ── OI Change delta ───────────────────────────────────────────────────────
     # Compare current OI with previous cycle to detect institutional positioning.
@@ -215,7 +333,7 @@ async def get_oi_data(symbol: str, redis) -> Optional[Dict]:
         pass
 
     logger.info(
-        f"NSE OI [{symbol}]: PCR={parsed['pcr']:.2f} "
+        f"OI [{symbol}, source={parsed.get('source', 'nse')}]: PCR={parsed['pcr']:.2f} "
         f"MaxPain={parsed['max_pain']} "
         f"OI_signal={parsed['oi_signal']} "
         f"Expiry={parsed['expiry_date']}"
@@ -224,44 +342,11 @@ async def get_oi_data(symbol: str, redis) -> Optional[Dict]:
 
 
 def _oi_change_signal(call_oi_change: int, put_oi_change: int) -> str:
-    """
-    Classify the OI delta without price context (used during OI fetch).
-    Full price-aware signal: use oi_price_signal() after combining with LTP.
-    """
+    """Classify the OI delta without price context (used during OI fetch)."""
     if put_oi_change > 0 and call_oi_change <= 0:
         return "BULLISH_OI"   # puts added, calls not — market hedging puts
     if call_oi_change > 0 and put_oi_change <= 0:
         return "BEARISH_OI"   # calls added, puts not
-    return "NEUTRAL"
-
-
-def oi_price_signal(
-    call_oi_change: int,
-    put_oi_change:  int,
-    price_change_pct: float,   # current bar return vs prev bar
-) -> str:
-    """
-    Combined OI + price signal — the most useful OI interpretation.
-
-    Classic Price + OI analysis:
-      Price ↑ + Total OI ↑  → new longs entering   = STRONG_BULLISH
-      Price ↑ + Total OI ↓  → short covering        = WEAK_BULLISH (fading)
-      Price ↓ + Total OI ↑  → new shorts entering   = STRONG_BEARISH
-      Price ↓ + Total OI ↓  → long exits / unwinding = WEAK_BEARISH
-
-    We use combined OI (calls + puts) as a proxy for total market commitment.
-    """
-    total_oi_change = call_oi_change + put_oi_change
-    price_up = price_change_pct >= 0
-
-    if price_up and total_oi_change > 0:
-        return "STRONG_BULLISH"
-    if price_up and total_oi_change < 0:
-        return "WEAK_BULLISH"
-    if not price_up and total_oi_change > 0:
-        return "STRONG_BEARISH"
-    if not price_up and total_oi_change < 0:
-        return "WEAK_BEARISH"
     return "NEUTRAL"
 
 
@@ -287,26 +372,28 @@ def is_strike_crowded(
     High OI = the market is using this strike as a hedge, making it more likely
     to be tested.
 
-    Fails OPEN (returns False, "not crowded") when oi_data is unavailable --
-    deliberately kept as-is 2026-08-28 (metrics-calculation audit) rather
-    than flipped to fail-closed, since the NSE scrape this depends on is
-    the single most unreliable data source in the pipeline and this gate
-    stacks with several other independent entry gates (VIX, IV rank, VWAP,
-    delta tolerance) already found to multiplicatively starve
-    credit_spread_v1/iron_condor_v1 of trades (2026-08-07 gate
-    consolidation). Flipping this one gate to fail-closed unilaterally
-    would trade off entry frequency against crowded-strike protection --
-    a real policy choice, not a bug fix; flagged for an explicit decision
-    instead. This warning at least makes the bypass visible in logs,
-    which it previously was not.
+    Fails CLOSED (returns True, "treat as crowded") when oi_data is
+    unavailable. Was deliberately left fail-open earlier 2026-08-28 while
+    the NSE website scrape was the ONLY OI source -- flipping it then would
+    have traded entry frequency against crowded-strike protection every
+    time that single unreliable source hiccuped. Now that Zerodha
+    (kite.quote(), same broker session already used for everything else)
+    is the PRIMARY OI source with the NSE scrape only as a fallback (see
+    get_oi_data()), a total OI outage requires BOTH sources to fail at
+    once -- rare enough that matching this codebase's normal fail-closed
+    convention for entry-risk parameters is the right default again. The
+    caller (_find_non_crowded_strike_within_delta_tolerance) already
+    returns None -- skip the entry -- when no acceptable strike is found,
+    so a total outage now means "skip this entry," not a silently
+    unprotected trade.
     """
     if not oi_data:
         logger.warning(
-            "is_strike_crowded: OI data unavailable for strike %s (%s) -- "
-            "crowded-strike check skipped, treating as not-crowded (fail-open).",
+            "is_strike_crowded: OI data unavailable (both Zerodha and NSE) for "
+            "strike %s (%s) -- treating as crowded (fail-closed).",
             strike, option_type,
         )
-        return False
+        return True
     key = "crowded_call_strikes" if option_type == "CE" else "crowded_put_strikes"
     return strike in oi_data.get(key, [])
 

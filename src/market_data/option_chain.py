@@ -76,7 +76,20 @@ def bs_delta(S: float, K: float, T: float, sigma: float, option_type: str = "CE"
 def implied_vol(market_price: float, S: float, K: float, T: float, option_type: str = "CE") -> Optional[float]:
     """
     Newton-Raphson implied volatility from market price.
-    Returns None if the price is below intrinsic value (can't solve).
+    Returns None if the price is below intrinsic value (can't solve), or if
+    Newton-Raphson never actually converges within tolerance.
+
+    Fixed 2026-08-28 (metrics-calculation audit): this used to return
+    whatever sigma the loop last landed on even when it never converged --
+    either vega collapsed too small to keep iterating, or all 100
+    iterations ran out without abs(diff) < 0.001. That value could be
+    clamped hard against the [0.01, 5.0] bounds (e.g. a nonsensical 500%
+    IV), no different in shape from a real, converged result. The
+    trading-critical call site (_get_live_sigma) already applies its own
+    0.05-3.0 sanity filter on top and would have caught most of this, but
+    the entry-time journal-only call sites (recording put_iv/call_iv for
+    later analytics) applied no such filter, risking garbage IV persisted
+    straight to trade_journal.
     """
     intrinsic = max(0.0, (S - K) if option_type == "CE" else (K - S))
     if market_price < intrinsic or market_price <= 0 or T <= 0:
@@ -89,13 +102,13 @@ def implied_vol(market_price: float, S: float, K: float, T: float, option_type: 
         d1 = _bs_d1(S, K, T, r, sigma)
         vega = S * _norm_pdf(d1) * math.sqrt(T)
         if vega < 1e-10:
-            break
+            return None   # can't converge -- vega too small to iterate further
         diff = price - market_price
         if abs(diff) < 0.001:
-            break
+            return round(sigma, 4)   # genuine convergence
         sigma -= diff / vega
         sigma = max(0.01, min(sigma, 5.0))
-    return round(sigma, 4)
+    return None   # exhausted iterations without converging
 
 
 def atr_to_annualised_vol(atr: float, underlying_price: float) -> float:

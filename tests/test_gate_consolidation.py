@@ -101,5 +101,5 @@ def test_oi_data_still_fetched_for_crowded_strike_check():
     # it's also used by the crowded-strike avoidance logic further down.
     for method_name in ("_process_credit_spread", "_process_iron_condor"):
         src = inspect.getsource(getattr(LiveTradingEngine, method_name))
-        assert "oi_data = await get_oi_data(symbol, redis)" in src
+        assert "oi_data = await get_oi_data(symbol, redis, kite=self._kite)" in src
         assert "is_strike_crowded(" in src

@@ -46,6 +46,8 @@ this codebase:
 """
 import inspect
 
+import pytest
+
 from src.strategies.momentum import MomentumStrategy
 from src.strategies.ema_crossover import EMACrossoverStrategy
 from src.market_data.option_chain import vix_allows_selling, iv_rank_allows_selling
@@ -467,18 +469,19 @@ def test_bs_delta_zero_sigma_put_uses_same_itm_edge_case():
     assert bs_delta(S=100.0, K=150.0, T=1.0, sigma=0.0, option_type="PE") == -1.0
 
 
-# ── is_strike_crowded(): visibility warning on missing OI data ─────────────
-# Deliberately still fails OPEN (not flipped to fail-closed) -- see the
-# function's own docstring for the trade-frequency tradeoff reasoning.
-# This only confirms the previously-silent bypass now logs a warning.
+# ── is_strike_crowded(): now fails CLOSED on missing OI data ───────────────
+# Flipped 2026-08-28 (same day, later in the audit) once Zerodha became the
+# PRIMARY OI source with NSE as fallback -- a total outage now needs BOTH
+# sources down at once, rare enough to match this codebase's normal
+# fail-closed convention for entry-risk parameters.
 
 from src.market_data.nse_oi import is_strike_crowded
 
 
-def test_is_strike_crowded_logs_warning_when_oi_data_missing(caplog):
+def test_is_strike_crowded_fails_closed_when_oi_data_missing(caplog):
     with caplog.at_level("WARNING"):
         result = is_strike_crowded(25000, None, "CE")
-    assert result is False
+    assert result is True
     assert any("OI data unavailable" in r.message for r in caplog.records)
 
 
@@ -486,3 +489,241 @@ def test_is_strike_crowded_still_works_normally_with_real_oi_data():
     oi_data = {"crowded_call_strikes": [25000], "crowded_put_strikes": []}
     assert is_strike_crowded(25000, oi_data, "CE") is True
     assert is_strike_crowded(24900, oi_data, "CE") is False
+
+
+def test_total_oi_outage_makes_crowded_strike_search_skip_entry():
+    """End-to-end: with is_strike_crowded now fail-closed, a total OI outage
+    (oi_data=None reaching every candidate) must make
+    _find_non_crowded_strike_within_delta_tolerance() return None -- the
+    caller's existing convention for "skip this entry"."""
+    from src.live_trading.live_trading_engine import LiveTradingEngine
+    result = LiveTradingEngine._find_non_crowded_strike_within_delta_tolerance(
+        oi_data=None, opt="PE", base_strike=100.0, interval=50.0,
+        target_delta=-0.20, underlying_price=100.0, dte=20, sigma=0.2,
+    )
+    assert result is None
+
+
+# ── OI/PCR: Zerodha kite.quote() as primary source, NSE scrape as fallback ──
+# User-requested 2026-08-28: "take data from zerodha, keep NSE data for
+# backup". Zerodha's kite.quote() already returns real, live `oi` for the
+# same option contracts elsewhere in this codebase -- now the primary OI
+# source via the daily-refreshed real-contract cache (REDIS_CONTRACT_PREFIX)
+# that already backs get_real_contract()/get_real_strike_interval(). NSE
+# scrape only runs when Zerodha is unavailable (no kite, cache miss, or
+# kite.quote() itself fails).
+
+import json as _json_oi
+import src.market_data.nse_oi as nse_oi_module
+from src.market_data.nse_oi import get_oi_data
+from src.core.constants import REDIS_CONTRACT_PREFIX
+
+
+class _FakeRedisOI:
+    def __init__(self, values=None):
+        self._values = values or {}
+
+    async def get(self, key):
+        return self._values.get(key)
+
+    async def set(self, key, value, ex=None):
+        self._values[key] = value
+
+
+class _FakeKiteOI:
+    def __init__(self, oi_by_key):
+        self._oi_by_key = oi_by_key
+
+    def quote(self, instruments):
+        return {k: {"oi": self._oi_by_key[k]} for k in instruments if k in self._oi_by_key}
+
+
+def _contract_cache_payload():
+    return {
+        "2026-09-25": {
+            "100": {"CE": "SYM26SEP100CE", "PE": "SYM26SEP100PE"},
+            "110": {"CE": "SYM26SEP110CE", "PE": "SYM26SEP110PE"},
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_oi_data_uses_zerodha_when_available_and_never_touches_nse(monkeypatch):
+    def _fail_if_called(symbol):
+        raise AssertionError("NSE scrape must not run when Zerodha succeeds")
+    monkeypatch.setattr(nse_oi_module, "_fetch_option_chain_blocking", _fail_if_called)
+
+    redis = _FakeRedisOI({
+        f"{REDIS_CONTRACT_PREFIX}SYM": _json_oi.dumps(_contract_cache_payload()),
+    })
+    kite = _FakeKiteOI({
+        "NFO:SYM26SEP100CE": 5000, "NFO:SYM26SEP100PE": 8000,
+        "NFO:SYM26SEP110CE": 3000, "NFO:SYM26SEP110PE": 2000,
+    })
+
+    result = await get_oi_data("SYM", redis, kite=kite)
+
+    assert result is not None
+    assert result["source"] == "zerodha"
+    assert result["total_call_oi"] == 8000
+    assert result["total_put_oi"] == 10000
+    assert result["pcr"] == round(10000 / 8000, 3)
+    assert result["expiry_date"] == "2026-09-25"
+    assert set(result["crowded_call_strikes"]) == {100, 110}
+    assert set(result["crowded_put_strikes"]) == {100, 110}
+
+
+@pytest.mark.asyncio
+async def test_get_oi_data_falls_back_to_nse_when_kite_unavailable(monkeypatch):
+    calls = []
+
+    def _fake_nse(symbol):
+        calls.append(symbol)
+        return {
+            "data": [{
+                "strikePrice": 100,
+                "CE": {"expiryDate": "25-Sep-2026", "openInterest": 4000},
+                "PE": {"expiryDate": "25-Sep-2026", "openInterest": 6000},
+            }],
+            "expiryDates": ["25-Sep-2026"],
+        }
+    monkeypatch.setattr(nse_oi_module, "_fetch_option_chain_blocking", _fake_nse)
+
+    redis = _FakeRedisOI({})  # no contract cache either way
+    result = await get_oi_data("SYM", redis, kite=None)
+
+    assert calls == ["SYM"]
+    assert result is not None
+    assert result["source"] == "nse"
+    assert result["total_call_oi"] == 4000
+    assert result["total_put_oi"] == 6000
+
+
+@pytest.mark.asyncio
+async def test_get_oi_data_falls_back_to_nse_when_zerodha_contract_cache_missing(monkeypatch):
+    """kite IS available, but the real-contract cache has no entry for this
+    symbol (e.g. daily refresh hasn't run yet) -- must fall back, not
+    return None outright."""
+    calls = []
+
+    def _fake_nse(symbol):
+        calls.append(symbol)
+        return {
+            "data": [{
+                "strikePrice": 100,
+                "CE": {"expiryDate": "25-Sep-2026", "openInterest": 1111},
+                "PE": {"expiryDate": "25-Sep-2026", "openInterest": 2222},
+            }],
+            "expiryDates": ["25-Sep-2026"],
+        }
+    monkeypatch.setattr(nse_oi_module, "_fetch_option_chain_blocking", _fake_nse)
+
+    redis = _FakeRedisOI({})  # cache miss for REDIS_CONTRACT_PREFIX too
+    kite = _FakeKiteOI({})
+    result = await get_oi_data("SYM", redis, kite=kite)
+
+    assert calls == ["SYM"]
+    assert result is not None
+    assert result["source"] == "nse"
+
+
+@pytest.mark.asyncio
+async def test_get_oi_data_reads_cache_before_hitting_either_source(monkeypatch):
+    def _fail_zerodha(*a, **kw):
+        raise AssertionError("must not fetch -- cache should have served this")
+    monkeypatch.setattr(nse_oi_module, "_fetch_zerodha_option_chain", _fail_zerodha)
+    def _fail_nse(symbol):
+        raise AssertionError("must not fetch -- cache should have served this")
+    monkeypatch.setattr(nse_oi_module, "_fetch_option_chain_blocking", _fail_nse)
+
+    cached_payload = {"pcr": 1.1, "source": "zerodha", "total_call_oi": 1, "total_put_oi": 1}
+    redis = _FakeRedisOI({"nse_oi:SYM": _json_oi.dumps(cached_payload)})
+    result = await get_oi_data("SYM", redis, kite=_FakeKiteOI({}))
+
+    assert result == cached_payload
+
+
+# ── Exit-side delta checks now prefer live market IV over the ATR proxy ────
+# User-requested 2026-08-28: "I believe live data would be right choice" --
+# matches the entry side (_get_live_sigma, upgraded 2026-08-21) instead of
+# staying on the ATR-derived historical-vol proxy only.
+
+def test_credit_spread_exit_delta_check_uses_live_sigma():
+    src = inspect.getsource(LiveTradingEngine._check_spread_exits)
+    idx = src.index("Delta-based exit — short leg delta")
+    block = src[idx:idx + 2000]
+    assert "await self._get_live_sigma(" in block
+
+
+def test_iron_condor_exit_delta_check_uses_live_sigma():
+    src = inspect.getsource(LiveTradingEngine._check_condor_exits)
+    idx = src.index("Delta-based exit — if either short leg")
+    block = src[idx:idx + 1200]
+    assert "await self._get_live_sigma(" in block
+
+
+# ── implied_vol(): no more clamped-but-not-converged sigma escaping as if
+# it were a real solve ──────────────────────────────────────────────────────
+
+import src.market_data.option_chain as option_chain_module
+from src.market_data.option_chain import implied_vol, bs_price
+
+
+def test_implied_vol_returns_none_when_vega_collapses(monkeypatch):
+    monkeypatch.setattr(option_chain_module, "_norm_pdf", lambda x: 0.0)
+    assert option_chain_module.implied_vol(10.0, 100.0, 100.0, 0.5, "CE") is None
+
+
+def test_implied_vol_returns_none_when_iterations_exhausted(monkeypatch):
+    monkeypatch.setattr(option_chain_module, "bs_price", lambda S, K, T, sigma, option_type: 999.0)
+    assert option_chain_module.implied_vol(10.0, 100.0, 100.0, 0.5, "CE") is None
+
+
+def test_implied_vol_still_converges_for_normal_inputs():
+    """Guard against over-fixing -- a genuinely solvable price must still
+    return a real answer close to the vol it was priced from."""
+    price = bs_price(100.0, 100.0, 0.5, 0.20, "CE")
+    result = implied_vol(price, 100.0, 100.0, 0.5, "CE")
+    assert result is not None
+    assert abs(result - 0.20) < 0.01
+
+
+# ── Entry-time Greeks/IV computation now has a try/except ──────────────────
+# Runs AFTER both legs are already filled at the broker -- an unguarded
+# exception here used to skip _log_trade_open() entirely, leaving a real,
+# live position with no journal entry, no deployed-capital tracking, and no
+# GTT backstop.
+
+def test_credit_spread_entry_greeks_has_try_except():
+    src = inspect.getsource(LiveTradingEngine._process_credit_spread)
+    idx = src.index("actual entry")
+    block = src[idx:idx + 2800]
+    assert "try:" in block
+    assert "except Exception as _greeks_exc:" in block
+
+
+def test_iron_condor_entry_greeks_has_try_except():
+    src = inspect.getsource(LiveTradingEngine._process_iron_condor)
+    idx = src.index("actual entry")
+    block = src[idx:idx + 2000]
+    assert "try:" in block
+    assert "except Exception as _greeks_exc_c:" in block
+
+
+# ── Dead code removal: IndicatorEngine, SignalGenerator, oi_price_signal() ──
+# Confirmed via grep (no callers anywhere in src/ or tests/, no __init__.py
+# re-exports) before deleting -- not guessed.
+
+import os
+
+
+def test_indicator_engine_file_removed():
+    assert not os.path.exists(os.path.join("src", "indicators", "indicator_engine.py"))
+
+
+def test_signal_generator_file_removed():
+    assert not os.path.exists(os.path.join("src", "strategies", "signal_generator.py"))
+
+
+def test_oi_price_signal_function_removed():
+    assert not hasattr(nse_oi_module, "oi_price_signal")
