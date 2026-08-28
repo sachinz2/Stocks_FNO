@@ -244,7 +244,7 @@ class StrategyMonitor:
             return
 
         if instance.is_active:
-            StrategyRegistry.pause_strategy(strategy_id, reason=reason)
+            StrategyRegistry.pause_strategy(strategy_id, reason=reason, source="monitor")
             self._pause_reasons[strategy_id] = reason
             # IST-naive, matching the rest of the system's convention (not
             # currently displayed on the dashboard, but kept consistent —

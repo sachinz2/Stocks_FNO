@@ -54,7 +54,7 @@ async def activate_strategy(body: StrategyActionRequest, request: Request):
 
 @router.post("/deactivate", dependencies=[Depends(require_admin_token)])
 async def deactivate_strategy(request: StrategyActionRequest):
-    ok = StrategyRegistry.pause_strategy(request.strategy_id, reason="Manual pause via dashboard")
+    ok = StrategyRegistry.pause_strategy(request.strategy_id, reason="Manual pause via dashboard", source="manual")
     if not ok:
         raise HTTPException(status_code=404, detail=f"Strategy '{request.strategy_id}' not found.")
     return {"status": "deactivated", "strategy_id": request.strategy_id}

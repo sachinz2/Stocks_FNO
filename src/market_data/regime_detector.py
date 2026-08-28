@@ -169,12 +169,29 @@ class MarketRegimeDetector:
         for sid, instance in active.items():
             should_be_active = sid in should_run
             if instance.is_active and not should_be_active:
-                StrategyRegistry.pause_strategy(sid, reason=f"Regime is {regime} — strategy not active in this regime")
+                StrategyRegistry.pause_strategy(
+                    sid, reason=f"Regime is {regime} — strategy not active in this regime", source="regime",
+                )
                 logger.warning(
                     f"RegimeSwitching: PAUSED {sid} — "
                     f"regime={regime} not in its allowed set"
                 )
-            elif not instance.is_active and should_be_active:
+            # Fixed 2026-08-28 (live incident): only resume a strategy THIS
+            # mechanism paused. Without the paused_by check, a
+            # StrategyMonitor auto-kill (real, statistically proven poor
+            # performance -- e.g. ema_crossover_v1's rolling PF 0.063) got
+            # immediately un-done here every cycle the regime happened to
+            # still allow the strategy, since this only ever checked
+            # is_active/should_be_active with no regard for WHY it was
+            # paused. Confirmed live: pause/resume fired every ~60s for 90+
+            # consecutive minutes -- evaluate_all() and this both run BEFORE
+            # the entry-signal loop each cycle, so the strategy was actually
+            # active by the time new entries were evaluated, completely
+            # defeating the circuit breaker rather than just flapping
+            # cosmetically. A monitor- or manually-paused strategy now stays
+            # paused regardless of regime until explicitly resumed via the
+            # API (StrategyMonitor's own established convention).
+            elif not instance.is_active and should_be_active and getattr(instance, "paused_by", None) == "regime":
                 StrategyRegistry.resume_strategy(sid)
                 logger.info(
                     f"RegimeSwitching: RESUMED {sid} — "

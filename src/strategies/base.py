@@ -10,6 +10,22 @@ class StrategyBase(ABC):
         self.parameters = parameters or {}
         self.is_active = False
         self.paused_reason: Optional[str] = None
+        # Fixed 2026-08-28 (live incident): which mechanism paused this
+        # strategy -- "regime" (MarketRegimeDetector.enforce_regime_switching),
+        # "monitor" (StrategyMonitor's PF/drawdown auto-kill), or "manual"
+        # (operator via /strategies/deactivate). See enforce_regime_switching's
+        # resume check for why this exists: regime-switching used to resume
+        # ANY inactive-but-regime-eligible strategy with no regard for why it
+        # was paused, so a StrategyMonitor auto-kill (real, statistically
+        # proven poor performance) and a regime-triggered pause immediately
+        # fought each other every single cycle the regime kept the strategy
+        # eligible -- confirmed live: ema_crossover_v1 (rolling PF 0.063,
+        # essentially all losing trades) was paused and resumed every ~60s
+        # for 90+ consecutive minutes, meaning it was actually is_active=True
+        # by the time each cycle's entry-signal loop ran (evaluate_all() and
+        # enforce_regime_switching() both run BEFORE it), completely
+        # defeating the circuit breaker in practice, not just cosmetically.
+        self.paused_by: Optional[str] = None
 
     @abstractmethod
     def initialize(self):
@@ -79,14 +95,22 @@ class StrategyRegistry:
         return cls._active_instances
 
     @classmethod
-    def pause_strategy(cls, instance_id: str, reason: Optional[str] = None) -> bool:
-        """Disable a running strategy (blocks new entries; exits still run)."""
+    def pause_strategy(cls, instance_id: str, reason: Optional[str] = None, source: str = "manual") -> bool:
+        """
+        Disable a running strategy (blocks new entries; exits still run).
+
+        source identifies WHY -- "regime" (MarketRegimeDetector), "monitor"
+        (StrategyMonitor's PF/drawdown auto-kill), or "manual" (operator via
+        the API, the default). See paused_by's docstring in StrategyBase for
+        why this exists.
+        """
         instance = cls._active_instances.get(instance_id)
         if not instance:
             logger.warning(f"pause_strategy: {instance_id} not found")
             return False
         instance.is_active = False
         instance.paused_reason = reason
+        instance.paused_by = source
         instance.on_pause()
         logger.warning(f"Strategy PAUSED: {instance_id} — {reason or 'manual'}")
         return True
@@ -100,5 +124,6 @@ class StrategyRegistry:
             return False
         instance.is_active = True
         instance.paused_reason = None
+        instance.paused_by = None
         logger.info(f"Strategy RESUMED: {instance_id}")
         return True

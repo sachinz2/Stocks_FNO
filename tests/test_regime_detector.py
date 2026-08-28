@@ -7,12 +7,17 @@ Covers two related 2026-08-06 fixes:
     trend check, so a low-VIX but genuinely trending market was forced into
     LOW_VOL instead of TRENDING.
 """
+import json
+
+import pytest
+
 from src.market_data.regime_detector import (
     MarketRegimeDetector as MRD,
     REGIME_STRATEGY_MAP,
     STRATEGY_EMA, STRATEGY_MOMENTUM, STRATEGY_SPREAD, STRATEGY_CONDOR,
     ATR_TREND_EXIT_THRESHOLD, ATR_TREND_THRESHOLD,
 )
+from src.strategies.base import StrategyRegistry, StrategyBase
 
 
 def test_low_vix_high_atr_classifies_trending():
@@ -69,3 +74,125 @@ def test_volatile_regime_includes_ema_crash_catching_excludes_momentum():
     # regime_detector.py's REGIME_STRATEGY_MAP comment for the full reasoning.
     assert STRATEGY_MOMENTUM not in REGIME_STRATEGY_MAP["VOLATILE"]
     assert STRATEGY_MOMENTUM in REGIME_STRATEGY_MAP["TRENDING"]
+
+
+# ── enforce_regime_switching() vs. StrategyMonitor auto-kill race ──────────
+# Live incident, 2026-08-28: enforce_regime_switching()'s resume branch only
+# ever checked is_active/should_be_active, with no regard for WHY a strategy
+# was currently paused. A StrategyMonitor auto-kill (ema_crossover_v1,
+# rolling PF 0.063 -- essentially all losing trades) got undone by this every
+# single cycle the regime happened to still allow the strategy, since
+# evaluate_all() (which re-pauses it) and enforce_regime_switching() (which
+# then immediately resumed it) both run before the entry-signal loop each
+# cycle -- confirmed live via logs: pause/resume fired every ~60s for 90+
+# consecutive minutes, meaning the strategy was actually active by the time
+# new entries were evaluated every single cycle, completely defeating the
+# circuit breaker rather than just flapping cosmetically in the health API.
+
+class _FakeStrategy(StrategyBase):
+    def initialize(self):
+        pass
+
+    def generate_signal(self, data):
+        return None
+
+    def manage_position(self, p, c):
+        return None
+
+    def shutdown(self):
+        pass
+
+
+class _FakeRedisRegime:
+    def __init__(self, regime: str):
+        self._regime = regime
+
+    async def get(self, key):
+        return json.dumps({"regime": self._regime})
+
+
+def _register(sid: str, is_active: bool, paused_by=None):
+    inst = _FakeStrategy(sid, {})
+    inst.is_active = is_active
+    inst.paused_by = paused_by
+    StrategyRegistry._active_instances[sid] = inst
+    return inst
+
+
+@pytest.mark.asyncio
+async def test_regime_switching_resumes_a_strategy_it_paused_for_regime_reasons():
+    sid = "ema_crossover_v1"
+    _register(sid, is_active=False, paused_by="regime")
+    try:
+        detector = MRD(_FakeRedisRegime("TRENDING"))
+        await detector.enforce_regime_switching()
+        assert StrategyRegistry._active_instances[sid].is_active is True
+    finally:
+        del StrategyRegistry._active_instances[sid]
+
+
+@pytest.mark.asyncio
+async def test_regime_switching_does_not_resume_a_monitor_paused_strategy():
+    """The exact live bug: a strategy paused by StrategyMonitor for real
+    poor performance must NOT be resumed just because the regime allows it."""
+    sid = "ema_crossover_v1"
+    _register(sid, is_active=False, paused_by="monitor")
+    try:
+        detector = MRD(_FakeRedisRegime("TRENDING"))
+        await detector.enforce_regime_switching()
+        assert StrategyRegistry._active_instances[sid].is_active is False, (
+            "a performance-based auto-kill must survive a regime that would "
+            "otherwise allow the strategy -- it needs an explicit manual resume"
+        )
+    finally:
+        del StrategyRegistry._active_instances[sid]
+
+
+@pytest.mark.asyncio
+async def test_regime_switching_does_not_resume_a_manually_paused_strategy():
+    sid = "ema_crossover_v1"
+    _register(sid, is_active=False, paused_by="manual")
+    try:
+        detector = MRD(_FakeRedisRegime("TRENDING"))
+        await detector.enforce_regime_switching()
+        assert StrategyRegistry._active_instances[sid].is_active is False
+    finally:
+        del StrategyRegistry._active_instances[sid]
+
+
+@pytest.mark.asyncio
+async def test_regime_switching_still_pauses_a_regime_ineligible_strategy():
+    """Guard against over-fixing -- the PAUSE side (unaffected by this fix)
+    must still work regardless of paused_by."""
+    sid = "iron_condor_v1"
+    _register(sid, is_active=True, paused_by=None)
+    try:
+        detector = MRD(_FakeRedisRegime("TRENDING"))  # excludes iron_condor_v1
+        await detector.enforce_regime_switching()
+        inst = StrategyRegistry._active_instances[sid]
+        assert inst.is_active is False
+        assert inst.paused_by == "regime"
+    finally:
+        del StrategyRegistry._active_instances[sid]
+
+
+def test_pause_strategy_records_source_and_defaults_to_manual():
+    sid = "credit_spread_v1"
+    _register(sid, is_active=True)
+    try:
+        StrategyRegistry.pause_strategy(sid, reason="test")
+        assert StrategyRegistry._active_instances[sid].paused_by == "manual"
+    finally:
+        del StrategyRegistry._active_instances[sid]
+
+
+def test_resume_strategy_clears_paused_by():
+    sid = "momentum_v1"
+    _register(sid, is_active=False, paused_by="monitor")
+    try:
+        StrategyRegistry.resume_strategy(sid)
+        inst = StrategyRegistry._active_instances[sid]
+        assert inst.is_active is True
+        assert inst.paused_by is None
+    finally:
+        del StrategyRegistry._active_instances[sid]
