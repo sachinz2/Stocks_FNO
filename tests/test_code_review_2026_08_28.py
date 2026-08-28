@@ -710,6 +710,44 @@ def test_iron_condor_entry_greeks_has_try_except():
     assert "except Exception as _greeks_exc_c:" in block
 
 
+# ── credit_spread_v1/iron_condor_v1 now trade 2 lots ────────────────────────
+# User-requested 2026-08-28: consistently the best-performing strategies to
+# date, still PAPER-only. Applied by multiplying the real exchange lot size
+# once, right after _get_lot_size() -- every downstream quantity (order
+# size, margin check, capital_at_risk, journal, GTT backstop) derives from
+# that same variable.
+
+from src.core.constants import STRATEGY_LOT_MULTIPLIER
+
+
+def test_lot_multiplier_is_2_for_premium_selling_strategies_only():
+    assert STRATEGY_LOT_MULTIPLIER["credit_spread_v1"] == 2
+    assert STRATEGY_LOT_MULTIPLIER["iron_condor_v1"] == 2
+    assert STRATEGY_LOT_MULTIPLIER.get("ema_crossover_v1", 1) == 1
+    assert STRATEGY_LOT_MULTIPLIER.get("momentum_v1", 1) == 1
+
+
+def test_credit_spread_entry_applies_lot_multiplier_after_fail_closed_check():
+    src = inspect.getsource(LiveTradingEngine._process_credit_spread)
+    idx = src.index("no verified real lot size available")
+    block = src[idx:idx + 700]
+    assert "lot_size  *= STRATEGY_LOT_MULTIPLIER.get(strategy.name, 1)" in block
+
+
+def test_iron_condor_entry_applies_lot_multiplier_after_fail_closed_check():
+    src = inspect.getsource(LiveTradingEngine._process_iron_condor)
+    idx = src.index("no verified real lot size available")
+    block = src[idx:idx + 700]
+    assert "lot_size  *= STRATEGY_LOT_MULTIPLIER.get(strategy.name, 1)" in block
+
+
+def test_single_leg_entry_does_not_apply_lot_multiplier():
+    """Guard against over-fixing -- ema_crossover_v1/momentum_v1's shared
+    single-leg entry path must be untouched."""
+    src = inspect.getsource(LiveTradingEngine._process_signal)
+    assert "STRATEGY_LOT_MULTIPLIER" not in src
+
+
 # ── Dead code removal: IndicatorEngine, SignalGenerator, oi_price_signal() ──
 # Confirmed via grep (no callers anywhere in src/ or tests/, no __init__.py
 # re-exports) before deleting -- not guessed.

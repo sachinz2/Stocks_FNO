@@ -17,6 +17,7 @@ from src.core.constants import (
     REDIS_TOP_SYMBOLS_CREDIT_SPREAD,
     REDIS_TOP_SYMBOLS_IRON_CONDOR,
     REDIS_TOP_SYMBOLS_MOMENTUM,
+    STRATEGY_LOT_MULTIPLIER,
 )
 from src.core.enums import SignalType, TradingMode
 from src.core.utils import (
@@ -2848,6 +2849,12 @@ class LiveTradingEngine:
                 "(fail-closed, not falling back to the static table for a live trading decision)."
             )
             return
+        # 2 lots for credit_spread_v1/iron_condor_v1 (2026-08-28) -- see
+        # STRATEGY_LOT_MULTIPLIER's docstring. Every downstream quantity
+        # (order size, margin check, capital_at_risk, journal, GTT
+        # backstop) derives from lot_size below, so this one multiplication
+        # is sufficient.
+        lot_size  *= STRATEGY_LOT_MULTIPLIER.get(strategy.name, 1)
         atr        = float(market_data.get("atr14", underlying_price * 0.01))
         interval   = await self._get_strike_interval(symbol, expiry)
         _atr_sigma = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, underlying_price)
@@ -3893,6 +3900,12 @@ class LiveTradingEngine:
                 "(fail-closed, not falling back to the static table for a live trading decision)."
             )
             return
+        # 2 lots for credit_spread_v1/iron_condor_v1 (2026-08-28) -- see
+        # STRATEGY_LOT_MULTIPLIER's docstring. Every downstream quantity
+        # (order size, margin check, capital_at_risk, journal, GTT
+        # backstop) derives from lot_size below, so this one multiplication
+        # is sufficient.
+        lot_size  *= STRATEGY_LOT_MULTIPLIER.get(strategy.name, 1)
         atr        = float(market_data.get("atr14", underlying_price * 0.01))
         interval   = await self._get_strike_interval(symbol, expiry)
         _atr_sigma = atr_to_annualised_vol(atr * _5MIN_ATR_SCALE, underlying_price)

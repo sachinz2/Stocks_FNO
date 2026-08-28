@@ -80,18 +80,6 @@ Methods:
 
 ---
 
-# INDICATOR PACKAGE
-IndicatorEngine
-Methods:
-* calculate_ema()
-* calculate_rsi()
-* calculate_atr()
-* calculate_vwap()
-* calculate_macd()
-* update_indicators()
-
----
-
 # STRATEGY PACKAGE
 Base Class: StrategyBase
 Methods:
@@ -101,15 +89,6 @@ Methods:
 * shutdown()
 
 VWAPStrategy, EMACrossoverStrategy, ORBStrategy, VolumeBreakoutStrategy All inherit: StrategyBase
-
----
-
-# SIGNAL ENGINE
-SignalEngine
-Methods:
-* generate_signals()
-* validate_signal()
-* store_signal()
 
 ---
 

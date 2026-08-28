@@ -58,7 +58,7 @@ Falcon Quant Platform is an automated algorithmic trading system built for NSE F
 | Walk-forward validation | Done — WalkForwardTester (IS/OOS windows) |
 | Monte Carlo reserve sizing | Done — MonteCarloSimulator (10,000 bootstraps) |
 | Parameter robustness analysis | Done — ParameterRobustnessAnalyzer |
-| OI change signal | Done — oi_price_signal() in nse_oi.py |
+| OI change signal | Done — _oi_change_signal() in nse_oi.py |
 | Email notifications | Done |
 | Web dashboard | Done (Streamlit) |
 | REST API | Done (FastAPI) |
@@ -1299,21 +1299,24 @@ sigma = await self._get_live_sigma(symbol, underlying_price, dte, interval, expi
 
 The ATR-derived `_atr_sigma` is retained separately as the **realized vol baseline** for the HV/IV ratio filter (`market_iv / _atr_sigma ≥ 1.10`). Using live ATM IV there instead would compare OTM implied vol against ATM implied vol (measuring skew, not the vol risk premium).
 
-### 11.7 NSE Open Interest Data
+### 11.7 Open Interest Data (Zerodha primary, NSE scrape fallback)
 
 **File:** `src/market_data/nse_oi.py`
 
-Now includes OI change-delta signal:
+`get_oi_data(symbol, redis, kite=None)` — as of 2026-08-28, tries Zerodha first: `_fetch_zerodha_option_chain()` pulls real, live `oi` via `kite.quote()` for every strike of the symbol's nearest expiry, using the same daily-refreshed real-contract cache (`REDIS_CONTRACT_PREFIX`) that backs strike/lot-size resolution elsewhere. Falls back to the NSE website scrape (`_fetch_option_chain_blocking()`) only if Zerodha is unavailable (no `kite`, contract-cache miss, or `kite.quote()` fails). Both sources produce an identical shape via the shared `_build_chain_summary()`, tagged with a `"source"` field (`"zerodha"` or `"nse"`). Cached in Redis for 15 minutes either way, to bound `kite.quote()` call volume.
+
+OI change-delta signal:
 
 ```python
-oi_price_signal(call_oi_change, put_oi_change, price_change_pct):
-    Price↑ + OI↑  → STRONG_BULLISH   (fresh longs entering)
-    Price↑ + OI↓  → WEAK_BULLISH     (short covering)
-    Price↓ + OI↑  → STRONG_BEARISH   (fresh shorts entering)
-    Price↓ + OI↓  → WEAK_BEARISH     (longs exiting)
+_oi_change_signal(call_oi_change, put_oi_change):
+    put_oi_change > 0, call_oi_change <= 0  → BULLISH_OI  (puts added, calls not)
+    call_oi_change > 0, put_oi_change <= 0  → BEARISH_OI  (calls added, puts not)
+    otherwise                               → NEUTRAL
 ```
 
-Previous OI snapshot stored in `nse_oi_prev:{symbol}` for change calculation.
+Previous OI snapshot stored in `nse_oi_prev:{symbol}` for change calculation, regardless of which source served the current cycle.
+
+`is_strike_crowded()` fails **closed** (treats a strike as crowded) when OI data is unavailable from both sources — a total outage now requires both to fail at once, rare enough to match this codebase's normal fail-closed convention for entry-risk parameters.
 
 ---
 

@@ -405,6 +405,22 @@ STRATEGY_CAPITAL_ALLOCATION = {
 # options, which these strategies don't use.
 INTRADAY_PRODUCT_STRATEGIES = {"ema_crossover_v1", "momentum_v1"}
 
+# Lot multiplier per strategy -- default 1 (exactly the real exchange lot
+# size from LiveTradingEngine._get_lot_size()). Added 2026-08-28:
+# credit_spread_v1/iron_condor_v1 now trade 2 lots per entry -- the two
+# consistently best-performing strategies to date (see
+# STRATEGY_CAPITAL_ALLOCATION's comment above), still PAPER-only. Applied
+# by multiplying the real lot size once, right after it's fetched, so
+# every downstream quantity (order size, margin check, capital_at_risk,
+# journal quantity, GTT backstop) scales together automatically -- the
+# per-strategy capital budget check (risk layer 5) already gates on
+# capital_at_risk, so this can't silently exceed either strategy's
+# allotted capital, it just reaches that budget in fewer concurrent trades.
+STRATEGY_LOT_MULTIPLIER = {
+    "credit_spread_v1": 2,
+    "iron_condor_v1":   2,
+}
+
 # Max open structures per sector (prevents correlated blow-ups)
 MAX_SECTOR_POSITIONS = 2
 
