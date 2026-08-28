@@ -286,8 +286,26 @@ def is_strike_crowded(
     Returns True if this strike has exceptionally high OI — avoid selling here.
     High OI = the market is using this strike as a hedge, making it more likely
     to be tested.
+
+    Fails OPEN (returns False, "not crowded") when oi_data is unavailable --
+    deliberately kept as-is 2026-08-28 (metrics-calculation audit) rather
+    than flipped to fail-closed, since the NSE scrape this depends on is
+    the single most unreliable data source in the pipeline and this gate
+    stacks with several other independent entry gates (VIX, IV rank, VWAP,
+    delta tolerance) already found to multiplicatively starve
+    credit_spread_v1/iron_condor_v1 of trades (2026-08-07 gate
+    consolidation). Flipping this one gate to fail-closed unilaterally
+    would trade off entry frequency against crowded-strike protection --
+    a real policy choice, not a bug fix; flagged for an explicit decision
+    instead. This warning at least makes the bypass visible in logs,
+    which it previously was not.
     """
     if not oi_data:
+        logger.warning(
+            "is_strike_crowded: OI data unavailable for strike %s (%s) -- "
+            "crowded-strike check skipped, treating as not-crowded (fail-open).",
+            strike, option_type,
+        )
         return False
     key = "crowded_call_strikes" if option_type == "CE" else "crowded_put_strikes"
     return strike in oi_data.get(key, [])

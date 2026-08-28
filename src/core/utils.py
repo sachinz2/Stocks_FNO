@@ -261,7 +261,7 @@ def estimate_option_premium(
     (e.g. when computing entry credits before strikes are chosen).
 
     ATR-based fallback model:
-      ATM premium at 20 DTE  ≈  ATR × 4  × sqrt(DTE/20)
+      ATM premium at 20 DTE  ≈  daily-scaled ATR × 4  × sqrt(DTE/20)
       Each interval OTM discounts by 25%
     """
     dte = max(dte, 1)
@@ -284,8 +284,22 @@ def estimate_option_premium(
     # ATR-based fallback
     if atr <= 0:
         return 0.01
+    # Fixed 2026-08-28 (code review): this branch used raw 5-min-bar ATR
+    # directly in a formula ("ATM premium ~= ATR x 4 x sqrt(DTE/20)")
+    # written for a DAILY-scale ATR -- the BS branch immediately above
+    # applies FIVE_MIN_ATR_DAILY_SCALE (~8.66x) before using atr for
+    # exactly this reason, but this fallback never did, understating every
+    # premium it estimates by ~8.66x. Not dead code: reached whenever a
+    # live option quote is stale/unavailable and no strike/underlying_price
+    # was supplied (6 call sites in live_trading_engine.py/option_chain.py,
+    # several feeding real stop-loss/target/trailing-stop comparisons for
+    # single-leg positions) -- a wildly understated premium there can
+    # trigger a spurious "target hit" or badly mis-set a trailing-stop
+    # level during precisely the data-staleness scenario this fallback
+    # exists to handle gracefully.
+    _daily_atr = atr * FIVE_MIN_ATR_DAILY_SCALE
     dte_factor = math.sqrt(dte / 20.0)
-    atm_premium = atr * 4.0 * dte_factor
+    atm_premium = _daily_atr * 4.0 * dte_factor
     otm_discount = 0.75 ** max(otm_intervals, 0)
     return max(round(atm_premium * otm_discount, 2), 0.05)
 

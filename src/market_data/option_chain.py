@@ -54,7 +54,17 @@ def bs_price(S: float, K: float, T: float, sigma: float, option_type: str = "CE"
 def bs_delta(S: float, K: float, T: float, sigma: float, option_type: str = "CE") -> float:
     """Black-Scholes delta."""
     if T <= 0 or sigma <= 0:
-        return 1.0 if (option_type == "CE" and S > K) else 0.0
+        # Fixed 2026-08-28 (metrics-calculation audit): a deep-ITM PE used
+        # to fall through to 0.0 here (as if OTM) instead of -1.0 -- this
+        # branch is reachable pre-expiry whenever atr_to_annualised_vol()
+        # returns exactly 0.0 (atr==0), and some entry-path call sites
+        # don't guard atr>0 before calling bs_delta(). A wrongly-0.0 PE
+        # delta would misreport a deep-ITM put as having no directional
+        # exposure at all.
+        if option_type == "CE":
+            return 1.0 if S > K else 0.0
+        else:
+            return -1.0 if S < K else 0.0
     r = _RISK_FREE_RATE
     d1 = _bs_d1(S, K, T, r, sigma)
     if option_type == "CE":

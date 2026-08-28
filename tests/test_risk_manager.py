@@ -144,6 +144,7 @@ def test_capital_at_risk_blocks_sell_entry_over_strategy_budget():
     ok = rm.validate_trade(
         "TESTCE", "SELL", 25, 10.0,
         strategy_name="credit_spread_v1", capital_at_risk=5000.0,
+        iv_rank=0.5, vix=15.0,
     )
     assert ok is False
 
@@ -156,6 +157,7 @@ def test_capital_at_risk_allows_sell_entry_within_budget():
     ok = rm.validate_trade(
         "TESTCE2", "SELL", 25, 10.0,
         strategy_name="credit_spread_v1", capital_at_risk=500.0,
+        iv_rank=0.5, vix=15.0,
     )
     assert ok is True
 
@@ -167,7 +169,10 @@ def test_sell_without_capital_at_risk_keeps_old_fail_open_default():
     budget = 300_000.0 * STRATEGY_CAPITAL_ALLOCATION["credit_spread_v1"]
     rm._strategy_deployed["credit_spread_v1"] = budget * 10  # absurdly over budget
 
-    ok = rm.validate_trade("TESTCE3", "SELL", 25, 10.0, strategy_name="credit_spread_v1")
+    ok = rm.validate_trade(
+        "TESTCE3", "SELL", 25, 10.0, strategy_name="credit_spread_v1",
+        iv_rank=0.5, vix=15.0,
+    )
     assert ok is True
 
 

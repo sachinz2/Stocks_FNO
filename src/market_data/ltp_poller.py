@@ -669,15 +669,39 @@ class LTPPoller:
         _adx_valid = not np.isnan(float(_adx_raw))
         adx14  = round(float(_adx_raw), 2) if _adx_valid else 0.0
 
-        # RVOL — current bar volume relative to 20-period average.
-        # rvol_valid: same "insufficient data vs genuinely computed" split as
-        # adx_valid above -- _vol_avg20 is NaN until 20 real-volume bars
-        # exist (roughly the first ~100 minutes of every session), during
-        # which the RVOL entry gate was silently disabled rather than
-        # blocking (see live_trading_engine.py's momentum RVOL check).
-        _vol_avg20 = volume.rolling(20).mean().iloc[-1]
-        _rvol_valid = bool(_vol_avg20 and _vol_avg20 > 0)
-        rvol = round(float(volume.iloc[-1] / _vol_avg20), 2) if _rvol_valid else 0.0
+        # RVOL — current bar volume relative to a 20-bar average of TODAY's
+        # own bars.
+        #
+        # Fixed 2026-08-28 (code review): this used to run rolling(20) over
+        # `volume` (the multi-day historical+live concatenated series, same
+        # one ATR/EMA/ADX use), not just today's bars. That series has
+        # ~750+ historical rows sitting before today's live rows, so the
+        # rolling window is NEVER short enough to produce NaN -- meaning
+        # rvol_valid was virtually always True, including on the very first
+        # tick of a session, directly contradicting this comment's own
+        # stated intent ("NaN until 20 real-volume bars exist, roughly the
+        # first ~100 minutes"). Worse than just "the guard never fires":
+        # during that real early-session window the average was silently
+        # computed against a baseline dominated by PRIOR DAYS' final bars
+        # -- typically the highest-volume bars of the whole session
+        # (closing auction activity) -- systematically understating RVOL
+        # for genuinely high early-session volume. Every caller relying on
+        # rvol_valid to mean "can't confirm, don't enter" (momentum.py's
+        # flat floor and two-tier pullback/breakout confirmation, the
+        # shared RVOL gate in live_trading_engine.py) was instead getting a
+        # confidently-labeled-valid number computed against the wrong
+        # population for the first ~1.5-2 hours of every single trading
+        # day. Fixed: use ONLY today's own bars (`live_rows`, already built
+        # above for session_vwap) as the RVOL baseline -- correctly NaN/
+        # unavailable until 20 of today's own bars genuinely exist.
+        if has_live_data and len(live_rows) >= 20:
+            _today_vol = pd.Series([r["volume"] for r in live_rows])
+            _vol_avg20 = _today_vol.rolling(20).mean().iloc[-1]
+            _rvol_valid = bool(_vol_avg20 and _vol_avg20 > 0 and not pd.isna(_vol_avg20))
+            rvol = round(float(_today_vol.iloc[-1] / _vol_avg20), 2) if _rvol_valid else 0.0
+        else:
+            _rvol_valid = False
+            rvol = 0.0
 
         # `vwap` is deliberately a multi-day cumulative figure (~750 historical
         # bars plus today's live bars) — a medium-term (10-day) trend anchor, see

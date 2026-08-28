@@ -150,6 +150,67 @@ def test_enrich_rvol_and_adx_invalid_with_insufficient_history():
     assert tick["rvol"] == 0.0
 
 
+def test_enrich_rvol_invalid_early_session_even_with_abundant_high_volume_history():
+    """Live incident, 2026-08-28: rolling(20) used to run over the
+    concatenated multi-day series (~750 historical rows sitting before
+    today's), which can NEVER be short enough to produce NaN -- rvol_valid
+    was virtually always True, including on the first tick of a session,
+    contradicting the very comment describing the intended NaN-until-20-
+    real-bars behavior. Worse, the "valid" reading was computed against
+    prior days' bars, typically dominated by closing-auction volume --
+    systematically understating RVOL exactly when it should have been
+    reported as unavailable. Reproduces that scenario directly: abundant
+    HIGH-volume historical baseline (simulating yesterday's closing surge)
+    + only 5 of today's own (genuinely low-volume) bars -- must report
+    rvol_valid=False, not a confidently-wrong low number."""
+    hist = _make_hist_baseline("2026-07-29", n=30, price=100.0, volume=50_000)
+
+    bars_today = []
+    base_time = IST.localize(dt.datetime(2026, 7, 30, 9, 15, 0))
+    for i in range(5):  # far short of 20 of TODAY's own bars
+        bars_today.append({
+            "date": (base_time + dt.timedelta(minutes=5 * i)).isoformat(),
+            "open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0,
+            "volume": 1000,  # genuinely low early-session volume
+        })
+    live_range = {
+        "bars_today": bars_today,
+        "cur_bar_open": 100.0, "cur_bar_high": 100.5, "cur_bar_low": 99.5,
+        "cur_bar_volume": 1000,
+        "day_open": 100.0, "day_high": 100.5, "day_low": 99.5,
+    }
+
+    tick = LTPPoller._enrich("TESTSTOCK", hist.copy(), 100.2, live_range=live_range)
+    assert tick["rvol_valid"] is False
+    assert tick["rvol"] == 0.0
+
+
+def test_enrich_rvol_valid_once_20_of_todays_own_bars_exist_even_with_thin_history():
+    """Guard against over-fixing -- once 20+ of TODAY's own bars genuinely
+    exist, RVOL must be considered valid regardless of how little
+    historical baseline data is available."""
+    hist = _make_hist_baseline("2026-07-29", n=2, price=100.0, volume=1000)
+
+    bars_today = []
+    base_time = IST.localize(dt.datetime(2026, 7, 30, 9, 15, 0))
+    for i in range(25):
+        bars_today.append({
+            "date": (base_time + dt.timedelta(minutes=5 * i)).isoformat(),
+            "open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0,
+            "volume": 1000,
+        })
+    live_range = {
+        "bars_today": bars_today,
+        "cur_bar_open": 100.0, "cur_bar_high": 100.5, "cur_bar_low": 99.5,
+        "cur_bar_volume": 3000,
+        "day_open": 100.0, "day_high": 100.5, "day_low": 99.5,
+    }
+
+    tick = LTPPoller._enrich("TESTSTOCK", hist.copy(), 100.2, live_range=live_range)
+    assert tick["rvol_valid"] is True
+    assert tick["rvol"] > 1.0
+
+
 def test_enrich_day_prev_close_is_prior_trading_day_not_bar_to_bar():
     # Fixed 2026-08-06: market breadth was computed from the previous 5-min
     # bar's close, not the actual previous trading day's close -- despite

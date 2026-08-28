@@ -326,3 +326,163 @@ def test_iron_condor_partial_exit_alert_is_throttled_per_structure():
     block = src[idx:idx + 1400]
     assert '_partial_exit_alerted' in block
     assert 'if not c.get("_partial_exit_alerted")' in block
+
+
+# ── Round 3: metrics-calculation audit (VIX already fixed separately) ──────
+# User asked for a full audit of VIX/RVOL/ATR/ADX/EMA/IV-Rank/sigma/delta/
+# OI/PCR calculation logic, and to prefer real Zerodha data where available.
+# Confirmed via 4 parallel deep-read agents + direct verification: two
+# severe, high-confidence bugs fixed here; several more real findings
+# flagged for the user's decision (bigger-scope changes, not blind fixes).
+
+from src.core.utils import estimate_option_premium
+from src.market_data.ltp_poller import LTPPoller
+
+
+def test_estimate_option_premium_fallback_applies_daily_atr_scale():
+    """Live-incident-adjacent finding, 2026-08-28: the ATR-based fallback
+    (used whenever a live option quote is stale/unavailable and no
+    strike/underlying_price was supplied) used raw 5-min-bar ATR directly
+    in a formula written for daily-scale ATR -- understating every premium
+    estimate by ~8.66x (FIVE_MIN_ATR_DAILY_SCALE). The BS branch (called
+    WITH strike/underlying_price) already applied this scale; the fallback
+    never did."""
+    from src.core.constants import FIVE_MIN_ATR_DAILY_SCALE
+    atr = 2.0
+    dte = 20
+    # No underlying_price/strike -> fallback branch.
+    premium = estimate_option_premium(atr, dte)
+    expected = round((atr * FIVE_MIN_ATR_DAILY_SCALE) * 4.0 * 1.0, 2)  # sqrt(20/20)=1.0
+    assert premium == expected
+    # Sanity: this must be meaningfully larger than the old (unscaled) bug
+    # would have produced -- guards against a future accidental revert.
+    old_buggy_value = round(atr * 4.0 * 1.0, 2)
+    assert premium > old_buggy_value * 5  # ~8.66x, generous margin for rounding
+
+
+def test_estimate_option_premium_fallback_otm_discount_still_applies():
+    atr = 2.0
+    dte = 20
+    atm = estimate_option_premium(atr, dte, otm_intervals=0)
+    one_otm = estimate_option_premium(atr, dte, otm_intervals=1)
+    assert one_otm == round(atm * 0.75, 2)
+
+
+def test_estimate_option_premium_bs_branch_unaffected_by_fallback_fix():
+    """Guard against over-fixing -- the correctly-scaled BS branch (called
+    WITH strike/underlying_price) must be untouched."""
+    premium = estimate_option_premium(
+        atr=2.0, dte=20, underlying_price=100.0, strike=100.0, option_type="CE",
+    )
+    assert premium > 0.05  # a real BS-priced ATM premium, not the floor
+
+
+# ── RVOL day-boundary contamination fix ─────────────────────────────────────
+# Covered in detail by tests/test_ltp_poller.py's new tests; this file just
+# confirms the fix note is present (matches this session's established
+# "verify the fix landed" convention for source-level checks).
+
+def test_ltp_poller_rvol_uses_todays_bars_not_multiday_series():
+    src = inspect.getsource(LTPPoller._enrich)
+    idx = src.index("RVOL — current bar volume")
+    block = src[idx:idx + 2000]
+    assert "if has_live_data and len(live_rows) >= 20:" in block
+    assert "_today_vol = pd.Series([r[" in block
+
+
+# ── risk_manager.validate_trade(): VIX/IV-rank gate must fail closed on None ─
+# Same bug class as vix_allows_selling()/iv_rank_allows_selling(), fixed
+# earlier the same day -- `if x is not None and x < threshold` silently
+# skips the whole gate when x is None, instead of blocking. Defense-in-depth:
+# real live entry paths already gate upstream via the already-fixed
+# option_chain functions, so this shouldn't change today's production
+# behavior, but any other/future caller of validate_trade() is now covered.
+
+from src.risk.risk_manager import RiskManager
+
+
+def test_validate_trade_blocks_credit_spread_when_iv_rank_missing():
+    rm = RiskManager(initial_capital=300_000.0)
+    ok = rm.validate_trade(
+        "TESTCE", "SELL", 25, 10.0,
+        strategy_name="credit_spread_v1", capital_at_risk=500.0,
+        iv_rank=None, vix=15.0,
+    )
+    assert ok is False
+
+
+def test_validate_trade_blocks_iron_condor_when_vix_missing():
+    rm = RiskManager(initial_capital=300_000.0)
+    ok = rm.validate_trade(
+        "TESTPE", "SELL", 25, 10.0,
+        strategy_name="iron_condor_v1", capital_at_risk=500.0,
+        iv_rank=0.5, vix=None,
+    )
+    assert ok is False
+
+
+def test_validate_trade_allows_credit_spread_with_real_iv_rank_and_vix():
+    """Guard against over-fixing -- real values in range must still pass."""
+    rm = RiskManager(initial_capital=300_000.0)
+    ok = rm.validate_trade(
+        "TESTCE", "SELL", 25, 10.0,
+        strategy_name="credit_spread_v1", capital_at_risk=500.0,
+        iv_rank=0.5, vix=15.0,
+    )
+    assert ok is True
+
+
+def test_validate_trade_ema_crossover_unaffected_by_iv_gate():
+    """The IV/VIX gate only applies to premium-selling strategies -- a
+    directional strategy passing neither must be unaffected."""
+    rm = RiskManager(initial_capital=300_000.0)
+    ok = rm.validate_trade("TESTCE", "BUY", 25, 10.0, strategy_name="ema_crossover_v1")
+    assert ok is True
+
+
+# ── bs_delta(): deep-ITM put edge case must return -1.0, not 0.0 ───────────
+# Reachable pre-expiry whenever atr_to_annualised_vol() returns exactly 0.0
+# (atr==0); some entry-path call sites don't guard atr>0 before calling
+# bs_delta(). A wrongly-0.0 PE delta misreports a deep-ITM put as having no
+# directional exposure at all.
+
+from src.market_data.option_chain import bs_delta
+
+
+def test_bs_delta_deep_itm_put_at_expiry_returns_minus_one():
+    assert bs_delta(S=100.0, K=150.0, T=0.0, sigma=0.2, option_type="PE") == -1.0
+
+
+def test_bs_delta_deep_otm_put_at_expiry_returns_zero():
+    assert bs_delta(S=150.0, K=100.0, T=0.0, sigma=0.2, option_type="PE") == 0.0
+
+
+def test_bs_delta_deep_itm_call_at_expiry_still_returns_one():
+    """Guard against over-fixing -- the CE branch (already correct) must be
+    unaffected."""
+    assert bs_delta(S=150.0, K=100.0, T=0.0, sigma=0.2, option_type="CE") == 1.0
+
+
+def test_bs_delta_zero_sigma_put_uses_same_itm_edge_case():
+    assert bs_delta(S=100.0, K=150.0, T=1.0, sigma=0.0, option_type="PE") == -1.0
+
+
+# ── is_strike_crowded(): visibility warning on missing OI data ─────────────
+# Deliberately still fails OPEN (not flipped to fail-closed) -- see the
+# function's own docstring for the trade-frequency tradeoff reasoning.
+# This only confirms the previously-silent bypass now logs a warning.
+
+from src.market_data.nse_oi import is_strike_crowded
+
+
+def test_is_strike_crowded_logs_warning_when_oi_data_missing(caplog):
+    with caplog.at_level("WARNING"):
+        result = is_strike_crowded(25000, None, "CE")
+    assert result is False
+    assert any("OI data unavailable" in r.message for r in caplog.records)
+
+
+def test_is_strike_crowded_still_works_normally_with_real_oi_data():
+    oi_data = {"crowded_call_strikes": [25000], "crowded_put_strikes": []}
+    assert is_strike_crowded(25000, oi_data, "CE") is True
+    assert is_strike_crowded(24900, oi_data, "CE") is False

@@ -230,14 +230,34 @@ class RiskManager:
             return True
 
         # ── 3. IV Rank gate (only for premium-selling strategies) ─────────────
+        # Fixed 2026-08-28 (metrics-calculation audit): `is not None and ...`
+        # meant a missing iv_rank/vix silently skipped this gate entirely
+        # (fails OPEN), same bug class as vix_allows_selling()/
+        # iv_rank_allows_selling() in option_chain.py, fixed earlier the same
+        # day to fail closed. Real live entry paths already gate upstream via
+        # those now-fixed functions, so this is defense-in-depth for any
+        # other/future caller of validate_trade(), not a behavior change for
+        # today's known call sites.
         if strategy_name in ("CREDIT_SPREAD", "IRON_CONDOR", "credit_spread_v1", "iron_condor_v1"):
-            if iv_rank is not None and iv_rank < 0.30:
+            if iv_rank is None:
+                logger.warning(
+                    f"Risk: IV rank unavailable for {symbol} [{strategy_name}] "
+                    "— cannot verify premium is rich enough, skipping."
+                )
+                return False
+            if iv_rank < 0.30:
                 logger.warning(
                     f"Risk: IV rank {iv_rank:.2f} < 0.30 for {symbol} "
                     f"[{strategy_name}] — options too cheap, skipping."
                 )
                 return False
-            if vix is not None and vix < 12.0:
+            if vix is None:
+                logger.warning(
+                    f"Risk: India VIX unavailable for {symbol} [{strategy_name}] "
+                    "— cannot verify market-wide premium level, skipping."
+                )
+                return False
+            if vix < 12.0:
                 logger.warning(
                     f"Risk: India VIX {vix:.1f} < 12 — market unusually quiet, "
                     f"premiums too cheap market-wide, skipping [{strategy_name}]."

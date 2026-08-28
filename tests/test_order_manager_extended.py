@@ -104,6 +104,7 @@ async def test_hedge_leg_does_not_double_count_deployed_capital():
     await om.place_order(
         "TESTCE", "SELL", 25, 10.0,
         is_spread_leg=False, strategy_name="credit_spread_v1", capital_at_risk=3750.0,
+        iv_rank=0.5, vix=15.0,
     )
     rm.add_deployed_capital("credit_spread_v1", 3750.0)
 
@@ -160,6 +161,7 @@ async def test_multi_leg_anchor_sell_leg_is_never_retried():
         om, order_repo,
         symbol="INFY26AUG1800PE", side="SELL", quantity=25, price=15.0,
         is_spread_leg=False, strategy_name="credit_spread_v1", capital_at_risk=3000.0,
+        iv_rank=0.5, vix=15.0,
     )
     cancelled = await om.expire_stale_orders()
 
