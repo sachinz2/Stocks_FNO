@@ -37,8 +37,6 @@ class CreditSpreadStrategy(StrategyBase):
         # not ours (see generate_signal()'s 2026-08-20 fix note). Same default as
         # IronCondorStrategy.flat_threshold so the two partitions actually meet.
         self.flat_threshold = self.parameters.get("flat_threshold", 0.1)
-        # How many strike intervals wide the spread should be
-        self.spread_width = self.parameters.get("spread_width", 2)
         # Close short leg when it has decayed to this fraction of sold price (75% profit)
         self.profit_close_pct = self.parameters.get("profit_close_pct", 0.25)
         # Stop loss: close if short leg rises to this multiple of sold price
@@ -49,7 +47,6 @@ class CreditSpreadStrategy(StrategyBase):
         logger.info(
             f"Initialized Credit Spread '{self.name}' | "
             f"low_vol_threshold={self.low_vol_threshold}% | "
-            f"spread_width={self.spread_width} intervals | "
             f"profit_target={int((1 - self.profit_close_pct) * 100)}% | "
             f"SL_multiple={self.stop_loss_multiple}x"
         )

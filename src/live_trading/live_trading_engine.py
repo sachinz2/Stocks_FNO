@@ -2860,16 +2860,27 @@ class LiveTradingEngine:
         # VIX + IV Rank gates — only sell premium when it is worth selling
         from src.market_data.option_chain import vix_allows_selling, iv_rank_allows_selling
         if not vix_allows_selling(vix):
-            logger.info(
-                f"[CreditSpread] {symbol} skipped — VIX={vix:.1f} too low "
-                f"(need ≥12.0 for rich premium). Not worth selling spreads."
-            )
+            # Fixed 2026-08-28 (code review): vix_allows_selling() now fails
+            # closed on vix=None, so this branch can be reached with vix
+            # itself being None -- the old f"{vix:.1f}" would crash on that
+            # (previously unreachable, since None used to fail OPEN and
+            # skip this branch entirely).
+            if vix is None:
+                logger.info(f"[CreditSpread] {symbol} skipped — VIX unavailable (fail-closed, can't confirm premium is worth selling).")
+            else:
+                logger.info(
+                    f"[CreditSpread] {symbol} skipped — VIX={vix:.1f} too low "
+                    f"(need ≥12.0 for rich premium). Not worth selling spreads."
+                )
             return
         if not iv_rank_allows_selling(iv_rank):
-            logger.info(
-                f"[CreditSpread] {symbol} skipped — IV Rank={iv_rank:.2f} too low "
-                f"(need ≥0.30). Premium too cheap."
-            )
+            if iv_rank is None:
+                logger.info(f"[CreditSpread] {symbol} skipped — IV Rank unavailable (fail-closed, can't confirm premium is worth selling).")
+            else:
+                logger.info(
+                    f"[CreditSpread] {symbol} skipped — IV Rank={iv_rank:.2f} too low "
+                    f"(need ≥0.30). Premium too cheap."
+                )
             return
 
         # OI/PCR sentiment — logged for visibility, not gated. Fixed 2026-08-07:
@@ -3676,9 +3687,22 @@ class LiveTradingEngine:
                 )
 
                 # D: increment SL frequency counter for adverse exits (circuit breaker)
-                _is_adverse = any(
-                    kw in exit_reason for kw in ("breach", "Breach", "SL:", " SL ", "spike SL")
-                )
+                #
+                # Fixed 2026-08-28 (code review): was string-matching
+                # exit_reason for keywords ("breach", "SL:", etc.) -- missed
+                # manage_position()'s own stop-loss exit, whose reason text
+                # is f"{name} short RsX -> RsY (pnl%)" with none of those
+                # substrings. Since the DTE-tiered profit check above almost
+                # always resolves before manage_position() is ever reached,
+                # that stop-loss branch is realistically the ONLY thing
+                # manage_position() fires live -- so the exact exit type
+                # this circuit breaker exists to catch (repeated stop-losses
+                # on the same symbol) never tripped it. Same fix, same
+                # reasoning, and the exact same real-P&L basis already
+                # adopted a few lines below for profit_closes/adverse_closes
+                # re-entry bucketing (see that comment) -- migrating this
+                # check to match closes the one place that was missed.
+                _is_adverse = net_pnl < 0
                 if _is_adverse:
                     _r = getattr(self, "_redis", None)
                     if _r:
@@ -3854,16 +3878,24 @@ class LiveTradingEngine:
         # VIX + IV Rank gates — only sell premium when it is worth selling
         from src.market_data.option_chain import vix_allows_selling, iv_rank_allows_selling
         if not vix_allows_selling(vix):
-            logger.info(
-                f"[IronCondor] {symbol} skipped — VIX={vix:.1f} too low "
-                f"(need ≥12.0 for rich premium). Not worth selling condors."
-            )
+            # Fixed 2026-08-28 (code review): same fail-closed fix as the
+            # credit_spread call site -- vix=None is now reachable here too.
+            if vix is None:
+                logger.info(f"[IronCondor] {symbol} skipped — VIX unavailable (fail-closed, can't confirm premium is worth selling).")
+            else:
+                logger.info(
+                    f"[IronCondor] {symbol} skipped — VIX={vix:.1f} too low "
+                    f"(need ≥12.0 for rich premium). Not worth selling condors."
+                )
             return
         if not iv_rank_allows_selling(iv_rank):
-            logger.info(
-                f"[IronCondor] {symbol} skipped — IV Rank={iv_rank:.2f} too low "
-                f"(need ≥0.30). Premium too cheap."
-            )
+            if iv_rank is None:
+                logger.info(f"[IronCondor] {symbol} skipped — IV Rank unavailable (fail-closed, can't confirm premium is worth selling).")
+            else:
+                logger.info(
+                    f"[IronCondor] {symbol} skipped — IV Rank={iv_rank:.2f} too low "
+                    f"(need ≥0.30). Premium too cheap."
+                )
             return
 
         # OI/PCR neutrality check — iron condors need a non-directional market.
@@ -4122,6 +4154,21 @@ class LiveTradingEngine:
                     self._exited_today.add(symbol)  # risk manager blocked it — stop retrying today
                 from src.market_data.option_chain import get_option_quote as _gq
                 _bad_uw = {"REJECTED", "REJECTED_BY_RISK", "CANCELLED", "FAILED"}
+                # Fixed 2026-08-28 (code review): PENDING_VERIFICATION was
+                # missing here -- order_manager.place_order() returns it
+                # specifically when a client-side timeout meant the fill
+                # outcome could NOT be verified against the broker (see
+                # place_order()'s own docstring), a genuinely unknown state,
+                # not a confirmed success. It fell through this check as
+                # neither None nor in _bad_uw, so an unconfirmed unwind was
+                # silently counted as closed -- the one status this check
+                # exists to catch. Deliberately NOT touching plain "OPEN"
+                # here: that's the same accepted-and-trusted status this
+                # codebase treats as success at every other order-placement
+                # site (the entry path above, _check_condor_exits's
+                # _close_leg), not something to second-guess in just this
+                # one spot.
+                _uncertain_uw = {"PENDING_VERIFICATION"}
                 _failed_unwinds = []
                 for (c, s, p, _l, _o) in placed:
                     rev = "BUY" if s == "SELL" else "SELL"
@@ -4129,8 +4176,11 @@ class LiveTradingEngine:
                     _uw = await self.order_manager.place_order(
                         c, rev, lot_size, _unwind_p, is_spread_leg=True, is_exit_order=True,
                     )
-                    if _uw is None or getattr(_uw, "order_status", "") in _bad_uw:
+                    _uw_status = getattr(_uw, "order_status", "")
+                    if _uw is None or _uw_status in _bad_uw:
                         _failed_unwinds.append(f"{rev} {c}")
+                    elif _uw_status in _uncertain_uw:
+                        _failed_unwinds.append(f"{rev} {c} [UNCONFIRMED — verify manually, do not assume closed]")
                 if _failed_unwinds:
                     logger.critical(
                         f"[IronCondor] UNWIND FAILED for {symbol} legs: {_failed_unwinds} — "
@@ -4492,6 +4542,27 @@ class LiveTradingEngine:
                         f"[IronCondor] Exit orders for {underlying} partially rejected — "
                         f"keeping position in tracking to retry next cycle."
                     )
+                    # Fixed 2026-08-28 (code review): this used to be
+                    # log-only -- the expiry-day equivalent of this exact
+                    # situation (_square_off_all's partial-close handling)
+                    # already sends a CRITICAL notify, but this normal-cycle
+                    # path, which can persist far longer (retried every
+                    # cycle indefinitely, not just on expiry day) and is
+                    # reached only AFTER a real exit condition already
+                    # fired, did not. One-shot per structure (via
+                    # _partial_exit_alerted on the tracked dict) -- this
+                    # runs on both the 60s signal cycle and the 10s
+                    # fast-exit job, so notifying every cycle a stuck
+                    # condor persists would spam far more than it informs.
+                    if not c.get("_partial_exit_alerted"):
+                        c["_partial_exit_alerted"] = True
+                        await self._notify(
+                            f"IronCondor: exit partially failed for {underlying}\n"
+                            f"Legs closed: PS={_ps_ok} PL={_pl_ok} CS={_cs_ok} CL={_cl_ok}\n"
+                            f"Structure remains tracked and will keep retrying the "
+                            f"unclosed leg(s) automatically -- no action needed unless "
+                            f"this persists."
+                        )
                     continue
 
                 c.pop("_ps_exit_fill", None)
@@ -4571,9 +4642,14 @@ class LiveTradingEngine:
                 )
 
                 # D: increment SL frequency counter for adverse exits (circuit breaker)
-                _is_adverse_c = any(
-                    kw in exit_reason for kw in ("breach", "Breach", "SL:", " SL ", "spike SL")
-                )
+                #
+                # Fixed 2026-08-28 (code review): same fix as the identical
+                # credit_spread_v1 pattern -- see that comment. String-
+                # matching exit_reason missed manage_position()'s own
+                # stop-loss exit text; real P&L (already the established
+                # basis for profit_closes/adverse_closes bucketing a few
+                # lines below) is the robust signal.
+                _is_adverse_c = net_pnl < 0
                 if _is_adverse_c:
                     _r_c = getattr(self, "_redis", None)
                     if _r_c:

@@ -178,10 +178,19 @@ def vix_allows_selling(vix: Optional[float]) -> bool:
     Threshold = 12.0 (aligns with LOW_VOL boundary in regime_detector.py).
     Below 12: market is unusually dead, premiums are too cheap everywhere.
     Between 12-14: quiet but normal — let per-symbol IV Rank decide instead.
-    If VIX is unknown (None), allow the trade (fail-open for paper mode).
+
+    Fixed 2026-08-28 (code review): was fail-OPEN on vix=None ("paper mode"
+    rationale) -- inconsistent with every other entry-blocking data gap in
+    this codebase (lot size, contract resolution, RS/MTF, entry price,
+    event calendar), all of which fail closed. A genuine VIX-feed outage in
+    live trading would otherwise let this gate silently pass, selling
+    premium with zero confirmation it's actually rich -- exactly what the
+    gate exists to prevent. A data outage is a data outage regardless of
+    paper vs. live mode; paper trading is supposed to validate what live
+    behavior would be, not a looser mode with weaker gates.
     """
     if vix is None:
-        return True
+        return False
     return vix >= 12.0
 
 
@@ -189,10 +198,14 @@ def iv_rank_allows_selling(iv_rank: Optional[float]) -> bool:
     """
     Per-symbol IV rank gate.
     Rank ≥ 0.30 (i.e., IV is in the top 70% of its year range) → ok to sell.
-    If rank is unknown, allow the trade (not enough history yet).
+
+    Fixed 2026-08-28 (code review): same fail-closed fix as
+    vix_allows_selling() above, same rationale -- "not enough history yet"
+    is exactly the kind of missing-data case this codebase's fail-closed
+    convention exists for, not a reason to let the trade through anyway.
     """
     if iv_rank is None:
-        return True
+        return False
     return iv_rank >= 0.30
 
 

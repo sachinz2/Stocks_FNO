@@ -18,23 +18,39 @@ Confirmed and fixed here:
     re-entering the same exact contract string, silently weakening the
     2-bar confirmation the 2026-08-27 fix was built to enforce.
 
-Findings from the same review NOT fixed here, deliberately -- flagged for
-the user's own judgment, not clear-cut bugs:
-  - credit_spread_v1: VIX/IV-rank gates fail open on None (contradicts this
-    codebase's fail-closed convention elsewhere) -- real, but changing a
-    premium-selling entry gate's fail-safe direction is a risk-policy
-    decision, not a pure bug fix.
-  - credit_spread_v1: the repeated-stop-loss circuit breaker's adverse-exit
-    string match doesn't catch manage_position()'s own stop-loss exit
-    reason text.
-  - credit_spread_v1: `spread_width` config parameter is dead (actual width
-    is fully delta-driven) -- a documentation/config-surface issue, not a
-    money-losing bug.
+Round 2 (same day, user asked to fix the remaining findings too): four more
+confirmed and fixed, all deliberately scoped to avoid touching the
+established "OPEN status is trusted" convention used everywhere else in
+this codebase:
+  - credit_spread_v1/iron_condor_v1: vix_allows_selling()/
+    iv_rank_allows_selling() now fail CLOSED on None instead of open,
+    matching every other entry-blocking data gap in this codebase. Fixed
+    the log-message formatting at all 4 call sites that would otherwise
+    crash on f"{None:.1f}" now that the None branch is actually reachable.
+  - credit_spread_v1/iron_condor_v1: the repeated-stop-loss circuit
+    breaker now uses net_pnl < 0 (the exact basis already adopted a few
+    lines below for profit_closes/adverse_closes bucketing) instead of
+    string-matching exit_reason, which missed manage_position()'s own
+    stop-loss exit text entirely.
+  - credit_spread_v1: removed the dead `spread_width` config parameter
+    (real width has always been delta-driven).
+  - iron_condor_v1: the entry-failure unwind path now treats
+    PENDING_VERIFICATION (a genuinely unconfirmed fill, not a success) the
+    same as a failed unwind -- alerts instead of silently assuming closed.
+    Deliberately did NOT touch plain "OPEN" handling here, which stays
+    consistent with every other order-placement site in this file.
+  - iron_condor_v1: partial-leg exit failures during the normal exit cycle
+    (not just the expiry-day path, which already alerted) now send one
+    notification per structure (guarded to avoid spamming on every 10s/60s
+    retry cycle a stuck leg persists across).
 """
 import inspect
 
 from src.strategies.momentum import MomentumStrategy
 from src.strategies.ema_crossover import EMACrossoverStrategy
+from src.market_data.option_chain import vix_allows_selling, iv_rank_allows_selling
+from src.strategies.credit_spread import CreditSpreadStrategy
+from src.live_trading.live_trading_engine import LiveTradingEngine
 
 
 def _mom(**overrides):
@@ -175,3 +191,138 @@ def test_main_py_momentum_config_documents_its_own_gaps_not_asserted_here():
     class-default-matching params despite the file's own "list everything
     explicitly" convention) -- no functional impact, not asserted as a bug."""
     pass
+
+
+# ── Round 2: VIX/IV-rank gates now fail closed ──────────────────────────────
+
+def test_vix_allows_selling_fails_closed_on_none():
+    assert vix_allows_selling(None) is False
+
+
+def test_vix_allows_selling_still_correct_for_real_values():
+    assert vix_allows_selling(11.9) is False
+    assert vix_allows_selling(12.0) is True
+    assert vix_allows_selling(15.0) is True
+
+
+def test_iv_rank_allows_selling_fails_closed_on_none():
+    assert iv_rank_allows_selling(None) is False
+
+
+def test_iv_rank_allows_selling_still_correct_for_real_values():
+    assert iv_rank_allows_selling(0.29) is False
+    assert iv_rank_allows_selling(0.30) is True
+
+
+def test_credit_spread_vix_none_log_message_does_not_crash_on_formatting():
+    """The old f"{vix:.1f}" would raise TypeError on vix=None -- now
+    reachable since vix_allows_selling(None) returns False. Source-level
+    check that the None case is branched around the numeric format string,
+    not a functional call (that needs a full engine + broker mock)."""
+    src = inspect.getsource(LiveTradingEngine._process_credit_spread)
+    idx = src.index("if not vix_allows_selling(vix):")
+    block = src[idx:idx + 500]
+    assert "if vix is None:" in block
+    assert "VIX unavailable" in block
+
+
+def test_credit_spread_iv_rank_none_log_message_does_not_crash_on_formatting():
+    src = inspect.getsource(LiveTradingEngine._process_credit_spread)
+    idx = src.index("if not iv_rank_allows_selling(iv_rank):")
+    block = src[idx:idx + 500]
+    assert "if iv_rank is None:" in block
+    assert "IV Rank unavailable" in block
+
+
+def test_iron_condor_vix_none_log_message_does_not_crash_on_formatting():
+    src = inspect.getsource(LiveTradingEngine._process_iron_condor)
+    idx = src.index("if not vix_allows_selling(vix):")
+    block = src[idx:idx + 500]
+    assert "if vix is None:" in block
+    assert "VIX unavailable" in block
+
+
+def test_iron_condor_iv_rank_none_log_message_does_not_crash_on_formatting():
+    src = inspect.getsource(LiveTradingEngine._process_iron_condor)
+    idx = src.index("if not iv_rank_allows_selling(iv_rank):")
+    block = src[idx:idx + 500]
+    assert "if iv_rank is None:" in block
+    assert "IV Rank unavailable" in block
+
+
+# ── Round 2: SL-frequency circuit breaker uses real P&L, not string match ──
+
+def test_credit_spread_circuit_breaker_uses_net_pnl_not_string_match():
+    src = inspect.getsource(LiveTradingEngine._check_spread_exits)
+    idx = src.index("increment SL frequency counter for adverse exits")
+    block = src[idx:idx + 1300]
+    assert "_is_adverse = net_pnl < 0" in block
+    assert "kw in exit_reason" not in block
+
+
+def test_iron_condor_circuit_breaker_uses_net_pnl_not_string_match():
+    src = inspect.getsource(LiveTradingEngine._check_condor_exits)
+    idx = src.index("increment SL frequency counter for adverse exits")
+    block = src[idx:idx + 900]
+    assert "_is_adverse_c = net_pnl < 0" in block
+    assert "kw in exit_reason" not in block
+
+
+# ── Round 2: dead spread_width parameter removed ────────────────────────────
+
+def test_spread_width_no_longer_a_credit_spread_attribute():
+    strat = CreditSpreadStrategy("credit_spread_v1", {})
+    strat.initialize()
+    assert not hasattr(strat, "spread_width")
+
+
+def test_main_py_no_longer_configures_spread_width():
+    from src.api import main as main_module
+    src = inspect.getsource(main_module)
+    idx = src.index('StrategyRegistry.load_strategy("CREDIT_SPREAD"')
+    block = src[idx:idx + 500]
+    # Checking for the dict-key form specifically, not the bare substring --
+    # the removal comment right above it legitimately mentions "spread_width"
+    # in prose while explaining what was taken out.
+    assert '"spread_width"' not in block
+
+
+def test_spread_width_override_is_silently_ignored_not_an_error():
+    """Guard against over-fixing -- a caller passing spread_width in
+    parameters (e.g. a stale config) must not crash initialize(), just be
+    ignored like any other unread parameter."""
+    strat = CreditSpreadStrategy("credit_spread_v1", {"spread_width": 5})
+    strat.initialize()  # must not raise
+    assert not hasattr(strat, "spread_width")
+
+
+# ── Round 2: iron_condor unwind PENDING_VERIFICATION handling ──────────────
+
+def test_iron_condor_unwind_treats_pending_verification_as_uncertain():
+    src = inspect.getsource(LiveTradingEngine._process_iron_condor)
+    idx = src.index("_bad_uw = {")
+    block = src[idx:idx + 2000]
+    assert '_uncertain_uw = {"PENDING_VERIFICATION"}' in block
+    assert "_uw_status in _uncertain_uw" in block
+    # PENDING_VERIFICATION must NOT be silently folded into the plain
+    # "OPEN = trust it" success path -- it needs its own branch.
+    assert '"PENDING_VERIFICATION"' not in block.split('_uncertain_uw = {')[0]
+
+
+# ── Round 2: iron_condor partial-leg exit failure now alerts (throttled) ───
+
+def test_iron_condor_partial_exit_failure_now_notifies():
+    src = inspect.getsource(LiveTradingEngine._check_condor_exits)
+    idx = src.index("Exit orders for {underlying} partially rejected")
+    block = src[idx:idx + 1400]
+    assert "await self._notify(" in block
+
+
+def test_iron_condor_partial_exit_alert_is_throttled_per_structure():
+    """Must not notify every cycle a stuck leg persists -- this exit-check
+    runs on both the 60s signal cycle and the 10s fast-exit job."""
+    src = inspect.getsource(LiveTradingEngine._check_condor_exits)
+    idx = src.index("Exit orders for {underlying} partially rejected")
+    block = src[idx:idx + 1400]
+    assert '_partial_exit_alerted' in block
+    assert 'if not c.get("_partial_exit_alerted")' in block

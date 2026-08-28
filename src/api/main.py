@@ -272,7 +272,13 @@ async def lifespan(app: FastAPI):
     })
     StrategyRegistry.load_strategy("CREDIT_SPREAD", "credit_spread_v1", {
         "fast_period": 20, "slow_period": 50,
-        "low_vol_threshold": 1.2, "spread_width": 2,
+        "low_vol_threshold": 1.2,
+        # Fixed 2026-08-28 (code review): removed the dead spread_width
+        # config knob (used to default to 2) -- actual spread width has
+        # always been fully delta-driven
+        # (find_delta_strike() in _process_credit_spread), never read from
+        # this parameter. Kept as a real config knob until now would have
+        # misled an operator into thinking it controlled risk sizing.
         "profit_close_pct": 0.25, "stop_loss_multiple": 2.0, "min_dte": 7,
     })
     StrategyRegistry.load_strategy("IRON_CONDOR", "iron_condor_v1", {
