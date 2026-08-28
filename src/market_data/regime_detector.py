@@ -261,19 +261,27 @@ class MarketRegimeDetector:
                 return float(raw)
         except Exception:
             pass
-        # Fallback: estimate from market-wide avg ATR% (very rough — this path is
-        # rarely hit since fetch_and_cache_vix() is the primary, working source).
-        # avg_atr_pct_daily is already scaled to daily-equivalent terms, so it's
-        # roughly comparable to VIX points 1:1 (both express expected daily move %).
-        try:
-            raw = await self._redis.get(REDIS_TREND_STATS_KEY)
-            if raw:
-                stats = json.loads(raw)
-                atr_pct_daily = stats.get("avg_atr_pct_daily", 0)
-                if atr_pct_daily > 0:
-                    return atr_pct_daily
-        except Exception:
-            pass
+        # Fixed 2026-08-28 (code review): removed the "estimate from
+        # market-wide avg ATR%" fallback that used to sit here. Its own
+        # comment claimed avg_atr_pct_daily is "roughly comparable to VIX
+        # points 1:1" -- confirmed live this is flatly wrong: real VIX sat
+        # around 11 for most of 2026-08-28 while this fallback was silently
+        # returning 1.5-2.0 (the day's actual ATR%) as if it WERE the VIX,
+        # for an extended stretch where the real cached value (written by
+        # fetch_and_cache_vix(), which correctly fetches NSE:INDIA VIX
+        # directly from Zerodha every 5 min) had gone stale. VIX is an
+        # annualized volatility measure; a raw daily ATR% is a completely
+        # different quantity on a different scale -- there is no valid 1:1
+        # relationship to lean on. Silently mislabeling one as the other
+        # corrupted the regime classification's most consequential input
+        # with no error logged anywhere. Go straight to the existing sane
+        # 15.0 middle-of-road default instead, now with a visible warning
+        # so a real-VIX outage is observable rather than silently patched
+        # over with a wrong number.
+        logger.warning(
+            "RegimeDetector: real India VIX unavailable (cache empty/stale) "
+            "-- using 15.0 middle-of-road default, NOT an ATR%-based guess."
+        )
         return 15.0   # middle-of-road default
 
     @staticmethod

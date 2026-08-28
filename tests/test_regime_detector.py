@@ -196,3 +196,50 @@ def test_resume_strategy_clears_paused_by():
         assert inst.paused_by is None
     finally:
         del StrategyRegistry._active_instances[sid]
+
+
+# ── _get_vix(): no more ATR%-as-VIX fallback ────────────────────────────────
+# Live incident, 2026-08-28: confirmed via production logs that real VIX
+# (~11 for most of the session) went stale in Redis for an extended stretch,
+# and _get_vix() silently substituted the day's ATR% (~1.5-2.0) as if it
+# WERE the VIX, based on a "roughly 1:1 comparable" assumption the same
+# day's real data disproves outright. VIX is an annualized volatility
+# measure; a raw daily ATR% is not comparable on any simple 1:1 basis.
+
+class _FakeRedisGetOnly:
+    def __init__(self, values: dict):
+        self._values = values
+
+    async def get(self, key):
+        return self._values.get(key)
+
+
+@pytest.mark.asyncio
+async def test_get_vix_returns_real_cached_value_when_present():
+    detector = MRD(_FakeRedisGetOnly({"market:india_vix": "11.2"}))
+    assert await detector._get_vix() == 11.2
+
+
+@pytest.mark.asyncio
+async def test_get_vix_falls_back_to_15_not_atr_pct_when_cache_empty():
+    """The exact live scenario: VIX cache empty, but market:trend_stats has
+    a real, very different ATR% (1.8) sitting right there -- must NOT be
+    used as a VIX substitute."""
+    detector = MRD(_FakeRedisGetOnly({
+        "market:trend_stats": json.dumps({"n_symbols": 132, "avg_atr_pct_daily": 1.8}),
+    }))
+    assert await detector._get_vix() == 15.0
+
+
+@pytest.mark.asyncio
+async def test_get_vix_falls_back_to_15_when_nothing_available():
+    detector = MRD(_FakeRedisGetOnly({}))
+    assert await detector._get_vix() == 15.0
+
+
+@pytest.mark.asyncio
+async def test_get_vix_fallback_logs_a_warning(caplog):
+    detector = MRD(_FakeRedisGetOnly({}))
+    with caplog.at_level("WARNING"):
+        await detector._get_vix()
+    assert any("India VIX unavailable" in r.message for r in caplog.records)
