@@ -420,6 +420,31 @@ class EMACrossoverStrategy(StrategyBase):
 
         return signal
 
+    def _clear_reversal_state(self, contract: Optional[str]) -> None:
+        """
+        Fixed 2026-08-28 (code review): _reversal_pending_count/
+        _reversal_pending_bar_key (added 2026-08-27) were only ever cleared
+        inside the EMA-reversal check itself (on fire, or when the gap
+        closes back up) -- every OTHER exit path (hard stop, target,
+        trailing, breakeven, underlying-based stop/target) left a partial
+        confirmation count sitting in memory forever, with nothing in
+        live_trading_engine.py ever touching these two dicts either (unlike
+        _peak_premiums, which the engine explicitly pops on every exit
+        path). Since this strategy resolves near-month expiry/ATM strikes,
+        re-entering the exact same contract string days later is routine,
+        not a corner case -- a stale count=1 (of the default
+        ema_reversal_confirm_bars=2) would let a future position on that
+        contract exit after just one fresh qualifying bar, silently halving
+        the confirmation window the 2026-08-27 fix was built to enforce.
+        Called from every exit path in manage_position() except the
+        reversal check itself (which already clears inline) -- once a
+        position is closing for ANY reason, its reversal-tracking state is
+        stale regardless of why.
+        """
+        if contract is not None:
+            self._reversal_pending_count.pop(contract, None)
+            self._reversal_pending_bar_key.pop(contract, None)
+
     def manage_position(self, current_position: Dict[str, Any], current_premium: float) -> Optional[str]:
         """
         Options position management based on option premium movement.
@@ -472,6 +497,11 @@ class EMACrossoverStrategy(StrategyBase):
             return "HOLD"
 
         pnl_pct = (current_premium - entry_premium) / entry_premium
+        # Fixed 2026-08-28 (code review): read once here so every exit path
+        # below can clear this contract's reversal-confirmation state on
+        # close, not just the reversal check's own exit -- see
+        # _clear_reversal_state()'s docstring for why this matters.
+        contract_id = current_position.get("contract")
 
         # 1. Underlying-based stop/target (added 2026-08-21) -- see
         # docstring and momentum.py's identical pattern for the rationale.
@@ -501,6 +531,7 @@ class EMACrossoverStrategy(StrategyBase):
                     f"{'-' if is_call_u else '+'} {self.underlying_stop_atr_mult}x "
                     f"ATR({entry_atr:.2f})) -- exiting."
                 )
+                self._clear_reversal_state(contract_id)
                 return "EXIT"
             if hit_target:
                 logger.info(
@@ -509,6 +540,7 @@ class EMACrossoverStrategy(StrategyBase):
                     f"{'+' if is_call_u else '-'} {self.underlying_target_atr_mult}x "
                     f"ATR({entry_atr:.2f})) -- exiting."
                 )
+                self._clear_reversal_state(contract_id)
                 return "EXIT"
 
         # 2. EMA reversal -- see docstring. Generalized 2026-08-21 from a
@@ -600,6 +632,7 @@ class EMACrossoverStrategy(StrategyBase):
                 f"[{self.name}] Stop loss: entry=Rs{entry_premium:.2f} "
                 f"current=Rs{current_premium:.2f} ({pnl_pct:.1%})"
             )
+            self._clear_reversal_state(contract_id)
             return "EXIT"
 
         # 4. Profit target
@@ -608,6 +641,7 @@ class EMACrossoverStrategy(StrategyBase):
                 f"[{self.name}] Target hit: entry=Rs{entry_premium:.2f} "
                 f"current=Rs{current_premium:.2f} ({pnl_pct:.1%})"
             )
+            self._clear_reversal_state(contract_id)
             return "EXIT"
 
         # 5. Trailing stop — only activates once we've been in profit
@@ -619,6 +653,7 @@ class EMACrossoverStrategy(StrategyBase):
                     f"[{self.name}] Trailing stop: peak=Rs{peak:.2f} "
                     f"current=Rs{current_premium:.2f} (drawdown {trail_drawdown:.1%})"
                 )
+                self._clear_reversal_state(contract_id)
                 return "EXIT"
 
         # 6. Breakeven stop (added 2026-08-13) -- the trailing stop above is
@@ -641,6 +676,7 @@ class EMACrossoverStrategy(StrategyBase):
                 f"(entry Rs{entry_premium:.2f}), now back to Rs{current_premium:.2f} -- "
                 "exiting to avoid a profitable trade becoming a loss."
             )
+            self._clear_reversal_state(contract_id)
             return "EXIT"
 
         return "HOLD"
@@ -661,6 +697,14 @@ class EMACrossoverStrategy(StrategyBase):
         # be trusted against bars that occurred while paused.
         self._adx_history.clear()
         self._history_bar_key.clear()
+        # Fixed 2026-08-28 (code review): the exit-side reversal-confirmation
+        # dicts (added 2026-08-27) were missing from this clear list, unlike
+        # every entry-side dict above -- a partial confirmation count
+        # observed before a pause shouldn't count toward a reversal detected
+        # after it resumes, same staleness risk already handled for
+        # _pending_*/_adx_history.
+        self._reversal_pending_count.clear()
+        self._reversal_pending_bar_key.clear()
 
     def shutdown(self):
         logger.info(f"Shutting down EMA Crossover Strategy '{self.name}'")

@@ -629,6 +629,7 @@ class MomentumStrategy(StrategyBase):
         # of is_new_bar, since there's no existing progress to protect --
         # bar_key-known-ness is handled below via the `bar_key is None`
         # check instead.
+        had_prior_state = state is not None
         if state is None or (direction != raw and is_new_bar):
             # Fresh qualification, or a direction flip mid-setup — start
             # over. Fixed 2026-08-21 (external review): only seed the
@@ -652,6 +653,22 @@ class MomentumStrategy(StrategyBase):
             # means this isn't a fresh entry point yet; don't start
             # tracking it, but don't otherwise treat it as invalidated.
             if not entry_extension_ok:
+                # Fixed 2026-08-28 (code review): this is a third silent-
+                # reset path of the same class fixed yesterday for the two
+                # expiry paths -- a direction flip wipes any prior tracked
+                # setup via _reset_pullback_state() above BEFORE this check,
+                # and if the new direction fails the extension gate, neither
+                # this branch nor the "trend established" log below ever
+                # fires, losing the transition with zero trace. Only log
+                # when there was actually prior state to lose -- a flip on
+                # an already-untracked symbol is a no-op worth staying quiet
+                # about.
+                if had_prior_state:
+                    logger.info(
+                        f"[{self.name}] {symbol} pullback setup cleared — direction flipped "
+                        f"to {raw} but the new direction is too extended from EMA20/VWAP "
+                        "to start tracking yet"
+                    )
                 return "HOLD"
             self._trend_state[symbol] = "ESTABLISHED"
             self._trend_direction[symbol] = raw
