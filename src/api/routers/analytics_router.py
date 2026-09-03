@@ -377,11 +377,14 @@ async def get_market_regime(request: Request):
     """
     Current market regime and which strategies are enabled/disabled.
 
-    Regime classification:
-      TRENDING    → VIX 12–20 + NIFTY ATR% ≥ 1.5%  → EMA crossover active
-      RANGE_BOUND → VIX 12–20 + flat EMA            → Iron condor active
-      VOLATILE    → VIX > 20                          → Credit spread active
-      LOW_VOL     → VIX < 12                          → Spread + condor active
+    Regime classification (see REGIME_STRATEGY_MAP in regime_detector.py for
+    the authoritative source):
+      TRENDING    → ATR% ≥ 1.5%                → EMA crossover + credit spread + momentum active
+      RANGE_BOUND → VIX ≥ 12 + ATR% low         → Iron condor + credit spread active
+      VOLATILE    → VIX > 20                    → Credit spread + EMA crossover (PE-only) active
+      LOW_VOL     → VIX < 12 + ATR% low         → Credit spread active only -- iron_condor_v1's
+                                                   own VIX>=12 entry gate can never pass here
+                                                   (fixed 2026-09-03, see REGIME_STRATEGY_MAP)
     """
     try:
         engine = getattr(request.app.state, "trading_engine", None)

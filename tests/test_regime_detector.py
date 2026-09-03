@@ -43,10 +43,31 @@ def test_high_vix_always_volatile_regardless_of_atr():
     assert MRD._classify(vix=25.0, atr_pct=0.5, ema_spread_pct=0.05) == "VOLATILE"
 
 
-def test_low_vol_and_range_bound_allow_identical_strategies():
-    # Confirms the reorder fix changes zero premium-seller (credit_spread_v1/
-    # iron_condor_v1) behavior -- both regimes must still map to the same set.
-    assert set(REGIME_STRATEGY_MAP["LOW_VOL"]) == set(REGIME_STRATEGY_MAP["RANGE_BOUND"])
+def test_low_vol_excludes_iron_condor_its_own_vix_gate_can_never_pass_there():
+    # Fixed 2026-09-03 (live incident): LOW_VOL is defined as vix < 12.0, but
+    # iron_condor_v1's own entry gate requires vix >= 12.0 -- mutually
+    # exclusive by construction. Confirmed live: 8 days of logs with
+    # substantial LOW_VOL time and zero RANGE_BOUND minutes, during which 96%
+    # of iron_condor_v1's skip lines were exactly this VIX-too-low block.
+    # credit_spread_v1 has the same VIX gate but also runs in TRENDING/
+    # VOLATILE, where VIX tends to sit >=12 anyway, so it keeps LOW_VOL as a
+    # (largely theoretical, but not self-contradicting) eligible regime.
+    assert STRATEGY_CONDOR not in REGIME_STRATEGY_MAP["LOW_VOL"]
+    assert STRATEGY_SPREAD in REGIME_STRATEGY_MAP["LOW_VOL"]
+
+
+def test_range_bound_is_the_only_regime_iron_condor_can_actually_trade_in():
+    # RANGE_BOUND (vix >= 12, ATR% low) is the one regime where both the
+    # regime gate and iron_condor_v1's own vix_allows_selling() gate can
+    # pass simultaneously.
+    assert STRATEGY_CONDOR in REGIME_STRATEGY_MAP["RANGE_BOUND"]
+    for regime, strategies in REGIME_STRATEGY_MAP.items():
+        if regime == "RANGE_BOUND":
+            continue
+        assert STRATEGY_CONDOR not in strategies, (
+            f"iron_condor_v1 should not be regime-eligible in {regime} -- "
+            "either its own gates or its defined-risk-in-a-move thesis rules it out"
+        )
 
 
 def test_hysteresis_low_vix_alone_does_not_exit_trending():

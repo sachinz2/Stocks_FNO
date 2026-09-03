@@ -111,7 +111,25 @@ REGIME_STRATEGY_MAP: Dict[str, list] = {
                                                            # excluded (see comment above) -- a trend-
                                                            # continuation thesis is the wrong bet on a
                                                            # regime defined by imminent violent reversal.
-    "LOW_VOL":     [STRATEGY_SPREAD, STRATEGY_CONDOR],   # quiet market = premium seller heaven
+    # Fixed 2026-09-03 (live incident: iron_condor_v1 had only 4 trades ever,
+    # last on 2026-07-13): iron_condor_v1 used to be listed here too, but
+    # LOW_VOL is DEFINED as vix < VIX_LOW_THRESHOLD (12.0, see _classify()
+    # above) while iron_condor_v1's own entry gate requires
+    # vix_allows_selling() -- vix >= 12.0 -- to consider premium rich enough
+    # to sell. Those two conditions are mutually exclusive by construction:
+    # whenever the regime classifier puts the market in LOW_VOL, iron_condor_v1
+    # is, by definition, looking at a VIX that will always fail its own entry
+    # gate. "Eligible in LOW_VOL" was fiction -- confirmed live via 8 days of
+    # logs (2026-08-12 to 08-21) with substantial LOW_VOL time every day and
+    # ZERO minutes of RANGE_BOUND, during which 96% of iron_condor_v1's
+    # skip-log lines were exactly this VIX-too-low block. RANGE_BOUND (VIX
+    # >= 12, ATR% low) is the only regime where iron_condor_v1's own gate can
+    # actually pass, so it's the only one listed now. credit_spread_v1 has
+    # the same VIX>=12 entry gate but doesn't have this problem -- it's also
+    # eligible in TRENDING/VOLATILE, where VIX tends to sit >=12 anyway, so
+    # it has regimes to fall back on that iron_condor_v1 structurally lacks.
+    "LOW_VOL":     [STRATEGY_SPREAD],   # quiet market = premium seller heaven (credit_spread_v1 only --
+                                          # iron_condor_v1's own VIX>=12 gate can never pass here, see above)
 }
 
 
