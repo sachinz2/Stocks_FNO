@@ -1452,6 +1452,70 @@ async def test_single_leg_entry_blocked_by_active_spread_on_same_underlying():
     assert fake.order_manager is None  # guard fired before any order could be placed
 
 
+# ── Paused strategies must keep observing (2026-09-03, external review) ────
+#
+# generate_signal() used to sit behind `if not strategy.is_active: return`,
+# meaning a paused strategy (regime switch, StrategyMonitor circuit-breaker,
+# or a manual pause) never called generate_signal() at all -- freezing
+# EMACrossoverStrategy's/MomentumStrategy's cross-cycle state
+# (prev_fast_ema/prev_slow_ema, pending-confirmation bar counts,
+# pullback/breakout tracking) for the entire pause window. A genuine
+# crossover/pullback event completing AND reversing during that window was
+# permanently, silently missed. Fix: generate_signal() is now always called
+# (observation continues); a resulting signal is only acted on if the
+# strategy is currently active (execution stays regime/circuit-breaker gated).
+
+def test_generate_signal_called_before_is_active_check():
+    src = inspect.getsource(LiveTradingEngine._process_signal)
+    gen_idx = src.index("strategy.generate_signal(market_data)")
+    active_idx = src.index("if not strategy.is_active:")
+    assert gen_idx < active_idx, (
+        "generate_signal() must run (state tracking) before the is_active "
+        "gate, not after -- a paused strategy must keep observing"
+    )
+
+
+@pytest.mark.asyncio
+async def test_paused_strategy_still_calls_generate_signal_but_places_no_order():
+    fake = _FakeCollisionEngine()
+    fake._get_market_data = AsyncMock(return_value={"close": 1200.0, "ltp_source": "live_tick"})
+    fake._notify = AsyncMock()
+    calls = []
+
+    def _tracking_generate_signal(market_data):
+        calls.append(market_data)
+        return SignalType.BUY
+
+    strategy = SimpleNamespace(
+        name="ema_crossover_v1", is_active=False,
+        generate_signal=_tracking_generate_signal,
+    )
+
+    await LiveTradingEngine._process_signal(fake, strategy, "BAJFINANCE", vix=15.0, regime="TRENDING")
+
+    assert len(calls) == 1, "generate_signal() must still be called while paused (state tracking)"
+    assert fake.order_manager is None  # but no order-placement path was ever reached
+
+
+@pytest.mark.asyncio
+async def test_active_strategy_generate_signal_can_still_lead_to_an_order_attempt():
+    """Guard against over-fixing -- an ACTIVE strategy's BUY signal must
+    still reach the downstream entry path (verified here via the same
+    single-leg collision guard already exercised above, which requires
+    generate_signal() + is_active + the entry pipeline all to have run)."""
+    fake = _FakeCollisionEngine(active_spreads={"BAJFINANCE": {"short_contract": "BAJFINANCE26SEP1160CE"}})
+    fake._get_market_data = AsyncMock(return_value={"close": 1200.0, "ltp_source": "live_tick"})
+    fake._notify = AsyncMock()
+    strategy = SimpleNamespace(
+        name="ema_crossover_v1", is_active=True,
+        generate_signal=lambda market_data: SignalType.BUY,
+    )
+
+    await LiveTradingEngine._process_signal(fake, strategy, "BAJFINANCE", vix=15.0, regime="TRENDING")
+
+    assert fake.order_manager is None  # collision guard fired, but only AFTER the pipeline ran
+
+
 def test_iron_condor_entry_uses_real_fill_not_quote():
     src = inspect.getsource(LiveTradingEngine._process_iron_condor)
     assert 'placed.append((contract, side, price, is_leg, order))' in src

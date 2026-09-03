@@ -2108,8 +2108,6 @@ class LiveTradingEngine:
         self, strategy, symbol: str, vix: Optional[float] = None,
         regime: Optional[str] = None,
     ) -> None:
-        if not strategy.is_active:
-            return
         market_data = await self._get_market_data(symbol)
         if not market_data:
             return
@@ -2136,6 +2134,26 @@ class LiveTradingEngine:
             return
 
         signal = strategy.generate_signal(market_data)
+
+        # Fixed 2026-09-03 (external review + live incident): the
+        # strategy.is_active check used to sit BEFORE generate_signal(),
+        # meaning a paused strategy (regime switch, StrategyMonitor
+        # circuit-breaker, or a manual pause) never called generate_signal()
+        # at all -- freezing EMACrossoverStrategy's/MomentumStrategy's
+        # cross-cycle state (prev_fast_ema/prev_slow_ema, pending-
+        # confirmation bar counts, pullback/breakout tracking) for the
+        # entire pause window. A genuine crossover/pullback event completing
+        # AND reversing during that window was permanently, silently missed
+        # -- confirmed live 2026-09-03 during today's own ema_crossover_v1
+        # pause/resume cycles. generate_signal() is now ALWAYS called
+        # (observation continues), but a resulting signal is only acted on
+        # -- entry gates, order placement, or the reversal-close path below
+        # -- if the strategy is currently active (execution stays regime/
+        # circuit-breaker gated). Routine position exits (stop-loss/target/
+        # trailing-stop/underlying-based) are unaffected -- those run via
+        # the separate, unconditional _check_open_option_exits(), not here.
+        if not strategy.is_active:
+            return
         if not signal or signal == SignalType.HOLD:
             return
         signal_str = signal.value if hasattr(signal, "value") else str(signal)

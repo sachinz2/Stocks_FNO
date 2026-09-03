@@ -180,7 +180,14 @@ class MarketRegimeDetector:
         """
         from src.strategies.base import StrategyRegistry
 
-        regime   = await self.get_cached_regime()
+        regime = await self.get_cached_regime()
+        if regime is None:
+            logger.warning(
+                "RegimeSwitching: regime unknown (Redis miss/error) -- "
+                "skipping enforcement this cycle rather than guessing. "
+                "No strategy paused or resumed on unverified data."
+            )
+            return
         active   = StrategyRegistry.get_active_strategies()
         should_run = set(REGIME_STRATEGY_MAP.get(regime, []))
 
@@ -216,15 +223,32 @@ class MarketRegimeDetector:
                     f"regime={regime} is in its allowed set"
                 )
 
-    async def get_cached_regime(self) -> str:
-        """Read regime from Redis. Returns RANGE_BOUND if no data yet."""
+    async def get_cached_regime(self) -> Optional[str]:
+        """
+        Read regime from Redis. Returns None if no data yet or on error.
+
+        Fixed 2026-09-03 (external review): used to default to "RANGE_BOUND"
+        on any miss/error -- silently turning "we genuinely don't know the
+        regime" into "we know it's RANGE_BOUND", the specific regime that
+        auto-permits iron_condor_v1/credit_spread_v1 entries. A Redis blip
+        (or, more narrowly, the brief window inside enforce_regime_switching()
+        between detect()'s write and this method's own independent read)
+        would silently un-pause a regime-ineligible strategy with zero real
+        basis for it -- the opposite of this codebase's fail-closed
+        convention used everywhere else (RS, MTF, lot size, contract
+        resolution, ADX validity). Both call sites already handle None
+        correctly: _classify()'s prev_regime=="TRENDING" comparison is
+        naturally False for None (same safe, stricter threshold as before),
+        and enforce_regime_switching() now explicitly skips enforcement
+        this cycle rather than guessing.
+        """
         try:
             raw = await self._redis.get(REDIS_REGIME_KEY)
             if raw:
-                return json.loads(raw).get("regime", "RANGE_BOUND")
+                return json.loads(raw).get("regime")
         except Exception:
             pass
-        return "RANGE_BOUND"
+        return None
 
     async def get_regime_report(self) -> dict:
         """Full regime payload for the API."""

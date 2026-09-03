@@ -197,6 +197,70 @@ async def test_regime_switching_still_pauses_a_regime_ineligible_strategy():
         del StrategyRegistry._active_instances[sid]
 
 
+# ── get_cached_regime()/enforce_regime_switching(): fail closed on unknown ──
+# Fixed 2026-09-03 (external review): get_cached_regime() used to default to
+# "RANGE_BOUND" on a Redis miss/error -- silently turning "we don't know the
+# regime" into "we know it's RANGE_BOUND", the specific regime that
+# auto-permits iron_condor_v1/credit_spread_v1 entries with zero real basis.
+
+class _FakeRedisMissing:
+    async def get(self, key):
+        return None
+
+
+class _FakeRedisBroken:
+    async def get(self, key):
+        raise ConnectionError("redis unavailable")
+
+
+@pytest.mark.asyncio
+async def test_get_cached_regime_returns_none_on_missing_key():
+    detector = MRD(_FakeRedisMissing())
+    assert await detector.get_cached_regime() is None
+
+
+@pytest.mark.asyncio
+async def test_get_cached_regime_returns_none_on_redis_error():
+    detector = MRD(_FakeRedisBroken())
+    assert await detector.get_cached_regime() is None
+
+
+@pytest.mark.asyncio
+async def test_get_cached_regime_still_returns_real_value_when_cached():
+    detector = MRD(_FakeRedisRegime("VOLATILE"))
+    assert await detector.get_cached_regime() == "VOLATILE"
+
+
+@pytest.mark.asyncio
+async def test_enforce_regime_switching_skips_enforcement_when_regime_unknown():
+    """The exact live risk: a total outage/blip must not silently auto-permit
+    iron_condor_v1/credit_spread_v1 by defaulting to RANGE_BOUND."""
+    sid = "iron_condor_v1"
+    _register(sid, is_active=False, paused_by="regime")
+    try:
+        detector = MRD(_FakeRedisMissing())
+        await detector.enforce_regime_switching()
+        assert StrategyRegistry._active_instances[sid].is_active is False, (
+            "must not resume on unknown regime -- no real basis for it"
+        )
+    finally:
+        del StrategyRegistry._active_instances[sid]
+
+
+@pytest.mark.asyncio
+async def test_enforce_regime_switching_does_not_pause_anything_when_regime_unknown():
+    sid = "credit_spread_v1"
+    _register(sid, is_active=True, paused_by=None)
+    try:
+        detector = MRD(_FakeRedisBroken())
+        await detector.enforce_regime_switching()
+        assert StrategyRegistry._active_instances[sid].is_active is True, (
+            "must not pause on unknown regime either -- skip enforcement entirely"
+        )
+    finally:
+        del StrategyRegistry._active_instances[sid]
+
+
 def test_pause_strategy_records_source_and_defaults_to_manual():
     sid = "credit_spread_v1"
     _register(sid, is_active=True)
