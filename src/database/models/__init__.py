@@ -11,9 +11,10 @@ from src.database.models.trade import Trade
 from src.database.models.audit import AuditLog
 from src.database.models.trade_journal import TradeJournal
 from src.database.models.capital_period import CapitalPeriod
+from src.database.models.gate_audit import GateAuditSnapshot
 
 __all__ = [
     "Base", "Stock", "Instrument", "OHLCData", "Indicator",
     "Signal", "Order", "Position", "Trade", "AuditLog", "TradeJournal",
-    "CapitalPeriod",
+    "CapitalPeriod", "GateAuditSnapshot",
 ]

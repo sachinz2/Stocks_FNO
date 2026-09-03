@@ -1,4 +1,6 @@
 import logging
+from datetime import timedelta
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -10,6 +12,20 @@ from src.core.constants import (
     JOB_ORDER_SYNC,
     JOB_SIGNAL_GENERATION,
 )
+from src.core.utils import now_ist
+
+# Fixed 2026-09-03 (external review): LTPPoller.poll() (builds this cycle's
+# OHLC/ATR/ADX/RVOL) and run_signal_cycle() (reads that same data to decide
+# entries) used to be two fully independent 60s IntervalTrigger jobs with no
+# ordering guarantee between them -- whichever job happened to be added to
+# the scheduler a few milliseconds earlier got a head start that had
+# nothing to do with which one actually needs to run first. Anchoring both
+# to the same reference moment, with the signal cycle offset behind the LTP
+# poll, guarantees fresh data every single interval rather than leaving it
+# to import-order accident. 25s leaves real margin under the 60s interval
+# even on a slower-than-usual poll cycle (misfire_grace_time=30 below
+# already assumes normal poll cycles finish well inside that).
+LTP_POLL_TO_SIGNAL_CYCLE_OFFSET_SECONDS = 25
 
 logger = logging.getLogger(__name__)
 
@@ -41,10 +57,35 @@ def schedule_trading_jobs(engine) -> None:
     """Register all recurring trading-day jobs onto the scheduler."""
     scheduler = get_scheduler()
 
-    # Signal generation — every 1 minute
+    # LTP poll + signal generation are anchored to the same epoch (see
+    # LTP_POLL_TO_SIGNAL_CYCLE_OFFSET_SECONDS above) so the signal cycle
+    # reliably runs after this interval's LTP/indicator refresh, not just
+    # whenever the two jobs happen to land relative to each other.
+    _cycle_epoch = now_ist()
+
+    ltp_poller = getattr(engine, "_symbol_poller", None)
+    if ltp_poller:
+        scheduler.add_job(
+            ltp_poller.poll,
+            IntervalTrigger(seconds=60, start_date=_cycle_epoch),
+            id="ltp_poll",
+            name="LTP Poller (Zerodha OHLC + indicators)",
+            replace_existing=True,
+            misfire_grace_time=30,
+        )
+    else:
+        logger.warning(
+            "schedule_trading_jobs: no symbol poller attached to engine -- "
+            "ltp_poll job NOT scheduled here (must be registered separately)."
+        )
+
+    # Signal generation — every 1 minute, offset behind the LTP poll above.
     scheduler.add_job(
         engine.run_signal_cycle,
-        IntervalTrigger(minutes=1),
+        IntervalTrigger(
+            minutes=1,
+            start_date=_cycle_epoch + timedelta(seconds=LTP_POLL_TO_SIGNAL_CYCLE_OFFSET_SECONDS),
+        ),
         id=JOB_SIGNAL_GENERATION,
         name="Signal Generation",
         replace_existing=True,

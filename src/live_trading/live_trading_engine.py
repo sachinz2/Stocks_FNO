@@ -381,6 +381,16 @@ class LiveTradingEngine:
         logger.info("Market OPEN — 09:15 IST")
         self._today_order_count = 0
         self._eod_notified_today = False
+        # Fixed 2026-09-03: _signal_gate_stats (see _audit_gate()) never had
+        # a daily reset -- harmless while it was purely in-memory (a
+        # restart cleared it anyway), but now that it's periodically
+        # persisted to gate_audit_snapshot (see
+        # _flush_gate_audit_snapshot()), a long-running process would keep
+        # accumulating the SAME counters across many days, making "gate
+        # stuck at 0 while pool keeps growing" impossible to read for any
+        # single day. Reset here so the snapshot table's counts are
+        # genuinely per-trading-day.
+        self._signal_gate_stats = {}
         self.risk_manager.reset_daily_state()
         await self._rebuild_deployed_capital()
 
@@ -546,6 +556,7 @@ class LiveTradingEngine:
         # cycle so a restart mid-confirmation doesn't silently reset it back to zero.
         await self._persist_ema_state()
         await self._persist_momentum_state()
+        await self._flush_gate_audit_snapshot()
 
     async def sync_orders(self) -> None:
         try:
@@ -2104,6 +2115,40 @@ class LiveTradingEngine:
         this exists and its limitations (in-memory, resets on restart)."""
         return {k: dict(v) for k, v in self._signal_gate_stats.items()}
 
+    async def _flush_gate_audit_snapshot(self) -> None:
+        """
+        Persist the current _signal_gate_stats snapshot to
+        gate_audit_snapshot -- one row per (strategy, gate), called once per
+        signal cycle (not once per candidate/gate-check -- that would be
+        hundreds of writes/minute for no real benefit, since the in-memory
+        counters below already accumulate the SAME information; this just
+        checkpoints them so a restart or a "why didn't X trade this week"
+        question doesn't depend on grepping raw logs).
+
+        Added 2026-09-03 (external review): _signal_gate_stats already
+        existed but was in-memory only. A failure here must never affect
+        trading -- this is pure observability, logged and swallowed like
+        every other non-critical background write in this file.
+        """
+        if not self._signal_gate_stats:
+            return
+        try:
+            from src.database.connection import AsyncSessionLocal
+            from src.database.models.gate_audit import GateAuditSnapshot
+            from src.database.repositories.base import BaseRepository
+            repo = BaseRepository(GateAuditSnapshot, AsyncSessionLocal)
+            snapshot_time = now_ist().replace(tzinfo=None)
+            for strategy_name, gates in self._signal_gate_stats.items():
+                for gate, pass_count in gates.items():
+                    await repo.create({
+                        "snapshot_time": snapshot_time,
+                        "strategy_name": strategy_name,
+                        "gate":          gate,
+                        "pass_count":    pass_count,
+                    })
+        except Exception as exc:
+            logger.debug(f"[GateAudit] snapshot flush failed (non-critical): {exc}")
+
     async def _process_signal(
         self, strategy, symbol: str, vix: Optional[float] = None,
         regime: Optional[str] = None,
@@ -2789,6 +2834,7 @@ class LiveTradingEngine:
                 f"[CreditSpread] {symbol} skipped — DTE={dte} < min_dte={min_dte}, too close to expiry"
             )
             return
+        self._audit_gate(strategy.name, "dte_passed")
 
         # DTE floor logic:
         #   Fresh entries need DTE ≥ 21 — enough theta runway for 2+ weeks of decay before
@@ -2867,6 +2913,7 @@ class LiveTradingEngine:
                 "(fail-closed, not falling back to the static table for a live trading decision)."
             )
             return
+        self._audit_gate(strategy.name, "lot_size_passed")
         # 2 lots for credit_spread_v1/iron_condor_v1 (2026-08-28) -- see
         # STRATEGY_LOT_MULTIPLIER's docstring. Every downstream quantity
         # (order size, margin check, capital_at_risk, journal, GTT
@@ -2898,6 +2945,7 @@ class LiveTradingEngine:
                     f"(need ≥12.0 for rich premium). Not worth selling spreads."
                 )
             return
+        self._audit_gate(strategy.name, "vix_passed")
         if not iv_rank_allows_selling(iv_rank):
             if iv_rank is None:
                 logger.info(f"[CreditSpread] {symbol} skipped — IV Rank unavailable (fail-closed, can't confirm premium is worth selling).")
@@ -2907,6 +2955,7 @@ class LiveTradingEngine:
                     f"(need ≥0.30). Premium too cheap."
                 )
             return
+        self._audit_gate(strategy.name, "iv_rank_passed")
 
         # OI/PCR sentiment — logged for visibility, not gated. Fixed 2026-08-07:
         # consolidated redundant direction-confirmation gates -- VWAP, PCR, and
@@ -2953,6 +3002,7 @@ class LiveTradingEngine:
                     f"above VWAP Rs{vwap:.2f} (intraday bullish momentum)"
                 )
                 return
+        self._audit_gate(strategy.name, "direction_passed")
 
         # Market breadth — logged for visibility, not gated (2026-08-07 gate
         # consolidation, see PCR comment above). breadth > 0.65: market
@@ -3004,6 +3054,7 @@ class LiveTradingEngine:
                 "(trend too strong; blowthrough risk)"
             )
             return
+        self._audit_gate(strategy.name, "adx_passed")
 
         # Event/earnings calendar filter — block entries within 5 trading days.
         # Earnings and RBI events cause IV crush and gap risk that destroys spread edge.
@@ -3013,6 +3064,7 @@ class LiveTradingEngine:
                 f"[CreditSpread] {symbol} skipped — earnings or NSE event within 5 days"
             )
             return
+        self._audit_gate(strategy.name, "event_calendar_passed")
 
         if spread_type == "BULL_PUT_SPREAD":
             opt          = "PE"
@@ -3106,6 +3158,7 @@ class LiveTradingEngine:
                 "contract-cache resolution."
             )
             return
+        self._audit_gate(strategy.name, "contract_resolved")
 
         _entry_prices = await get_entry_prices_for_spread(
             symbol, short_contract, long_contract,
@@ -3182,6 +3235,7 @@ class LiveTradingEngine:
                 f"(need ~Rs{required_margin:,.0f})"
             )
             return
+        self._audit_gate(strategy.name, "margin_passed")
 
         # Max-loss figure for the per-strategy capital budget check (risk layer 5)
         # — passed explicitly since the short leg below is a SELL (see
@@ -3233,6 +3287,7 @@ class LiveTradingEngine:
             else:
                 self._exited_today.add(symbol)
             return
+        self._audit_gate(strategy.name, "trade_placed")
 
         self._today_order_count += 2
 
@@ -3849,6 +3904,7 @@ class LiveTradingEngine:
                 f"[IronCondor] {symbol} skipped — DTE={dte} < min_dte={min_dte}, too close to expiry"
             )
             return
+        self._audit_gate(strategy.name, "dte_passed")
 
         # Same DTE floor logic as credit spreads:
         #   Fresh entries need DTE ≥ 21. Re-entries after same-day profit close need DTE ≥ 14.
@@ -3918,6 +3974,7 @@ class LiveTradingEngine:
                 "(fail-closed, not falling back to the static table for a live trading decision)."
             )
             return
+        self._audit_gate(strategy.name, "lot_size_passed")
         # 2 lots for credit_spread_v1/iron_condor_v1 (2026-08-28) -- see
         # STRATEGY_LOT_MULTIPLIER's docstring. Every downstream quantity
         # (order size, margin check, capital_at_risk, journal, GTT
@@ -3946,6 +4003,7 @@ class LiveTradingEngine:
                     f"(need ≥12.0 for rich premium). Not worth selling condors."
                 )
             return
+        self._audit_gate(strategy.name, "vix_passed")
         if not iv_rank_allows_selling(iv_rank):
             if iv_rank is None:
                 logger.info(f"[IronCondor] {symbol} skipped — IV Rank unavailable (fail-closed, can't confirm premium is worth selling).")
@@ -3955,6 +4013,7 @@ class LiveTradingEngine:
                     f"(need ≥0.30). Premium too cheap."
                 )
             return
+        self._audit_gate(strategy.name, "iv_rank_passed")
 
         # OI/PCR neutrality check — iron condors need a non-directional market.
         # Fixed 2026-08-07: consolidated redundant neutrality-confirmation gates
@@ -3977,6 +4036,7 @@ class LiveTradingEngine:
                 f"(need 0.7–1.4 for neutral condor). Market too directional."
             )
             return
+        self._audit_gate(strategy.name, "direction_passed")
 
         # Market breadth — logged for visibility, not gated (see PCR comment above).
         _breadth_ic = None
@@ -4013,6 +4073,7 @@ class LiveTradingEngine:
                 "(market trending; range-bound thesis invalid)"
             )
             return
+        self._audit_gate(strategy.name, "adx_passed")
 
         # Event/earnings calendar filter — block entries within 5 trading days.
         from src.market_data.event_calendar import has_event_within_days as _has_event_ic
@@ -4021,6 +4082,7 @@ class LiveTradingEngine:
                 f"[IronCondor] {symbol} skipped — earnings or NSE event within 5 days"
             )
             return
+        self._audit_gate(strategy.name, "event_calendar_passed")
 
         # Delta-based: short ~0.20, hedge ~0.10 on each wing
         put_short_strike  = find_delta_strike(underlying_price, -0.20, "PE", dte, sigma, interval)
@@ -4120,6 +4182,7 @@ class LiveTradingEngine:
                 "drifted outside delta tolerance of target 0.20 after contract-cache resolution."
             )
             return
+        self._audit_gate(strategy.name, "contract_resolved")
 
         # Fetch real Kite LTPs for all 4 legs — same as credit spread entry.
         # ATR estimates are CE/PE-blind (put_short_p == call_short_p always), which
@@ -4186,6 +4249,7 @@ class LiveTradingEngine:
                 f"(need ~Rs{required_margin:,.0f})"
             )
             return
+        self._audit_gate(strategy.name, "margin_passed")
 
         # Max-loss figure for the per-strategy capital budget check (risk layer 5)
         # — passed explicitly on the first (SELL) leg only, same rationale as
@@ -4251,6 +4315,7 @@ class LiveTradingEngine:
                     )
                 return
             placed.append((contract, side, price, is_leg, order))
+        self._audit_gate(strategy.name, "trade_placed")
 
         self._today_order_count += 4
 

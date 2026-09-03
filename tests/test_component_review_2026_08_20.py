@@ -140,6 +140,7 @@ async def test_expire_stale_orders_failure_does_not_block_exit_checks():
         _broker_position_state_known=True,
         _persist_ema_state=AsyncMock(),
         _persist_momentum_state=AsyncMock(),
+        _flush_gate_audit_snapshot=AsyncMock(),
         _ENTRY_WARMUP_MINUTES=0,
         _get_active_symbols=AsyncMock(return_value=[]),
     )

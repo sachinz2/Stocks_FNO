@@ -396,6 +396,46 @@ async def get_market_regime(request: Request):
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+@router.get("/gate-audit")
+async def get_gate_audit():
+    """
+    Latest entry-gate pass-count snapshot, per strategy -- e.g.
+    {"momentum_v1": {"signal_generated": 12, "dte_passed": 12, "rvol_passed": 3, "adx_passed": 3}}
+
+    Added 2026-09-03 (external review): a gate whose count stops growing
+    relative to earlier gates (in the order each strategy actually checks
+    them -- see _process_signal()/_process_credit_spread()/
+    _process_iron_condor() in live_trading_engine.py) is the live
+    bottleneck for that strategy today -- e.g. rvol_passed=3 next to
+    adx_passed=0 means ADX, not RVOL, is where candidates are dying. Backed
+    by gate_audit_snapshot (persisted once per signal cycle -- see
+    LiveTradingEngine._flush_gate_audit_snapshot()), so this survives
+    restarts, unlike the in-memory counters it's built from. Counts reset
+    at market open each day (on_market_open()), so this is always "today's"
+    picture, not an all-time total.
+    """
+    try:
+        from sqlalchemy import select, func
+        from src.database.models.gate_audit import GateAuditSnapshot
+        async with AsyncSessionLocal() as session:
+            latest_time = (await session.execute(
+                select(func.max(GateAuditSnapshot.snapshot_time))
+            )).scalar()
+            if latest_time is None:
+                return {"snapshot_time": None, "strategies": {}}
+            rows = (await session.execute(
+                select(GateAuditSnapshot).where(GateAuditSnapshot.snapshot_time == latest_time)
+            )).scalars().all()
+
+        strategies: Dict[str, Dict[str, int]] = {}
+        for r in rows:
+            strategies.setdefault(r.strategy_name, {})[r.gate] = r.pass_count
+        return {"snapshot_time": latest_time.isoformat(), "strategies": strategies}
+    except Exception as e:
+        logger.error(f"Analytics /gate-audit error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
 @router.get("/rs-ranks")
 async def get_rs_ranks(request: Request, top: int = Query(10, le=40)):
     """

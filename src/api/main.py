@@ -377,14 +377,10 @@ async def lifespan(app: FastAPI):
         name="Daily Zerodha Reconciliation",
         replace_existing=True,
     )
-    scheduler.add_job(
-        ltp_poller.poll,
-        IntervalTrigger(seconds=60),
-        id="ltp_poll",
-        name="LTP Poller (Zerodha OHLC + indicators)",
-        replace_existing=True,
-        misfire_grace_time=30,
-    )
+    # ltp_poll is now registered inside schedule_trading_jobs() above (via
+    # engine._symbol_poller), anchored to the same epoch as the signal-cycle
+    # job so the two have a guaranteed ordering -- see
+    # LTP_POLL_TO_SIGNAL_CYCLE_OFFSET_SECONDS in core/scheduler.py.
 
     # RS Ranking: runs every 5 minutes (downloads 30d daily history — heavier)
     scheduler.add_job(

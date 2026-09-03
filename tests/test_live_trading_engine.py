@@ -1545,3 +1545,126 @@ def test_daily_report_includes_capital_lines_sourced_from_risk_manager_and_zerod
     assert '"Initial Capital: ₹{initial_capital:,.2f}"' in src
     assert '"Capital in Use:  ₹{capital_in_use:,.2f}"' in src
     assert '"Capital Left:    ₹{capital_left:,.2f}"' in src
+
+
+# ── Persistent gate-audit trail (2026-09-03, external review) ──────────────
+#
+# _signal_gate_stats already tracked per-strategy entry-gate pass counts,
+# but only in memory -- reset on every restart, turning every "why no
+# trades" investigation into ad-hoc log-grepping (as happened repeatedly
+# today for credit_spread_v1's VIX-gate drought and momentum_v1's RVOL
+# corruption). _flush_gate_audit_snapshot() persists the current counts to
+# gate_audit_snapshot once per signal cycle. Also: credit_spread_v1/
+# iron_condor_v1 had ZERO existing _audit_gate() instrumentation (only the
+# shared single-leg path did) -- exactly the two strategies today's real
+# findings came from -- so their key checkpoints (VIX, IV rank, direction/
+# PCR, ADX, event calendar, contract resolution, margin, order placement)
+# are now instrumented too.
+
+class _FakeGateAuditRepo:
+    created = []
+
+    def __init__(self, model, session):
+        pass
+
+    async def create(self, obj_in):
+        _FakeGateAuditRepo.created.append(obj_in)
+        return obj_in
+
+
+class _FakeGateAuditEngine:
+    _flush_gate_audit_snapshot = LiveTradingEngine._flush_gate_audit_snapshot
+
+    def __init__(self, stats=None):
+        self._signal_gate_stats = stats or {}
+
+
+@pytest.mark.asyncio
+async def test_flush_gate_audit_snapshot_writes_one_row_per_strategy_gate(monkeypatch):
+    import src.database.repositories.base as base_mod
+    _FakeGateAuditRepo.created = []
+    monkeypatch.setattr(base_mod, "BaseRepository", _FakeGateAuditRepo)
+
+    fake = _FakeGateAuditEngine({
+        "momentum_v1": {"signal_generated": 12, "rvol_passed": 3, "adx_passed": 3},
+        "credit_spread_v1": {"signal_generated": 8, "vix_passed": 0},
+    })
+    await fake._flush_gate_audit_snapshot()
+
+    rows = _FakeGateAuditRepo.created
+    assert len(rows) == 5
+    momentum_rows = {r["gate"]: r["pass_count"] for r in rows if r["strategy_name"] == "momentum_v1"}
+    assert momentum_rows == {"signal_generated": 12, "rvol_passed": 3, "adx_passed": 3}
+    credit_rows = {r["gate"]: r["pass_count"] for r in rows if r["strategy_name"] == "credit_spread_v1"}
+    assert credit_rows == {"signal_generated": 8, "vix_passed": 0}
+    assert all("snapshot_time" in r for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_flush_gate_audit_snapshot_is_a_noop_when_stats_empty(monkeypatch):
+    import src.database.repositories.base as base_mod
+    _FakeGateAuditRepo.created = []
+    monkeypatch.setattr(base_mod, "BaseRepository", _FakeGateAuditRepo)
+
+    fake = _FakeGateAuditEngine({})
+    await fake._flush_gate_audit_snapshot()
+
+    assert _FakeGateAuditRepo.created == []
+
+
+@pytest.mark.asyncio
+async def test_flush_gate_audit_snapshot_swallows_repo_errors():
+    class _BrokenRepo:
+        def __init__(self, model, session):
+            pass
+
+        async def create(self, obj_in):
+            raise ConnectionError("db unavailable")
+
+    import src.database.repositories.base as base_mod
+    fake = _FakeGateAuditEngine({"momentum_v1": {"signal_generated": 1}})
+
+    # Patch directly on the module the function imports from -- must not
+    # raise and must not block the rest of run_signal_cycle().
+    orig = base_mod.BaseRepository
+    base_mod.BaseRepository = _BrokenRepo
+    try:
+        await fake._flush_gate_audit_snapshot()  # must not raise
+    finally:
+        base_mod.BaseRepository = orig
+
+
+def test_on_market_open_resets_signal_gate_stats():
+    src = inspect.getsource(LiveTradingEngine.on_market_open)
+    assert "self._signal_gate_stats = {}" in src
+
+
+def test_run_signal_cycle_flushes_gate_audit_snapshot_every_cycle():
+    src = inspect.getsource(LiveTradingEngine.run_signal_cycle)
+    assert "await self._flush_gate_audit_snapshot()" in src
+
+
+# credit_spread_v1/iron_condor_v1 previously had zero _audit_gate()
+# instrumentation -- confirm the new checkpoints landed in both, in the
+# order they're actually checked.
+
+def test_credit_spread_entry_has_gate_audit_checkpoints():
+    src = inspect.getsource(LiveTradingEngine._process_credit_spread)
+    expected_gates = [
+        "dte_passed", "lot_size_passed", "vix_passed", "iv_rank_passed",
+        "direction_passed", "adx_passed", "event_calendar_passed",
+        "contract_resolved", "margin_passed", "trade_placed",
+    ]
+    positions = [src.index(f'"{gate}"') for gate in expected_gates]
+    assert positions == sorted(positions), "gate checkpoints must appear in the order they're actually checked"
+
+
+def test_iron_condor_entry_has_gate_audit_checkpoints():
+    src = inspect.getsource(LiveTradingEngine._process_iron_condor)
+    expected_gates = [
+        "dte_passed", "lot_size_passed", "vix_passed", "iv_rank_passed",
+        "direction_passed", "adx_passed", "event_calendar_passed",
+        "contract_resolved", "margin_passed", "trade_placed",
+    ]
+    positions = [src.index(f'"{gate}"') for gate in expected_gates]
+    assert positions == sorted(positions), "gate checkpoints must appear in the order they're actually checked"
