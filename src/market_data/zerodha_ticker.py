@@ -61,6 +61,23 @@ class ZerodhaTicker:
         # in this class — no extra locking needed.
         self._connected_at = None
         self._last_tick_at = None
+        # Fixed 2026-09-03 (live incident): set in start(), BEFORE connect()
+        # is even attempted -- unlike _connected_at (only set by _on_connect
+        # actually firing). Confirmed live: a reconnect attempt at 08:30
+        # logged "connecting..." and then NOTHING for 3.5+ hours -- no
+        # on_connect, no on_error, no on_disconnect, exactly the failure
+        # mode seconds_since_last_tick()'s docstring already describes from
+        # the 2026-07-31 incident. But with only _last_tick_at/_connected_at
+        # as fallbacks, BOTH stay None forever in this exact scenario (ticks
+        # need a connect, and the reference the watchdog was built to use
+        # for "connect never confirmed" requires... a confirmed connect) --
+        # seconds_since_last_tick() returned None the entire time, so
+        # `stale_for is not None` was never true and the watchdog's
+        # os._exit(1) path was never reached. All 132 F&O symbols sat on
+        # the historical-close bootstrap fallback the whole morning with
+        # nothing able to detect or recover from it -- only an unrelated
+        # manual deploy at 12:07 happened to restart the process and fix it.
+        self._connect_attempted_at = None
 
     def fetch_instrument_tokens(self) -> int:
         """
@@ -140,6 +157,8 @@ class ZerodhaTicker:
         if not self._instrument_tokens:
             logger.error("ZerodhaTicker: no instrument tokens — call fetch_instrument_tokens() first.")
             return
+        from src.core.utils import now_ist
+        self._connect_attempted_at = now_ist()
         t = threading.Thread(target=self._run_ticker, daemon=True, name="ZerodhaTicker")
         t.start()
         logger.info("ZerodhaTicker: background thread started.")
@@ -154,9 +173,10 @@ class ZerodhaTicker:
 
     def seconds_since_last_tick(self) -> Optional[float]:
         """
-        Seconds since the last real (market-hours) tick was processed, or
-        since the most recent successful connect if no tick has arrived yet.
-        None if this ticker has never connected at all.
+        Seconds since the last real (market-hours) tick was processed, since
+        the most recent successful connect if no tick has arrived yet, or
+        since the most recent connection ATTEMPT if it never even confirmed
+        connecting. None only if start() has genuinely never been called.
 
         Used by the staleness watchdog (api/main.py's self-heal job) to catch
         a connection that LOOKS fine — "WebSocket connected" logged, no
@@ -170,9 +190,23 @@ class ZerodhaTicker:
         full process restart (fresh KiteTicker, fresh reactor thread) fixed
         it; this watchdog gives the same recovery without needing a human to
         notice and SSH in.
+
+        Fixed 2026-09-03 (live incident: the exact scenario above recurred
+        for 3.5+ hours -- 08:30 reconnect attempt, never confirmed, all 132
+        F&O symbols on the bootstrap fallback until an unrelated manual
+        deploy happened to restart the process at 12:07). The fallback chain
+        used to be _last_tick_at or _connected_at only -- both are set
+        INSIDE callbacks (_on_ticks/_on_connect) that never fire in exactly
+        this failure mode, so this returned None the entire 3.5 hours and
+        the watchdog's `stale_for is not None` check was never true --
+        os._exit(1) was never reached despite being built specifically for
+        this. _connect_attempted_at (set in start(), before connect() is
+        even attempted) closes that gap: even a connection that never
+        confirms now has a real, growing "how long has this been stuck"
+        duration to measure against.
         """
         from src.core.utils import now_ist
-        reference = self._last_tick_at or self._connected_at
+        reference = self._last_tick_at or self._connected_at or self._connect_attempted_at
         if reference is None:
             return None
         return (now_ist() - reference).total_seconds()

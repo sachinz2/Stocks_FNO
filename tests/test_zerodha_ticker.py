@@ -32,12 +32,60 @@ def _bare_ticker():
     t = ZerodhaTicker.__new__(ZerodhaTicker)
     t._connected_at = None
     t._last_tick_at = None
+    t._connect_attempted_at = None
     return t
 
 
 def test_never_connected_returns_none():
     t = _bare_ticker()
     assert t.seconds_since_last_tick() is None
+
+
+# ── _connect_attempted_at fallback (2026-09-03 live incident) ──────────────
+# A connection attempt that never confirms (no on_connect, no on_error --
+# the exact 2026-07-31 pattern) used to leave BOTH _last_tick_at and
+# _connected_at at None forever, since both are only ever set INSIDE
+# callbacks that never fire in this failure mode -- seconds_since_last_tick()
+# returned None the whole time, so the watchdog's staleness check was never
+# true. Confirmed live 2026-09-03: this exact scenario recurred for 3.5+
+# hours with the watchdog never firing.
+
+def test_connect_attempted_but_never_confirmed_still_reports_staleness(frozen_now):
+    t = _bare_ticker()
+    t._connect_attempted_at = frozen_now["t"]  # start() called, connect() never confirmed
+    frozen_now["t"] = IST.localize(dt.datetime(2026, 7, 31, 10, 5, 0))  # +300s, no on_connect ever
+    stale_for = t.seconds_since_last_tick()
+    assert stale_for is not None, (
+        "must report a real duration even when on_connect never fires -- "
+        "this is exactly the failure mode the watchdog exists to catch"
+    )
+    assert abs(stale_for - 300) < 0.01
+
+
+def test_connect_attempted_then_confirmed_prefers_the_later_connected_at(frozen_now):
+    """Guard against over-fixing -- once a real connect DOES confirm, that
+    (later, more accurate) timestamp must win over the attempt time."""
+    t = _bare_ticker()
+    t._connect_attempted_at = frozen_now["t"]
+    frozen_now["t"] = IST.localize(dt.datetime(2026, 7, 31, 10, 1, 0))  # +60s, connect confirms
+    t._connected_at = frozen_now["t"]
+    frozen_now["t"] = IST.localize(dt.datetime(2026, 7, 31, 10, 1, 45))  # +45s since connect
+    stale_for = t.seconds_since_last_tick()
+    assert abs(stale_for - 45) < 0.01
+
+
+def test_start_sets_connect_attempted_at_before_connecting(monkeypatch, frozen_now):
+    t = _bare_ticker()
+    t._instrument_tokens = {"RELIANCE": 100}
+
+    # Prevent the real background thread from actually running KiteTicker.
+    monkeypatch.setattr(t, "_run_ticker", lambda: None)
+    import threading
+    monkeypatch.setattr(threading.Thread, "start", lambda self: None)
+
+    assert t._connect_attempted_at is None
+    t.start()
+    assert t._connect_attempted_at == frozen_now["t"]
 
 
 def test_connected_no_tick_yet_measures_from_connect_time(frozen_now):
