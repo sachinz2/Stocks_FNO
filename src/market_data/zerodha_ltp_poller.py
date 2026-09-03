@@ -12,12 +12,41 @@ cost a single API request per cycle. Well within the 10 req/sec REST limit.
 import asyncio
 import json
 import logging
+from datetime import timedelta
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL_SECONDS = 5
 _NSE_PREFIX = "NSE:"
+# Fixed 2026-09-02 (live incident: momentum_v1 producing zero signals for 8
+# days despite the market trending hard -- traced to RVOL being unreliable
+# at the exact moment of breakout confirmation). This poller's own docstring
+# claims it "updates only the close field... leaving indicators intact",
+# but the implementation does a full read-modify-write of the whole tick
+# JSON blob every POLL_INTERVAL_SECONDS for every symbol -- while
+# ZerodhaTicker (WebSocket) does the SAME full read-modify-write on every
+# tick, many times a second, to build cur_bar_volume/bars_today (see
+# update_intraday_bar() in core/utils.py). A classic race: if this poller
+# reads a symbol's tick dict, then WebSocket writes a fresher version
+# (advancing cur_bar_volume/_last_cum_volume), then THIS poller writes back
+# its own now-stale full snapshot, it silently reverts WebSocket's progress
+# -- rolling _last_cum_volume backward. The next real WebSocket tick then
+# computes volume_traded (now) minus the reverted _last_cum_volume as a
+# single tick's "delta", potentially dumping hours of cumulative volume
+# into one bar (confirmed live: KALYANKJIL's cur_bar_volume reached
+# 21,195,761 -- essentially the entire day's cumulative volume -- while
+# every other bar that day was in the tens/hundreds of thousands). The
+# 2026-07-30 fix ("WebSocket is the sole bar-BUILDER") reduced how often
+# this happened (poller no longer calls update_intraday_bar() itself) but
+# did not eliminate the underlying read-modify-write race, since poller's
+# blind whole-dict write can still clobber fields it never intended to
+# touch. Skipping the write entirely whenever WebSocket has ticked for this
+# symbol within the last few poll cycles removes the race for the ~99% of
+# the session WebSocket is healthy, while still allowing this poller to act
+# as a genuine fallback (the original, documented purpose) once WebSocket
+# has gone quiet for real.
+_WS_FRESH_WINDOW = timedelta(seconds=POLL_INTERVAL_SECONDS * 3)
 
 
 REDIS_TOKEN_KEY = "zerodha:access_token"
@@ -160,6 +189,26 @@ class ZerodhaLTPPoller:
                 raw = await self._redis.get(redis_key)
                 if raw:
                     tick = json.loads(raw)
+                    # Fixed 2026-09-02: "single-writer removes the race entirely"
+                    # (above) was incomplete -- this poller's own full read-
+                    # modify-write of the SAME key still races with WebSocket's,
+                    # and can silently revert cur_bar_volume/_last_cum_volume/
+                    # bars_today to a stale snapshot even though this poller
+                    # never touches those fields itself (see module-level
+                    # _WS_FRESH_WINDOW comment for the full incident). Skip the
+                    # write entirely when WebSocket has ticked for this symbol
+                    # recently -- there is nothing for this poller to usefully
+                    # add, and every write is a chance to clobber newer state.
+                    _ws_stamp = tick.get("_ws_last_tick_at")
+                    if _ws_stamp:
+                        try:
+                            from datetime import datetime
+                            from src.core.utils import now_ist
+                            _ws_age = now_ist() - datetime.fromisoformat(_ws_stamp)
+                            if _ws_age < _WS_FRESH_WINDOW:
+                                continue
+                        except Exception:
+                            pass
                     tick["close"]      = ltp
                     tick["ltp_source"] = "zerodha_rest"
                 else:

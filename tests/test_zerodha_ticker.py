@@ -3,6 +3,7 @@ ZerodhaTicker.seconds_since_last_tick() -- the core logic behind the
 tick-staleness watchdog in src/api/main.py's _kite_self_heal job.
 """
 import datetime as dt
+import json
 import pytz
 import pytest
 
@@ -196,3 +197,52 @@ def test_set_instrument_tokens_survives_a_broken_live_connection():
     t.set_instrument_tokens({"RELIANCE": 100})  # must not raise
 
     assert t._instrument_tokens == {"RELIANCE": 100}  # bookkeeping still updated
+
+
+# ── _on_ticks() stamps a WebSocket freshness marker (2026-09-02 fix) ───────
+# Live incident: ZerodhaLTPPoller's own read-modify-write of the same Redis
+# key could silently revert cur_bar_volume/_last_cum_volume to a stale
+# snapshot, corrupting RVOL and starving momentum_v1 of real breakout
+# confirmations for 8 days. Fix: ZerodhaTicker stamps _ws_last_tick_at on
+# every write; the REST poller skips its own write when that stamp is
+# recent (see test_zerodha_ltp_poller.py for the poller-side tests).
+
+class _FakeSyncRedis:
+    def __init__(self):
+        self.store = {}
+
+    def get(self, key):
+        return self.store.get(key)
+
+    def set(self, key, value):
+        self.store[key] = value
+
+
+def test_on_ticks_stamps_ws_last_tick_at(frozen_now, monkeypatch):
+    monkeypatch.setattr("src.core.utils.is_market_open", lambda: True)
+    t = _bare_ticker()
+    t._redis = _FakeSyncRedis()
+    t._token_symbol = {100: "RELIANCE"}
+    frozen_now["t"] = IST.localize(dt.datetime(2026, 9, 2, 12, 0, 0))
+
+    t._on_ticks(None, [{"instrument_token": 100, "last_price": 2500.0, "volume_traded": 500000}])
+
+    stored = json.loads(t._redis.store["tick:RELIANCE"])
+    assert stored["close"] == 2500.0
+    assert stored["_ws_last_tick_at"] == frozen_now["t"].isoformat()
+
+
+def test_on_ticks_updates_stamp_on_every_batch(frozen_now, monkeypatch):
+    monkeypatch.setattr("src.core.utils.is_market_open", lambda: True)
+    t = _bare_ticker()
+    t._redis = _FakeSyncRedis()
+    t._token_symbol = {100: "RELIANCE"}
+
+    frozen_now["t"] = IST.localize(dt.datetime(2026, 9, 2, 12, 0, 0))
+    t._on_ticks(None, [{"instrument_token": 100, "last_price": 2500.0, "volume_traded": 500000}])
+
+    frozen_now["t"] = IST.localize(dt.datetime(2026, 9, 2, 12, 0, 5))
+    t._on_ticks(None, [{"instrument_token": 100, "last_price": 2501.0, "volume_traded": 500100}])
+
+    stored = json.loads(t._redis.store["tick:RELIANCE"])
+    assert stored["_ws_last_tick_at"] == frozen_now["t"].isoformat()

@@ -12,6 +12,7 @@ correctly (kite.quote() called, not kite.ltp(), and the resolved price
 lands in Redis with the right key/TTL).
 """
 from datetime import datetime, timedelta
+import json
 import pytest
 
 from src.market_data.zerodha_ltp_poller import ZerodhaLTPPoller
@@ -155,3 +156,121 @@ def test_set_symbols_does_not_touch_registered_option_contracts():
     poller.set_symbols(["NEW1"])
 
     assert "NFO:OLD126SEP100CE" in poller._option_instruments
+
+
+# ── Underlying-stock refresh: skip the write when WebSocket is fresh ───────
+# Live incident, 2026-09-02: momentum_v1 produced zero real trading signals
+# for 8 days despite a hard, sustained market move -- traced to RVOL being
+# near-zero at the exact moment of every breakout confirmation attempt,
+# across dozens of stocks and days. Root cause: this poller's docstring
+# claims it "updates only the close field... leaving indicators intact",
+# but its full read-modify-write of the same Redis key ZerodhaTicker
+# (WebSocket) writes to on every tick could still silently revert
+# cur_bar_volume/_last_cum_volume to a stale snapshot -- confirmed live via
+# a corrupted tick showing cur_bar_volume near the day's ENTIRE cumulative
+# volume, ~40x every other bar that day. Fixed by skipping this poller's
+# write for any symbol WebSocket has ticked for recently (see
+# _WS_FRESH_WINDOW), removing the race for the ~99% of the session
+# WebSocket is healthy while preserving genuine-outage fallback behavior.
+
+class _FakeKiteUnderlying:
+    def __init__(self, ltp_response):
+        self.ltp_response = ltp_response
+
+    def ltp(self, instruments):
+        return self.ltp_response
+
+    def quote(self, instruments):
+        return {}
+
+
+@pytest.mark.asyncio
+async def test_skips_write_when_websocket_ticked_recently(monkeypatch):
+    now = datetime(2026, 9, 2, 12, 0, 0)
+    monkeypatch.setattr("src.core.utils.is_market_open", lambda: True)
+    monkeypatch.setattr("src.core.utils.now_ist", lambda: now)
+
+    fake_redis = _FakeRedis()
+    ws_stamp = (now - timedelta(seconds=3)).isoformat()  # well within the fresh window
+    fake_redis.store["tick:RELIANCE"] = json.dumps({
+        "symbol": "RELIANCE", "close": 2490.0, "ltp_source": "zerodha_realtime",
+        "_ws_last_tick_at": ws_stamp, "cur_bar_volume": 12345,
+    })
+
+    fake_kite = _FakeKiteUnderlying({"NSE:RELIANCE": {"last_price": 2500.0}})
+    poller = ZerodhaLTPPoller(fake_kite, fake_redis, symbols=["RELIANCE"])
+
+    updated = await poller.refresh_ltp()
+
+    assert updated == 0
+    stored = json.loads(fake_redis.store["tick:RELIANCE"])
+    assert stored["close"] == 2490.0, "must not overwrite -- WebSocket owns this symbol right now"
+    assert stored["cur_bar_volume"] == 12345, "must not touch fields it never intended to change"
+
+
+@pytest.mark.asyncio
+async def test_still_writes_close_when_websocket_gone_stale(monkeypatch):
+    now = datetime(2026, 9, 2, 12, 0, 0)
+    monkeypatch.setattr("src.core.utils.is_market_open", lambda: True)
+    monkeypatch.setattr("src.core.utils.now_ist", lambda: now)
+
+    fake_redis = _FakeRedis()
+    ws_stamp = (now - timedelta(seconds=60)).isoformat()  # well beyond the fresh window
+    fake_redis.store["tick:RELIANCE"] = json.dumps({
+        "symbol": "RELIANCE", "close": 2490.0, "ltp_source": "zerodha_realtime",
+        "_ws_last_tick_at": ws_stamp,
+    })
+
+    fake_kite = _FakeKiteUnderlying({"NSE:RELIANCE": {"last_price": 2500.0}})
+    poller = ZerodhaLTPPoller(fake_kite, fake_redis, symbols=["RELIANCE"])
+
+    updated = await poller.refresh_ltp()
+
+    assert updated == 1, "genuine WebSocket outage -- this poller must still act as fallback"
+    stored = json.loads(fake_redis.store["tick:RELIANCE"])
+    assert stored["close"] == 2500.0
+    assert stored["ltp_source"] == "zerodha_rest"
+
+
+@pytest.mark.asyncio
+async def test_still_writes_close_when_no_websocket_stamp_present(monkeypatch):
+    """Guard against over-fixing -- ticks written before this fix (or by a
+    process that never had a WebSocket connection) have no _ws_last_tick_at
+    at all and must not be silently frozen forever."""
+    now = datetime(2026, 9, 2, 12, 0, 0)
+    monkeypatch.setattr("src.core.utils.is_market_open", lambda: True)
+    monkeypatch.setattr("src.core.utils.now_ist", lambda: now)
+
+    fake_redis = _FakeRedis()
+    fake_redis.store["tick:RELIANCE"] = json.dumps({
+        "symbol": "RELIANCE", "close": 2490.0, "ltp_source": "zerodha_rest",
+    })
+
+    fake_kite = _FakeKiteUnderlying({"NSE:RELIANCE": {"last_price": 2500.0}})
+    poller = ZerodhaLTPPoller(fake_kite, fake_redis, symbols=["RELIANCE"])
+
+    updated = await poller.refresh_ltp()
+
+    assert updated == 1
+    stored = json.loads(fake_redis.store["tick:RELIANCE"])
+    assert stored["close"] == 2500.0
+
+
+@pytest.mark.asyncio
+async def test_malformed_ws_stamp_does_not_block_the_write(monkeypatch):
+    now = datetime(2026, 9, 2, 12, 0, 0)
+    monkeypatch.setattr("src.core.utils.is_market_open", lambda: True)
+    monkeypatch.setattr("src.core.utils.now_ist", lambda: now)
+
+    fake_redis = _FakeRedis()
+    fake_redis.store["tick:RELIANCE"] = json.dumps({
+        "symbol": "RELIANCE", "close": 2490.0, "_ws_last_tick_at": "not-a-timestamp",
+    })
+    fake_kite = _FakeKiteUnderlying({"NSE:RELIANCE": {"last_price": 2500.0}})
+    poller = ZerodhaLTPPoller(fake_kite, fake_redis, symbols=["RELIANCE"])
+
+    updated = await poller.refresh_ltp()
+
+    assert updated == 1
+    stored = json.loads(fake_redis.store["tick:RELIANCE"])
+    assert stored["close"] == 2500.0

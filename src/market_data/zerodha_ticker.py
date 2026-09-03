@@ -277,6 +277,14 @@ class ZerodhaTicker:
                         "close": ltp,
                         "ltp_source": "zerodha_realtime",
                     }
+                # Freshness stamp for ZerodhaLTPPoller's race-avoidance check
+                # (see refresh_ltp()'s docstring) -- lets the REST poller tell
+                # "WebSocket is actively healthy for this symbol right now"
+                # from "WebSocket has gone quiet, genuine fallback needed",
+                # instead of guessing from ltp_source alone (which stays
+                # stuck at "zerodha_realtime" forever after the last tick,
+                # even hours into an outage).
+                data["_ws_last_tick_at"] = self._last_tick_at.isoformat()
                 update_intraday_bar(data, ltp, volume_traded=volume_traded)
                 self._redis.set(redis_key, json.dumps(data))
             except Exception as e:
