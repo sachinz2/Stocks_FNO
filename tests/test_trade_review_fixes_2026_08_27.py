@@ -342,10 +342,17 @@ def test_main_py_wires_momentum_extension_and_vwap_fixes():
 
 def _mbar(symbol="RELIANCE", ema20=105.0, ema50=100.0, adx=30.0, close=108.0,
           atr=3.0, vwap=None, rvol=1.6, rvol_valid=True, bar_key="live:t0"):
+    # Fixed 2026-09-04: breakout confirmation reads rvol_closed_bar/
+    # rvol_closed_bar_valid (the last finalized bar's RVOL), not the plain
+    # rvol/rvol_valid fields -- see momentum.py's matching fix note. Mirrored
+    # from the same kwargs here so these tests still express "this bar's
+    # RVOL reading" without a rename at every call site.
     return {
         "symbol": symbol, "ema20": ema20, "ema50": ema50, "adx14": adx,
         "close": close, "atr14": atr, "vwap": vwap if vwap is not None else close,
-        "rvol": rvol, "rvol_valid": rvol_valid, "ohlc_bar_key": bar_key,
+        "rvol": rvol, "rvol_valid": rvol_valid,
+        "rvol_closed_bar": rvol, "rvol_closed_bar_valid": rvol_valid,
+        "ohlc_bar_key": bar_key,
     }
 
 

@@ -26,10 +26,18 @@ def _mom(**overrides):
 
 def _bar(symbol="RELIANCE", ema20=105.0, ema50=100.0, adx=30.0, close=110.0,
          atr=2.0, vwap=110.0, rvol=1.5, rvol_valid=True, bar_key="live:t0"):
+    # Fixed 2026-09-04: the pullback+breakout state machine reads
+    # rvol_closed_bar/rvol_closed_bar_valid (the last FINALIZED bar's RVOL),
+    # not the plain rvol/rvol_valid fields (the still-forming current bar's
+    # volume-so-far) -- see momentum.py's matching fix note. Both are set
+    # here from the same rvol/rvol_valid kwargs so these tests still express
+    # "this bar's RVOL reading" without every call site needing a rename.
     return {
         "symbol": symbol, "ema20": ema20, "ema50": ema50, "adx14": adx,
         "close": close, "atr14": atr, "vwap": vwap, "rvol": rvol,
-        "rvol_valid": rvol_valid, "ohlc_bar_key": bar_key,
+        "rvol_valid": rvol_valid,
+        "rvol_closed_bar": rvol, "rvol_closed_bar_valid": rvol_valid,
+        "ohlc_bar_key": bar_key,
     }
 
 
@@ -150,6 +158,46 @@ def test_invalid_rvol_on_the_breakout_bar_itself_does_not_satisfy_confirmation()
     # though a real contraction preceded it, this bar's own RVOL is unknown
     # and must not satisfy breakout_rvol_min.
     signal = strat.generate_signal(_bar(close=113.0, rvol=0.0, rvol_valid=False, bar_key="live:t3"))
+    assert signal == "HOLD"
+    assert strat._trend_state.get("RELIANCE") == "PULLBACK"
+
+
+def test_breakout_confirmation_uses_closed_bar_rvol_not_the_forming_bar():
+    """Fixed 2026-09-04 (live incident): the breakout check only evaluates on
+    is_new_bar -- the instant a new 5-min bucket starts and ltp_poller's plain
+    `rvol` (the still-forming current bar) resets to a few-seconds-old,
+    structurally deflated number. It must read `rvol_closed_bar` (the last
+    FINALIZED bar's real, full-bar RVOL) instead. Confirmed live: with plain
+    `rvol`, every breakout attempt in 2+ weeks read 0.0-0.96 and momentum_v1's
+    pullback model fired zero live trades in that entire window."""
+    strat = _mom(adx_rising_required=False, ema_slope_required=False,
+                 extension_atr_mult=0, vwap_extension_pct=0)
+    strat.generate_signal(_bar(close=110.0, rvol=1.6, bar_key="live:t0"))
+    strat.generate_signal(_bar(close=112.0, rvol=1.6, bar_key="live:t1"))  # extends, ref=112
+    strat.generate_signal(_bar(close=111.0, rvol=1.0, bar_key="live:t2"))  # pullback
+    # Breakout bar: the still-forming bar's plain rvol is near-zero (exactly
+    # the live symptom), but the last CLOSED bar's rvol_closed_bar clears the
+    # flat threshold -- must fire on the closed-bar reading, not the forming one.
+    bar = _bar(close=113.0, bar_key="live:t3")
+    bar["rvol"], bar["rvol_valid"] = 0.02, True
+    bar["rvol_closed_bar"], bar["rvol_closed_bar_valid"] = 1.6, True
+    signal = strat.generate_signal(bar)
+    assert signal == "BUY"
+
+
+def test_breakout_confirmation_rejects_when_only_the_forming_bar_rvol_is_strong():
+    """Mirror of the above: a strong plain `rvol` (forming bar) must NOT
+    substitute for a weak/invalid rvol_closed_bar -- proves the closed-bar
+    field is authoritative, not just an additional passing path."""
+    strat = _mom(adx_rising_required=False, ema_slope_required=False,
+                 extension_atr_mult=0, vwap_extension_pct=0)
+    strat.generate_signal(_bar(close=110.0, rvol=1.6, bar_key="live:t0"))
+    strat.generate_signal(_bar(close=112.0, rvol=1.6, bar_key="live:t1"))  # extends, ref=112
+    strat.generate_signal(_bar(close=111.0, rvol=1.0, bar_key="live:t2"))  # pullback
+    bar = _bar(close=113.0, bar_key="live:t3")
+    bar["rvol"], bar["rvol_valid"] = 5.0, True
+    bar["rvol_closed_bar"], bar["rvol_closed_bar_valid"] = 0.02, True
+    signal = strat.generate_signal(bar)
     assert signal == "HOLD"
     assert strat._trend_state.get("RELIANCE") == "PULLBACK"
 

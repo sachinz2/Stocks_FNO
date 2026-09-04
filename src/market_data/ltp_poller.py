@@ -703,6 +703,33 @@ class LTPPoller:
             _rvol_valid = False
             rvol = 0.0
 
+        # RVOL of the LAST COMPLETED 5-min bar, as opposed to `rvol` above
+        # (the still-forming current bar's volume-so-far).
+        #
+        # Fixed 2026-09-04 (live incident): momentum.py's pullback+breakout
+        # confirmation only evaluates on the `is_new_bar` transition -- the
+        # exact instant a new 5-min bucket starts and `cur_bar_volume` resets
+        # to 0 (see update_intraday_bar() in core/utils.py). `rvol` at that
+        # instant is this brand-new bar's few-seconds-old volume compared
+        # against a rolling average dominated by full, completed bars --
+        # structurally deflated regardless of how strong the actual breakout
+        # is. Confirmed live: every one of 41 breakout RVOL rejections logged
+        # over 2+ weeks read 0.0-0.96, never once near the 0.8/1.3
+        # thresholds, across many different stocks/dates/times -- not "volume
+        # happened to be weak," a fixed measurement bias. momentum_v1's
+        # pullback model (default since 2026-08-21) fired zero live trades in
+        # that entire window as a result. This uses ONLY `bars_today`
+        # (finalized bars with real, full-bar volume) so both the numerator
+        # and the rolling-average population are on equal footing.
+        if live_range and len(live_range.get("bars_today") or []) >= 20:
+            _closed_vol = pd.Series([b.get("volume", 0) for b in live_range["bars_today"]])
+            _closed_avg20 = _closed_vol.rolling(20).mean().iloc[-1]
+            _rvol_closed_valid = bool(_closed_avg20 and _closed_avg20 > 0 and not pd.isna(_closed_avg20))
+            rvol_closed_bar = round(float(_closed_vol.iloc[-1] / _closed_avg20), 2) if _rvol_closed_valid else 0.0
+        else:
+            _rvol_closed_valid = False
+            rvol_closed_bar = 0.0
+
         # `vwap` is deliberately a multi-day cumulative figure (~750 historical
         # bars plus today's live bars) — a medium-term (10-day) trend anchor, see
         # live_trading_engine.py's credit-spread VWAP check. `session_vwap`
@@ -744,6 +771,8 @@ class LTPPoller:
             "adx_valid":      _adx_valid,
             "rvol":           rvol,
             "rvol_valid":     _rvol_valid,
+            "rvol_closed_bar":       rvol_closed_bar,
+            "rvol_closed_bar_valid": _rvol_closed_valid,
             "ema_spread_pct": ema_spread_pct,
             "vwap":           round(vwap, 4),
             "session_vwap":   round(session_vwap, 4),

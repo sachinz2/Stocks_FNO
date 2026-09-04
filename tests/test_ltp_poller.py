@@ -211,6 +211,67 @@ def test_enrich_rvol_valid_once_20_of_todays_own_bars_exist_even_with_thin_histo
     assert tick["rvol"] > 1.0
 
 
+def test_enrich_rvol_closed_bar_ignores_the_barely_formed_current_bar():
+    """Live incident, 2026-09-04: momentum.py's pullback+breakout check only
+    evaluates on the instant a new 5-min bucket starts -- exactly when
+    cur_bar_volume has just reset and only holds a few seconds of volume.
+    Plain `rvol` (which includes that forming bar as its numerator) reads a
+    structurally deflated number regardless of how strong the real breakout
+    bar was. `rvol_closed_bar` must be computed from bars_today alone (real,
+    full-bar volume in both numerator and rolling average) so a genuinely
+    high-volume breakout bar reads as high RVOL even while the next bar has
+    barely started forming."""
+    hist = _make_hist_baseline("2026-07-29", n=2, price=100.0, volume=1000)
+
+    bars_today = []
+    base_time = IST.localize(dt.datetime(2026, 7, 30, 9, 15, 0))
+    for i in range(19):
+        bars_today.append({
+            "date": (base_time + dt.timedelta(minutes=5 * i)).isoformat(),
+            "open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0,
+            "volume": 5000,
+        })
+    # The just-completed bar: a real, elevated-volume breakout bar.
+    bars_today.append({
+        "date": (base_time + dt.timedelta(minutes=5 * 19)).isoformat(),
+        "open": 100.0, "high": 101.5, "low": 100.0, "close": 101.5,
+        "volume": 8000,
+    })
+    live_range = {
+        "bars_today": bars_today,
+        # The NEW bar has barely started -- only a few seconds/ticks of volume.
+        "cur_bar_open": 101.5, "cur_bar_high": 101.6, "cur_bar_low": 101.5,
+        "cur_bar_volume": 50,
+        "day_open": 100.0, "day_high": 101.6, "day_low": 99.5,
+    }
+
+    tick = LTPPoller._enrich("TESTSTOCK", hist.copy(), 101.55, live_range=live_range)
+
+    # Plain rvol is dragged down by the barely-formed current bar -- the
+    # exact live symptom (breakout RVOL readings of 0.0-0.96 for 2+ weeks).
+    assert tick["rvol"] < 0.1
+    # rvol_closed_bar correctly reflects the real breakout bar's elevated volume.
+    assert tick["rvol_closed_bar_valid"] is True
+    assert tick["rvol_closed_bar"] > 1.3
+
+
+def test_enrich_rvol_closed_bar_invalid_with_fewer_than_20_completed_bars():
+    hist = _make_hist_baseline("2026-07-29", n=2, price=100.0, volume=1000)
+    bars_today = [{
+        "date": (IST.localize(dt.datetime(2026, 7, 30, 9, 15, 0))).isoformat(),
+        "open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0, "volume": 5000,
+    }]
+    live_range = {
+        "bars_today": bars_today,
+        "cur_bar_open": 100.0, "cur_bar_high": 100.5, "cur_bar_low": 99.5,
+        "cur_bar_volume": 100,
+        "day_open": 100.0, "day_high": 100.5, "day_low": 99.5,
+    }
+    tick = LTPPoller._enrich("TESTSTOCK", hist.copy(), 100.2, live_range=live_range)
+    assert tick["rvol_closed_bar_valid"] is False
+    assert tick["rvol_closed_bar"] == 0.0
+
+
 def test_enrich_day_prev_close_is_prior_trading_day_not_bar_to_bar():
     # Fixed 2026-08-06: market breadth was computed from the previous 5-min
     # bar's close, not the actual previous trading day's close -- despite

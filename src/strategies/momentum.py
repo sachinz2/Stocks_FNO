@@ -593,7 +593,20 @@ class MomentumStrategy(StrategyBase):
         extension no longer resets progress on its own.
         """
         close = data.get("close")
-        rvol  = data.get("rvol")
+        # Fixed 2026-09-04 (live incident): this whole function only advances
+        # on `is_new_bar` -- the exact instant a new 5-min bucket starts and
+        # ltp_poller's plain `rvol` (the still-forming current bar's volume-
+        # so-far) resets to a few-seconds-old, structurally deflated number
+        # compared against a rolling average of full completed bars. Both the
+        # contraction history below and the breakout check further down need
+        # `rvol_closed_bar` instead -- the LAST FINALIZED bar's real, full-bar
+        # RVOL -- so "did volume actually confirm this move" is measured
+        # against a real bar, not a hundredth of one. Confirmed live: with
+        # plain `rvol`, every breakout attempt in 2+ weeks read 0.0-0.96
+        # (never near the 0.8/1.3 thresholds) and momentum_v1's pullback
+        # model (default since 2026-08-21) fired zero live trades in that
+        # entire window. See ltp_poller.py's matching fix note.
+        rvol  = data.get("rvol_closed_bar")
         # Fixed 2026-08-21 (deep review): ltp_poller emits rvol=0.0 (with
         # rvol_valid=False) as an "insufficient volume history" sentinel for
         # roughly the first 100 minutes of every session -- treated as a
@@ -601,7 +614,7 @@ class MomentumStrategy(StrategyBase):
         # volume contraction and could satisfy had_contraction below. Fail
         # closed the same way the rest of the codebase treats rvol_valid:
         # an invalid bar's RVOL is unknown, not a real reading.
-        rvol_valid = data.get("rvol_valid")
+        rvol_valid = data.get("rvol_closed_bar_valid")
 
         is_new_bar = bar_key is not None and bar_key != self._pullback_bar_key.get(symbol)
         if is_new_bar:
