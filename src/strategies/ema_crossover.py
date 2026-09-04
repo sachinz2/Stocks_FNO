@@ -59,6 +59,31 @@ class EMACrossoverStrategy(StrategyBase):
     def initialize(self):
         self.fast_period = self.parameters.get("fast_period", 20)
         self.slow_period = self.parameters.get("slow_period", 50)
+        # Fixed 2026-09-04 (thorough cross-check of all strategies):
+        # fast_period/slow_period were configurable in NAME only -- the
+        # entire indicator pipeline (ltp_poller.py's _enrich()) hardcodes
+        # ema20/ema50, and two other consumers of these same EMAs (this
+        # class's own EMA-reversal exit check and the engine's 15-min MTF
+        # filter) independently hardcode the literal "ema20"/"ema50" keys
+        # too, never reading fast_period/slow_period at all. Configuring any
+        # other pair (e.g. this class's own docstring backlog item "test
+        # 10/30, 13/21, 9/21") made generate_signal()'s data.get(f"ema
+        # {fast_period}") always return None, silently going dormant --
+        # every cycle hitting the fast_ema is None guard below and returning
+        # HOLD forever, with no error, no log, nothing to indicate why.
+        # Currently a no-op (src/api/main.py loads this strategy with the
+        # matching 20/50 default), but loud and fail-closed now rather than
+        # silently inert the moment anyone acts on that backlog item.
+        if (self.fast_period, self.slow_period) != (20, 50):
+            raise ValueError(
+                f"{self.name}: fast_period={self.fast_period}/slow_period={self.slow_period} "
+                "is not supported -- the indicator pipeline (ltp_poller.py) only ever "
+                "computes ema20/ema50, and the EMA-reversal exit check and the engine's "
+                "15-min MTF filter both hardcode ema20/ema50 too. Using any other pair "
+                "would silently return HOLD forever with no signal ever generated. "
+                "Extend ltp_poller.py's _enrich() (and both hardcoded consumers above) "
+                "to compute a configurable pair before changing this."
+            )
         self.stop_loss_pct = self.parameters.get("stop_loss_pct", 0.50)
         self.target_pct = self.parameters.get("target_pct", 1.0)
         self.trailing_stop_pct = self.parameters.get("trailing_stop_pct", 0.25)
@@ -233,11 +258,12 @@ class EMACrossoverStrategy(StrategyBase):
         - ohlc_bar_key (optional): changes once per 5-min bar; used so that
           signal_confirm_bars counts distinct completed candles, not engine cycles.
         """
-        symbol   = data.get("symbol", "")
-        fast_ema = data.get(f"ema{self.fast_period}")
-        slow_ema = data.get(f"ema{self.slow_period}")
-        bar_key  = data.get("ohlc_bar_key")  # None in test/backtest contexts
-        adx      = data.get("adx14")
+        symbol    = data.get("symbol", "")
+        fast_ema  = data.get(f"ema{self.fast_period}")
+        slow_ema  = data.get(f"ema{self.slow_period}")
+        bar_key   = data.get("ohlc_bar_key")  # None in test/backtest contexts
+        adx       = data.get("adx14")
+        adx_valid = data.get("adx_valid")
 
         if fast_ema is None or slow_ema is None:
             logger.warning(f"Strategy {self.name}: Missing EMA data.")
@@ -248,7 +274,15 @@ class EMACrossoverStrategy(StrategyBase):
         # debounce as _pending_bar_key below and the identical pattern in
         # momentum.py. Feeds the ADX-rising half of the gate applied below,
         # once a crossover has actually confirmed.
-        if adx is not None and bar_key is not None and bar_key != self._history_bar_key.get(symbol):
+        # Fixed 2026-09-04 (thorough cross-check of all strategies): only
+        # append when adx_valid is True -- ltp_poller.py emits adx14=0.0
+        # (not None) paired with adx_valid=False as an "insufficient
+        # history" sentinel, same convention as RVOL's rvol_valid.
+        # Unconditional appending let 0.0 sentinels sit in _adx_history, so
+        # a later genuinely-computed-but-still-low ADX could pass the
+        # "ADX rising" fallback below (adx > hist_adx[-2]) purely because it
+        # was compared against an injected 0.0, not because ADX actually rose.
+        if adx is not None and adx_valid and bar_key is not None and bar_key != self._history_bar_key.get(symbol):
             self._adx_history.setdefault(symbol, []).append(adx)
             self._adx_history[symbol] = self._adx_history[symbol][-self._HISTORY_LEN:]
             self._history_bar_key[symbol] = bar_key

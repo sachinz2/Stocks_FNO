@@ -344,11 +344,12 @@ class MomentumStrategy(StrategyBase):
           live_trading_engine.py, these are refinements ON TOP OF an
           already-qualifying ADX/EMA signal, not the sole gate on a trade).
         """
-        symbol   = data.get("symbol", "")
-        fast_ema = data.get(f"ema{self.fast_period}")
-        slow_ema = data.get(f"ema{self.slow_period}")
-        adx      = data.get("adx14")
-        bar_key  = data.get("ohlc_bar_key")
+        symbol     = data.get("symbol", "")
+        fast_ema   = data.get(f"ema{self.fast_period}")
+        slow_ema   = data.get(f"ema{self.slow_period}")
+        adx        = data.get("adx14")
+        adx_valid  = data.get("adx_valid")
+        bar_key    = data.get("ohlc_bar_key")
 
         if fast_ema is None or slow_ema is None or adx is None or not slow_ema:
             return "HOLD"
@@ -361,10 +362,22 @@ class MomentumStrategy(StrategyBase):
         # (_history_bar_key) since history should keep accumulating even
         # while no candidate direction is pending (_pending_bar_key gets
         # cleared whenever the ADX/spread condition drops out).
+        # Fixed 2026-09-04 (thorough cross-check of all strategies): ADX is
+        # only appended when adx_valid is True now. ltp_poller.py emits
+        # adx14=0.0 (not None) paired with adx_valid=False as an
+        # "insufficient history" sentinel, same convention as RVOL's
+        # rvol_valid -- appending it unconditionally let 0.0 sentinels sit
+        # in _adx_history, so a later genuinely-computed-but-still-low ADX
+        # (e.g. 12.0, well under adx_entry_threshold) could pass the
+        # "ADX rising" fallback below purely because `12.0 > 0.0`, not
+        # because ADX actually rose. bar_key still advances either way (the
+        # bar itself did happen), only the value recorded into history is
+        # now gated.
         if bar_key is not None and bar_key != self._history_bar_key.get(symbol):
-            self._adx_history.setdefault(symbol, []).append(adx)
+            if adx_valid:
+                self._adx_history.setdefault(symbol, []).append(adx)
+                self._adx_history[symbol] = self._adx_history[symbol][-self._HISTORY_LEN:]
             self._ema_history.setdefault(symbol, []).append(fast_ema)
-            self._adx_history[symbol] = self._adx_history[symbol][-self._HISTORY_LEN:]
             self._ema_history[symbol] = self._ema_history[symbol][-self._HISTORY_LEN:]
             self._history_bar_key[symbol] = bar_key
 

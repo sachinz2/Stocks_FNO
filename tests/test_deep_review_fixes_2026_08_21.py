@@ -66,7 +66,7 @@ def test_engine_credit_spread_skips_entry_on_none_prices():
     from src.live_trading.live_trading_engine import LiveTradingEngine
     src = inspect.getsource(LiveTradingEngine._process_credit_spread)
     idx = src.index("_entry_prices = await get_entry_prices_for_spread")
-    block = src[idx:idx + 300]
+    block = src[idx:idx + 400]
     assert "if _entry_prices is None" in block
 
 
@@ -520,13 +520,47 @@ def test_migration_b008_is_the_new_head_after_b007():
 
 def test_extract_fill_updates_tracks_filled_quantity_independently_of_fill_price():
     from src.orders.order_manager import OrderManager
-    # fill_price already recorded (existing_fill_price is not None) --
-    # filled_quantity must still update, since a partial fill's quantity
-    # keeps growing across later polls even after the average price of the
-    # partial fill was already recorded once.
+    # filled_quantity must update regardless of whether fill_price changed --
+    # a partial fill's quantity keeps growing across later polls. Uses the
+    # SAME broker-reported fill_price as existing_fill_price here (no real
+    # price change this poll) specifically to isolate that filled_quantity's
+    # update is independent of any fill_price change -- see
+    # test_extract_fill_updates_refreshes_fill_price_on_a_growing_partial_fill
+    # (2026-09-04) for the fill_price-changes-too case.
     updates = OrderManager._extract_fill_updates(
-        {"fill_price": 50.0, "filled_quantity": 300}, expected_price=48.0, existing_fill_price=48.5,
+        {"fill_price": 48.5, "filled_quantity": 300}, expected_price=48.0, existing_fill_price=48.5,
     )
+    assert updates == {"filled_quantity": 300}
+
+
+def test_extract_fill_updates_refreshes_fill_price_on_a_growing_partial_fill():
+    """Fixed 2026-09-04 (live incident): fill_price used to be captured ONCE
+    and never refreshed -- correct for PaperBroker's atomic fills, but wrong
+    for a real Zerodha order that fills in multiple tranches at different
+    average prices. Every downstream consumer (P&L, daily-loss kill switch,
+    StrategyMonitor's rolling PF) trusts fill_price as authoritative, so a
+    frozen stale price silently corrupts all of them the first time a real
+    limit order fills in more than one poll."""
+    from src.orders.order_manager import OrderManager
+    # Poll 1 recorded fill_price=99.50 from a partial fill. Poll 2: the order
+    # has filled further (or completed) at a different average -- must overwrite.
+    updates = OrderManager._extract_fill_updates(
+        {"fill_price": 100.75, "filled_quantity": 750}, expected_price=100.0, existing_fill_price=99.50,
+    )
+    assert updates["fill_price"] == 100.75
+    assert updates["slippage"] == round(100.75 - 100.0, 4)
+    assert updates["filled_quantity"] == 750
+
+
+def test_extract_fill_updates_is_a_noop_when_fill_price_is_unchanged():
+    """Guard against over-fixing: an unchanged average price must not
+    generate a spurious update/slippage recompute every single poll."""
+    from src.orders.order_manager import OrderManager
+    updates = OrderManager._extract_fill_updates(
+        {"fill_price": 99.50, "filled_quantity": 300}, expected_price=100.0, existing_fill_price=99.50,
+    )
+    assert "fill_price" not in updates
+    assert "slippage" not in updates
     assert updates == {"filled_quantity": 300}
 
 
@@ -617,15 +651,26 @@ def test_stale_order_retry_uses_unfilled_remainder_not_full_quantity():
 
     asyncio.run(om.expire_stale_orders())
 
-    assert released_calls == [("momentum_v1", pytest.approx(300 * 40.0))], (
-        "only the unfilled remainder's price*qty must be released, not the full original quantity"
+    # Fixed 2026-09-04 (live incident): release now uses the SAME price
+    # basis (the adjusted retry price) that the retry's own place_order()
+    # call re-adds capital at -- previously this released at the ORIGINAL
+    # order.price (40.0) while the retry re-added at the adjusted
+    # ~1.5%-moved price, a persistent capital-accounting drift on every
+    # retry. Only the unfilled remainder's qty is used either way.
+    from src.orders.order_manager import RETRY_PRICE_ADJUSTMENT
+    _retry_price = round(40.0 * (1 + RETRY_PRICE_ADJUSTMENT), 2)
+    assert released_calls == [("momentum_v1", pytest.approx(300 * _retry_price))], (
+        "only the unfilled remainder's qty must be released, at the SAME price basis "
+        "the retry re-adds capital at, not the full original quantity or a mismatched price"
     )
 
-    # The retry (second place_order call) must request only the remainder.
+    # The retry (second place_order call) must request only the remainder,
+    # at the same adjusted price used for the release above.
     broker = om.broker
     assert len(broker.placed) == 2  # original + retry
-    _, _, retry_qty, _ = broker.placed[-1]
+    _, _, retry_qty, retry_order_price = broker.placed[-1]
     assert retry_qty == 300
+    assert retry_order_price == pytest.approx(_retry_price)
 
 
 # ── IV rank fed real market IV, not ATR-derived historical vol ─────────────

@@ -41,10 +41,6 @@ class IronCondorStrategy(StrategyBase):
         self.low_vol_threshold = self.parameters.get("low_vol_threshold", 1.2)
         # Below this EMA spread% the trend is flat — condor is appropriate
         self.flat_threshold = self.parameters.get("flat_threshold", 0.1)
-        # Short strikes this many intervals away from ATM (gives small buffer)
-        self.short_offset = self.parameters.get("short_offset", 1)
-        # Long strikes this many intervals further from short strikes (hedge width)
-        self.hedge_offset = self.parameters.get("hedge_offset", 2)
         # Close at 75% profit: short legs have decayed to this fraction of sold price
         self.profit_close_pct = self.parameters.get("profit_close_pct", 0.25)
         # Stop loss: close if either short leg rises to this multiple of sold price
@@ -55,7 +51,17 @@ class IronCondorStrategy(StrategyBase):
         logger.info(
             f"Initialized Iron Condor '{self.name}' | "
             f"low_vol={self.low_vol_threshold}% | flat_EMA={self.flat_threshold}% | "
-            f"short_offset={self.short_offset} interval | hedge_width={self.hedge_offset} intervals | "
+            # Fixed 2026-09-04 (thorough cross-check of all strategies):
+            # short_offset/hedge_offset used to be logged here as if they
+            # drove strike selection -- they never did. The engine's
+            # _process_iron_condor() selects all 4 strikes purely by
+            # Black-Scholes delta targeting (short legs ~0.20 delta, long
+            # legs ~0.10 delta via find_delta_strike()); short_offset/
+            # hedge_offset were read into self.* but never consulted by
+            # that path. Removed as dead config (see git history for the
+            # 1/2-interval literals this used to describe); log now
+            # describes what actually determines the strikes.
+            f"strike_selection=delta-targeted (short~0.20/0.10 delta) | "
             f"profit_target={int((1 - self.profit_close_pct) * 100)}% | "
             f"SL={self.stop_loss_multiple}x | min_DTE={self.min_dte}"
         )

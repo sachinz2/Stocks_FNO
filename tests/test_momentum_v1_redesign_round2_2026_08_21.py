@@ -375,9 +375,16 @@ def test_engine_captures_entry_underlying_price_and_atr_at_entry():
     import inspect
     src = inspect.getsource(LiveTradingEngine._process_signal)
     idx = src.index('"entry_regime":  regime,')
-    block = src[idx:idx + 500]
+    block = src[idx:idx + 2000]
     assert '"entry_underlying_price": underlying_price' in block
-    assert '"entry_atr":' in block and "atr,\n" in block[block.index('"entry_atr":'):]
+    # Fixed 2026-09-04 (live incident): entry_atr must be stored ALREADY
+    # scaled by _5MIN_ATR_SCALE -- the raw 5-min-bar ATR was being fed
+    # directly into momentum_v1's/ema_crossover_v1's underlying-based
+    # stop/target with no scaling, landing the stop/target ~0.15-0.3% from
+    # entry (ordinary tick noise), firing almost immediately on nearly every
+    # entry. See momentum.py/ema_crossover.py's manage_position() -- neither
+    # applies the scale factor itself, so it must be applied once here.
+    assert '"entry_atr":              atr * _5MIN_ATR_SCALE,' in block
 
 
 def test_engine_threads_entry_context_into_manage_position_call():

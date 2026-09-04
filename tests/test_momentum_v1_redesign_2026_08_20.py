@@ -35,9 +35,13 @@ def _mom(**overrides):
 
 
 def _bar(symbol="RELIANCE", ema20=105.0, ema50=100.0, adx=30.0, close=2500.0,
-         atr=20.0, vwap=2500.0, bar_key="live:t0"):
+         atr=20.0, vwap=2500.0, bar_key="live:t0", adx_valid=True):
+    # adx_valid=True by default: these tests pass real numeric ADX values
+    # meant to represent genuine readings, not ltp_poller's adx14=0.0/
+    # adx_valid=False "insufficient history" sentinel (2026-09-04 fix).
     return {
         "symbol": symbol, "ema20": ema20, "ema50": ema50, "adx14": adx,
+        "adx_valid": adx_valid,
         "close": close, "atr14": atr, "vwap": vwap, "ohlc_bar_key": bar_key,
     }
 

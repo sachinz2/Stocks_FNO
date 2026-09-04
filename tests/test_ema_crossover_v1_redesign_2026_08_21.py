@@ -26,8 +26,16 @@ def _ema(**overrides):
     return strat
 
 
-def _bar(symbol="RELIANCE", fast=101.0, slow=100.0, adx=20.0, bar_key="live:t0"):
-    return {"symbol": symbol, "ema20": fast, "ema50": slow, "adx14": adx, "ohlc_bar_key": bar_key}
+def _bar(symbol="RELIANCE", fast=101.0, slow=100.0, adx=20.0, bar_key="live:t0", adx_valid=True):
+    # adx_valid=True by default: these tests pass real numeric ADX values
+    # meant to represent genuine readings, not ltp_poller's adx14=0.0/
+    # adx_valid=False "insufficient history" sentinel -- see
+    # test_adx_invalid_sentinel_does_not_register_as_a_rising_data_point
+    # (2026-09-04) for that sentinel-specific case.
+    return {
+        "symbol": symbol, "ema20": fast, "ema50": slow, "adx14": adx,
+        "adx_valid": adx_valid, "ohlc_bar_key": bar_key,
+    }
 
 
 # ── Internal ADX gate (>=threshold OR rising) ────────────────────────────────

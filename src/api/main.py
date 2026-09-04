@@ -284,7 +284,9 @@ async def lifespan(app: FastAPI):
     StrategyRegistry.load_strategy("IRON_CONDOR", "iron_condor_v1", {
         "fast_period": 20, "slow_period": 50,
         "low_vol_threshold": 1.2, "flat_threshold": 0.1,
-        "short_offset": 1, "hedge_offset": 2,
+        # Fixed 2026-09-04: short_offset/hedge_offset removed -- dead config,
+        # never consulted by _process_iron_condor()'s actual (delta-based)
+        # strike selection. See iron_condor.py's matching fix note.
         "profit_close_pct": 0.25, "stop_loss_multiple": 2.0, "min_dte": 7,
     })
     StrategyRegistry.load_strategy("MOMENTUM", "momentum_v1", {

@@ -2291,6 +2291,27 @@ class LiveTradingEngine:
         # DTE range filter — keeps us in the liquid, balanced-theta window
         min_dte = getattr(strategy, "min_dte", 0)
         max_dte = getattr(strategy, "max_dte", 999)
+
+        # Fixed 2026-09-04 (live incident): single-leg entries used to
+        # resolve expiry via get_near_month_expiry() alone, which only rolls
+        # to next month once near-month DTE < 7 -- but fresh entries require
+        # DTE >= min_dte (10 for both ema_crossover_v1/momentum_v1). For DTE
+        # 7/8/9 every month, the near-month contract is still "current"
+        # (>=7) but too close for a new position (<10), and nothing rolls it
+        # forward -- a genuine ~3-trading-day dead zone every month where
+        # neither strategy can open any new position, distinct from the
+        # already-fixed max_dte-too-high symptom right AFTER a roll (see
+        # test_single_leg_dte_dead_zone_2026_08_20.py). credit_spread_v1/
+        # iron_condor_v1 already avoid this via get_entry_expiry(min_dte) --
+        # applying the same fix here, matching that exact pattern.
+        if dte < min_dte:
+            expiry = get_entry_expiry(min_dte)
+            dte    = (expiry - now_ist().replace(tzinfo=None)).days
+            logger.info(
+                f"[{strategy.name}] {symbol} near-month DTE < {min_dte} — "
+                f"rolling fresh entry to next month's expiry (DTE={dte})"
+            )
+
         if not (min_dte <= dte <= max_dte):
             logger.info(
                 f"[{strategy.name}] DTE={dte} outside [{min_dte},{max_dte}] "
@@ -2665,7 +2686,22 @@ class LiveTradingEngine:
                     # stop/target in manage_position(); a no-op for
                     # strategies that don't check these fields.
                     "entry_underlying_price": underlying_price,
-                    "entry_atr":              atr,
+                    # Fixed 2026-09-04 (live incident): `atr` here is the raw
+                    # 5-min-bar ATR (market_data["atr14"]) -- momentum_v1's and
+                    # ema_crossover_v1's underlying-based stop/target both
+                    # consume this directly as `entry_atr` with NO scaling,
+                    # unlike every other consumer of this same field (sigma
+                    # computation two lines above via _5MIN_ATR_SCALE,
+                    # estimate_option_premium(), regime_detector's ATR
+                    # threshold), which all apply FIVE_MIN_ATR_DAILY_SCALE
+                    # (~8.66x) before treating it as a "real" daily-scale
+                    # price-move threshold. Unscaled, the stop/target land
+                    # ~0.15-0.3% from entry -- ordinary tick noise blows
+                    # through that within minutes, firing this "primary exit
+                    # driver" (per momentum_v1's own docstring) almost
+                    # immediately on nearly every entry, before either
+                    # strategy's actual thesis has a chance to develop.
+                    "entry_atr":              atr * _5MIN_ATR_SCALE,
                     # Running MFE/MAE (external review, round 2 -- sections
                     # 22-23), updated every exit-check cycle below and
                     # written to trade_journal at exit.
@@ -3160,10 +3196,26 @@ class LiveTradingEngine:
             return
         self._audit_gate(strategy.name, "contract_resolved")
 
+        # Fixed 2026-09-04 (live incident): the ATR-fallback branch inside
+        # get_entry_prices_for_spread() (used when a leg's real live quote is
+        # unavailable) needs the ACTUAL number of strike-intervals each leg
+        # sits OTM -- without these, it silently defaulted to
+        # short_otm_intervals=0 (treats the short leg as ATM) and
+        # long_otm_intervals=2, regardless of where delta-targeting actually
+        # placed these strikes (typically several intervals OTM, further
+        # depending on volatility/strike grid). That overstated the short
+        # leg's estimated premium (and understated the long leg's, relative
+        # to its real OTM distance), inflating the reported net credit and
+        # mis-pricing the long leg's real BUY limit order. iron_condor_v1's
+        # sibling call site was already given this treatment; this one never
+        # was. Computed from the real, resolved strikes now in scope.
+        _short_otm = round(abs(short_strike - underlying_price) / interval) if interval else 0
+        _long_otm  = round(abs(long_strike - underlying_price) / interval) if interval else 2
         _entry_prices = await get_entry_prices_for_spread(
             symbol, short_contract, long_contract,
             kite=self._kite, redis=getattr(self, "_redis", None),
             atr=atr, dte=dte,
+            short_otm_intervals=_short_otm, long_otm_intervals=_long_otm,
         )
         if _entry_prices is None:
             logger.warning(
@@ -3226,9 +3278,16 @@ class LiveTradingEngine:
             )
             return
 
-        # Margin check — in live mode verify we have enough balance before placing
+        # Margin check — in live mode verify we have enough balance before placing.
+        # Fixed 2026-09-04 (thorough cross-check of all strategies): comment
+        # corrected -- this is the GROSS wing width, not max loss (max loss
+        # = wing width - net_credit, computed correctly a few lines below as
+        # _capital_at_risk). Not netting the credit here is intentionally
+        # conservative (over-requires margin, never under-requires it), so
+        # this was a comment/behavior mismatch, not a bug -- just describing
+        # the wrong figure.
         spread_width   = abs(short_strike - long_strike)
-        required_margin = spread_width * lot_size   # worst-case margin = max loss
+        required_margin = spread_width * lot_size   # gross wing width (conservative; does not net credit)
         if not await self._check_available_margin(required_margin):
             logger.warning(
                 f"[CreditSpread] {symbol} skipped — insufficient margin "
@@ -4190,13 +4249,26 @@ class LiveTradingEngine:
         from src.market_data.option_chain import get_entry_prices_for_spread
         _kite  = getattr(self, "_kite",  None)
         _redis = getattr(self, "_redis", None)
+        # Fixed 2026-09-04 (live incident): these were hardcoded to
+        # short_otm_intervals=1/long_otm_intervals=3, matching this
+        # strategy's config-declared short_offset=1/hedge_width=2 -- but
+        # actual strike selection above is 100% delta-targeted
+        # (find_delta_strike(), short_offset/hedge_offset are unused dead
+        # parameters), so the real OTM distance can differ from these
+        # hardcoded assumptions depending on volatility/strike grid. Computed
+        # from the real, resolved strikes now in scope instead, matching the
+        # fix just applied to credit_spread_v1's identical call site.
+        _put_short_otm  = round(abs(put_short_strike  - underlying_price) / interval) if interval else 1
+        _put_long_otm   = round(abs(put_long_strike   - underlying_price) / interval) if interval else 3
+        _call_short_otm = round(abs(call_short_strike - underlying_price) / interval) if interval else 1
+        _call_long_otm  = round(abs(call_long_strike  - underlying_price) / interval) if interval else 3
         _put_prices = await get_entry_prices_for_spread(
             symbol, psc, plc, _kite, _redis, atr, dte,
-            short_otm_intervals=1, long_otm_intervals=3,
+            short_otm_intervals=_put_short_otm, long_otm_intervals=_put_long_otm,
         )
         _call_prices = await get_entry_prices_for_spread(
             symbol, csc, clc, _kite, _redis, atr, dte,
-            short_otm_intervals=1, long_otm_intervals=3,
+            short_otm_intervals=_call_short_otm, long_otm_intervals=_call_long_otm,
         )
         if _put_prices is None or _call_prices is None:
             logger.warning(
@@ -4961,18 +5033,69 @@ class LiveTradingEngine:
         kite        = getattr(self, "_kite", None)
         redis       = getattr(self, "_redis", None)
 
-        # Build set of contracts belonging to active multi-leg positions
+        # Fixed 2026-09-04 (live incident): this used to gate EVERY tracked
+        # spread/condor on the GLOBAL near-month `is_expiry`, not each
+        # structure's OWN stored expiry_date. But _process_credit_spread/
+        # _process_iron_condor deliberately roll fresh entries to NEXT
+        # month's contract once near-month DTE < entry_min_dte (get_entry_
+        # expiry()) -- so for a ~2-3 week window every cycle, some open
+        # structures legitimately hold a next-month contract with real
+        # DTE~25-35 while the near-month contract everyone else is on
+        # approaches ITS expiry. When the global near-month DTE hit <=1,
+        # every position was swept into the force-close loop below --
+        # including next-month structures weeks from their real expiry --
+        # cutting off the theta-decay runway the roll-forward logic exists
+        # to protect. This is the exact bug class already fixed in the
+        # restore path (see "spread_expiry = datetime.fromisoformat(...)"
+        # above in this file) but never applied here. Now computed
+        # per-structure, exactly like the restore path.
         spread_condor_contracts: set = set()
-        if not is_expiry:
-            for s in self._active_spreads.values():
+        _spread_is_expiry: Dict[str, bool] = {}
+        _spread_dte: Dict[str, int] = {}
+        for _sym, s in self._active_spreads.items():
+            try:
+                s_expiry = datetime.fromisoformat(s["expiry_date"])
+            except (KeyError, ValueError, TypeError):
+                s_expiry = expiry
+            s_dte = (s_expiry - now_ist().replace(tzinfo=None)).days
+            _spread_is_expiry[_sym] = s_dte <= 1
+            _spread_dte[_sym] = s_dte
+            if s_dte > 1:
                 for key in ("short_contract", "long_contract"):
                     if s.get(key):
                         spread_condor_contracts.add(s[key])
-            for c in self._active_condors.values():
+
+        _condor_is_expiry: Dict[str, bool] = {}
+        _condor_dte: Dict[str, int] = {}
+        for _sym, c in self._active_condors.items():
+            try:
+                c_expiry = datetime.fromisoformat(c["expiry_date"])
+            except (KeyError, ValueError, TypeError):
+                c_expiry = expiry
+            c_dte = (c_expiry - now_ist().replace(tzinfo=None)).days
+            _condor_is_expiry[_sym] = c_dte <= 1
+            _condor_dte[_sym] = c_dte
+            if c_dte > 1:
                 for key in ("put_short_contract", "put_long_contract",
                             "call_short_contract", "call_long_contract"):
                     if c.get(key):
                         spread_condor_contracts.add(c[key])
+
+        # Per-CONTRACT lookup (not per-structure) so the per-position loop
+        # below can classify each leg it force-closes, regardless of the
+        # global `is_expiry` -- absent (single-leg EMA/momentum contracts,
+        # which never roll forward, so the global near-month `is_expiry` is
+        # always accurate for them) falls back to the global flag.
+        _leg_is_expiry: Dict[str, bool] = {}
+        for _sym, s in self._active_spreads.items():
+            for key in ("short_contract", "long_contract"):
+                if s.get(key):
+                    _leg_is_expiry[s[key]] = _spread_is_expiry[_sym]
+        for _sym, c in self._active_condors.items():
+            for key in ("put_short_contract", "put_long_contract",
+                        "call_short_contract", "call_long_contract"):
+                if c.get(key):
+                    _leg_is_expiry[c[key]] = _condor_is_expiry[_sym]
 
         positions = await self._safe_get_positions()
         closed_ema = 0
@@ -4995,8 +5118,10 @@ class LiveTradingEngine:
                 if qty == 0:
                     continue
 
-                # On normal days, skip spread/condor legs — they hold overnight
-                if not is_expiry and contract in spread_condor_contracts:
+                # Skip legs belonging to a structure that is NOT at its own
+                # expiry (per-structure now, see the fix note above) — they
+                # hold overnight regardless of the global near-month DTE.
+                if contract in spread_condor_contracts:
                     continue
 
                 side    = "SELL" if qty > 0 else "BUY"
@@ -5081,7 +5206,10 @@ class LiveTradingEngine:
                     _entry_p = float(pos.get("avg_price") or 0)
                     _signed  = 1 if qty > 0 else -1
                     _pnl     = round((_sq_fill_p - _entry_p) * abs(qty) * _signed, 2)
-                    _reason  = "Expiry day force-close" if is_expiry else "EOD square-off"
+                    # Per-CONTRACT classification (falls back to the global
+                    # near-month is_expiry for single-leg EMA/momentum
+                    # contracts, which is accurate for them -- see fix note above).
+                    _reason  = "Expiry day force-close" if _leg_is_expiry.get(contract, is_expiry) else "EOD square-off"
                     await self._log_trade_close(
                         journal_id=_jrnl_info.get("journal_id"),
                         exit_price=_sq_fill_p,
@@ -5097,222 +5225,238 @@ class LiveTradingEngine:
                         _entry_p * abs(qty),
                     )
 
-                if is_expiry:
+                if _leg_is_expiry.get(contract, is_expiry):
                     closed_expiry += 1
                 else:
                     closed_ema += 1
             except Exception as exc:
                 logger.error(f"Square-off error [{contract}]: {exc} -- position may still be open, will retry next cycle")
 
-        if is_expiry:
-            # Fixed 2026-08-20 (deep review): this whole block used to run
-            # unconditionally for every tracked spread/condor once is_expiry
-            # was True, regardless of whether all of that structure's legs
-            # actually closed in the per-position loop above (a leg is only
-            # present in _exit_prices on a successful close -- absent if its
-            # order was REJECTED_BY_RISK/FAILED and the loop `continue`d
-            # past it). That meant a partially-closed structure still got
-            # its GTT backstop cancelled, a fabricated trade_journal close
-            # (falling back to the ENTRY premium for the unclosed leg, as if
-            # it hadn't moved), its deployed capital released, and dropped
-            # from _active_spreads/_active_condors entirely -- while a REAL
-            # naked leg was still open at the broker, with its exchange-level
-            # stop now gone and its journal row already (wrongly) marked
-            # closed, on the single highest gamma/assignment-risk day of its
-            # life. Only fully-closed structures (every leg present in
-            # _exit_prices) get that treatment now; a partially-closed one
-            # stays tracked so the normal _check_spread_exits/_check_condor_
-            # exits path retries the remaining leg(s) next cycle, with a loud
-            # alert since this is expiry day.
-            _spreads_done: List[str] = []
-            for _sym, _s in self._active_spreads.items():
-                _legs = (_s.get("short_contract", ""), _s.get("long_contract", ""))
-                if all(leg and leg in _exit_prices for leg in _legs):
-                    _spreads_done.append(_sym)
-                else:
-                    logger.critical(
-                        f"EXPIRY DAY: spread {_sym} has a leg that failed to close {_legs} "
-                        f"-- leaving it tracked for retry; GTT/journal/capital-release skipped."
-                    )
-                    await self._notify(
-                        f"CRITICAL: expiry-day close FAILED for spread {_sym}\n"
-                        f"Legs: {_legs}\n"
-                        f"At least one leg's close order was rejected/failed. This structure "
-                        f"remains open past expiry -- manual review required."
-                    )
-
-            _condors_done: List[str] = []
-            for _sym, _c in self._active_condors.items():
-                _legs = (
-                    _c.get("put_short_contract", ""), _c.get("put_long_contract", ""),
-                    _c.get("call_short_contract", ""), _c.get("call_long_contract", ""),
+        # Fixed 2026-08-20 (deep review): this whole block used to run
+        # unconditionally for every tracked spread/condor once is_expiry
+        # was True, regardless of whether all of that structure's legs
+        # actually closed in the per-position loop above (a leg is only
+        # present in _exit_prices on a successful close -- absent if its
+        # order was REJECTED_BY_RISK/FAILED and the loop `continue`d
+        # past it). That meant a partially-closed structure still got
+        # its GTT backstop cancelled, a fabricated trade_journal close
+        # (falling back to the ENTRY premium for the unclosed leg, as if
+        # it hadn't moved), its deployed capital released, and dropped
+        # from _active_spreads/_active_condors entirely -- while a REAL
+        # naked leg was still open at the broker, with its exchange-level
+        # stop now gone and its journal row already (wrongly) marked
+        # closed, on the single highest gamma/assignment-risk day of its
+        # life. Only fully-closed structures (every leg present in
+        # _exit_prices) get that treatment now; a partially-closed one
+        # stays tracked so the normal _check_spread_exits/_check_condor_
+        # exits path retries the remaining leg(s) next cycle, with a loud
+        # alert since this is expiry day.
+        # Fixed 2026-09-04 (live incident): this whole block used to be
+        # gated on the GLOBAL `is_expiry` -- now runs unconditionally, with
+        # each structure filtered by its OWN _spread_is_expiry/
+        # _condor_is_expiry (per-structure, see fix note above) instead, so
+        # a structure that isn't individually at expiry is skipped entirely
+        # here (never attempted to close, never flagged as a failed leg).
+        _spreads_done: List[str] = []
+        for _sym, _s in self._active_spreads.items():
+            if not _spread_is_expiry.get(_sym):
+                continue
+            _legs = (_s.get("short_contract", ""), _s.get("long_contract", ""))
+            if all(leg and leg in _exit_prices for leg in _legs):
+                _spreads_done.append(_sym)
+            else:
+                logger.critical(
+                    f"EXPIRY DAY: spread {_sym} has a leg that failed to close {_legs} "
+                    f"-- leaving it tracked for retry; GTT/journal/capital-release skipped."
                 )
-                if all(leg and leg in _exit_prices for leg in _legs):
-                    _condors_done.append(_sym)
-                else:
-                    logger.critical(
-                        f"EXPIRY DAY: condor {_sym} has a leg that failed to close {_legs} "
-                        f"-- leaving it tracked for retry; GTT/journal/capital-release skipped."
-                    )
-                    await self._notify(
-                        f"CRITICAL: expiry-day close FAILED for condor {_sym}\n"
-                        f"Legs: {_legs}\n"
-                        f"At least one leg's close order was rejected/failed. This structure "
-                        f"remains open past expiry -- manual review required."
-                    )
-
-            # Cancel GTT backstops before clearing so exchange-level orders don't
-            # fire after our positions are already closed by the square-off above.
-            # Only for structures that FULLY closed -- see fix note above.
-            for _sym in _spreads_done:
-                _s = self._active_spreads[_sym]
-                await self._cancel_gtt(_s.get("gtt_id"), _s.get("short_contract", ""))
-            for _sym in _condors_done:
-                _c = self._active_condors[_sym]
-                await self._cancel_gtt(_c.get("put_short_gtt_id"),  _c.get("put_short_contract",  ""))
-                await self._cancel_gtt(_c.get("call_short_gtt_id"), _c.get("call_short_contract", ""))
-
-            # Log trade_journal close for spread/condor structures force-closed above.
-            # Their legs aren't in _single_leg_journals (that dict is EMA-only), so the
-            # per-leg loop above can't log them — without this, these trades would keep
-            # exit_time/pnl = NULL forever despite being genuinely closed by real orders.
-            # Fixed 2026-08-13: per-structure try/except, same rationale as the main
-            # square-off loop above -- one malformed spread/condor record shouldn't
-            # block the journal close (and capital release) for every other one,
-            # especially on expiry day when getting this right matters most.
-            # Only for structures that FULLY closed -- see 2026-08-20 fix note above.
-            for _sym in _spreads_done:
-                _s = self._active_spreads[_sym]
-                try:
-                    _short_x = _exit_prices.get(_s.get("short_contract", ""), _s.get("short_premium", 0))
-                    _long_x  = _exit_prices.get(_s.get("long_contract", ""),  _s.get("long_premium", 0))
-                    _lot     = _s.get("lot_size", 0)
-                    _net     = ((_s.get("short_premium", 0) - _short_x) - (_s.get("long_premium", 0) - _long_x)) * _lot
-                    _width   = abs(_s.get("short_strike", 0) - _s.get("long_strike", 0))
-                    # Fixed 2026-08-21 (deep review): real-fill basis
-                    # (matching entry reservation / normal exit release),
-                    # was still using the stale quote-based net_credit here.
-                    _fill_credit = _s.get("short_premium", 0) - _s.get("long_premium", 0)
-                    self.risk_manager.release_deployed_capital(
-                        _s.get("strategy_name", "credit_spread_v1"),
-                        (_width - _fill_credit) * _lot,
-                    )
-                    await self._log_trade_close(
-                        journal_id=_s.get("journal_id"),
-                        exit_price=round(_short_x - _long_x, 2),
-                        pnl=round(_net, 2),
-                        exit_reason=f"Expiry day force-close (DTE={dte})",
-                    )
-                except Exception as exc:
-                    # Fixed 2026-08-13: this was log-only. The real broker
-                    # position is already flat (closed by real orders in the
-                    # per-leg loop above) by the time we get here, so leaving
-                    # this entry in _active_spreads for a "retry" would be
-                    # actively dangerous -- exit-check cycles would keep
-                    # treating a genuinely-closed structure as open and could
-                    # place a real order against it. It still gets cleared
-                    # below like every other structure; only the journal
-                    # write failed, so the trade_journal row's exit_time/
-                    # exit_price/pnl would otherwise stay NULL forever with
-                    # nothing left in the running process to retry against.
-                    # A loud alert with every figure needed to manually
-                    # correct the row (same methodology as this session's
-                    # earlier manual trade_journal corrections) is the safe
-                    # way to not lose this silently.
-                    logger.error(
-                        f"Expiry force-close journal error [spread {_s.get('short_contract', '?')}]: {exc}"
-                    )
-                    await self._notify(
-                        f"CRITICAL: expiry force-close journal write FAILED\n"
-                        f"Spread: {_s.get('short_contract', '?')} / {_s.get('long_contract', '?')}\n"
-                        f"journal_id={_s.get('journal_id')} error={exc}\n"
-                        f"Broker position is already closed -- only the trade_journal "
-                        f"row is missing its exit. MANUAL INTERVENTION REQUIRED: correct "
-                        f"trade_journal.exit_time/exit_price/pnl for journal_id="
-                        f"{_s.get('journal_id')} by hand."
-                    )
-            for _sym in _condors_done:
-                _c = self._active_condors[_sym]
-                try:
-                    _ps_x = _exit_prices.get(_c.get("put_short_contract", ""),  _c.get("put_short_premium", 0))
-                    _pl_x = _exit_prices.get(_c.get("put_long_contract", ""),   _c.get("put_long_premium", 0))
-                    _cs_x = _exit_prices.get(_c.get("call_short_contract", ""), _c.get("call_short_premium", 0))
-                    _cl_x = _exit_prices.get(_c.get("call_long_contract", ""),  _c.get("call_long_premium", 0))
-                    _lot_c = _c.get("lot_size", 0)
-                    _net_c = (
-                        (_c.get("put_short_premium", 0)  - _ps_x)
-                        + (_c.get("call_short_premium", 0) - _cs_x)
-                        - (_c.get("put_long_premium", 0)   - _pl_x)
-                        - (_c.get("call_long_premium", 0)  - _cl_x)
-                    ) * _lot_c
-                    _put_wing_x  = abs(_c.get("put_short_strike", 0)  - _c.get("put_long_strike", 0))
-                    _call_wing_x = abs(_c.get("call_short_strike", 0) - _c.get("call_long_strike", 0))
-                    # Fixed 2026-08-21 (deep review): real-fill basis
-                    # (matching entry reservation / normal exit release),
-                    # was still using the stale quote-based net_credit here.
-                    _fill_credit_c = (
-                        (_c.get("put_short_premium", 0) - _c.get("put_long_premium", 0))
-                        + (_c.get("call_short_premium", 0) - _c.get("call_long_premium", 0))
-                    )
-                    self.risk_manager.release_deployed_capital(
-                        _c.get("strategy_name", "iron_condor_v1"),
-                        (max(_put_wing_x, _call_wing_x) - _fill_credit_c) * _lot_c,
-                    )
-                    await self._log_trade_close(
-                        journal_id=_c.get("journal_id"),
-                        exit_price=round(_ps_x + _cs_x - _pl_x - _cl_x, 2),
-                        pnl=round(_net_c, 2),
-                        exit_reason=f"Expiry day force-close (DTE={dte})",
-                    )
-                except Exception as exc:
-                    # See the matching comment on the spread loop above --
-                    # same rationale: broker position is already flat, so
-                    # this entry still gets cleared below; only the journal
-                    # write is lost without a loud alert to fix it by hand.
-                    logger.error(
-                        f"Expiry force-close journal error [condor {_c.get('put_short_contract', '?')}]: {exc}"
-                    )
-                    await self._notify(
-                        f"CRITICAL: expiry force-close journal write FAILED\n"
-                        f"Condor: {_c.get('put_short_contract', '?')} / "
-                        f"{_c.get('call_short_contract', '?')}\n"
-                        f"journal_id={_c.get('journal_id')} error={exc}\n"
-                        f"Broker position is already closed -- only the trade_journal "
-                        f"row is missing its exit. MANUAL INTERVENTION REQUIRED: correct "
-                        f"trade_journal.exit_time/exit_price/pnl for journal_id="
-                        f"{_c.get('journal_id')} by hand."
-                    )
-
-            # Expiry-day clear — only structures confirmed fully closed above
-            # (2026-08-20 fix: previously an unconditional .clear() dropped
-            # every structure regardless of whether all its legs actually closed).
-            for _sym in _spreads_done:
-                del self._active_spreads[_sym]
-            for _sym in _condors_done:
-                del self._active_condors[_sym]
-            await self._persist_state()
-            if closed_expiry and not self._eod_notified_today:
-                self._eod_notified_today = True
                 await self._notify(
-                    f"EXPIRY SQUARE-OFF (DTE={dte})\n"
-                    f"Force-closed {closed_expiry} position(s) to avoid assignment risk."
+                    f"CRITICAL: expiry-day close FAILED for spread {_sym}\n"
+                    f"Legs: {_legs}\n"
+                    f"At least one leg's close order was rejected/failed. This structure "
+                    f"remains open past expiry -- manual review required."
                 )
-        else:
-            # Normal day — only EMA crossover legs were closed
-            await self._persist_state()
-            held_spreads = len(self._active_spreads)
-            held_condors = len(self._active_condors)
-            parts = []
-            if closed_ema:
-                parts.append(f"Closed {closed_ema} EMA crossover leg(s).")
-            if held_spreads or held_condors:
-                parts.append(
-                    f"Holding overnight: {held_spreads} spread(s) + {held_condors} condor(s) "
-                    f"(DTE={dte}). Exit conditions (SL/profit/DTE<7) active tomorrow."
+
+        _condors_done: List[str] = []
+        for _sym, _c in self._active_condors.items():
+            if not _condor_is_expiry.get(_sym):
+                continue
+            _legs = (
+                _c.get("put_short_contract", ""), _c.get("put_long_contract", ""),
+                _c.get("call_short_contract", ""), _c.get("call_long_contract", ""),
+            )
+            if all(leg and leg in _exit_prices for leg in _legs):
+                _condors_done.append(_sym)
+            else:
+                logger.critical(
+                    f"EXPIRY DAY: condor {_sym} has a leg that failed to close {_legs} "
+                    f"-- leaving it tracked for retry; GTT/journal/capital-release skipped."
                 )
-            if parts and not self._eod_notified_today:
-                self._eod_notified_today = True
-                await self._notify("EOD POSITION UPDATE\n" + "\n".join(parts))
+                await self._notify(
+                    f"CRITICAL: expiry-day close FAILED for condor {_sym}\n"
+                    f"Legs: {_legs}\n"
+                    f"At least one leg's close order was rejected/failed. This structure "
+                    f"remains open past expiry -- manual review required."
+                )
+
+        # Cancel GTT backstops before clearing so exchange-level orders don't
+        # fire after our positions are already closed by the square-off above.
+        # Only for structures that FULLY closed -- see fix note above.
+        for _sym in _spreads_done:
+            _s = self._active_spreads[_sym]
+            await self._cancel_gtt(_s.get("gtt_id"), _s.get("short_contract", ""))
+        for _sym in _condors_done:
+            _c = self._active_condors[_sym]
+            await self._cancel_gtt(_c.get("put_short_gtt_id"),  _c.get("put_short_contract",  ""))
+            await self._cancel_gtt(_c.get("call_short_gtt_id"), _c.get("call_short_contract", ""))
+
+        # Log trade_journal close for spread/condor structures force-closed above.
+        # Their legs aren't in _single_leg_journals (that dict is EMA-only), so the
+        # per-leg loop above can't log them — without this, these trades would keep
+        # exit_time/pnl = NULL forever despite being genuinely closed by real orders.
+        # Fixed 2026-08-13: per-structure try/except, same rationale as the main
+        # square-off loop above -- one malformed spread/condor record shouldn't
+        # block the journal close (and capital release) for every other one,
+        # especially on expiry day when getting this right matters most.
+        # Only for structures that FULLY closed -- see 2026-08-20 fix note above.
+        for _sym in _spreads_done:
+            _s = self._active_spreads[_sym]
+            try:
+                _short_x = _exit_prices.get(_s.get("short_contract", ""), _s.get("short_premium", 0))
+                _long_x  = _exit_prices.get(_s.get("long_contract", ""),  _s.get("long_premium", 0))
+                _lot     = _s.get("lot_size", 0)
+                _net     = ((_s.get("short_premium", 0) - _short_x) - (_s.get("long_premium", 0) - _long_x)) * _lot
+                _width   = abs(_s.get("short_strike", 0) - _s.get("long_strike", 0))
+                # Fixed 2026-08-21 (deep review): real-fill basis
+                # (matching entry reservation / normal exit release),
+                # was still using the stale quote-based net_credit here.
+                _fill_credit = _s.get("short_premium", 0) - _s.get("long_premium", 0)
+                self.risk_manager.release_deployed_capital(
+                    _s.get("strategy_name", "credit_spread_v1"),
+                    (_width - _fill_credit) * _lot,
+                )
+                # Fixed 2026-09-04: use this STRUCTURE's own dte, not the
+                # global near-month dte (see fix note above).
+                await self._log_trade_close(
+                    journal_id=_s.get("journal_id"),
+                    exit_price=round(_short_x - _long_x, 2),
+                    pnl=round(_net, 2),
+                    exit_reason=f"Expiry day force-close (DTE={_spread_dte.get(_sym, dte)})",
+                )
+            except Exception as exc:
+                # Fixed 2026-08-13: this was log-only. The real broker
+                # position is already flat (closed by real orders in the
+                # per-leg loop above) by the time we get here, so leaving
+                # this entry in _active_spreads for a "retry" would be
+                # actively dangerous -- exit-check cycles would keep
+                # treating a genuinely-closed structure as open and could
+                # place a real order against it. It still gets cleared
+                # below like every other structure; only the journal
+                # write failed, so the trade_journal row's exit_time/
+                # exit_price/pnl would otherwise stay NULL forever with
+                # nothing left in the running process to retry against.
+                # A loud alert with every figure needed to manually
+                # correct the row (same methodology as this session's
+                # earlier manual trade_journal corrections) is the safe
+                # way to not lose this silently.
+                logger.error(
+                    f"Expiry force-close journal error [spread {_s.get('short_contract', '?')}]: {exc}"
+                )
+                await self._notify(
+                    f"CRITICAL: expiry force-close journal write FAILED\n"
+                    f"Spread: {_s.get('short_contract', '?')} / {_s.get('long_contract', '?')}\n"
+                    f"journal_id={_s.get('journal_id')} error={exc}\n"
+                    f"Broker position is already closed -- only the trade_journal "
+                    f"row is missing its exit. MANUAL INTERVENTION REQUIRED: correct "
+                    f"trade_journal.exit_time/exit_price/pnl for journal_id="
+                    f"{_s.get('journal_id')} by hand."
+                )
+        for _sym in _condors_done:
+            _c = self._active_condors[_sym]
+            try:
+                _ps_x = _exit_prices.get(_c.get("put_short_contract", ""),  _c.get("put_short_premium", 0))
+                _pl_x = _exit_prices.get(_c.get("put_long_contract", ""),   _c.get("put_long_premium", 0))
+                _cs_x = _exit_prices.get(_c.get("call_short_contract", ""), _c.get("call_short_premium", 0))
+                _cl_x = _exit_prices.get(_c.get("call_long_contract", ""),  _c.get("call_long_premium", 0))
+                _lot_c = _c.get("lot_size", 0)
+                _net_c = (
+                    (_c.get("put_short_premium", 0)  - _ps_x)
+                    + (_c.get("call_short_premium", 0) - _cs_x)
+                    - (_c.get("put_long_premium", 0)   - _pl_x)
+                    - (_c.get("call_long_premium", 0)  - _cl_x)
+                ) * _lot_c
+                _put_wing_x  = abs(_c.get("put_short_strike", 0)  - _c.get("put_long_strike", 0))
+                _call_wing_x = abs(_c.get("call_short_strike", 0) - _c.get("call_long_strike", 0))
+                # Fixed 2026-08-21 (deep review): real-fill basis
+                # (matching entry reservation / normal exit release),
+                # was still using the stale quote-based net_credit here.
+                _fill_credit_c = (
+                    (_c.get("put_short_premium", 0) - _c.get("put_long_premium", 0))
+                    + (_c.get("call_short_premium", 0) - _c.get("call_long_premium", 0))
+                )
+                self.risk_manager.release_deployed_capital(
+                    _c.get("strategy_name", "iron_condor_v1"),
+                    (max(_put_wing_x, _call_wing_x) - _fill_credit_c) * _lot_c,
+                )
+                # Fixed 2026-09-04: use this STRUCTURE's own dte, not the
+                # global near-month dte (see fix note above).
+                await self._log_trade_close(
+                    journal_id=_c.get("journal_id"),
+                    exit_price=round(_ps_x + _cs_x - _pl_x - _cl_x, 2),
+                    pnl=round(_net_c, 2),
+                    exit_reason=f"Expiry day force-close (DTE={_condor_dte.get(_sym, dte)})",
+                )
+            except Exception as exc:
+                # See the matching comment on the spread loop above --
+                # same rationale: broker position is already flat, so
+                # this entry still gets cleared below; only the journal
+                # write is lost without a loud alert to fix it by hand.
+                logger.error(
+                    f"Expiry force-close journal error [condor {_c.get('put_short_contract', '?')}]: {exc}"
+                )
+                await self._notify(
+                    f"CRITICAL: expiry force-close journal write FAILED\n"
+                    f"Condor: {_c.get('put_short_contract', '?')} / "
+                    f"{_c.get('call_short_contract', '?')}\n"
+                    f"journal_id={_c.get('journal_id')} error={exc}\n"
+                    f"Broker position is already closed -- only the trade_journal "
+                    f"row is missing its exit. MANUAL INTERVENTION REQUIRED: correct "
+                    f"trade_journal.exit_time/exit_price/pnl for journal_id="
+                    f"{_c.get('journal_id')} by hand."
+                )
+
+        # Expiry-day clear — only structures confirmed fully closed above
+        # (2026-08-20 fix: previously an unconditional .clear() dropped
+        # every structure regardless of whether all its legs actually closed).
+        for _sym in _spreads_done:
+            del self._active_spreads[_sym]
+        for _sym in _condors_done:
+            del self._active_condors[_sym]
+        await self._persist_state()
+
+        # Fixed 2026-09-04: merged from a global is_expiry/else branch into
+        # one unconditional summary -- with per-structure expiry, BOTH some
+        # structures force-closing at their own expiry AND other structures
+        # (or single-leg EMA legs) being handled normally can genuinely
+        # happen in the same run now, which the old either/or branching
+        # couldn't represent.
+        held_spreads = len(self._active_spreads)
+        held_condors = len(self._active_condors)
+        parts = []
+        if closed_ema:
+            parts.append(f"Closed {closed_ema} EMA crossover leg(s).")
+        if closed_expiry:
+            parts.append(
+                f"Force-closed {closed_expiry} spread/condor leg(s) at their own "
+                f"expiry (DTE<=1) to avoid assignment risk."
+            )
+        if held_spreads or held_condors:
+            parts.append(
+                f"Holding overnight: {held_spreads} spread(s) + {held_condors} condor(s). "
+                f"Exit conditions (SL/profit/DTE<7, or their own expiry) active tomorrow."
+            )
+        if parts and not self._eod_notified_today:
+            self._eod_notified_today = True
+            await self._notify("EOD POSITION UPDATE\n" + "\n".join(parts))
 
     # ── Trade Journal helpers ─────────────────────────────────────────────────
 

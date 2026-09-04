@@ -588,19 +588,6 @@ class OrderManager:
                     f"remainder ({_remaining_qty}) is eligible for capital release/retry."
                 )
 
-            # Release deployed capital tentatively added at submission — only
-            # ever applies to the same case place_order() adds it for (BUY,
-            # strategy_name set, not a spread/condor hedge leg). Independent
-            # of whether we go on to retry below. Only the unfilled
-            # remainder's capital is released -- see comment above.
-            if (
-                _remaining_qty > 0 and ctx and order.price is not None
-                and order.side == "BUY" and ctx.get("strategy") and not ctx.get("is_spread_leg")
-            ):
-                self.risk_manager.release_deployed_capital(
-                    ctx["strategy"], _remaining_qty * float(order.price)
-                )
-
             eligible = (
                 _remaining_qty > 0
                 and ctx is not None
@@ -609,8 +596,36 @@ class OrderManager:
                 and not ctx.get("is_retry")
                 and (ctx.get("is_exit_order") or ctx.get("strategy") not in _MULTI_LEG_STRATEGIES)
             )
+            # Fixed 2026-09-04 (live incident): computed BEFORE the release
+            # below (used to be computed after) specifically so the release
+            # can use the SAME price basis that place_order() will re-add on
+            # retry, eliminating a ~1.5% capital-accounting drift every time
+            # a retry actually happens -- release used the ORIGINAL
+            # order.price while the retry's own place_order() call re-added
+            # capital via quantity * retry_price (_adjusted_retry_price()
+            # moves price ~1.5% toward the market), a persistent mismatch
+            # between _strategy_deployed and the strategy's true capital
+            # budget on every retry. Not retrying still releases at the
+            # original order.price, correctly matching what was reserved.
+            retry_price = self._adjusted_retry_price(order.side, float(order.price)) if eligible else None
+            _release_price = retry_price if retry_price is not None else (
+                float(order.price) if order.price is not None else None
+            )
+
+            # Release deployed capital tentatively added at submission — only
+            # ever applies to the same case place_order() adds it for (BUY,
+            # strategy_name set, not a spread/condor hedge leg). Independent
+            # of whether we go on to retry below. Only the unfilled
+            # remainder's capital is released -- see comment above.
+            if (
+                _remaining_qty > 0 and ctx and _release_price is not None
+                and order.side == "BUY" and ctx.get("strategy") and not ctx.get("is_spread_leg")
+            ):
+                self.risk_manager.release_deployed_capital(
+                    ctx["strategy"], _remaining_qty * _release_price
+                )
+
             if eligible:
-                retry_price = self._adjusted_retry_price(order.side, float(order.price))
                 logger.info(
                     f"Retrying stale order {order.id}: {order.side} {_remaining_qty} "
                     f"{order.symbol} @ Rs{order.price} -> Rs{retry_price} (one attempt only)"
@@ -662,10 +677,29 @@ class OrderManager:
         forwarded that fill_price to the DB until sync_orders() ran later).
         """
         updates: Dict[str, Any] = {}
-        if existing_fill_price is None:
-            b_fill = b_order.get("fill_price") or b_order.get("average_price")
-            if b_fill:
-                b_fill = float(b_fill)
+        # Fixed 2026-09-04 (live incident): this used to only ever write
+        # fill_price ONCE (the `if existing_fill_price is None:` guard) --
+        # correct for a single atomic fill, but wrong the moment an order
+        # fills in more than one tranche. filled_quantity is deliberately
+        # re-read on every poll (see the comment below, already fixed
+        # 2026-08-21) because it keeps growing across a partial fill; the
+        # SAME growth applies to the broker's reported average_price, which
+        # is a running average over however much has filled so far and
+        # keeps moving until the order is fully done. Once-only capture froze
+        # fill_price at whatever the average was on the FIRST poll that saw
+        # any fill at all -- and every downstream consumer treats fill_price
+        # as the authoritative real price (_real_fill() -> every entry/exit
+        # P&L calc -> trade_journal -> the daily-loss kill switch's PnL
+        # baseline -> StrategyMonitor's rolling PF/drawdown). PaperBroker
+        # fills synchronously/atomically (no partials), so this was invisible
+        # in paper mode -- it fires the first time a live Zerodha LIMIT order
+        # fills in multiple tranches, routine for thin F&O contracts. Now
+        # re-read on every poll, same as filled_quantity, so the value always
+        # reflects the broker's current (eventually final) average price.
+        b_fill = b_order.get("fill_price") or b_order.get("average_price")
+        if b_fill:
+            b_fill = float(b_fill)
+            if b_fill != existing_fill_price:
                 updates["fill_price"] = b_fill
                 if expected_price:
                     updates["slippage"] = round(b_fill - expected_price, 4)
