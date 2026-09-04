@@ -123,12 +123,21 @@ def check_eod_notification_guard(repo: Path) -> Result:
     src = _read(repo, "src/live_trading/live_trading_engine.py")
     if "_eod_notified_today" not in src:
         return FAIL, name, "_eod_notified_today flag not found — is_square_off_time() is true for the whole 15:20-15:30 window and _square_off_all() runs every cycle in it, so without this the notification spams every minute."
+    # Fixed 2026-09-04: _square_off_all() used to branch on the GLOBAL
+    # near-month is_expiry into two separate notify paths (expiry-day /
+    # normal-day), each with its own guard -- hence this check originally
+    # required 2. That branch was a real bug (see the per-structure expiry
+    # fix the same day) and has been consolidated into ONE unconditional
+    # summary with a single guard, since per-structure expiry means "some
+    # closed at their own expiry AND others held" can genuinely both be true
+    # in the same run, which the old either/or branch couldn't represent.
+    # One guarded path is strictly safer than needing to keep two in sync.
     guards = len(re.findall(r"and not self\._eod_notified_today", src))
-    if guards < 2:
-        return FAIL, name, f"Expected the guard on both the expiry-day and normal-day notify calls, found {guards}/2."
+    if guards < 1:
+        return FAIL, name, f"Expected at least one guard on the EOD/expiry notify call, found {guards}."
     if "self._eod_notified_today = False" not in src:
         return FAIL, name, "Flag is never reset — would stay stuck 'already notified' forever after the first trading day."
-    return PASS, name, "Guard present on both notify paths and reset at market open."
+    return PASS, name, "Guard present on the (now-consolidated, single-path) notify call and reset at market open."
 
 
 def check_dte_rollover_exists(repo: Path) -> Result:
