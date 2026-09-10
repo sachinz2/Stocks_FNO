@@ -193,6 +193,17 @@ class EMACrossoverStrategy(StrategyBase):
         self.underlying_stop_atr_mult   = self.parameters.get("underlying_stop_atr_mult", 1.4)
         self.underlying_target_atr_mult = self.parameters.get("underlying_target_atr_mult", 2.0)
 
+        # Fixed 2026-09-10 (user request): an ADDITIONAL, independent exit --
+        # alongside (not replacing) trailing_stop_pct/breakeven_activation_pct.
+        # Once this position's absolute profit (Rs, not %) first crosses the
+        # engine's activation floor (default Rs700 -- PROFIT_BOOKING_
+        # ACTIVATION_RS, engine-side since it needs cross-cycle peak tracking
+        # the strategy object doesn't own), exit once profit has given back
+        # this fraction of its peak. See manage_position()'s check below and
+        # live_trading_engine.py's _check_open_option_exits() for the
+        # peak-tracking side. Same mechanism as momentum_v1's.
+        self.profit_booking_giveback_pct = self.parameters.get("profit_booking_giveback_pct", 0.35)
+
         # Fixed 2026-08-21 (external review, section 14): expose the same
         # delta-based strike selection mechanism built for momentum_v1 --
         # None/0 keeps the existing ATM behavior (this strategy's own
@@ -245,7 +256,9 @@ class EMACrossoverStrategy(StrategyBase):
             f"ConfirmBars={self.signal_confirm_bars} | "
             f"EMAReversalExit={self.ema_reversal_exit} "
             f"(min_gap={self.ema_reversal_min_gap_pct:.2%}, confirm_bars={self.ema_reversal_confirm_bars}) | "
-            f"EntryMinGap={self.entry_min_gap_pct:.2%}"
+            f"EntryMinGap={self.entry_min_gap_pct:.2%} | "
+            f"ProfitBooking: giveback {self.profit_booking_giveback_pct:.0%} of peak "
+            f"once profit crosses engine activation floor"
         )
 
     def generate_signal(self, data: Dict[str, Any]) -> Optional[str]:
@@ -493,8 +506,24 @@ class EMACrossoverStrategy(StrategyBase):
           - entry_underlying_price, entry_atr : optional, feed the
                               underlying-based stop/target added 2026-08-21;
                               skipped gracefully if either is missing.
+          - quantity, peak_profit_rs : added 2026-09-10 (user request), feed
+                              the Rs-profit-booking exit below; peak_profit_rs
+                              is None until the engine's activation floor
+                              (default Rs700) has been crossed at least once,
+                              and the check is skipped (not fail-closed) if
+                              either is missing.
 
         Exit conditions (in priority order):
+          0. Rs-profit-booking giveback (added 2026-09-10, user request) —
+                                checked FIRST, ahead of everything else: once
+                                profit has ever crossed the engine's Rs
+                                activation floor, exit if it has since given
+                                back profit_booking_giveback_pct of its peak.
+                                Protecting an already-large, realized gain
+                                from evaporating is treated as a distinct,
+                                higher-priority concern than the checks below
+                                — ADDITIONAL to (not a replacement for) the
+                                pct-based trailing stop (#5)/breakeven (#6).
           1. Underlying-based stop/target (added 2026-08-21) — mirrors
                                 momentum_v1's round-2 addition, and checked
                                 first for the same reason momentum_v1's own
@@ -536,6 +565,28 @@ class EMACrossoverStrategy(StrategyBase):
         # close, not just the reversal check's own exit -- see
         # _clear_reversal_state()'s docstring for why this matters.
         contract_id = current_position.get("contract")
+
+        # 0. Fixed 2026-09-10 (user request): Rs-profit-booking giveback,
+        # checked FIRST -- see this method's docstring (check #0) for why.
+        # peak_profit_rs is None until the engine's activation floor
+        # (default Rs700) has been crossed at least once for this position;
+        # skipped gracefully (not fail-closed) until then, and if quantity
+        # is missing (e.g. an older restored position).
+        _pb_qty = current_position.get("quantity")
+        _pb_peak_rs = current_position.get("peak_profit_rs")
+        if _pb_peak_rs is not None and _pb_qty:
+            _pb_current_rs = (current_premium - entry_premium) * _pb_qty
+            _pb_floor = _pb_peak_rs * (1 - self.profit_booking_giveback_pct)
+            if _pb_current_rs <= _pb_floor:
+                logger.info(
+                    f"[{self.name}] Profit-booking giveback: current profit "
+                    f"Rs{_pb_current_rs:.0f} <= Rs{_pb_floor:.0f} "
+                    f"({self.profit_booking_giveback_pct:.0%} given back from "
+                    f"peak Rs{_pb_peak_rs:.0f}) -- exiting."
+                )
+                if contract_id is not None:
+                    self._clear_reversal_state(contract_id)
+                return "EXIT"
 
         # 1. Underlying-based stop/target (added 2026-08-21) -- see
         # docstring and momentum.py's identical pattern for the rationale.

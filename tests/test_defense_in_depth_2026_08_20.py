@@ -179,7 +179,7 @@ async def test_last_signal_date_persists_and_restores_across_restart():
         _redis=_FakeRedis(),
         _active_spreads={}, _active_condors={}, _single_leg_journals={},
         _exited_today=set(), _profit_closed_today=set(), _today_order_count=0,
-        _peak_premiums={}, _last_signal_date={"momentum_v1": "2026-08-15"},
+        _peak_premiums={}, _peak_profits={}, _last_signal_date={"momentum_v1": "2026-08-15"},
     )
 
     await LiveTradingEngine._persist_state(fake)

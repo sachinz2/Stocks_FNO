@@ -53,7 +53,7 @@ def _fake_engine(active_condors, active_spreads=None):
             place_order=AsyncMock(return_value=SimpleNamespace(order_status="OPEN", fill_price=5.0))
         ),
         risk_manager=_FakeRiskMgr(),
-        _peak_premiums={}, _single_leg_journals={},
+        _peak_premiums={}, _peak_profits={}, _single_leg_journals={},
         _active_spreads=active_spreads or {}, _active_condors=active_condors,
         _kite=None, _redis=None,
         _eod_notified_today=False,

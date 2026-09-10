@@ -216,6 +216,17 @@ class MomentumStrategy(StrategyBase):
         self.underlying_stop_atr_mult   = self.parameters.get("underlying_stop_atr_mult", 1.0)
         self.underlying_target_atr_mult = self.parameters.get("underlying_target_atr_mult", 2.0)
 
+        # Fixed 2026-09-10 (user request): an ADDITIONAL, independent exit --
+        # alongside (not replacing) trailing_stop_pct/breakeven_activation_pct
+        # above. Once this position's absolute profit (Rs, not %) first
+        # crosses the engine's activation floor (default Rs700 --
+        # PROFIT_BOOKING_ACTIVATION_RS, engine-side since it needs
+        # cross-cycle peak tracking the strategy object doesn't own), exit
+        # once profit has given back this fraction of its peak. See
+        # manage_position()'s check below and live_trading_engine.py's
+        # _check_open_option_exits() for the peak-tracking side.
+        self.profit_booking_giveback_pct = self.parameters.get("profit_booking_giveback_pct", 0.35)
+
         # Signal confirmation: the ADX/EMA-spread condition must hold for this
         # many distinct 5-min bars before firing — same debouncing principle as
         # EMACrossoverStrategy's signal_confirm_bars, needed because ADX/EMA
@@ -329,7 +340,9 @@ class MomentumStrategy(StrategyBase):
             f"PullbackModel={self.use_pullback_continuation_model} "
             f"(max_bars={self.max_pullback_bars}, breakout_RVOL>={self.breakout_rvol_min} "
             f"after contraction<{self.pullback_rvol_low}) | "
-            f"ConfirmBars={self.signal_confirm_bars} (legacy path only)"
+            f"ConfirmBars={self.signal_confirm_bars} (legacy path only) | "
+            f"ProfitBooking: giveback {self.profit_booking_giveback_pct:.0%} of peak "
+            f"once profit crosses engine activation floor"
         )
 
     def generate_signal(self, data: Dict[str, Any]) -> Optional[str]:
@@ -812,8 +825,25 @@ class MomentumStrategy(StrategyBase):
                               underlying-based stop/target added 2026-08-21
                               (round 2); skipped (not fail-closed) if either
                               is missing.
+          - quantity, peak_profit_rs : added 2026-09-10 (user request), feed
+                              the Rs-profit-booking exit below; peak_profit_rs
+                              is None until the engine's activation floor
+                              (default Rs700) has been crossed at least once,
+                              and the check is skipped (not fail-closed) if
+                              either is missing.
 
         Exit conditions (in priority order):
+          0. Rs-profit-booking giveback (added 2026-09-10, user request) —
+                                  checked FIRST, ahead of everything else:
+                                  once profit has ever crossed the engine's
+                                  Rs activation floor, exit if it has since
+                                  given back profit_booking_giveback_pct of
+                                  its peak. Protecting an already-large,
+                                  realized gain from evaporating is treated
+                                  as a distinct, higher-priority concern than
+                                  the directional/structural checks below —
+                                  ADDITIONAL to (not a replacement for) the
+                                  pct-based trailing stop (#6)/breakeven (#7).
           1. Underlying-based stop/target (added 2026-08-21, round 2) — the
                                   PRIMARY exit driver per the external
                                   review: underlying's close has moved
@@ -859,6 +889,26 @@ class MomentumStrategy(StrategyBase):
 
         pnl_pct = (current_premium - entry_premium) / entry_premium
         current_adx = current_position.get("current_adx")
+
+        # Fixed 2026-09-10 (user request): Rs-profit-booking giveback,
+        # checked FIRST -- see this method's docstring (check #0) for why.
+        # peak_profit_rs is None until the engine's activation floor
+        # (default Rs700) has been crossed at least once for this position;
+        # skipped gracefully (not fail-closed) until then, and if quantity
+        # is missing (e.g. an older restored position).
+        _pb_qty = current_position.get("quantity")
+        _pb_peak_rs = current_position.get("peak_profit_rs")
+        if _pb_peak_rs is not None and _pb_qty:
+            _pb_current_rs = (current_premium - entry_premium) * _pb_qty
+            _pb_floor = _pb_peak_rs * (1 - self.profit_booking_giveback_pct)
+            if _pb_current_rs <= _pb_floor:
+                logger.info(
+                    f"[{self.name}] Profit-booking giveback: current profit "
+                    f"Rs{_pb_current_rs:.0f} <= Rs{_pb_floor:.0f} "
+                    f"({self.profit_booking_giveback_pct:.0%} given back from "
+                    f"peak Rs{_pb_peak_rs:.0f}) -- exiting."
+                )
+                return "EXIT"
 
         # Fixed 2026-08-21 (external review, round 2 -- sections 20-21):
         # underlying-based stop/target, the PRIMARY exit driver per the

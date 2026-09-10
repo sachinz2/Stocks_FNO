@@ -45,7 +45,7 @@ def _reversal_engine(order_status):
     stub = SimpleNamespace(
         order_manager=SimpleNamespace(place_order=AsyncMock(return_value=_FakeOrder(order_status, 40.0))),
         risk_manager=_FakeRiskMgr(),
-        _peak_premiums={"RELIANCE26AUG2900CE": 45.0},
+        _peak_premiums={"RELIANCE26AUG2900CE": 45.0}, _peak_profits={},
         _single_leg_journals={"RELIANCE26AUG2900CE": {"journal_id": 1, "strategy_name": "ema_crossover_v1"}},
         _kite=None, _redis=None,
         _real_fill=LiveTradingEngine._real_fill,
@@ -103,7 +103,7 @@ async def test_square_off_does_not_journal_close_when_broker_rejects(monkeypatch
     fake = SimpleNamespace(
         order_manager=SimpleNamespace(place_order=AsyncMock(return_value=_FakeOrder("FAILED"))),
         risk_manager=_FakeRiskMgr(),
-        _peak_premiums={"TCS26AUG3800CE": 55.0},
+        _peak_premiums={"TCS26AUG3800CE": 55.0}, _peak_profits={},
         _single_leg_journals={"TCS26AUG3800CE": {"journal_id": 2, "strategy_name": "momentum_v1"}},
         _active_spreads={}, _active_condors={},
         _kite=None, _redis=None,
@@ -138,7 +138,7 @@ async def test_exit_all_options_for_does_not_journal_close_when_broker_rejects(m
     fake = SimpleNamespace(
         order_manager=SimpleNamespace(place_order=AsyncMock(return_value=_FakeOrder("FAILED"))),
         risk_manager=_FakeRiskMgr(),
-        _peak_premiums={},
+        _peak_premiums={}, _peak_profits={},
         _single_leg_journals={"CIPLA26AUG1500CE": {"journal_id": 3, "strategy_name": "ema_crossover_v1"}},
         _active_spreads={}, _active_condors={}, _exited_today=set(),
         _kite=None, _redis=None,

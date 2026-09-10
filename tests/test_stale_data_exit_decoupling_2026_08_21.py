@@ -63,6 +63,9 @@ class _FakeExitCheckEngine:
             }
         }
         self._peak_premiums = {}
+        self._peak_profits = {}
+        self._PROFIT_BOOKING_ACTIVATION_RS = 700.0
+        self._PROFIT_BOOKING_GIVEBACK_PCT = 0.35
         self._stale_data_since = {}
         self._stale_data_alerted = set()
         self._STALE_DATA_ALERT_SECONDS = 120

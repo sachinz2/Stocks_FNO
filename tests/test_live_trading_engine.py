@@ -214,6 +214,7 @@ class _FakeEngine:
         self.order_manager = _FakeOrderManager(fill_price)
         self.risk_manager = _FakeRiskManager()
         self._peak_premiums = {"TITAN26AUG4975CE": 50.0}
+        self._peak_profits = {}
         self._single_leg_journals = {
             "TITAN26AUG4975CE": {
                 "journal_id": 154, "underlying": "TITAN",
@@ -542,6 +543,7 @@ class _FakeSquareOffEngine:
         self.order_manager = _FakeSquareOffOrderManager(fill_price)
         self.risk_manager = _FakeRiskManager()
         self._peak_premiums = {"TITAN26AUG4950CE": 50.0}
+        self._peak_profits = {}
         self._single_leg_journals = {
             "TITAN26AUG4950CE": {"journal_id": 200, "strategy_name": "ema_crossover_v1"},
         }
@@ -652,6 +654,7 @@ class _FakeMultiSquareOffEngine:
         )
         self.risk_manager = _FakeRiskManager()
         self._peak_premiums = {"TITAN26AUG4950CE": 50.0, "RELIANCE26AUG1400CE": 20.0}
+        self._peak_profits = {}
         self._single_leg_journals = {
             "TITAN26AUG4950CE":    {"journal_id": 200, "strategy_name": "ema_crossover_v1"},
             "RELIANCE26AUG1400CE": {"journal_id": 201, "strategy_name": "momentum_v1"},
@@ -734,6 +737,7 @@ class _FakeExpiryJournalFailEngine:
         self.order_manager = _FakeExpiryJournalFailOrderManager(fill_price=5.0)
         self.risk_manager = _FakeRiskManager()
         self._peak_premiums = {}
+        self._peak_profits = {}
         self._single_leg_journals = {}
         self._active_spreads = {
             "GOODSPR": {
@@ -855,6 +859,7 @@ class _FakeExitAllEngine:
         self.order_manager = _FakeExitAllOrderManager(fill_price)
         self.risk_manager = _FakeRiskManager()
         self._peak_premiums = {"CIPLA26AUG1250CE": 30.0}
+        self._peak_profits = {}
         self._single_leg_journals = {
             "CIPLA26AUG1250CE": {"journal_id": 300, "strategy_name": "ema_crossover_v1"},
         }

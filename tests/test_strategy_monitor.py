@@ -53,18 +53,19 @@ class _FakeRepo:
 
 
 @pytest.mark.asyncio
-async def test_drawdown_check_actually_fires_and_auto_pauses():
+async def test_evaluate_strategy_never_auto_pauses_even_on_a_severe_drawdown():
+    """Removed 2026-09-10 (explicit user request): _evaluate_strategy() must
+    be a pure no-op now, regardless of how bad the rolling PF/drawdown is --
+    auto-pause enforcement is gone entirely, not just tuned. This is the
+    same 30-trade construction the old test used (20 wins of +1000, one
+    -18,000 loss well past credit_spread_v1's drawdown threshold, then 9
+    more wins) specifically because it used to trigger a real pause; now it
+    must not."""
     sid = "credit_spread_v1"
     StrategyRegistry._active_instances[sid] = _FakeStrategy(sid, {})
     StrategyRegistry._active_instances[sid].is_active = True
 
     try:
-        # 30 trades constructed to isolate Check 2 (drawdown) from Check 1
-        # (profit factor): 20 wins of +1000 (peak 20,000), one -18,000 loss
-        # (drawdown = 18,000, > 1.5x credit_spread_v1's 10,000 expected =
-        # 15,000 threshold), then 9 more +1000 wins. PF = 29000/18000 ~= 1.61,
-        # comfortably above the 0.9 floor, so Check 1 must NOT fire -- only
-        # Check 2 should.
         pnls = [1000] * 20 + [-18000] + [1000] * 9
         rows = [_Row(p) for p in pnls]
         monitor = StrategyMonitor(_FakeRepo(rows))
@@ -72,8 +73,31 @@ async def test_drawdown_check_actually_fires_and_auto_pauses():
         await monitor._evaluate_strategy(sid)
 
         inst = StrategyRegistry._active_instances[sid]
-        assert inst.is_active is False, "strategy with a real large drawdown must be auto-paused"
-        assert "drawdown" in (monitor._pause_reasons.get(sid) or "").lower()
+        assert inst.is_active is True, "auto-pause has been removed -- must never pause a strategy"
+        assert monitor._pause_reasons.get(sid) is None
+    finally:
+        del StrategyRegistry._active_instances[sid]
+
+
+@pytest.mark.asyncio
+async def test_get_report_still_shows_rolling_pf_and_drawdown_for_monitoring():
+    """Guard against over-removing: get_report() (the /analytics/strategy-health
+    data source) must keep computing real numbers for manual monitoring even
+    though nothing acts on them automatically anymore."""
+    sid = "credit_spread_v1"
+    StrategyRegistry._active_instances[sid] = _FakeStrategy(sid, {})
+    StrategyRegistry._active_instances[sid].is_active = True
+    try:
+        pnls = [1000] * 20 + [-18000] + [1000] * 9
+        rows = [_Row(p) for p in pnls]
+        monitor = StrategyMonitor(_FakeRepo(rows))
+
+        report = await monitor.get_report()
+
+        assert report[sid]["rolling_pf"] is not None
+        assert report[sid]["rolling_drawdown"] == 18000.0
+        assert report[sid]["is_active"] is True
+        assert report[sid]["paused_reason"] is None
     finally:
         del StrategyRegistry._active_instances[sid]
 
@@ -124,7 +148,12 @@ async def test_manual_resume_grace_period_prevents_immediate_re_pause():
 
 
 @pytest.mark.asyncio
-async def test_manual_resume_still_re_pauses_once_enough_fresh_bad_trades_close():
+async def test_manual_resume_never_re_pauses_now_that_auto_pause_is_removed():
+    """Removed 2026-09-10 (explicit user request): this used to prove the
+    manual-resume grace period was not a PERMANENT bypass -- 30 fresh losing
+    trades since resume used to still trigger a real re-pause. Now that
+    auto-pause enforcement is gone entirely, that re-pause must never
+    happen, no matter how bad the fresh trades since resume are."""
     sid = "ema_crossover_v1"
     StrategyRegistry._active_instances[sid] = _FakeStrategy(sid, {})
     StrategyRegistry._active_instances[sid].is_active = True
@@ -132,8 +161,6 @@ async def test_manual_resume_still_re_pauses_once_enough_fresh_bad_trades_close(
         resume_time = datetime(2026, 8, 27, 9, 0, 0)
         old_time = resume_time - timedelta(days=1)
         new_time = resume_time + timedelta(hours=1)
-        # 20 old losses (must be excluded) + 30 NEW losses since resume
-        # (enough to re-evaluate, and bad enough to justify a real re-pause).
         rows = (
             [_Row(-2000, exit_time=old_time) for _ in range(20)]
             + [_Row(-2000, exit_time=new_time) for _ in range(30)]
@@ -144,10 +171,7 @@ async def test_manual_resume_still_re_pauses_once_enough_fresh_bad_trades_close(
         await monitor._evaluate_strategy(sid)
 
         inst = StrategyRegistry._active_instances[sid]
-        assert inst.is_active is False, (
-            "the grace period must not be a permanent bypass -- 30 genuinely "
-            "fresh losing trades since resume must still trigger a re-pause"
-        )
+        assert inst.is_active is True, "auto-pause has been removed -- must never re-pause"
     finally:
         del StrategyRegistry._active_instances[sid]
 

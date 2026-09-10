@@ -1,17 +1,24 @@
 """
-StrategyMonitor — Concern #4
+StrategyMonitor — rolling performance reporting (Concern #4)
 
-Automatically pauses strategies that show statistical deterioration:
-  1. Rolling profit factor < ROLLING_PF_FLOOR (default 0.9) over last N closed trades
-  2. Rolling drawdown > DRAWDOWN_MULTIPLIER × expected_drawdown
+Reads closed trades from the trade_journal table and computes rolling
+profit factor / drawdown per strategy for the /analytics/strategy-health
+dashboard. Does NOT touch live positions or pause strategies.
 
-The monitor reads closed trades from the trade_journal table; it does NOT touch
-live positions. Strategy auto-kill only blocks NEW entries — the engine continues
-to run exits for any positions already open.
+Removed 2026-09-10 (explicit user request): this used to auto-pause a
+strategy whenever its rolling PF fell below ROLLING_PF_FLOOR (0.9) or its
+rolling drawdown exceeded DRAWDOWN_MULTIPLIER x expected_drawdown, over the
+last ROLLING_WINDOW closed trades. In practice it repeatedly auto-paused
+ema_crossover_v1 at every single market open for over a week (rolling PF
+0.063, dominated by one bad trade cluster) with no way to recover except a
+manual /activate call each morning -- judged to cost more in lost trading
+opportunity than it protected against. See _evaluate_strategy()'s docstring
+for what was removed; rolling_pf/rolling_drawdown are still computed and
+displayed by get_report() for manual monitoring.
 
 Usage:
     monitor = StrategyMonitor(trade_journal_repo, expected_drawdown_map)
-    await monitor.evaluate_all()        # called every cycle by LiveTradingEngine
+    await monitor.evaluate_all()        # called every cycle by LiveTradingEngine (now a no-op)
     await monitor.get_report()          # called by /analytics/strategy-health API
 """
 
@@ -26,10 +33,13 @@ from src.strategies.base import StrategyRegistry
 logger = logging.getLogger(__name__)
 
 # ── Configurable thresholds ──────────────────────────────────────────────────
+# Fixed 2026-09-10: auto-pause enforcement (_evaluate_strategy()) was removed
+# per explicit user request -- these three still size the rolling window and
+# label the (now purely informational) pf_floor/dd_threshold fields in
+# get_report(), consumed by /analytics/strategy-health.
 ROLLING_WINDOW      = 30    # number of recent closed trades to evaluate
-ROLLING_PF_FLOOR    = 0.9   # pause if gross_wins / gross_losses < this
-DRAWDOWN_MULTIPLIER = 1.5   # pause if rolling_dd > multiplier × expected_dd
-MIN_TRADES_REQUIRED = 30    # don't evaluate with fewer trades — 10 is statistically meaningless
+ROLLING_PF_FLOOR    = 0.9   # displayed as the reference floor, no longer enforced
+DRAWDOWN_MULTIPLIER = 1.5   # displayed as the reference multiplier, no longer enforced
 
 # Expected per-strategy max drawdown (₹) — operator-configurable at startup.
 # These are conservative defaults; override via constructor.
@@ -59,8 +69,9 @@ DEFAULT_EXPECTED_DRAWDOWN: Dict[str, float] = {
 
 class StrategyMonitor:
     """
-    Evaluates rolling metrics for each active strategy and auto-pauses
-    when performance falls below operator-defined thresholds.
+    Computes rolling PF/drawdown metrics for each active strategy, for
+    manual monitoring via /analytics/strategy-health. No longer auto-pauses
+    -- see module docstring, removed 2026-09-10.
     """
 
     def __init__(
@@ -182,77 +193,25 @@ class StrategyMonitor:
         return trades
 
     async def _evaluate_strategy(self, strategy_id: str) -> None:
-        trades = await self._filtered_trades(strategy_id)
-
-        if len(trades) < MIN_TRADES_REQUIRED:
-            return  # not enough history to make a call
-
-        # ── Check 1: Rolling profit factor ────────────────────────────────────
-        pf = self._profit_factor(trades)
-        if pf is not None and pf < self.pf_floor:
-            reason = (
-                f"Rolling PF {pf:.3f} < floor {self.pf_floor} "
-                f"(last {len(trades)} trades)"
-            )
-            self._auto_pause(strategy_id, reason)
-            return
-
-        # ── Check 2: Rolling drawdown vs expected ─────────────────────────────
-        rolling_dd = self._rolling_drawdown(trades)
-        exp_dd     = self.expected_drawdown.get(
-            strategy_id,
-            DEFAULT_EXPECTED_DRAWDOWN.get(strategy_id, 0),
-        )
-        if exp_dd > 0 and rolling_dd is not None:
-            threshold = self.dd_multiplier * exp_dd
-            if rolling_dd > threshold:
-                reason = (
-                    f"Rolling drawdown ₹{rolling_dd:.0f} > "
-                    f"{self.dd_multiplier}× expected ₹{exp_dd:.0f} = ₹{threshold:.0f} "
-                    f"(last {len(trades)} trades)"
-                )
-                self._auto_pause(strategy_id, reason)
-                return
-
-        # ── All checks passed — log if previously paused ──────────────────────
-        if self._pause_reasons.get(strategy_id):
-            # Fixed 2026-08-20 (deep review): pf/rolling_dd can legitimately
-            # be None here (_profit_factor() returns None whenever the
-            # rolling window has zero losing trades -- "can't compute a
-            # denominator"), but this f-string used to format them with
-            # `:.3f`/`:.0f` unconditionally, raising an uncaught TypeError
-            # that -- with no try/except around evaluate_all()'s caller at
-            # the time -- aborted the rest of that signal cycle, including
-            # all new-entry generation, and would repeat every cycle for as
-            # long as the zero-losers condition persisted.
-            pf_str = f"{pf:.3f}" if pf is not None else "N/A"
-            dd_str = f"₹{rolling_dd:.0f}" if rolling_dd is not None else "N/A"
-            logger.info(
-                f"StrategyMonitor: {strategy_id} now healthy "
-                f"(PF={pf_str}, DD={dd_str}). "
-                "Operator must manually /resume to re-enable."
-            )
-
-    def _auto_pause(self, strategy_id: str, reason: str) -> None:
         """
-        Pause the strategy if it is still running.
-        Idempotent — safe to call repeatedly; only logs on the FIRST pause.
+        Removed 2026-09-10 (explicit user request): this used to auto-pause
+        a strategy whenever its rolling PF fell below pf_floor or its
+        rolling drawdown exceeded dd_multiplier x expected_drawdown (see git
+        history for the removed Check 1/Check 2 logic and _auto_pause()).
+        In practice this repeatedly auto-paused ema_crossover_v1 at every
+        single market open for over a week (rolling PF 0.063, dominated by
+        the Aug 24-26 trade cluster) with no way to recover except a manual
+        /activate call each morning -- the user decided this cost more in
+        lost trading opportunity than it protected against and asked for it
+        to be removed entirely, rather than tuned.
+        get_report() (used by /analytics/strategy-health) still computes and
+        displays rolling_pf/rolling_drawdown independently of this method --
+        those numbers remain visible for manual monitoring, they just no
+        longer trigger an automatic pause. Kept as a no-op (rather than
+        deleting evaluate_all()'s call site in the engine) so re-enabling
+        enforcement in the future is a small, localized change here.
         """
-        active = StrategyRegistry.get_active_strategies()
-        instance = active.get(strategy_id)
-        if not instance:
-            return
-
-        if instance.is_active:
-            StrategyRegistry.pause_strategy(strategy_id, reason=reason, source="monitor")
-            self._pause_reasons[strategy_id] = reason
-            # IST-naive, matching the rest of the system's convention (not
-            # currently displayed on the dashboard, but kept consistent —
-            # same bug class fixed elsewhere today).
-            self._paused_at[strategy_id] = now_ist().replace(tzinfo=None).isoformat()
-            logger.error(
-                f"AUTO-KILL: Strategy '{strategy_id}' paused. Reason: {reason}"
-            )
+        return
 
     async def _load_recent_trades(self, strategy_id: str):
         """

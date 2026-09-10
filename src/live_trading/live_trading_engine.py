@@ -59,6 +59,7 @@ _REDIS_ORDER_COUNT     = "engine:order_count"
 _REDIS_EMA_STATE       = "engine:ema_crossover_state"
 _REDIS_MOMENTUM_STATE  = "engine:momentum_state"
 _REDIS_PEAK_PREMIUMS   = "engine:peak_premiums"
+_REDIS_PEAK_PROFITS    = "engine:peak_profits"
 _REDIS_LAST_SIGNAL     = "engine:last_signal_date"
 
 
@@ -120,6 +121,22 @@ class LiveTradingEngine:
         # per-symbol duplicate check and the portfolio-wide daily order count.
         self._max_concurrent_intraday: int = getattr(settings, "MAX_CONCURRENT_INTRADAY", 2)
         self._peak_premiums:   Dict[str, float] = {}
+        # Fixed 2026-09-10 (user request): peak PROFIT in rupees per
+        # single-leg position, tracked ONLY once that position's profit has
+        # crossed PROFIT_BOOKING_ACTIVATION_RS at least once -- see
+        # _check_open_option_exits()'s update logic and momentum.py/
+        # ema_crossover.py's manage_position() for the exit check that
+        # consumes it. Distinct from _peak_premiums (peak option PRICE,
+        # unconditional, feeds the existing pct-based trailing stop) -- this
+        # is peak ABSOLUTE RUPEE PROFIT, gated behind an activation floor,
+        # feeding an ADDITIONAL, independent exit check alongside the
+        # existing trailing/breakeven logic (not a replacement for it).
+        self._peak_profits:    Dict[str, float] = {}
+        # Once a single-leg position's absolute profit (Rs) first reaches
+        # this, its peak profit starts being tracked (see above) and the
+        # additional 35%-give-back-from-peak exit becomes active for it.
+        self._PROFIT_BOOKING_ACTIVATION_RS: float = getattr(settings, "PROFIT_BOOKING_ACTIVATION_RS", 700.0)
+        self._PROFIT_BOOKING_GIVEBACK_PCT:  float = getattr(settings, "PROFIT_BOOKING_GIVEBACK_PCT", 0.35)
         self._active_spreads:       Dict[str, Dict[str, Any]] = {}
         self._active_condors:       Dict[str, Dict[str, Any]] = {}
         self._exited_today:         set = set()   # adverse exits today — blocks same-day re-entry
@@ -662,6 +679,7 @@ class LiveTradingEngine:
         await self._persist_state()
         self._today_order_count = 0
         self._peak_premiums.clear()
+        self._peak_profits.clear()
         # _active_spreads and _active_condors are intentionally NOT cleared here —
         # credit spreads and iron condors are multi-day theta strategies that must
         # carry overnight. They are managed by _check_spread_exits / _check_condor_exits
@@ -747,6 +765,11 @@ class LiveTradingEngine:
             # protection and letting the position ride all the way down to the
             # full hard stop instead.
             await redis.set(_REDIS_PEAK_PREMIUMS, json.dumps({"date": today, "peaks": self._peak_premiums}))
+            # Fixed 2026-09-10 (user request): same rationale as
+            # _REDIS_PEAK_PREMIUMS above -- a restart must not discard an
+            # already-activated profit-booking peak (see
+            # _check_open_option_exits()'s update logic).
+            await redis.set(_REDIS_PEAK_PROFITS,  json.dumps({"date": today, "peaks": self._peak_profits}))
             # Fixed 2026-08-20 (component review): _last_signal_date must
             # survive restarts for _check_signal_staleness() to correctly
             # span multiple days -- the incident it exists to catch (DTE-
@@ -1029,6 +1052,26 @@ class LiveTradingEngine:
                         if k in _known_contracts
                     }
                     logger.info(f"Restored {len(self._peak_premiums)} peak premium(s) for today")
+
+            # Fixed 2026-09-10 (user request): same restore rationale as
+            # _REDIS_PEAK_PREMIUMS just above, for the profit-booking peak.
+            profit_peaks_raw = await redis.get(_REDIS_PEAK_PROFITS)
+            if profit_peaks_raw:
+                profit_peaks_data = json.loads(profit_peaks_raw)
+                if profit_peaks_data.get("date") == today:
+                    _known_contracts_pp = set(self._single_leg_journals.keys())
+                    for s in self._active_spreads.values():
+                        _known_contracts_pp.update((s.get("short_contract"), s.get("long_contract")))
+                    for c in self._active_condors.values():
+                        _known_contracts_pp.update((
+                            c.get("put_short_contract"), c.get("put_long_contract"),
+                            c.get("call_short_contract"), c.get("call_long_contract"),
+                        ))
+                    self._peak_profits = {
+                        k: v for k, v in profit_peaks_data.get("peaks", {}).items()
+                        if k in _known_contracts_pp
+                    }
+                    logger.info(f"Restored {len(self._peak_profits)} peak profit(s) for today")
 
             # Fixed 2026-08-20 (component review): restore across restarts --
             # unlike the other per-day state above, this is NOT date-filtered
@@ -1757,6 +1800,28 @@ class LiveTradingEngine:
                     self._peak_premiums[contract] = current_p
                     peak = current_p
 
+                # Fixed 2026-09-10 (user request): a SEPARATE, additional
+                # profit-booking rule for intraday (single-leg) positions --
+                # once a position's absolute profit (Rs, not %) first
+                # reaches PROFIT_BOOKING_ACTIVATION_RS, track its peak
+                # profit every cycle (~1 min, this method's own cadence) and
+                # persist it (see _persist_state()/_restore_state()) the
+                # same way _peak_premiums already is. Runs ALONGSIDE the
+                # existing pct-based trailing_stop_pct/breakeven_activation_pct
+                # logic in manage_position() below, not in place of it --
+                # whichever check fires first closes the position. The
+                # actual "has it dropped 35% from peak, exit" decision is
+                # made by the strategy itself (momentum.py/ema_crossover.py),
+                # this just maintains the activation-gated peak and hands it
+                # over as plain data, same separation of concerns as `peak`
+                # (premium peak) above.
+                _current_profit_rs = (current_p - entry_p) * qty
+                if _current_profit_rs >= self._PROFIT_BOOKING_ACTIVATION_RS:
+                    _prior_profit_peak = self._peak_profits.get(contract)
+                    if _prior_profit_peak is None or _current_profit_rs > _prior_profit_peak:
+                        self._peak_profits[contract] = _current_profit_rs
+                peak_profit_rs = self._peak_profits.get(contract)
+
                 exit_reason: Optional[str] = None
                 # Fixed 2026-08-20 (deep review): force-close any position
                 # restored from a PREVIOUS day -- single-leg positions must
@@ -1810,6 +1875,14 @@ class LiveTradingEngine:
                         {
                             "avg_price": entry_p,
                             "peak_premium": peak,
+                            # Fixed 2026-09-10 (user request): feeds the
+                            # additional Rs-profit-booking exit (see the
+                            # engine-side tracking above and this dict's
+                            # consumer in manage_position()); peak_profit_rs
+                            # is None until this position's profit has
+                            # crossed the activation floor at least once.
+                            "quantity":       qty,
+                            "peak_profit_rs": peak_profit_rs,
                             "current_adx": market_data.get("adx14"),
                             # For the VOLATILE crash-catching reversal exit (see
                             # EMACrossoverStrategy.manage_position() /
@@ -1904,6 +1977,7 @@ class LiveTradingEngine:
             return False
 
         self._peak_premiums.pop(contract, None)
+        self._peak_profits.pop(contract, None)
         # Fixed 2026-08-06: was getattr(db_order, "avg_price", ...) -- the
         # Order model's real column is fill_price (see database/models/
         # order.py); "avg_price" doesn't exist on it at all, so this always
@@ -2216,10 +2290,10 @@ class LiveTradingEngine:
         logger.info(f"Signal [{strategy.name}] {signal_str} {symbol}")
 
         if signal_str in ("BULL_PUT_SPREAD", "BEAR_CALL_SPREAD"):
-            await self._process_credit_spread(strategy, symbol, signal_str, market_data, vix=vix)
+            await self._process_credit_spread(strategy, symbol, signal_str, market_data, vix=vix, regime=regime)
             return
         if signal_str == "IRON_CONDOR":
-            await self._process_iron_condor(strategy, symbol, market_data, vix=vix)
+            await self._process_iron_condor(strategy, symbol, market_data, vix=vix, regime=regime)
             return
         if signal_str == "EXIT":
             await self._exit_all_options_for(symbol)
@@ -2667,7 +2741,7 @@ class LiveTradingEngine:
                 structure_type="SINGLE_LEG", contracts=[contract],
                 entry_price=_entry_fill, quantity=lot_size,
                 market_data=market_data, iv_rank=iv_rank, vix=vix,
-                dte=dte, entry_option_delta=_delta_target,
+                dte=dte, entry_option_delta=_delta_target, regime=regime,
             )
             if journal_id:
                 self._single_leg_journals[contract] = {
@@ -2802,6 +2876,7 @@ class LiveTradingEngine:
                 logger.error(f"REVERSAL EXIT FAILED [{contract}]: order rejected or failed — position left open, will retry next cycle")
                 continue
             self._peak_premiums.pop(contract, None)
+            self._peak_profits.pop(contract, None)
             # Fixed 2026-08-07: sixth instance of the fill_price bug fixed
             # earlier today (single-leg/spread/condor exits, square-off,
             # exit_all_options_for) -- pnl was computed from exit_p (the
@@ -2833,6 +2908,7 @@ class LiveTradingEngine:
         spread_type: str,
         market_data: Dict[str, Any],
         vix: Optional[float] = None,
+        regime: Optional[str] = None,
     ) -> None:
         if symbol in self._active_spreads:
             return
@@ -3421,7 +3497,7 @@ class LiveTradingEngine:
             structure_type=spread_type,
             contracts=[short_contract, long_contract],
             entry_price=round(short_fill - long_fill, 2), quantity=lot_size,
-            market_data=market_data, iv_rank=iv_rank, vix=vix,
+            market_data=market_data, iv_rank=iv_rank, vix=vix, regime=regime,
             daily_atr_pct=_daily_atr, credit_to_max_loss_pct=_credit_to_max_loss,
             **_greeks_kwargs,
         )
@@ -3929,6 +4005,7 @@ class LiveTradingEngine:
         symbol: str,
         market_data: Dict[str, Any],
         vix: Optional[float] = None,
+        regime: Optional[str] = None,
     ) -> None:
         if symbol in self._active_condors:
             return
@@ -4442,7 +4519,7 @@ class LiveTradingEngine:
             structure_type="IRON_CONDOR", contracts=[psc, plc, csc, clc],
             entry_price=round(put_short_fill + call_short_fill - put_long_fill - call_long_fill, 2),
             quantity=lot_size,
-            market_data=market_data, iv_rank=iv_rank, vix=vix,
+            market_data=market_data, iv_rank=iv_rank, vix=vix, regime=regime,
             daily_atr_pct=_daily_atr, credit_to_max_loss_pct=_credit_to_max_loss,
             put_short_delta=_put_short_delta_val, call_short_delta=_call_short_delta_val,
             put_long_delta=_put_long_delta_val, call_long_delta=_call_long_delta_val,
@@ -4987,6 +5064,7 @@ class LiveTradingEngine:
                 logger.error(f"EXIT-SIGNAL CLOSE FAILED [{contract}]: order rejected or failed — position left open, will retry next cycle")
                 continue
             self._peak_premiums.pop(contract, None)
+            self._peak_profits.pop(contract, None)
             # float() cast: see 2026-08-12 fix note in _execute_single_leg_exit.
             _ex_fill_p = self._real_fill(_ex_order, exit_p)
 
@@ -5185,6 +5263,7 @@ class LiveTradingEngine:
                     logger.error(f"SQUARE-OFF FAILED [{contract}]: order rejected or failed — position left open overnight, will retry next cycle")
                     continue
                 self._peak_premiums.pop(contract, None)
+                self._peak_profits.pop(contract, None)
                 # Fixed 2026-08-07: same fill_price bug as _execute_single_leg_exit
                 # / credit-spread / iron-condor exits (fixed earlier today) --
                 # this fourth exit path also computed pnl from the pre-slippage
@@ -5471,6 +5550,7 @@ class LiveTradingEngine:
         market_data: Dict,
         iv_rank: Optional[float],
         vix: Optional[float],
+        regime: Optional[str] = None,
         dte: Optional[int] = None,
         entry_option_delta: Optional[float] = None,
         daily_atr_pct: Optional[float] = None,
@@ -5507,6 +5587,13 @@ class LiveTradingEngine:
                 "entry_price":    entry_price,
                 "quantity":       quantity,
                 "regime_atr_pct": round(atr_pct, 4),
+                # Fixed 2026-09-10: the REAL market-wide regime active at
+                # entry (VIX + market-wide ATR% + EMA spread -- the same
+                # classification that actually gated whether this strategy
+                # was even eligible to trade), not a fabricated per-stock
+                # approximation. See _log_trade_close()'s matching fix note
+                # for what this replaced.
+                "regime_label":   regime,
                 "ema_spread_pct": round(ema_sp, 4),
                 "iv_rank":        iv_rank,
                 "vix_at_entry":   vix,
@@ -5566,18 +5653,6 @@ class LiveTradingEngine:
             atr_exit = md.get("atr14") or md.get("atr_at_exit")
             vix_exit = md.get("vix") or md.get("vix_at_exit")
 
-            # Derive regime label from ATR%: same heuristic as LTPPoller
-            regime: Optional[str] = None
-            atr_pct = md.get("atr_pct")
-            if atr_pct is not None:
-                atr_pct = float(atr_pct)
-                if atr_pct >= 2.5:
-                    regime = "VOLATILE"
-                elif atr_pct >= 1.2:
-                    regime = "TRENDING"
-                else:
-                    regime = "RANGE_BOUND"
-
             updates = {
                 "exit_time":          exit_t,
                 "exit_price":         exit_price,
@@ -5586,7 +5661,14 @@ class LiveTradingEngine:
                 "hold_days":          hold_days,
                 "atr_at_exit":        float(atr_exit) if atr_exit is not None else None,
                 "vix_at_exit":        float(vix_exit) if vix_exit is not None else None,
-                "regime_label":       regime,
+                # Fixed 2026-09-10: regime_label is now set ONCE, at entry
+                # (_log_trade_open(), from the real market-wide regime that
+                # gated eligibility) -- this used to overwrite it here with a
+                # fabricated per-stock ATR%-only approximation computed at
+                # EXIT time, completely different from (and unrelated to) the
+                # actual regime classification used everywhere else in the
+                # system. Deliberately absent from `updates` now so exit
+                # never touches the entry-time value.
                 "total_slippage_pts": round(total_slippage_pts, 4) if total_slippage_pts is not None else None,
                 "slippage":           round(total_slippage_pts, 4) if total_slippage_pts is not None else None,
             }

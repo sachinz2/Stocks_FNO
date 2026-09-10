@@ -481,7 +481,7 @@ def test_main_py_wires_all_four_fixes_for_ema_crossover():
 def test_engine_passes_contract_and_bar_key_into_manage_position():
     src = inspect.getsource(LiveTradingEngine._check_open_option_exits)
     idx = src.index("result = owner_strategy.manage_position(")
-    block = src[idx:idx + 2300]
+    block = src[idx:idx + 3000]
     assert '"contract":     contract' in block
     assert '"ohlc_bar_key": market_data.get("ohlc_bar_key")' in block
 
