@@ -172,6 +172,15 @@ class MomentumStrategy(StrategyBase):
         self.stop_loss_pct     = self.parameters.get("stop_loss_pct", 0.50)
         self.target_pct        = self.parameters.get("target_pct", 1.50)
         self.trailing_stop_pct = self.parameters.get("trailing_stop_pct", 0.30)
+        # Fixed 2026-09-10 (user request): a bigger bet gets a tighter hard
+        # stop -- once this position's total premium value at entry
+        # (entry_premium x quantity, the actual Rs capital committed) exceeds
+        # large_position_threshold_rs, the hard stop loss (check below)
+        # tightens from stop_loss_pct to large_position_stop_loss_pct. Only
+        # the HARD stop -- weakening-trend stop/trailing/breakeven/target are
+        # unaffected.
+        self.large_position_threshold_rs = self.parameters.get("large_position_threshold_rs", 25_000.0)
+        self.large_position_stop_loss_pct = self.parameters.get("large_position_stop_loss_pct", 0.25)
         # Weakening-trend stop (added 2026-08-14) -- closes the dead zone
         # between adx_exit_threshold and adx_entry_threshold. Once ADX drops
         # below adx_entry_threshold, the trend is no longer strong enough to
@@ -331,7 +340,10 @@ class MomentumStrategy(StrategyBase):
             f"min_EMA_spread={self.min_ema_spread_pct}% (slope={self.ema_slope_required}) | "
             f"extension<={self.extension_atr_mult}xATR vwap_ext<={self.vwap_extension_pct}% | "
             f"RVOL>={self.rvol_entry_threshold} | delta_target={self.entry_option_delta or 'ATM'} | "
-            f"SL={self.stop_loss_pct:.0%} WeakeningSL={self.weakening_stop_loss_pct:.0%} "
+            f"SL={self.stop_loss_pct:.0%} "
+            f"(->{self.large_position_stop_loss_pct:.0%} if entry premium value "
+            f">Rs{self.large_position_threshold_rs:,.0f}) "
+            f"WeakeningSL={self.weakening_stop_loss_pct:.0%} "
             f"TP={self.target_pct:.0%} Trail={self.trailing_stop_pct:.0%} "
             f"Breakeven activates at +{self.breakeven_activation_pct:.0%} | "
             f"UnderlyingInvalidation={self.underlying_invalidation_exit} "
@@ -856,6 +868,10 @@ class MomentumStrategy(StrategyBase):
                                   ahead of every premium-based check below,
                                   which remain as a backstop.
           2. Hard stop loss     — premium fell >= stop_loss_pct from entry
+                                  (tightened to large_position_stop_loss_pct,
+                                  added 2026-09-10, if this position's total
+                                  entry premium value exceeds
+                                  large_position_threshold_rs)
           3. Weakening-trend stop — premium fell >= weakening_stop_loss_pct
                                   from entry AND ADX has already dropped below
                                   adx_entry_threshold (the trend no longer
@@ -952,10 +968,24 @@ class MomentumStrategy(StrategyBase):
                 )
                 return "EXIT"
 
-        if pnl_pct <= -self.stop_loss_pct:
+        # Fixed 2026-09-10 (user request): a bigger bet gets a tighter hard
+        # stop -- see initialize()'s param comments. total_premium_value is
+        # the Rs capital actually committed at entry (fixed for this
+        # position's life, unlike current P&L), so the threshold check is
+        # stable regardless of how current_premium moves.
+        _quantity = current_position.get("quantity")
+        _effective_stop_loss_pct = self.stop_loss_pct
+        if _quantity:
+            _total_premium_value = entry_premium * _quantity
+            if _total_premium_value > self.large_position_threshold_rs:
+                _effective_stop_loss_pct = self.large_position_stop_loss_pct
+
+        if pnl_pct <= -_effective_stop_loss_pct:
             logger.info(
                 f"[{self.name}] Stop loss hit: entry={entry_premium:.2f} "
-                f"current={current_premium:.2f} ({pnl_pct:.1%})"
+                f"current={current_premium:.2f} ({pnl_pct:.1%}) "
+                f"[stop={_effective_stop_loss_pct:.0%}"
+                f"{' -- large position' if _effective_stop_loss_pct != self.stop_loss_pct else ''}]"
             )
             return "EXIT"
 

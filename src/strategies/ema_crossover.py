@@ -87,6 +87,15 @@ class EMACrossoverStrategy(StrategyBase):
         self.stop_loss_pct = self.parameters.get("stop_loss_pct", 0.50)
         self.target_pct = self.parameters.get("target_pct", 1.0)
         self.trailing_stop_pct = self.parameters.get("trailing_stop_pct", 0.25)
+        # Fixed 2026-09-10 (user request): a bigger bet gets a tighter hard
+        # stop -- once this position's total premium value at entry
+        # (entry_premium x quantity, the actual Rs capital committed) exceeds
+        # large_position_threshold_rs, the hard stop loss (check below)
+        # tightens from stop_loss_pct to large_position_stop_loss_pct. Only
+        # the HARD stop -- trailing/breakeven/target are unaffected. Same
+        # mechanism as momentum_v1's.
+        self.large_position_threshold_rs = self.parameters.get("large_position_threshold_rs", 25_000.0)
+        self.large_position_stop_loss_pct = self.parameters.get("large_position_stop_loss_pct", 0.25)
         # Once a position has been up at least this much from entry, it must
         # never be allowed to close as a realized loss -- see manage_position()'s
         # breakeven-stop check for why trailing_stop_pct alone doesn't guarantee this.
@@ -249,7 +258,10 @@ class EMACrossoverStrategy(StrategyBase):
             f"RVOL hard_gate={self.rvol_hard_gate} | require_RS={self.require_rs} | "
             f"MTF strict={self.mtf_strict} strong_opposition>={self.mtf_strong_opposition_pct}% | "
             f"delta_target={self.entry_option_delta or 'ATM'} | "
-            f"SL={self.stop_loss_pct:.0%} TP={self.target_pct:.0%} Trail={self.trailing_stop_pct:.0%} "
+            f"SL={self.stop_loss_pct:.0%} "
+            f"(->{self.large_position_stop_loss_pct:.0%} if entry premium value "
+            f">Rs{self.large_position_threshold_rs:,.0f}) "
+            f"TP={self.target_pct:.0%} Trail={self.trailing_stop_pct:.0%} "
             f"Breakeven activates at +{self.breakeven_activation_pct:.0%} | "
             f"UnderlyingStop={self.underlying_stop_atr_mult}xATR "
             f"UnderlyingTarget={self.underlying_target_atr_mult}xATR | "
@@ -550,6 +562,10 @@ class EMACrossoverStrategy(StrategyBase):
                                 VOLATILE-specific concept. Toggle via
                                 ema_reversal_exit.
           3. Hard stop loss  — premium fell >= stop_loss_pct (default 50%) from entry
+                                (tightened to large_position_stop_loss_pct,
+                                added 2026-09-10, if this position's total
+                                entry premium value exceeds
+                                large_position_threshold_rs)
           4. Profit target   — premium rose >= target_pct (default 100%, i.e. 2×) from entry
           5. Trailing stop   — premium fell >= trailing_stop_pct (default 25%) from its peak
           6. Breakeven stop  — once up >= breakeven_activation_pct (default 15%) from
@@ -711,11 +727,21 @@ class EMACrossoverStrategy(StrategyBase):
                     self._reversal_pending_count.pop(contract, None)
                     self._reversal_pending_bar_key.pop(contract, None)
 
-        # 3. Hard stop loss
-        if pnl_pct <= -self.stop_loss_pct:
+        # 3. Hard stop loss -- Fixed 2026-09-10 (user request): tightened
+        # for a bigger bet, see initialize()'s param comments.
+        _quantity = current_position.get("quantity")
+        _effective_stop_loss_pct = self.stop_loss_pct
+        if _quantity:
+            _total_premium_value = entry_premium * _quantity
+            if _total_premium_value > self.large_position_threshold_rs:
+                _effective_stop_loss_pct = self.large_position_stop_loss_pct
+
+        if pnl_pct <= -_effective_stop_loss_pct:
             logger.info(
                 f"[{self.name}] Stop loss: entry=Rs{entry_premium:.2f} "
-                f"current=Rs{current_premium:.2f} ({pnl_pct:.1%})"
+                f"current=Rs{current_premium:.2f} ({pnl_pct:.1%}) "
+                f"[stop={_effective_stop_loss_pct:.0%}"
+                f"{' -- large position' if _effective_stop_loss_pct != self.stop_loss_pct else ''}]"
             )
             self._clear_reversal_state(contract_id)
             return "EXIT"
