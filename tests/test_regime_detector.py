@@ -301,8 +301,11 @@ class _FakeRedisGetOnly:
 
 @pytest.mark.asyncio
 async def test_get_vix_returns_real_cached_value_when_present():
+    # Fixed 2026-09-15: _get_vix() now returns (vix, is_real) so detect()
+    # can tell a genuine reading apart from the 15.0 fallback guess -- see
+    # detect()'s UNKNOWN-regime fix.
     detector = MRD(_FakeRedisGetOnly({"market:india_vix": "11.2"}))
-    assert await detector._get_vix() == 11.2
+    assert await detector._get_vix() == (11.2, True)
 
 
 @pytest.mark.asyncio
@@ -313,13 +316,13 @@ async def test_get_vix_falls_back_to_15_not_atr_pct_when_cache_empty():
     detector = MRD(_FakeRedisGetOnly({
         "market:trend_stats": json.dumps({"n_symbols": 132, "avg_atr_pct_daily": 1.8}),
     }))
-    assert await detector._get_vix() == 15.0
+    assert await detector._get_vix() == (15.0, False)
 
 
 @pytest.mark.asyncio
 async def test_get_vix_falls_back_to_15_when_nothing_available():
     detector = MRD(_FakeRedisGetOnly({}))
-    assert await detector._get_vix() == 15.0
+    assert await detector._get_vix() == (15.0, False)
 
 
 @pytest.mark.asyncio
@@ -328,3 +331,82 @@ async def test_get_vix_fallback_logs_a_warning(caplog):
     with caplog.at_level("WARNING"):
         await detector._get_vix()
     assert any("India VIX unavailable" in r.message for r in caplog.records)
+
+
+# ── detect(): UNKNOWN regime instead of a fabricated RANGE_BOUND ───────────
+#
+# Fixed 2026-09-15 (external review): detect() used to classify against
+# fabricated default indicator values (vix=15.0, atr_pct=1.0, ema_spread=
+# 0.15) whenever real VIX and/or market:trend_stats were missing, always
+# producing a real-looking regime -- almost always RANGE_BOUND, the one
+# regime that auto-permits credit_spread_v1/iron_condor_v1 entries. This is
+# distinct from the already-fixed get_cached_regime() (only protects
+# against Redis itself being unreachable) -- detect() always wrote SOME
+# regime to Redis, so a later get_cached_regime() read it back as real.
+
+class _FakeRedisFull:
+    """Minimal dict-backed fake supporting both get and set, for testing
+    detect()'s full read-classify-write cycle."""
+    def __init__(self, values: dict = None):
+        self.store = dict(values or {})
+
+    async def get(self, key):
+        return self.store.get(key)
+
+    async def set(self, key, value):
+        self.store[key] = value
+
+
+@pytest.mark.asyncio
+async def test_detect_publishes_unknown_when_both_vix_and_trend_stats_missing():
+    detector = MRD(_FakeRedisFull({}))
+    regime = await detector.detect()
+    assert regime == "UNKNOWN"
+    published = json.loads(detector._redis.store["market:regime"])
+    assert published["regime"] == "UNKNOWN"
+
+
+@pytest.mark.asyncio
+async def test_detect_publishes_unknown_when_only_trend_stats_missing():
+    # Real VIX present, but market:trend_stats absent (e.g. LTPPoller hasn't
+    # completed its first cycle yet this session) -- still not enough to
+    # classify confidently.
+    detector = MRD(_FakeRedisFull({"market:india_vix": "13.5"}))
+    regime = await detector.detect()
+    assert regime == "UNKNOWN"
+
+
+@pytest.mark.asyncio
+async def test_detect_publishes_unknown_when_only_vix_missing():
+    detector = MRD(_FakeRedisFull({
+        "market:trend_stats": json.dumps({"n_symbols": 50, "avg_atr_pct_daily": 1.8, "avg_ema_spread_pct": 0.3}),
+    }))
+    regime = await detector.detect()
+    assert regime == "UNKNOWN"
+
+
+@pytest.mark.asyncio
+async def test_detect_classifies_normally_when_both_real_inputs_present():
+    detector = MRD(_FakeRedisFull({
+        "market:india_vix": "13.5",
+        "market:trend_stats": json.dumps({"n_symbols": 50, "avg_atr_pct_daily": 1.8, "avg_ema_spread_pct": 0.3}),
+    }))
+    regime = await detector.detect()
+    assert regime == "TRENDING"  # real ATR% above threshold
+
+
+@pytest.mark.asyncio
+async def test_unknown_regime_blocks_all_new_entries_but_is_not_a_special_case_in_enforce():
+    # REGIME_STRATEGY_MAP.get("UNKNOWN", []) is naturally empty -- no special
+    # casing needed in enforce_regime_switching() itself for this to pause
+    # every currently-active strategy's new entries.
+    sid = "credit_spread_v1"
+    _register(sid, is_active=True, paused_by=None)
+    try:
+        detector = MRD(_FakeRedisRegime("UNKNOWN"))
+        await detector.enforce_regime_switching()
+        inst = StrategyRegistry._active_instances[sid]
+        assert inst.is_active is False
+        assert inst.paused_by == "regime"
+    finally:
+        del StrategyRegistry._active_instances[sid]

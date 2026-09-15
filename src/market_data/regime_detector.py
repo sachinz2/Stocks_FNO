@@ -147,11 +147,39 @@ class MarketRegimeDetector:
     async def detect(self) -> str:
         """
         Classify the current regime. Writes result to Redis and returns it.
-        Falls back to RANGE_BOUND (most conservative) if data is missing.
+
+        Fixed 2026-09-15 (external review): used to fall back to RANGE_BOUND
+        whenever real VIX and/or market:trend_stats were missing, by
+        silently classifying against the SAME hardcoded default indicator
+        values (vix=15.0, atr_pct=1.0, ema_spread=0.15) that
+        _get_market_indicators()/_get_vix() have always used as fill-ins.
+        RANGE_BOUND is not a neutral "don't know" -- it's the one regime
+        that auto-permits credit_spread_v1/iron_condor_v1 entries. This is a
+        DIFFERENT bug from the already-fixed get_cached_regime() (which only
+        protects against Redis itself being unreachable): detect() runs
+        periodically and ALWAYS wrote a real, confidently-classified-looking
+        regime to Redis even when the indicators feeding it were fabricated
+        defaults, so get_cached_regime() would then correctly read back a
+        real (but bogus) "RANGE_BOUND" -- passing right through that
+        earlier fix. Now publishes the real, explicit "UNKNOWN" when either
+        input is missing; REGIME_STRATEGY_MAP.get("UNKNOWN", []) is
+        naturally empty, so enforce_regime_switching() pauses every
+        currently-active strategy's NEW ENTRIES (exits are unaffected, per
+        its own docstring) until real data resumes -- no separate wiring
+        needed anywhere else.
         """
-        vix, atr_pct, ema_spread_pct = await self._get_market_indicators()
+        vix, atr_pct, ema_spread_pct, data_known = await self._get_market_indicators()
         prev_regime = await self.get_cached_regime()
-        regime = self._classify(vix, atr_pct, ema_spread_pct, prev_regime)
+        if not data_known:
+            regime = "UNKNOWN"
+            logger.warning(
+                "MarketRegimeDetector: VIX and/or market:trend_stats "
+                "unavailable -- publishing UNKNOWN regime (blocks new "
+                "entries for all regime-gated strategies; exits unaffected) "
+                "instead of guessing against fabricated default indicators."
+            )
+        else:
+            regime = self._classify(vix, atr_pct, ema_spread_pct, prev_regime)
 
         payload = {
             "regime":            regime,
@@ -276,12 +304,17 @@ class MarketRegimeDetector:
     # ── Internal ──────────────────────────────────────────────────────────────
 
     async def _get_market_indicators(self):
-        """Return (vix, market_atr_pct, market_ema_spread_pct). Falls back to safe
-        mid-zone defaults if LTPPoller hasn't published market:trend_stats yet
-        (e.g. market just opened, or market is closed)."""
-        vix          = await self._get_vix()
+        """Return (vix, market_atr_pct, market_ema_spread_pct, data_known).
+        Falls back to safe mid-zone defaults if LTPPoller hasn't published
+        market:trend_stats yet (e.g. market just opened, or market is
+        closed) -- but data_known is False whenever EITHER real VIX or real
+        trend_stats couldn't be read, so detect() can tell a genuine
+        classification apart from one built on fill-in defaults (see
+        detect()'s 2026-09-15 fix for why that distinction matters)."""
+        vix, vix_known = await self._get_vix()
         atr_pct      = 1.0   # safe default = mid-zone
         ema_spread   = 0.15
+        trend_known  = False
 
         try:
             raw = await self._redis.get(REDIS_TREND_STATS_KEY)
@@ -290,17 +323,21 @@ class MarketRegimeDetector:
                 if stats.get("n_symbols", 0) > 0:
                     atr_pct    = stats.get("avg_atr_pct_daily", atr_pct)
                     ema_spread = stats.get("avg_ema_spread_pct", ema_spread)
+                    trend_known = True
         except Exception as e:
             logger.debug(f"RegimeDetector: trend stats read error: {e}")
 
-        return vix, round(atr_pct, 3), round(ema_spread, 3)
+        return vix, round(atr_pct, 3), round(ema_spread, 3), (vix_known and trend_known)
 
-    async def _get_vix(self) -> float:
-        """Read VIX from Redis (written by ZerodhaLTPPoller or engine)."""
+    async def _get_vix(self):
+        """Read VIX from Redis (written by ZerodhaLTPPoller or engine).
+        Returns (vix, is_real) -- is_real is False when falling back to the
+        15.0 middle-of-road default, so callers can tell a genuine VIX
+        reading apart from a guess (see detect()'s 2026-09-15 fix)."""
         try:
             raw = await self._redis.get(REDIS_VIX_KEY)
             if raw:
-                return float(raw)
+                return float(raw), True
         except Exception:
             pass
         # Fixed 2026-08-28 (code review): removed the "estimate from
@@ -324,7 +361,7 @@ class MarketRegimeDetector:
             "RegimeDetector: real India VIX unavailable (cache empty/stale) "
             "-- using 15.0 middle-of-road default, NOT an ATR%-based guess."
         )
-        return 15.0   # middle-of-road default
+        return 15.0, False   # middle-of-road default, not a real reading
 
     @staticmethod
     def _classify(vix: float, atr_pct: float, ema_spread_pct: float,
