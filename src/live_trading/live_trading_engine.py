@@ -13,10 +13,12 @@ from src.core.constants import (
     MAX_SECTOR_POSITIONS,
     REDIS_LOT_SIZE_PREFIX,
     REDIS_TICK_PREFIX,
-    REDIS_TOP_SYMBOLS_KEY,
     REDIS_TOP_SYMBOLS_CREDIT_SPREAD,
     REDIS_TOP_SYMBOLS_IRON_CONDOR,
-    REDIS_TOP_SYMBOLS_MOMENTUM,
+    REDIS_TOP_SYMBOLS_EMA_BULL,
+    REDIS_TOP_SYMBOLS_EMA_BEAR,
+    REDIS_TOP_SYMBOLS_MOMENTUM_BULL,
+    REDIS_TOP_SYMBOLS_MOMENTUM_BEAR,
     STRATEGY_LOT_MULTIPLIER,
 )
 from src.core.enums import SignalType, TradingMode
@@ -6345,22 +6347,49 @@ class LiveTradingEngine:
             return real_interval
         return FNO_STRIKE_INTERVALS.get(symbol, 50)
 
+    async def _get_pool_union(self, redis, key_a: str, key_b: str) -> List[str]:
+        """Deduped union of two candidate-pool keys, preserving each side's
+        own internal ranking order (bull candidates first, then bear).
+        Empty if BOTH sides are empty/absent -- caller decides the fallback."""
+        out: List[str] = []
+        for key in (key_a, key_b):
+            raw = await redis.get(key)
+            if raw:
+                for sym in json.loads(raw):
+                    if sym not in out:
+                        out.append(sym)
+        return out
+
     async def _get_active_symbols(self, strategy=None) -> List[str]:
         redis = getattr(self, "_redis", None)
         if redis:
             class_name = strategy.__class__.__name__ if strategy else ""
-            if class_name == "CreditSpreadStrategy":
-                key = REDIS_TOP_SYMBOLS_CREDIT_SPREAD
-            elif class_name == "IronCondorStrategy":
-                key = REDIS_TOP_SYMBOLS_IRON_CONDOR
-            elif class_name == "MomentumStrategy":
-                key = REDIS_TOP_SYMBOLS_MOMENTUM
-            else:
-                key = REDIS_TOP_SYMBOLS_KEY
             try:
-                raw = await redis.get(key)
-                if raw:
-                    return json.loads(raw)
+                if class_name == "CreditSpreadStrategy":
+                    raw = await redis.get(REDIS_TOP_SYMBOLS_CREDIT_SPREAD)
+                    if raw:
+                        return json.loads(raw)
+                elif class_name == "IronCondorStrategy":
+                    raw = await redis.get(REDIS_TOP_SYMBOLS_IRON_CONDOR)
+                    if raw:
+                        return json.loads(raw)
+                elif class_name == "MomentumStrategy":
+                    # Fixed 2026-09-15 (external review, "separate bull/bear
+                    # candidate pools"): union of both sides' own full top-N
+                    # -- a day dominated by one direction can no longer have
+                    # its candidates crowded out of a single shared top-N by
+                    # unrelated noise on the other side.
+                    symbols = await self._get_pool_union(
+                        redis, REDIS_TOP_SYMBOLS_MOMENTUM_BULL, REDIS_TOP_SYMBOLS_MOMENTUM_BEAR,
+                    )
+                    if symbols:
+                        return symbols
+                else:
+                    symbols = await self._get_pool_union(
+                        redis, REDIS_TOP_SYMBOLS_EMA_BULL, REDIS_TOP_SYMBOLS_EMA_BEAR,
+                    )
+                    if symbols:
+                        return symbols
             except Exception:
                 pass
         return self._symbols

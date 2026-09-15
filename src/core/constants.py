@@ -431,6 +431,18 @@ REDIS_TOP_SYMBOLS_CREDIT_SPREAD = "nfo:top5:spread"       # Credit spread: low A
 REDIS_TOP_SYMBOLS_IRON_CONDOR = "nfo:top5:condor"         # Iron condor: low ATR + EMA flat
 REDIS_TOP_SYMBOLS_MOMENTUM = "nfo:top5:momentum"          # Momentum: high ADX + wide EMA spread (established trend)
 
+# Fixed 2026-09-15 (external review, "separate bull/bear candidate pools"):
+# EMA/momentum candidates ranked by a single absolute-value score with no
+# regard for direction -- on a day dominated by one direction, unrelated
+# noise on the OTHER side can still occupy top-N slots, crowding out
+# genuine same-direction candidates that would otherwise fill the pool.
+# Each strategy now gets its OWN full top-N on each side; the engine reads
+# the union of both (see LiveTradingEngine._get_active_symbols()).
+REDIS_TOP_SYMBOLS_EMA_BULL = "nfo:top5:ema_bull"          # EMA20 > EMA50 currently
+REDIS_TOP_SYMBOLS_EMA_BEAR = "nfo:top5:ema_bear"          # EMA20 < EMA50 currently
+REDIS_TOP_SYMBOLS_MOMENTUM_BULL = "nfo:top5:momentum_bull"
+REDIS_TOP_SYMBOLS_MOMENTUM_BEAR = "nfo:top5:momentum_bear"
+
 REDIS_LOT_SIZE_PREFIX = "nfo:lot:"
 
 # Real per-symbol contract data (expiry -> strike -> {CE/PE: real tradingsymbol}),

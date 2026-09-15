@@ -71,6 +71,10 @@ from src.core.constants import (
     REDIS_TOP_SYMBOLS_CREDIT_SPREAD,
     REDIS_TOP_SYMBOLS_IRON_CONDOR,
     REDIS_TOP_SYMBOLS_MOMENTUM,
+    REDIS_TOP_SYMBOLS_EMA_BULL,
+    REDIS_TOP_SYMBOLS_EMA_BEAR,
+    REDIS_TOP_SYMBOLS_MOMENTUM_BULL,
+    REDIS_TOP_SYMBOLS_MOMENTUM_BEAR,
 )
 from src.core.utils import now_ist
 
@@ -311,6 +315,14 @@ class LTPPoller:
         spread_scores: Dict[str, float] = {}
         condor_scores: Dict[str, float] = {}
         momentum_scores: Dict[str, float] = {}
+        # Fixed 2026-09-15 (external review, "separate bull/bear candidate
+        # pools"): bucketed by CURRENT EMA20-vs-EMA50 relationship alongside
+        # (not instead of) the combined dicts above -- see
+        # REDIS_TOP_SYMBOLS_EMA_BULL's docstring in core/constants.py.
+        ema_bull_scores: Dict[str, float] = {}
+        ema_bear_scores: Dict[str, float] = {}
+        momentum_bull_scores: Dict[str, float] = {}
+        momentum_bear_scores: Dict[str, float] = {}
         all_ticks: list = []  # collected for market-breadth computation after the loop
 
         for symbol in self.symbols:
@@ -390,6 +402,13 @@ class LTPPoller:
                         condor_scores[symbol] = c
                     if m > 0:
                         momentum_scores[symbol] = m
+                    # Fixed 2026-09-15 (external review, "separate bull/bear
+                    # candidate pools") -- current EMA20-vs-EMA50 sign, same
+                    # classifier both strategies' pools use.
+                    _is_bullish = tick.get("ema20", 0) > tick.get("ema50", 0)
+                    (ema_bull_scores if _is_bullish else ema_bear_scores)[symbol] = e
+                    if m > 0:
+                        (momentum_bull_scores if _is_bullish else momentum_bear_scores)[symbol] = m
                     # Fixed 2026-09-15 (external review, "EMA event
                     # watchlist"): refresh (not just add) on every cycle the
                     # symbol stays within the entry band -- a stock hovering
@@ -495,6 +514,38 @@ class LTPPoller:
             empty_reason="No symbols eligible today (ADX all < 25)",
         )
         logger.info(f"Momentum pool: {status}")
+
+        # Fixed 2026-09-15 (external review, "separate bull/bear candidate
+        # pools"): each side gets its OWN full top-N, so a day dominated by
+        # one direction can't have its candidates crowded out of a single
+        # shared top-N by unrelated noise on the other side -- see
+        # REDIS_TOP_SYMBOLS_EMA_BULL's docstring in core/constants.py. The
+        # engine takes the union of both (LiveTradingEngine._get_active_symbols()).
+        # force_include passes the SAME watchlist set to both EMA sides --
+        # _publish_pool's own `s in scores` guard means a bear-side
+        # watchlisted symbol can never spuriously appear in the bull pool.
+        status = await self._publish_pool(
+            REDIS_TOP_SYMBOLS_EMA_BULL, ema_bull_scores, n,
+            empty_reason="No bullish-structured symbol scored today",
+            force_include=set(self._ema_watchlist),
+        )
+        logger.info(f"EMA bull pool: {status}")
+        status = await self._publish_pool(
+            REDIS_TOP_SYMBOLS_EMA_BEAR, ema_bear_scores, n,
+            empty_reason="No bearish-structured symbol scored today",
+            force_include=set(self._ema_watchlist),
+        )
+        logger.info(f"EMA bear pool: {status}")
+        status = await self._publish_pool(
+            REDIS_TOP_SYMBOLS_MOMENTUM_BULL, momentum_bull_scores, n,
+            empty_reason="No bullish-structured symbol with ADX >= 25 today",
+        )
+        logger.info(f"Momentum bull pool: {status}")
+        status = await self._publish_pool(
+            REDIS_TOP_SYMBOLS_MOMENTUM_BEAR, momentum_bear_scores, n,
+            empty_reason="No bearish-structured symbol with ADX >= 25 today",
+        )
+        logger.info(f"Momentum bear pool: {status}")
 
     async def _read_day_range(self, symbol: str) -> Optional[dict]:
         """
