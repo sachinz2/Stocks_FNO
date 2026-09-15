@@ -2671,11 +2671,7 @@ class LiveTradingEngine:
         # and publishing ranks every cycle but nothing ever consulted them).
         # Trend-following works best on stocks already outperforming NIFTY (see
         # rs_ranker.py docstring: "Only the top-N by RS score are eligible for
-        # trading"). Applied to BUY only — RSRanker ranks strongest-to-weakest,
-        # which is the correct gate for "buy calls on strength," but it has no
-        # symmetric "weakest stocks" ranking that would justify gating SELL
-        # (put-buying) entries the same way, so SELL is intentionally left
-        # ungated here.
+        # trading").
         #
         # Fixed 2026-08-20 (external review): used to fail OPEN (allow the
         # trade) whenever ranks weren't available -- both on a genuine
@@ -2685,8 +2681,8 @@ class LiveTradingEngine:
         # already-validated decision), that's inconsistent with this
         # codebase's fail-closed convention for entry-blocking data (lot
         # size, contract resolution, margin, RVOL validity all already fail
-        # closed) -- now blocks the BUY entry instead of silently skipping
-        # the filter. Trade-off: BUY entries for both strategies are delayed
+        # closed) -- now blocks the entry instead of silently skipping
+        # the filter. Trade-off: entries for both strategies are delayed
         # by however long RSRanker's first cycle takes each morning, same as
         # the existing RVOL-unavailable behavior already accepts.
         # Fixed 2026-08-21 (external review, section 11 -- "make ADX/RVOL/
@@ -2701,7 +2697,15 @@ class LiveTradingEngine:
         # philosophy: an early crossover shouldn't need the stock to
         # ALREADY be a top-10 RS leader, which is itself a lagging
         # confirmation.
-        if signal_str == "BUY" and self.rs_ranker and getattr(strategy, "require_rs", True):
+        # Fixed 2026-09-15 (external review, "symmetric RS ranking"): SELL
+        # used to be entirely ungated here because RSRanker had no
+        # symmetric "weakest stocks" list to check against -- RS filtering
+        # for a bearish (put-buying) entry should look for stocks already
+        # UNDERPERFORMING NIFTY, the mirror of "buy calls on strength," not
+        # skip the filter altogether. RSRanker now publishes a bottom-N
+        # (weakest-vs-NIFTY) list (see rs_ranker.py's rank()); SELL checks
+        # against that instead of top-N, same fail-closed handling either way.
+        if signal_str in ("BUY", "SELL") and self.rs_ranker and getattr(strategy, "require_rs", True):
             try:
                 _rs_ranks = await self.rs_ranker.get_ranks()
             except Exception as _rs_exc:
@@ -2717,13 +2721,22 @@ class LiveTradingEngine:
                     "closed on this entry filter."
                 )
                 return
-            _rs_top_syms = {e["symbol"] for e in _rs_ranks[:10]}
-            if symbol not in _rs_top_syms:
-                logger.info(
-                    f"[{strategy.name}] {symbol} skipped — not in RS top-10 "
-                    "vs NIFTY (relative strength too weak for a long entry)"
-                )
-                return
+            if signal_str == "BUY":
+                _rs_top_syms = {e["symbol"] for e in _rs_ranks[:10]}
+                if symbol not in _rs_top_syms:
+                    logger.info(
+                        f"[{strategy.name}] {symbol} skipped — not in RS top-10 "
+                        "vs NIFTY (relative strength too weak for a long entry)"
+                    )
+                    return
+            else:
+                _rs_bottom_syms = {e["symbol"] for e in _rs_ranks[-10:]}
+                if symbol not in _rs_bottom_syms:
+                    logger.info(
+                        f"[{strategy.name}] {symbol} skipped — not in RS bottom-10 "
+                        "vs NIFTY (relative strength too strong for a short entry)"
+                    )
+                    return
         self._audit_gate(strategy.name, "rs_passed")
 
         # Multi-timeframe confirmation — 15-min EMA direction must agree with 5-min signal.

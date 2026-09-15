@@ -512,6 +512,84 @@ async def test_rvol_valid_gate_respects_rvol_hard_gate_false():
     )
 
 
+class _FakeRsGateEngine(_FakeRvolGateEngine):
+    """Same rationale as _FakeRvolGateEngine, extended with a real
+    rs_ranker double to drive _process_signal() past RVOL/ADX and reach the
+    RS gate specifically (2026-09-15, "symmetric RS ranking")."""
+    def __init__(self, rs_ranks):
+        super().__init__()
+        # Valid RVOL/ADX so both of those gates pass cleanly, isolating
+        # this test to the RS gate.
+        self._get_market_data = AsyncMock(return_value={
+            "close": 1200.0, "ltp_source": "live_tick",
+            "rvol": 2.0, "rvol_valid": True,
+            "adx14": 30.0, "adx_valid": True,
+        })
+        self.rs_ranker = SimpleNamespace(get_ranks=AsyncMock(return_value=rs_ranks))
+        # Not under test here -- only need the pipeline to stop gracefully
+        # somewhere after rs_passed, not actually resolve a real contract.
+        self._get_lot_size = AsyncMock(return_value=None)
+
+
+def _rs_ranks_fixture():
+    ranks = [{"symbol": f"SYM{i}", "rs_score": 100 - i, "rank": i + 1} for i in range(15)]
+    ranks[0]["symbol"] = "STRONGSTOCK"   # rank 1 -- top-10, must pass BUY / fail SELL
+    ranks[14]["symbol"] = "WEAKSTOCK"    # rank 15 -- bottom-10, must pass SELL / fail BUY
+    return ranks
+
+
+@pytest.mark.asyncio
+async def test_sell_rs_gate_blocks_a_strong_stock_not_in_the_bottom_10():
+    # Fixed 2026-09-15: SELL used to be entirely ungated by RS. A stock
+    # STRONG relative to NIFTY has no business being shorted on a
+    # trend-following thesis -- must be blocked, same discipline the BUY
+    # side already had.
+    fake = _FakeRsGateEngine(_rs_ranks_fixture())
+    strategy = SimpleNamespace(
+        name="momentum_v1", is_active=True, min_dte=0, max_dte=999,
+        rvol_checked_internally=True, adx_checked_internally=True,
+        require_rs=True,
+        generate_signal=lambda market_data: SignalType.SELL,
+    )
+
+    await LiveTradingEngine._process_signal(fake, strategy, "STRONGSTOCK", vix=15.0, regime="TRENDING")
+
+    stats = fake._signal_gate_stats.get("momentum_v1", {})
+    assert "rs_passed" not in stats
+
+
+@pytest.mark.asyncio
+async def test_sell_rs_gate_passes_a_weak_stock_in_the_bottom_10():
+    fake = _FakeRsGateEngine(_rs_ranks_fixture())
+    strategy = SimpleNamespace(
+        name="momentum_v1", is_active=True, min_dte=0, max_dte=999,
+        rvol_checked_internally=True, adx_checked_internally=True,
+        require_rs=True,
+        generate_signal=lambda market_data: SignalType.SELL,
+    )
+
+    await LiveTradingEngine._process_signal(fake, strategy, "WEAKSTOCK", vix=15.0, regime="TRENDING")
+
+    stats = fake._signal_gate_stats.get("momentum_v1", {})
+    assert stats.get("rs_passed", 0) >= 1
+
+
+@pytest.mark.asyncio
+async def test_sell_rs_gate_fails_closed_when_ranks_unavailable():
+    fake = _FakeRsGateEngine([])
+    strategy = SimpleNamespace(
+        name="momentum_v1", is_active=True, min_dte=0, max_dte=999,
+        rvol_checked_internally=True, adx_checked_internally=True,
+        require_rs=True,
+        generate_signal=lambda market_data: SignalType.SELL,
+    )
+
+    await LiveTradingEngine._process_signal(fake, strategy, "ANYSTOCK", vix=15.0, regime="TRENDING")
+
+    stats = fake._signal_gate_stats.get("momentum_v1", {})
+    assert "rs_passed" not in stats
+
+
 def test_credit_spread_adx_gate_checks_validity_flag_and_blocks():
     src = inspect.getsource(LiveTradingEngine._process_credit_spread)
     assert '_adx_cs_valid = bool(market_data.get("adx_valid"' in src

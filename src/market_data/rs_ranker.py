@@ -38,6 +38,14 @@ logger = logging.getLogger(__name__)
 
 REDIS_RS_RANKS_KEY = "nfo:rs_ranks"
 REDIS_RS_TOP10_KEY = "nfo:rs_top10"
+# Fixed 2026-09-15 (external review, "symmetric RS ranking"): RS only ever
+# ranked strongest-to-weakest for BUY eligibility -- SELL (put-buying)
+# entries were intentionally left ungated (see live_trading_engine.py's own
+# comment: "the ranker only ranks strongest stocks", no symmetric "weakest"
+# list existed to gate against). A bottom-N (weakest-vs-NIFTY) list closes
+# that gap: trend-following on the SELL side works best on stocks already
+# UNDERPERFORMING NIFTY, the mirror of "buy calls on strength."
+REDIS_RS_BOTTOM10_KEY = "nfo:rs_bottom10"
 NIFTY_SYMBOL       = "NIFTY50"
 NIFTY_50_TOKEN     = 256265   # Zerodha NSE instrument token for NIFTY 50 index (stable)
 
@@ -131,6 +139,9 @@ class RSRanker:
             entry["rank"] = i
 
         top10 = [e["symbol"] for e in scores[: self.top_n]]
+        # Weakest-first (mirrors top10 being strongest-first) -- see
+        # REDIS_RS_BOTTOM10_KEY's docstring above.
+        bottom10 = [e["symbol"] for e in scores[-self.top_n:][::-1]] if scores else []
 
         # TTL = 3x the 5-minute schedule interval: survives one or two missed/
         # slow cycles, but a sustained outage lets these keys expire rather
@@ -138,6 +149,7 @@ class RSRanker:
         # they're stale (fixed 2026-08-20, deep review).
         await self._redis.set(REDIS_RS_RANKS_KEY, json.dumps(scores), ex=900)
         await self._redis.set(REDIS_RS_TOP10_KEY, json.dumps(top10), ex=900)
+        await self._redis.set(REDIS_RS_BOTTOM10_KEY, json.dumps(bottom10), ex=900)
 
         if scores:
             logger.info(
@@ -155,6 +167,22 @@ class RSRanker:
         except Exception:
             pass
         return self.symbols[:n]
+
+    async def get_bottom_n(self, n: int = 10) -> List[str]:
+        """Return cached bottom-N (weakest-vs-NIFTY) symbols by RS,
+        weakest-first -- see REDIS_RS_BOTTOM10_KEY's docstring. No
+        all-symbols fallback (unlike get_top_n): an empty/missing cache
+        here must be treated as "can't confirm weakness," not "everything
+        is eligible" -- callers gating SELL entries on this should fail
+        closed on an empty result, the same convention already used for
+        get_top_n's caller (require_rs)."""
+        try:
+            raw = await self._redis.get(REDIS_RS_BOTTOM10_KEY)
+            if raw:
+                return json.loads(raw)[:n]
+        except Exception:
+            pass
+        return []
 
     async def get_ranks(self) -> List[dict]:
         """Return full ranked list for the API."""
