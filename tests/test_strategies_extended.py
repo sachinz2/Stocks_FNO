@@ -253,3 +253,64 @@ def test_momentum_weakening_stop_reproduces_tatasteel_dead_zone_2026_08_14():
     weakening_exit_price = entry * (1 - mom.weakening_stop_loss_pct)
     pos = {"avg_price": entry, "peak_premium": entry, "current_adx": 24.0}
     assert mom.manage_position(pos, weakening_exit_price) == "EXIT"
+
+
+# ── ADX validity sentinel must not force-close a position (2026-09-15) ─────
+#
+# Live incident review found the exit-side current_adx was handed to
+# manage_position() with no validity flag, unlike every ADX-gated ENTRY
+# check in the codebase. ltp_poller.py's adx14=0.0 is a sentinel for
+# "insufficient history to compute ADX this cycle", not a genuine low
+# reading -- treating it as real let the trend-exhaustion exit ("exiting
+# regardless of premium P&L") force-close ANY position, profitable or not,
+# purely because ADX was momentarily unmeasurable.
+
+def test_trend_exhaustion_does_not_fire_on_invalid_adx_sentinel():
+    mom = MomentumStrategy("mom_test", {})
+    mom.initialize()
+    # current_adx=0.0 (the real live sentinel value) + current_adx_valid=False
+    # -- without the fix, 0.0 < adx_exit_threshold (22) would force-close
+    # this position even though it's sitting at a solid, healthy profit.
+    pos = {
+        "avg_price": 100.0, "peak_premium": 100.0,
+        "current_adx": 0.0, "current_adx_valid": False,
+    }
+    assert mom.manage_position(pos, 110.0) == "HOLD"  # +10%, comfortably short of target
+
+
+def test_weakening_stop_does_not_fire_on_invalid_adx_sentinel():
+    mom = MomentumStrategy("mom_test", {})
+    mom.initialize()
+    # Same sentinel, but this time ALSO down 26% (would have fired the
+    # weakening stop pre-fix, exactly like the TATASTEEL scenario above,
+    # except here the "low ADX" is fake -- an unconfirmable reading, not a
+    # genuinely weakened trend).
+    pos = {
+        "avg_price": 100.0, "peak_premium": 100.0,
+        "current_adx": 0.0, "current_adx_valid": False,
+    }
+    assert mom.manage_position(pos, 74.0) == "HOLD"  # -26%, short of the 50% hard stop
+
+
+def test_trend_exhaustion_still_fires_once_adx_is_confirmed_valid_again():
+    """Guard against over-fixing: once current_adx_valid is genuinely True
+    with a real low reading, the exhaustion exit must still fire exactly as
+    before -- the sentinel guard doesn't disable the check permanently."""
+    mom = MomentumStrategy("mom_test", {})
+    mom.initialize()
+    pos = {
+        "avg_price": 100.0, "peak_premium": 100.0,
+        "current_adx": 18.0, "current_adx_valid": True,
+    }
+    assert mom.manage_position(pos, 110.0) == "EXIT"
+
+
+def test_adx_valid_defaults_permissively_when_key_is_absent():
+    """Guard against over-fixing the other way: existing callers/tests that
+    never set current_adx_valid at all (only current_adx) must be
+    unaffected -- the key's ABSENCE is not the same as the live sentinel's
+    explicit current_adx_valid=False."""
+    mom = MomentumStrategy("mom_test", {})
+    mom.initialize()
+    pos = {"avg_price": 100.0, "peak_premium": 100.0, "current_adx": 18.0}
+    assert mom.manage_position(pos, 110.0) == "EXIT"

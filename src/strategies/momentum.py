@@ -827,8 +827,16 @@ class MomentumStrategy(StrategyBase):
         current_position must contain:
           - avg_price      : entry premium paid
           - peak_premium   : highest premium seen since entry (tracked by engine)
-          - current_adx    : underlying's current ADX14 (optional — only the
-                              exhaustion exit uses it; other checks run without it)
+          - current_adx, current_adx_valid : underlying's current ADX14
+                              (optional — used by the weakening-trend stop
+                              and the trend-exhaustion exit; other checks
+                              run without it). current_adx_valid distinguishes
+                              a genuinely-low ADX from ltp_poller's adx14=0.0
+                              "insufficient history / momentarily
+                              unconfirmable" sentinel (added 2026-09-15 --
+                              see the fix note on both ADX-based checks
+                              below) -- both checks are skipped, not treated
+                              as a confirmed low reading, when False.
           - current_close, current_ema_fast, is_call : optional, feed the
                               structural-invalidation exit added 2026-08-20;
                               that check is skipped (not fail-closed) if
@@ -905,6 +913,18 @@ class MomentumStrategy(StrategyBase):
 
         pnl_pct = (current_premium - entry_premium) / entry_premium
         current_adx = current_position.get("current_adx")
+        # Fixed 2026-09-15 (bug hunt following the RVOL incident review):
+        # ltp_poller.py's adx14=0.0 is a sentinel for "insufficient history
+        # to compute ADX at all this cycle" (NOT a genuinely low reading) --
+        # every ADX-gated ENTRY check in this codebase already fails closed
+        # on this via adx_valid. Both ADX-based EXIT checks below now do the
+        # same: current_adx_valid defaults to True (via getattr(...,None)'s
+        # absence being treated permissively) ONLY for backward-compat with
+        # any caller that doesn't pass it at all (e.g. these strategy-level
+        # unit tests, which pass real numeric ADX values with no reason to
+        # simulate the sentinel) -- an explicit current_adx_valid=False
+        # (the real live sentinel case) is what actually disables the check.
+        current_adx_valid = current_position.get("current_adx_valid", True)
 
         # Fixed 2026-09-10 (user request): Rs-profit-booking giveback,
         # checked FIRST -- see this method's docstring (check #0) for why.
@@ -991,6 +1011,7 @@ class MomentumStrategy(StrategyBase):
 
         if (
             current_adx is not None
+            and current_adx_valid
             and float(current_adx) < self.adx_entry_threshold
             and pnl_pct <= -self.weakening_stop_loss_pct
         ):
@@ -1086,7 +1107,7 @@ class MomentumStrategy(StrategyBase):
             if current_position.get("entry_regime") == "VOLATILE"
             else self.adx_exit_threshold
         )
-        if current_adx is not None and float(current_adx) < adx_exit:
+        if current_adx is not None and current_adx_valid and float(current_adx) < adx_exit:
             logger.info(
                 f"[{self.name}] Trend exhausted: ADX={float(current_adx):.1f} "
                 f"< {adx_exit} — exiting regardless of premium P&L."

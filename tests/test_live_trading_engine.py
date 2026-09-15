@@ -483,6 +483,35 @@ async def test_rvol_valid_gate_still_blocks_strategies_without_internal_check():
     assert stats.get("dte_passed", 0) >= 1  # got that far, blocked right after
 
 
+@pytest.mark.asyncio
+async def test_rvol_valid_gate_respects_rvol_hard_gate_false():
+    """Fixed 2026-09-15 (user-reported live incident): PAYTM and BANDHANBNK
+    both fired real, confirmed ema_crossover_v1 crossovers on 2026-09-15
+    and were both discarded with 'RVOL not yet computable' -- even though
+    ema_crossover_v1 sets rvol_hard_gate=False specifically so RVOL is never
+    supposed to be a hard requirement for it (a genuine EMA20/50 cross
+    doesn't need above-average volume to be real). The validity check used
+    to ignore rvol_hard_gate entirely (unlike the adjacent threshold check,
+    which always respected it) -- a stricter standard for "RVOL unknown"
+    than for "RVOL confirmed low", backwards. Now consistent: a strategy
+    that opted out of the hard gate gets treated the same way whether RVOL
+    is measurably low OR simply not yet measurable."""
+    fake = _FakeRvolGateEngine()
+    strategy = SimpleNamespace(
+        name="ema_crossover_v1", is_active=True, min_dte=0, max_dte=999,
+        rvol_hard_gate=False,
+        generate_signal=lambda market_data: SignalType.SELL,
+    )
+
+    await LiveTradingEngine._process_signal(fake, strategy, "PAYTM", vix=15.0, regime="TRENDING")
+
+    stats = fake._signal_gate_stats.get("ema_crossover_v1", {})
+    assert stats.get("rvol_passed", 0) >= 1, (
+        "rvol_hard_gate=False must make an unmeasurable RVOL non-blocking, "
+        "same as an already-measured low RVOL"
+    )
+
+
 def test_credit_spread_adx_gate_checks_validity_flag_and_blocks():
     src = inspect.getsource(LiveTradingEngine._process_credit_spread)
     assert '_adx_cs_valid = bool(market_data.get("adx_valid"' in src

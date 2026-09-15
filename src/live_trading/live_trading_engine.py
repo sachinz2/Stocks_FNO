@@ -1883,7 +1883,23 @@ class LiveTradingEngine:
                             # crossed the activation floor at least once.
                             "quantity":       qty,
                             "peak_profit_rs": peak_profit_rs,
+                            # Fixed 2026-09-15 (bug hunt following the RVOL
+                            # incident review): current_adx used to be handed
+                            # over with no validity flag, unlike every
+                            # ADX-gated ENTRY check in this file (all of
+                            # which read adx_valid alongside adx14 -- see
+                            # ltp_poller.py's adx14=0.0 sentinel convention,
+                            # "insufficient history" is NOT a real low
+                            # reading). momentum_v1's weakening-trend-stop
+                            # and trend-exhaustion EXIT checks had no such
+                            # guard, so a momentarily-unconfirmable ADX
+                            # (0.0 sentinel) could force-close a position --
+                            # the trend-exhaustion check explicitly fires
+                            # "regardless of premium P&L" -- purely because
+                            # ADX was unmeasurable that cycle, not because
+                            # the trend actually weakened.
                             "current_adx": market_data.get("adx14"),
+                            "current_adx_valid": market_data.get("adx_valid"),
                             # For the VOLATILE crash-catching reversal exit (see
                             # EMACrossoverStrategy.manage_position() /
                             # MomentumStrategy.adx_exit_threshold_volatile) — both
@@ -2435,11 +2451,31 @@ class LiveTradingEngine:
         # its own state is cleared). Now exempted the same way the
         # threshold check below already is.
         if not _rvol_valid and not getattr(strategy, "rvol_checked_internally", False):
+            # Fixed 2026-09-15 (user-reported live incident, PAYTM/BANDHANBNK
+            # both discarded on 2026-09-15): this used to hard-block
+            # regardless of rvol_hard_gate, inconsistent with the check just
+            # below it -- for a strategy that already declared "RVOL isn't a
+            # hard requirement for me" (ema_crossover_v1 sets
+            # rvol_hard_gate=False specifically because a genuine EMA20/50
+            # cross doesn't need above-average volume to be real -- see its
+            # class docstring), a genuinely LOW RVOL was already treated as
+            # a non-blocking confidence note, but an UNMEASURABLE RVOL
+            # (the common case in the first ~100 min of every session) was
+            # still treated as an unconditional hard block -- a stricter
+            # standard for "unknown" than for "confirmed low", the wrong way
+            # around. Now consistent: both cases respect rvol_hard_gate the
+            # same way.
+            if getattr(strategy, "rvol_hard_gate", True):
+                logger.info(
+                    f"[{strategy.name}] {symbol} skipped — RVOL not yet computable "
+                    "(insufficient volume history; cannot confirm breakout strength)"
+                )
+                return
             logger.info(
-                f"[{strategy.name}] {symbol} skipped — RVOL not yet computable "
-                "(insufficient volume history; cannot confirm breakout strength)"
+                f"[{strategy.name}] {symbol} RVOL not yet computable "
+                "(insufficient volume history) -- not a hard gate for this "
+                "strategy, proceeding with lower confidence."
             )
-            return
         # Fixed 2026-08-20 (external review integration): strategy-overridable
         # via rvol_entry_threshold (defaults to the original 1.3 for anything
         # that doesn't set one, e.g. ema_crossover_v1) -- momentum_v1 raises
