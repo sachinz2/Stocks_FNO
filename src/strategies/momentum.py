@@ -276,6 +276,24 @@ class MomentumStrategy(StrategyBase):
         # the higher flat rvol_entry_threshold.
         self.pullback_rvol_low  = self.parameters.get("pullback_rvol_low", 0.8)
         self.breakout_rvol_min  = self.parameters.get("breakout_rvol_min", 1.3)
+        # Fixed 2026-09-15 (external review, "breakdown continuation mode"):
+        # a genuinely straight-line trend day (established 09:30, breaks
+        # down/up continuously for hours with no real pause) never forms a
+        # PULLBACK under the model above -- ESTABLISHED just keeps updating
+        # _pullback_ref to the new extreme every bar and returns HOLD
+        # indefinitely, since there's never a dip to break back through.
+        # That's correct behavior for the pullback+breakout EVENT the model
+        # is built around, but it means the strategy can sit out an entire
+        # real, strong, one-directional session waiting for a pause that
+        # structurally isn't coming. Additive, not a replacement: only
+        # considered once ESTABLISHED has been continuously extending for
+        # breakdown_min_established_bars bars with elevated RVOL confirming
+        # real participation, not just drift -- same RVOL discipline the
+        # normal breakout path already requires. False fully restores the
+        # pre-2026-09-15 pullback-only behavior.
+        self.enable_breakdown_continuation = self.parameters.get("enable_breakdown_continuation", True)
+        self.breakdown_min_established_bars = self.parameters.get("breakdown_min_established_bars", 3)
+        self.breakdown_rvol_min = self.parameters.get("breakdown_rvol_min", 1.5)
         self.min_dte: int = self.parameters.get("min_dte", 10)
         # Fixed 2026-08-20: 25 left a structural monthly dead zone -- see
         # EMACrossoverStrategy.initialize()'s matching comment for the full
@@ -310,6 +328,10 @@ class MomentumStrategy(StrategyBase):
         self._pullback_bars:    Dict[str, int] = {}    # bars spent in PULLBACK so far
         self._pullback_bar_key: Dict[str, str] = {}
         self._rvol_history:     Dict[str, list] = {}   # bar-aligned, feeds the two-tier RVOL check
+        # Fixed 2026-09-15 (external review, "breakdown continuation mode"):
+        # consecutive bars spent in ESTABLISHED while continuously extending
+        # (never dipping into PULLBACK) -- see enable_breakdown_continuation.
+        self._established_bars: Dict[str, int] = {}
 
         # Read by live_trading_engine.py's RVOL entry gate: when the pullback
         # model is active, _pullback_continuation_signal() already makes a
@@ -579,6 +601,7 @@ class MomentumStrategy(StrategyBase):
         self._trend_direction.pop(symbol, None)
         self._pullback_ref.pop(symbol, None)
         self._pullback_bars.pop(symbol, None)
+        self._established_bars.pop(symbol, None)
 
     def _pullback_continuation_signal(
         self, symbol: str, raw: Optional[str], data: Dict[str, Any], bar_key: Optional[str],
@@ -606,6 +629,13 @@ class MomentumStrategy(StrategyBase):
               extend past the current reference (a genuine dip/consolidation
               off the local high/low) locks in _pullback_ref as the level
               that must be broken to confirm resumption.
+          ESTABLISHED -> fires (breakdown continuation, added 2026-09-15):
+              if the trend keeps extending with no dip for
+              breakdown_min_established_bars consecutive bars and RVOL
+              confirms real participation, fires directly from ESTABLISHED
+              instead of waiting indefinitely for a PULLBACK that a genuine
+              straight-line move structurally never produces -- see
+              enable_breakdown_continuation in initialize().
           PULLBACK -> fires: a later bar's close breaks back through
               _pullback_ref in the trend's direction, with RVOL confirmation
               (see the two-tier check below) -- this is the actual "event."
@@ -725,6 +755,7 @@ class MomentumStrategy(StrategyBase):
             self._trend_direction[symbol] = raw
             self._pullback_ref[symbol] = close
             self._pullback_bars[symbol] = 0
+            self._established_bars[symbol] = 0
             self._rvol_history[symbol] = [rvol] if rvol is not None and rvol_valid else []
             # Fixed 2026-08-27 (live incident, monitoring gap): promoted
             # from no log at all to INFO -- with LOG_LEVEL=INFO in
@@ -744,6 +775,25 @@ class MomentumStrategy(StrategyBase):
             extending = (close > ref) if raw == "BUY" else (close < ref)
             if extending:
                 self._pullback_ref[symbol] = close
+                self._established_bars[symbol] = self._established_bars.get(symbol, 0) + 1
+                # Fixed 2026-09-15 (external review, "breakdown continuation
+                # mode"): a straight-line move that never dips into PULLBACK
+                # would otherwise sit here returning HOLD indefinitely --
+                # see enable_breakdown_continuation's docstring in
+                # initialize(). Fires once the trend has extended
+                # continuously for breakdown_min_established_bars bars with
+                # RVOL confirming real participation, same quality bar the
+                # normal pullback breakout requires.
+                if self.enable_breakdown_continuation and self._established_bars[symbol] >= self.breakdown_min_established_bars:
+                    if rvol is not None and rvol_valid and rvol >= self.breakdown_rvol_min:
+                        logger.info(
+                            f"[{self.name}] {symbol} {raw} breakdown continuation confirmed — "
+                            f"extended {self._established_bars[symbol]} bars with no pullback, "
+                            f"close={close:.2f} RVOL={rvol:.2f} — firing."
+                        )
+                        self._reset_pullback_state(symbol)
+                        self._rvol_history.pop(symbol, None)
+                        return raw
                 return "HOLD"
             self._trend_state[symbol] = "PULLBACK"
             self._pullback_bars[symbol] = 1

@@ -48,18 +48,55 @@ def test_pullback_continuation_model_is_the_new_default():
     assert strat.use_pullback_continuation_model is True
 
 
-def test_never_pulling_back_never_fires_even_though_the_gate_qualifies_every_bar():
-    """Guard against the old debounce semantics leaking back in -- a trend
-    that just keeps extending (never dips) never produces a genuine
-    pullback+breakout EVENT, so it must never fire under the new model,
-    unlike the old 'same condition for N bars' debounce."""
+def test_never_pulling_back_fires_via_breakdown_continuation_once_rvol_confirms():
+    # Fixed 2026-09-15 (external review, "breakdown continuation mode"):
+    # this used to assert a straight-line-extending trend NEVER fires --
+    # correct for the pullback+breakout EVENT alone, but it meant the
+    # strategy could sit out an entire real, strong, one-directional
+    # session waiting for a pause that structurally never comes. It now
+    # fires once ESTABLISHED has extended continuously for
+    # breakdown_min_established_bars bars with RVOL confirming real
+    # participation (see enable_breakdown_continuation).
     strat = _mom(adx_rising_required=False, ema_slope_required=False,
                  extension_atr_mult=0, vwap_extension_pct=0)
     signals = []
     close = 110.0
     for i in range(6):
         close += 1.0  # strictly extending every bar -- never a pullback
-        signals.append(strat.generate_signal(_bar(adx=30.0, close=close, bar_key=f"live:t{i}")))
+        signals.append(strat.generate_signal(_bar(adx=30.0, close=close, rvol=1.6, bar_key=f"live:t{i}")))
+    assert signals.count("BUY") == 1, "must fire exactly once, not every bar past the threshold"
+    fire_index = signals.index("BUY")
+    # Bar 0 seeds ESTABLISHED (HOLD); each subsequent extending bar
+    # increments _established_bars, firing once it reaches the threshold.
+    assert fire_index == strat.breakdown_min_established_bars
+
+
+def test_breakdown_continuation_disabled_falls_back_to_pullback_only_behavior():
+    # Rollback path: enable_breakdown_continuation=False must fully restore
+    # the pre-2026-09-15 "never fires without a real pullback" behavior.
+    strat = _mom(adx_rising_required=False, ema_slope_required=False,
+                 extension_atr_mult=0, vwap_extension_pct=0,
+                 enable_breakdown_continuation=False)
+    signals = []
+    close = 110.0
+    for i in range(6):
+        close += 1.0
+        signals.append(strat.generate_signal(_bar(adx=30.0, close=close, rvol=1.6, bar_key=f"live:t{i}")))
+    assert all(s == "HOLD" for s in signals)
+
+
+def test_breakdown_continuation_does_not_fire_without_rvol_confirmation():
+    # Same fail-closed discipline the normal breakout path already applies
+    # -- an extending trend with no volume confirmation must not fire.
+    strat = _mom(adx_rising_required=False, ema_slope_required=False,
+                 extension_atr_mult=0, vwap_extension_pct=0)
+    signals = []
+    close = 110.0
+    for i in range(6):
+        close += 1.0
+        signals.append(strat.generate_signal(
+            _bar(adx=30.0, close=close, rvol=0.0, rvol_valid=False, bar_key=f"live:t{i}")
+        ))
     assert all(s == "HOLD" for s in signals)
 
 
