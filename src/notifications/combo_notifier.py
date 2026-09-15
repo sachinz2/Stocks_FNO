@@ -50,9 +50,20 @@ class ComboNotifier:
     def paused(self, value: bool) -> None:
         self.email.paused = value
 
+    # Fixed 2026-09-15 (deep review): this used to be `self.email.enabled or
+    # self.telegram.enabled`, directly contradicting the comment two lines
+    # above (which already documents that `paused`/`enabled` must reflect
+    # EMAIL specifically, matching what admin_router's "/email-alerts"
+    # endpoints are named and documented to control). With only Telegram
+    # configured, admin_router.get_email_alert_status()'s "configured" field
+    # -- and the dashboard's "Email Alerts" panel, which reads it -- reported
+    # email as active when EmailNotifier.enabled was actually False and
+    # EmailNotifier.send() was silently returning False on every call. An
+    # operator relying on that panel to know "will I get emailed if
+    # something breaks" was told the opposite of the truth for that channel.
     @property
     def enabled(self) -> bool:
-        return self.email.enabled or self.telegram.enabled
+        return self.email.enabled
 
     async def send(self, message: str) -> bool:
         results = await asyncio.gather(

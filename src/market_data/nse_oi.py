@@ -255,13 +255,21 @@ def _calculate_max_pain(
     max_pain_k = all_strikes[len(all_strikes) // 2]
 
     for test_price in all_strikes:
-        # Call buyers lose when test_price < strike
+        # Fixed 2026-09-15 (deep review): call/put payout formulas were
+        # swapped -- a call is ITM (pays the holder) when test_price > strike,
+        # a put is ITM when strike > test_price. The old code computed
+        # max(0, k - test_price) (the PUT payout shape) against call_oi, and
+        # max(0, test_price - k) (the CALL payout shape) against put_oi --
+        # minimizing the wrong-signed total, so the returned "max pain"
+        # strike could land at the opposite end of the strike range from the
+        # real one. Repro: call_oi={90:100,100:1000,110:100}, put_oi={} ->
+        # correct max pain is 90 (buggy code picked 110). Currently only
+        # logged/published, not gated on by any strategy.
         call_loss = sum(
-            max(0, k - test_price) * oi for k, oi in call_oi.items()
+            max(0, test_price - k) * oi for k, oi in call_oi.items()
         )
-        # Put buyers lose when test_price > strike
         put_loss = sum(
-            max(0, test_price - k) * oi for k, oi in put_oi.items()
+            max(0, k - test_price) * oi for k, oi in put_oi.items()
         )
         total_loss = call_loss + put_loss
         if total_loss < min_pain:

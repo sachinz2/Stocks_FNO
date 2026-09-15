@@ -3911,6 +3911,23 @@ class LiveTradingEngine:
                 if not (_short_ok and _long_ok):
                     if _short_ok:
                         spread["_short_exit_fill"] = _short_fill
+                        # Fixed 2026-09-15 (deep review): the exchange-side
+                        # GTT backstop is placed on the SHORT leg only (see
+                        # _place_gtt_backstop's docstring). If the short leg
+                        # just closed here but the long leg's exit got
+                        # rejected, the position stays tracked (correctly)
+                        # for retry next cycle -- but the GTT on the now-flat
+                        # short contract was left armed until the full-success
+                        # branch below, reached only once BOTH legs close.
+                        # If the sibling long leg's rejection persists for
+                        # multiple cycles while the underlying keeps moving,
+                        # the stale GTT can fire on its own at the exchange,
+                        # opening a brand-new position this engine never
+                        # tracks, journals, or monitors. Cancel it here, the
+                        # moment the leg it guards goes flat, not only on
+                        # full structure close.
+                        await self._cancel_gtt(spread.get("gtt_id"), spread.get("short_contract", ""))
+                        spread["gtt_id"] = None
                     if _long_ok:
                         spread["_long_exit_fill"] = _long_fill
                     # Fixed 2026-08-21 (deep review): always persist here, not
@@ -4873,10 +4890,22 @@ class LiveTradingEngine:
                 if not (_ps_ok and _pl_ok and _cs_ok and _cl_ok):
                     if _ps_ok:
                         c["_ps_exit_fill"] = _ps_fill
+                        # Fixed 2026-09-15 (deep review): same stale-GTT gap
+                        # fixed in _check_spread_exits -- the put short leg's
+                        # GTT backstop must be cancelled the moment that leg
+                        # goes flat, not only once all 4 legs have closed.
+                        # Otherwise a persisting rejection on a sibling leg
+                        # leaves this GTT armed on a contract the engine now
+                        # holds zero quantity of, able to fire on its own and
+                        # open an untracked position.
+                        await self._cancel_gtt(c.get("put_short_gtt_id"), c.get("put_short_contract", ""))
+                        c["put_short_gtt_id"] = None
                     if _pl_ok:
                         c["_pl_exit_fill"] = _pl_fill
                     if _cs_ok:
                         c["_cs_exit_fill"] = _cs_fill
+                        await self._cancel_gtt(c.get("call_short_gtt_id"), c.get("call_short_contract", ""))
+                        c["call_short_gtt_id"] = None
                     if _cl_ok:
                         c["_cl_exit_fill"] = _cl_fill
                     # Fixed 2026-08-21 (deep review): always persist, not only

@@ -1,6 +1,6 @@
 from typing import Generic, TypeVar, Type, List, Optional, Any, Dict
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete
+from sqlalchemy import select, delete, update as sa_update
 from src.database.base import Base
 
 ModelType = TypeVar("ModelType", bound=Base)
@@ -25,13 +25,24 @@ class BaseRepository(Generic[ModelType]):
             return db_obj
 
     async def update(self, db_obj: ModelType, obj_in: Dict[str, Any]) -> ModelType:
+        # Writes only the given fields via a targeted UPDATE, never via
+        # session.merge(db_obj) -- merge() pushes EVERY loaded attribute of
+        # db_obj onto the row, so if db_obj was fetched earlier and some
+        # other column changed at the DB since (a concurrent writer in a
+        # different session -- routine in this codebase, e.g. order sync
+        # and order expiry racing on the same "OPEN" orders), merge()
+        # would silently revert that column back to its stale value.
         async with self._factory() as session:
-            merged = await session.merge(db_obj)
-            for field, value in obj_in.items():
-                setattr(merged, field, value)
+            await session.execute(
+                sa_update(self.model)
+                .where(self.model.id == db_obj.id)
+                .values(**obj_in)
+            )
             await session.commit()
-            await session.refresh(merged)
-            return merged
+            result = await session.execute(
+                select(self.model).where(self.model.id == db_obj.id)
+            )
+            return result.scalars().first()
 
     async def delete(self, id: int) -> bool:
         async with self._factory() as session:

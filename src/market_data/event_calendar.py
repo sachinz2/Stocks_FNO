@@ -25,6 +25,8 @@ import logging
 import os
 from datetime import date, timedelta
 
+from src.core.utils import _is_nse_holiday
+
 logger = logging.getLogger(__name__)
 
 _CALENDAR_REDIS_KEY = "event:calendar"
@@ -40,11 +42,33 @@ class CalendarUnavailable(Exception):
     outcome, not an unavailability."""
 
 
+def _add_trading_days(start: date, n: int) -> date:
+    """Return the date that is *n* NSE trading days after *start* (skips
+    weekends and NSE holidays)."""
+    d = start
+    counted = 0
+    while counted < n:
+        d += timedelta(days=1)
+        if d.weekday() < 5 and not _is_nse_holiday(d):
+            counted += 1
+    return d
+
+
 async def has_event_within_days(symbol: str, redis, days: int = 5) -> bool:
     """
-    Return True if an event is scheduled for *symbol* within *days* calendar
+    Return True if an event is scheduled for *symbol* within *days* TRADING
     days from today, OR if the calendar could not be loaded from either
     source at all.
+
+    Fixed 2026-09-15 (deep review): the cutoff used to be `today +
+    timedelta(days=days)` -- plain CALENDAR days -- while every call site's
+    own comment ("block entries within 5 trading days") and this module's
+    docstring both promise trading days. Any event whose window crossed a
+    weekend or NSE holiday was under-protected: e.g. an earnings date that
+    is 4 trading days away (Fri/Mon/Tue/Wed from a Thursday) but 6 calendar
+    days away fell outside a naive `today+5` cutoff, letting a new
+    credit_spread_v1/iron_condor_v1 position open just 1 trading day before
+    earnings -- exactly the IV-crush/gap risk this gate exists to prevent.
 
     Fixed 2026-08-27 (second-opinion review): this used to return False on
     ANY lookup failure, including total unavailability (Redis down AND the
@@ -65,7 +89,7 @@ async def has_event_within_days(symbol: str, redis, days: int = 5) -> bool:
         return True
 
     today   = date.today()
-    cutoff  = today + timedelta(days=days)
+    cutoff  = _add_trading_days(today, days)
 
     # Check symbol-specific dates AND market-wide events
     dates_to_check: list = list(calendar.get(symbol) or [])

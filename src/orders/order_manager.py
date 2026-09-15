@@ -558,6 +558,24 @@ class OrderManager:
                         "at the broker — not expiring/retrying."
                     )
                     continue
+                # Fixed 2026-09-15 (deep review): the cancel failed AND the
+                # re-sync couldn't positively confirm the order resolved to
+                # a terminal status (refreshed is None -- sync_orders()/
+                # get_by_id hit the same transient outage that broke
+                # cancel_order() -- or refreshed.order_status is still
+                # "OPEN", i.e. the cancel genuinely failed and the order is
+                # still live). Falling through to expire+retry here would
+                # place a genuine duplicate order at the broker while the
+                # original stays resting and, once marked EXPIRED, is
+                # permanently invisible to sync_orders()'s OPEN-only query
+                # -- a real fill on it would go untracked forever. Leave it
+                # as-is; the next cycle retries cancellation.
+                logger.warning(
+                    f"Stale order {order.id}: cancel failed and could not "
+                    "confirm broker-side resolution — leaving for next "
+                    "cycle, not expiring."
+                )
+                continue
 
             await self.order_repo.update(order, {
                 "order_status": "EXPIRED",

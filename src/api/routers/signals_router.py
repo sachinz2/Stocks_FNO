@@ -1,11 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, status
-from src.api.dto.schemas import SignalGenerateRequest, SignalGenerateResponse
+from src.api.dto.schemas import SignalGenerateRequest
 from src.api.services.auth import require_admin_token
 from src.database.connection import AsyncSessionLocal
 from src.database.models.signal import Signal
-from src.database.models.stock import Stock
 from src.database.repositories.base import BaseRepository
-from datetime import datetime
 import logging
 
 logger = logging.getLogger(__name__)
@@ -68,33 +66,26 @@ async def get_signal(signal_id: int):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
 
 
-@router.post("/generate", response_model=SignalGenerateResponse, dependencies=[Depends(require_admin_token)])
+@router.post("/generate", dependencies=[Depends(require_admin_token)])
 async def generate_signals(
     request: SignalGenerateRequest,
 ):
     """Manually trigger signal generation — requires the shared admin token (X-Admin-Token header)."""
-    try:
-        stock_repo = BaseRepository(Stock, AsyncSessionLocal)
-        signal_repo = BaseRepository(Signal, AsyncSessionLocal)
-
-        stocks = await stock_repo.filter(fno_enabled=True, active=True)
-        generated_count = 0
-
-        for stock in stocks:
-            if stock.deleted_at:
-                continue
-            await signal_repo.create({
-                "strategy_name": request.strategy,
-                "symbol": stock.symbol,
-                "signal_type": "BUY",
-                "confidence": 0.75,
-                "generated_at": datetime.utcnow(),
-                "status": "PENDING",
-            })
-            generated_count += 1
-
-        logger.info(f"Generated {generated_count} signals for strategy {request.strategy}")
-        return SignalGenerateResponse(generated=generated_count)
-    except Exception as e:
-        logger.error(f"Error generating signals: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
+    # Fixed 2026-09-15 (deep review): this endpoint never ran any real
+    # strategy logic -- it inserted one hardcoded signal_type="BUY",
+    # confidence=0.75 row per fno_enabled stock, unconditionally, with no
+    # validation that request.strategy is even a real registered strategy.
+    # LiveTradingEngine/the strategies never write to the `signals` table
+    # (they only log signal text) -- this stub was the ONLY writer to it,
+    # so every row GET /signals ever returned was fabricated, with no way
+    # for a caller to tell it apart from a genuine signal-generation run.
+    # Same fix pattern as risk_router/backtest_router/stocks_router (fake
+    # 200 -> honest 501); GET /signals and GET /signals/{id} are untouched
+    # since they honestly read whatever real rows exist.
+    raise HTTPException(
+        status.HTTP_501_NOT_IMPLEMENTED,
+        detail=(
+            "Manual signal generation via this endpoint is not implemented — "
+            "it previously inserted fabricated signal rows, not real strategy output."
+        ),
+    )
