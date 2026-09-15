@@ -76,6 +76,15 @@ from src.core.utils import now_ist
 
 logger = logging.getLogger(__name__)
 
+# Fixed 2026-09-15 (external review): a candidate pool key was previously
+# either SET (candidates found) or DELETED (none found) -- both an actual
+# empty pool and a poll() that crashed before reaching this symbol's score
+# looked identical downstream (key absent). Each pool now also gets a
+# companion ":status" key so a consumer (engine, dashboard, health check)
+# can distinguish READY/EMPTY/ERROR instead of inferring from key absence.
+_POOL_STATUS_SUFFIX = ":status"
+_POOL_STATUS_TTL_SEC = 150  # generous vs the 60s poll cadence
+
 HISTORY_REFRESH_SECONDS      = 300  # reload 5-min OHLC baseline every 5 min
 _HISTORY_15M_REFRESH_SECONDS = 900  # reload 15-min OHLC baseline every 15 min
 
@@ -191,6 +200,42 @@ class LTPPoller:
         self._kite   = kite
         self._tokens = instrument_tokens or {}
 
+    async def _publish_pool_error(self, reason: str) -> None:
+        """Mark all four candidate pools ERROR -- called when poll() fails
+        before it can even attempt per-symbol scoring. Deliberately does NOT
+        touch the base list keys (nfo:top5*) -- leaving the last-known-good
+        candidate list in place with a visible ERROR status is safer than
+        engine callers suddenly seeing zero candidates from one bad cycle."""
+        payload = json.dumps({
+            "status": "ERROR", "symbols_count": 0,
+            "generated_at": now_ist().replace(tzinfo=None).isoformat(),
+            "reason": reason,
+        })
+        for key in (REDIS_TOP_SYMBOLS_KEY, REDIS_TOP_SYMBOLS_CREDIT_SPREAD,
+                    REDIS_TOP_SYMBOLS_IRON_CONDOR, REDIS_TOP_SYMBOLS_MOMENTUM):
+            try:
+                await self._redis.set(f"{key}{_POOL_STATUS_SUFFIX}", payload, ex=_POOL_STATUS_TTL_SEC)
+            except Exception as exc:
+                logger.error(f"LTPPoller: failed to publish ERROR pool status for {key}: {exc}")
+
+    async def _publish_pool(self, key: str, scores: Dict[str, float], n: int,
+                             empty_reason: str) -> None:
+        """Publish a candidate pool's top-N list (existing wire format,
+        unchanged for backward compatibility) plus a companion ":status" key
+        so a consumer can tell READY (n>0 candidates) apart from EMPTY (poll
+        succeeded, genuinely nothing qualified today) without confusing
+        either with ERROR (poll itself failed -- see _publish_pool_error)."""
+        generated_at = now_ist().replace(tzinfo=None).isoformat()
+        if scores:
+            top = sorted(scores, key=scores.__getitem__, reverse=True)[:n]
+            await self._redis.set(key, json.dumps(top))
+            status = {"status": "READY", "symbols_count": len(top), "generated_at": generated_at}
+        else:
+            await self._redis.delete(key)
+            status = {"status": "EMPTY", "symbols_count": 0, "generated_at": generated_at, "reason": empty_reason}
+        await self._redis.set(f"{key}{_POOL_STATUS_SUFFIX}", json.dumps(status), ex=_POOL_STATUS_TTL_SEC)
+        return status.get("status")
+
     async def poll(self) -> None:
         """Called every 60 s by APScheduler."""
         from src.core.utils import is_market_open
@@ -199,24 +244,35 @@ class LTPPoller:
 
         loop = asyncio.get_running_loop()
 
-        # Refresh self.symbols from the dynamically-recomputed active
-        # universe (unioned with any open-position underlying) BEFORE the
-        # OHLC prefetch below, so a symbol the weekly job just added starts
-        # getting polled the same cycle instead of waiting for a restart.
-        await self._refresh_active_symbols()
+        try:
+            # Refresh self.symbols from the dynamically-recomputed active
+            # universe (unioned with any open-position underlying) BEFORE the
+            # OHLC prefetch below, so a symbol the weekly job just added starts
+            # getting polled the same cycle instead of waiting for a restart.
+            await self._refresh_active_symbols()
 
-        # Warm both OHLC caches concurrently before the sequential per-symbol
-        # loop below -- see _prefetch_stale_histories()'s docstring. By the
-        # time the loop calls _get_history()/_get_history_15m(), any symbol
-        # prefetched here just returns the now-warm cache, no blocking I/O.
-        await self._prefetch_stale_histories(
-            self.symbols, loop, self._fetch_kite_ohlc,
-            self._history_loaded_at, self._history, HISTORY_REFRESH_SECONDS,
-        )
-        await self._prefetch_stale_histories(
-            self.symbols, loop, self._fetch_kite_ohlc_15m,
-            self._history_15m_loaded_at, self._history_15m, _HISTORY_15M_REFRESH_SECONDS,
-        )
+            # Warm both OHLC caches concurrently before the sequential per-symbol
+            # loop below -- see _prefetch_stale_histories()'s docstring. By the
+            # time the loop calls _get_history()/_get_history_15m(), any symbol
+            # prefetched here just returns the now-warm cache, no blocking I/O.
+            await self._prefetch_stale_histories(
+                self.symbols, loop, self._fetch_kite_ohlc,
+                self._history_loaded_at, self._history, HISTORY_REFRESH_SECONDS,
+            )
+            await self._prefetch_stale_histories(
+                self.symbols, loop, self._fetch_kite_ohlc_15m,
+                self._history_15m_loaded_at, self._history_15m, _HISTORY_15M_REFRESH_SECONDS,
+            )
+        except Exception as exc:
+            # Fixed 2026-09-15 (external review): a failure here used to
+            # propagate up uncaught (or, depending on caller, silently abort
+            # the whole poll with no trace of WHY every pool then went stale/
+            # empty). Now explicitly marks every pool ERROR with the real
+            # reason before re-raising, so a consumer sees "poller broke",
+            # not "market has zero candidates today".
+            logger.error(f"LTPPoller: poll() setup failed, marking all pools ERROR: {exc}")
+            await self._publish_pool_error(str(exc))
+            raise
 
         ema_scores: Dict[str, float] = {}
         spread_scores: Dict[str, float] = {}
@@ -366,39 +422,37 @@ class LTPPoller:
 
         n = ACTIVE_TRADING_SYMBOLS
 
-        # Publish EMA crossover pool (existing key — high ATR + strong trend)
-        if ema_scores:
-            top_ema = sorted(ema_scores, key=ema_scores.__getitem__, reverse=True)[:n]
-            await self._redis.set(REDIS_TOP_SYMBOLS_KEY, json.dumps(top_ema))
-            logger.info(f"EMA pool top-{n}: {top_ema}")
+        # Fixed 2026-09-15 (external review): each pool now publishes a
+        # companion ":status" key (READY/EMPTY/ERROR, see _publish_pool) so a
+        # consumer can distinguish "genuinely nothing qualified today" from
+        # "poller broke" instead of both looking like a missing/absent key.
+        # EMA previously had NO empty-case handling at all (no else branch,
+        # no TTL on the base key) -- if ema_scores were ever empty the key
+        # would silently keep serving an arbitrarily stale list forever;
+        # unified onto the same _publish_pool() path as the other three pools.
+        status = await self._publish_pool(
+            REDIS_TOP_SYMBOLS_KEY, ema_scores, n,
+            empty_reason="No symbol scored (should not normally happen -- ema_score has no floor gate)",
+        )
+        logger.info(f"EMA pool: {status}")
 
-        # Publish credit spread pool (low ATR + EMA directional)
-        if spread_scores:
-            top_spread = sorted(spread_scores, key=spread_scores.__getitem__, reverse=True)[:n]
-            await self._redis.set(REDIS_TOP_SYMBOLS_CREDIT_SPREAD, json.dumps(top_spread))
-            logger.info(f"Credit spread pool top-{n}: {top_spread}")
-        else:
-            # No symbols in low-vol directional regime today — clear the key
-            await self._redis.delete(REDIS_TOP_SYMBOLS_CREDIT_SPREAD)
-            logger.info("Credit spread pool: no eligible symbols today (ATR% all >= 1.2%)")
+        status = await self._publish_pool(
+            REDIS_TOP_SYMBOLS_CREDIT_SPREAD, spread_scores, n,
+            empty_reason="No symbols in low-vol directional regime today (ATR% all >= 1.2%)",
+        )
+        logger.info(f"Credit spread pool: {status}")
 
-        # Publish iron condor pool (low ATR + flat EMA)
-        if condor_scores:
-            top_condor = sorted(condor_scores, key=condor_scores.__getitem__, reverse=True)[:n]
-            await self._redis.set(REDIS_TOP_SYMBOLS_IRON_CONDOR, json.dumps(top_condor))
-            logger.info(f"Iron condor pool top-{n}: {top_condor}")
-        else:
-            await self._redis.delete(REDIS_TOP_SYMBOLS_IRON_CONDOR)
-            logger.info("Iron condor pool: no eligible symbols today (all have directional EMA or high ATR%)")
+        status = await self._publish_pool(
+            REDIS_TOP_SYMBOLS_IRON_CONDOR, condor_scores, n,
+            empty_reason="No symbols eligible today (all have directional EMA or high ATR%)",
+        )
+        logger.info(f"Iron condor pool: {status}")
 
-        # Publish momentum pool (high ADX + wide EMA spread — established trend)
-        if momentum_scores:
-            top_momentum = sorted(momentum_scores, key=momentum_scores.__getitem__, reverse=True)[:n]
-            await self._redis.set(REDIS_TOP_SYMBOLS_MOMENTUM, json.dumps(top_momentum))
-            logger.info(f"Momentum pool top-{n}: {top_momentum}")
-        else:
-            await self._redis.delete(REDIS_TOP_SYMBOLS_MOMENTUM)
-            logger.info("Momentum pool: no eligible symbols today (ADX all < 25)")
+        status = await self._publish_pool(
+            REDIS_TOP_SYMBOLS_MOMENTUM, momentum_scores, n,
+            empty_reason="No symbols eligible today (ADX all < 25)",
+        )
+        logger.info(f"Momentum pool: {status}")
 
     async def _read_day_range(self, symbol: str) -> Optional[dict]:
         """

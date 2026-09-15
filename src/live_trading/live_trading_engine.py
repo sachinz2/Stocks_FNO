@@ -62,6 +62,32 @@ _REDIS_PEAK_PREMIUMS   = "engine:peak_premiums"
 _REDIS_PEAK_PROFITS    = "engine:peak_profits"
 _REDIS_LAST_SIGNAL     = "engine:last_signal_date"
 
+# Fixed 2026-09-15 (external review, "SignalDecisionTrace" recommendation):
+# canonical ordering across BOTH the single-leg (_process_signal) and
+# spread/condor (_process_credit_spread/_process_iron_condor) gate
+# pipelines, used by _record_signal_trace() to infer the LAST gate a
+# specific (strategy, symbol) candidate reached this cycle, by diffing
+# _signal_gate_stats before/after one _process_signal() call rather than
+# threading a trace object through every early-return branch of those
+# already carefully-hardened live entry-gate functions. Each pipeline is
+# strictly linear on its own (a candidate can only reach gate N after
+# passing gate N-1), and the two pipelines never share a strategy, so a
+# single merged order that respects each pipeline's own real sequence is
+# sufficient -- see SignalDecisionTrace's model docstring for the full
+# reasoning and its accepted limitation (stage, not exact numeric reason).
+_CANONICAL_GATE_ORDER = [
+    "signal_generated",                                              # single-leg only
+    "dte_passed",                                                    # shared, first gate both pipelines
+    "lot_size_passed", "vix_passed", "iv_rank_passed", "direction_passed",  # spread/condor only
+    "rvol_passed",                                                   # single-leg only
+    "adx_passed",                                                    # shared name, different position per pipeline
+    "event_calendar_passed",                                         # spread/condor only
+    "rs_passed", "mtf_passed", "lot_passed",                         # single-leg only
+    "contract_resolved",                                             # shared
+    "margin_passed",                                                 # spread/condor only
+    "trade_placed",                                                  # shared, terminal
+]
+
 
 def _pending_exits(engine) -> Dict[str, int]:
     """
@@ -564,10 +590,21 @@ class LiveTradingEngine:
         for strategy_id, strategy in active_strategies.items():
             symbols = await self._get_active_symbols(strategy)
             for symbol in symbols:
+                # Fixed 2026-09-15 (external review, "SignalDecisionTrace"
+                # recommendation): snapshot gate counts before the call so
+                # _record_signal_trace() can diff afterward and persist a
+                # per-symbol, per-cycle "what happened to THIS candidate"
+                # row -- see its own docstring for why this wraps the call
+                # rather than instrumenting _process_signal's internals.
+                _gates_before = dict(self._signal_gate_stats.get(strategy_id, {}))
                 try:
                     await self._process_signal(strategy, symbol, vix=vix, regime=regime)
+                    await self._record_signal_trace(strategy_id, symbol, regime, _gates_before)
                 except Exception as exc:
                     logger.error(f"Signal error [{strategy_id}:{symbol}]: {exc}")
+                    await self._record_signal_trace(
+                        strategy_id, symbol, regime, _gates_before, exception=str(exc)
+                    )
 
         # Persist EMA crossover's / Momentum's per-symbol confirmation progress every
         # cycle so a restart mid-confirmation doesn't silently reset it back to zero.
@@ -2238,6 +2275,63 @@ class LiveTradingEngine:
                     })
         except Exception as exc:
             logger.debug(f"[GateAudit] snapshot flush failed (non-critical): {exc}")
+
+    async def _record_signal_trace(
+        self, strategy_name: str, symbol: str, regime: Optional[str],
+        gates_before: Dict[str, int], exception: Optional[str] = None,
+    ) -> None:
+        """
+        Persist ONE signal_decision_trace row for (strategy_name, symbol)
+        this cycle -- WHY this specific candidate entered or got rejected,
+        complementing GateAuditSnapshot's cumulative per-strategy counts.
+        See SignalDecisionTrace's model docstring for the full design
+        rationale (diff-based, not threaded through _process_signal).
+
+        Called by the signal-cycle loop immediately around each
+        _process_signal() call with a before-snapshot of
+        self._signal_gate_stats[strategy_name] (copied BEFORE the call).
+        Pure observability -- a failure here must never affect trading, same
+        convention as _flush_gate_audit_snapshot().
+        """
+        try:
+            gates_after = self._signal_gate_stats.get(strategy_name, {})
+            reached = [
+                g for g in gates_after
+                if gates_after.get(g, 0) > gates_before.get(g, 0)
+            ]
+            if exception is not None:
+                final_decision = "ERROR"
+                last_gate = max(reached, key=_CANONICAL_GATE_ORDER.index) if reached else None
+                detail = exception[:255]
+            elif not reached:
+                # Strategy didn't act on this symbol at all this cycle --
+                # generate_signal() returned HOLD, the strategy is currently
+                # paused, or market data wasn't live yet. Cannot distinguish
+                # which without touching _process_signal's internals (see
+                # model docstring's accepted limitation).
+                final_decision, last_gate, detail = "NO_SIGNAL", None, None
+            elif "trade_placed" in reached:
+                final_decision, last_gate, detail = "ENTERED", "trade_placed", None
+            else:
+                final_decision = "REJECTED"
+                last_gate = max(reached, key=_CANONICAL_GATE_ORDER.index)
+                detail = None
+
+            from src.database.connection import AsyncSessionLocal
+            from src.database.models.signal_decision_trace import SignalDecisionTrace
+            from src.database.repositories.base import BaseRepository
+            repo = BaseRepository(SignalDecisionTrace, AsyncSessionLocal)
+            await repo.create({
+                "timestamp":         now_ist().replace(tzinfo=None),
+                "strategy_name":     strategy_name,
+                "symbol":            symbol,
+                "regime":            regime,
+                "final_decision":    final_decision,
+                "last_gate_reached": last_gate,
+                "detail":            detail,
+            })
+        except Exception as exc:
+            logger.debug(f"[SignalTrace] record failed (non-critical): {exc}")
 
     async def _process_signal(
         self, strategy, symbol: str, vix: Optional[float] = None,

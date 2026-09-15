@@ -436,6 +436,59 @@ async def get_gate_audit():
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+@router.get("/signal-trace")
+async def get_signal_trace(
+    strategy: str = None, symbol: str = None, decision: str = None, limit: int = 200,
+):
+    """
+    Per-candidate signal decision trace -- WHY a specific (strategy, symbol)
+    entered a trade or got rejected on a specific cycle, complementing
+    /gate-audit's cumulative per-strategy counts with a per-candidate view.
+
+    Added 2026-09-15 (external review, "SignalDecisionTrace" recommendation).
+    final_decision is one of NO_SIGNAL (strategy didn't act -- HOLD,
+    inactive, or missing data), REJECTED (a real signal died at
+    last_gate_reached), ENTERED, or ERROR. See
+    LiveTradingEngine._record_signal_trace()'s docstring for exactly how
+    last_gate_reached is derived and its accepted limitation (stage, not the
+    specific numeric reason -- e.g. "died at rvol_passed", not "RVOL=1.1 <
+    1.3"; that detail is still only in the adjacent log line for now).
+
+    Optional filters: strategy, symbol, decision (NO_SIGNAL/REJECTED/
+    ENTERED/ERROR). limit caps rows returned, most recent first (default
+    200, since candidate pools are small -- this is minutes, not days, of
+    history at max).
+    """
+    try:
+        from sqlalchemy import select
+        from src.database.models.signal_decision_trace import SignalDecisionTrace
+        async with AsyncSessionLocal() as session:
+            stmt = select(SignalDecisionTrace).order_by(SignalDecisionTrace.timestamp.desc())
+            if strategy:
+                stmt = stmt.where(SignalDecisionTrace.strategy_name == strategy)
+            if symbol:
+                stmt = stmt.where(SignalDecisionTrace.symbol == symbol)
+            if decision:
+                stmt = stmt.where(SignalDecisionTrace.final_decision == decision)
+            stmt = stmt.limit(min(limit, 1000))
+            rows = (await session.execute(stmt)).scalars().all()
+        return [
+            {
+                "timestamp":         r.timestamp.isoformat(),
+                "strategy_name":     r.strategy_name,
+                "symbol":            r.symbol,
+                "regime":            r.regime,
+                "final_decision":    r.final_decision,
+                "last_gate_reached": r.last_gate_reached,
+                "detail":            r.detail,
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        logger.error(f"Analytics /signal-trace error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
 @router.get("/rs-ranks")
 async def get_rs_ranks(request: Request, top: int = Query(10, le=40)):
     """
