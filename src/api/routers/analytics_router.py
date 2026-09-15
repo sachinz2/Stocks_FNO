@@ -350,6 +350,28 @@ async def get_signal_audit(request: Request):
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+@router.get("/position-fetch-health")
+async def get_position_fetch_health(request: Request):
+    """
+    Cumulative (since process start) counts of broker.get_positions() call
+    outcomes and how many signal cycles the "broker position state unknown"
+    safety gate has blocked new entries for (2026-09-15, external review,
+    "broker position-state visibility"). That gate is already correct/safe
+    on its own (confirmed by the same review) -- this makes how OFTEN it
+    fires observable, since an intermittently-failing broker API (not fully
+    down) would otherwise silently zero out new entries indefinitely while
+    every other health check still reports UP.
+    """
+    try:
+        engine = getattr(request.app.state, "trading_engine", None)
+        if not engine:
+            return {"message": "Trading engine not initialised."}
+        return engine.get_position_fetch_stats()
+    except Exception as e:
+        logger.error(f"Analytics /position-fetch-health error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
 @router.get("/portfolio-exposure")
 async def get_portfolio_exposure(request: Request):
     """
@@ -452,7 +474,12 @@ async def get_signal_trace(
     LiveTradingEngine._record_signal_trace()'s docstring for exactly how
     last_gate_reached is derived and its accepted limitation (stage, not the
     specific numeric reason -- e.g. "died at rvol_passed", not "RVOL=1.1 <
-    1.3"; that detail is still only in the adjacent log line for now).
+    1.3"; that detail is still only in the adjacent log line for now). For
+    final_decision=ERROR, `detail` is prefixed with a best-effort category
+    -- BROKER_ERROR / GATE_ERROR / OPTION_CHAIN_ERROR / RISK_ERROR /
+    DATA_OR_STRATEGY_ERROR / UNKNOWN_ERROR (see
+    LiveTradingEngine._classify_signal_error(); "external review,
+    structured error classification").
 
     Optional filters: strategy, symbol, decision (NO_SIGNAL/REJECTED/
     ENTERED/ERROR). limit caps rows returned, most recent first (default

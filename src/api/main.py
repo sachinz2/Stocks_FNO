@@ -881,6 +881,16 @@ async def health_check():
         "symbols_without_live_data": None,
         "n_symbols":                 None,
     }
+    # Fixed 2026-09-15 (external review, "universe/candidate visibility"):
+    # "the strategy is scanning 40 stocks" could previously silently mean
+    # far fewer in practice with no visible signal -- see
+    # ltp_poller.py's market:universe_health publish for what these mean.
+    universe_health = {
+        "universe_size":   None,
+        "history_valid":   None,
+        "live_data_valid": None,
+        "candidate_count": None,
+    }
 
     try:
         import json
@@ -896,6 +906,13 @@ async def health_check():
                 data_source["all_symbols_live"]          = trend.get("all_symbols_live")
                 data_source["symbols_without_live_data"]  = trend.get("symbols_without_live_data")
                 data_source["n_symbols"]                  = trend.get("n_symbols")
+            health_raw = await app.state.redis.get("market:universe_health")
+            if health_raw:
+                health = json.loads(health_raw)
+                universe_health["universe_size"]   = health.get("universe_size")
+                universe_health["history_valid"]   = health.get("history_valid")
+                universe_health["live_data_valid"] = health.get("live_data_valid")
+                universe_health["candidate_count"] = health.get("candidate_count")
     except Exception as e:
         redis_status = f"DOWN: {e}"
 
@@ -921,12 +938,13 @@ async def health_check():
         pass
 
     return {
-        "status":         overall,
-        "database":       db_status,
-        "redis":          redis_status,
-        "ltp_source":     source_label,
-        "data_source":    data_source,
-        "available_cash": available_cash,
+        "status":          overall,
+        "database":        db_status,
+        "redis":           redis_status,
+        "ltp_source":      source_label,
+        "data_source":     data_source,
+        "universe_health": universe_health,
+        "available_cash":  available_cash,
     }
 
 

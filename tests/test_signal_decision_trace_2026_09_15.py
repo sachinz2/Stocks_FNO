@@ -27,6 +27,12 @@ class _FakeTraceRepo:
 
 class _FakeTraceEngine:
     _record_signal_trace = LiveTradingEngine._record_signal_trace
+    # staticmethod() wrapper required: a plain function stored as a class
+    # attribute is auto-bound as a regular method (self injected as the
+    # first arg) unless explicitly marked static -- LiveTradingEngine
+    # itself doesn't need this since Python resolves @staticmethod there
+    # directly, but re-assigning the already-unwrapped function here does.
+    _classify_signal_error = staticmethod(LiveTradingEngine._classify_signal_error)
 
     def __init__(self, stats):
         self._signal_gate_stats = stats
@@ -116,13 +122,55 @@ async def test_error_records_exception_detail_and_last_reached_gate():
     fake = _FakeTraceEngine({"momentum_v1": gates_after})
 
     await fake._record_signal_trace(
-        "momentum_v1", "SBIN", "TRENDING", gates_before, exception="KeyError: 'adx14'",
+        "momentum_v1", "SBIN", "TRENDING", gates_before, exception=KeyError("adx14"),
     )
 
     row = _FakeTraceRepo.created[0]
     assert row["final_decision"] == "ERROR"
     assert row["last_gate_reached"] == "dte_passed"
-    assert "KeyError" in row["detail"]
+    assert "adx14" in row["detail"]
+
+
+# ── _classify_signal_error() -- structured error classification ────────────
+# 2026-09-15, external review: "an exception can look like an ordinary
+# rejected trade" without this. Packed into `detail` rather than a new
+# column, to avoid an Alembic migration for a best-effort refinement.
+
+def test_classify_broker_error_by_exception_type():
+    assert LiveTradingEngine._classify_signal_error(ConnectionError("timeout"), None) == "BROKER_ERROR"
+    assert LiveTradingEngine._classify_signal_error(TimeoutError("timeout"), "dte_passed") == "BROKER_ERROR"
+
+
+def test_classify_pre_signal_error_when_no_gate_reached():
+    assert LiveTradingEngine._classify_signal_error(KeyError("adx14"), None) == "DATA_OR_STRATEGY_ERROR"
+
+
+def test_classify_gate_error_for_entry_gate_checkpoints():
+    for gate in ("dte_passed", "rvol_passed", "adx_passed", "rs_passed", "mtf_passed"):
+        assert LiveTradingEngine._classify_signal_error(ValueError("x"), gate) == "GATE_ERROR"
+
+
+def test_classify_option_chain_error_for_contract_resolution_checkpoints():
+    for gate in ("lot_passed", "contract_resolved"):
+        assert LiveTradingEngine._classify_signal_error(ValueError("x"), gate) == "OPTION_CHAIN_ERROR"
+
+
+def test_classify_risk_error_at_margin_checkpoint():
+    assert LiveTradingEngine._classify_signal_error(ValueError("x"), "margin_passed") == "RISK_ERROR"
+
+
+@pytest.mark.asyncio
+async def test_error_detail_is_prefixed_with_its_classification():
+    gates_before = {}
+    gates_after = {}  # nothing incremented -- pre-signal failure
+    fake = _FakeTraceEngine({"momentum_v1": gates_after})
+
+    await fake._record_signal_trace(
+        "momentum_v1", "SBIN", "TRENDING", gates_before, exception=KeyError("adx14"),
+    )
+
+    row = _FakeTraceRepo.created[0]
+    assert row["detail"].startswith("[DATA_OR_STRATEGY_ERROR]")
 
 
 @pytest.mark.asyncio

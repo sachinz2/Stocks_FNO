@@ -324,6 +324,12 @@ class LTPPoller:
         momentum_bull_scores: Dict[str, float] = {}
         momentum_bear_scores: Dict[str, float] = {}
         all_ticks: list = []  # collected for market-breadth computation after the loop
+        # Fixed 2026-09-15 (external review, "universe/candidate visibility"):
+        # counts how many of self.symbols actually had enough history to be
+        # scored this cycle -- without this, "scanning 40 stocks" could
+        # silently mean 5 in practice (a widespread history-fetch outage)
+        # with zero visible signal. See market:universe_health below.
+        _history_valid_count = 0
 
         for symbol in self.symbols:
             try:
@@ -333,6 +339,7 @@ class LTPPoller:
                         logger.warning(f"Not enough history for {symbol} (need 50 bars), skipping (won't repeat).")
                         self._no_history_warned.add(symbol)
                     continue
+                _history_valid_count += 1
 
                 ltp = float(df["close"].iloc[-1])
 
@@ -479,6 +486,27 @@ class LTPPoller:
                     }),
                     ex=120,  # 2-min TTL — poll runs every 60 s
                 )
+
+        # Fixed 2026-09-15 (external review, "universe/candidate
+        # visibility"): "the strategy is scanning 40 stocks" could
+        # previously silently mean far fewer in practice (a widespread
+        # history-fetch outage, or most of the universe stuck on the
+        # bootstrap fallback) with no visible signal short of grepping logs
+        # for the per-symbol warnings above. candidate_count is
+        # len(ema_scores) -- EMA always scores every symbol with valid
+        # history (no floor gate, see _score_all's docstring), so it's the
+        # accurate "how many symbols were even considered this cycle" count.
+        await self._redis.set(
+            "market:universe_health",
+            json.dumps({
+                "universe_size":   len(self.symbols),
+                "history_valid":   _history_valid_count,
+                "live_data_valid": len(self.symbols) - len(self._no_live_data_warned),
+                "candidate_count": len(ema_scores),
+                "timestamp":       datetime.now().isoformat(),
+            }),
+            ex=120,  # 2-min TTL — poll runs every 60 s
+        )
 
         n = ACTIVE_TRADING_SYMBOLS
 

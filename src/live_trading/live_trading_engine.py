@@ -236,6 +236,16 @@ class LiveTradingEngine:
         # broker's real position state is unknown, rather than silently treating
         # a fetch failure as "nothing open, safe to enter more."
         self._broker_position_state_known: bool = True
+        # Fixed 2026-09-15 (external review, "broker position-state
+        # visibility"): the block above is already correct/safe (confirmed
+        # by the same review) -- this just makes how OFTEN it fires
+        # observable. A broker API that's intermittently failing (not fully
+        # down) would otherwise silently zero out new entries indefinitely
+        # while every other health check still reports UP. See
+        # get_position_fetch_stats().
+        self._position_fetch_stats: Dict[str, int] = {
+            "success": 0, "failure": 0, "entry_cycles_blocked": 0,
+        }
         # Fixed 2026-09-15 (external review, global-regime NIFTY
         # subscription): resolved once in main.py's kite provisioning (see
         # fno_universe.resolve_nifty_token()), attached here via
@@ -595,9 +605,12 @@ class LiveTradingEngine:
         # Exits above already ran (closing/protecting existing positions is
         # not gated the same way), just new entries this cycle.
         if not self._broker_position_state_known:
+            self._position_fetch_stats["entry_cycles_blocked"] += 1
             logger.warning(
                 "Broker position state unknown (last get_positions() call "
-                "failed) — skipping all new entries this cycle."
+                "failed) — skipping all new entries this cycle. "
+                f"({self._position_fetch_stats['entry_cycles_blocked']} cycle(s) "
+                "blocked this way since process start.)"
             )
             await self._persist_ema_state()
             await self._persist_momentum_state()
@@ -619,7 +632,7 @@ class LiveTradingEngine:
                 except Exception as exc:
                     logger.error(f"Signal error [{strategy_id}:{symbol}]: {exc}")
                     await self._record_signal_trace(
-                        strategy_id, symbol, regime, _gates_before, exception=str(exc)
+                        strategy_id, symbol, regime, _gates_before, exception=exc
                     )
 
         # Persist EMA crossover's / Momentum's per-symbol confirmation progress every
@@ -2292,9 +2305,54 @@ class LiveTradingEngine:
         except Exception as exc:
             logger.debug(f"[GateAudit] snapshot flush failed (non-critical): {exc}")
 
+    @staticmethod
+    def _classify_signal_error(exc: Exception, last_gate: Optional[str]) -> str:
+        """
+        Best-effort error category for an exception raised somewhere inside
+        one _process_signal() call -- 2026-09-15, external review
+        ("structured error classification"): "an exception can look like an
+        ordinary rejected trade" without this. SignalDecisionTrace already
+        solves the core complaint (final_decision="ERROR" is a distinct
+        value from "REJECTED"); this adds a coarser WHAT-KIND-OF-error on
+        top, packed into the existing `detail` field rather than a new
+        column (avoids an Alembic migration for a refinement).
+
+        Necessarily approximate, same accepted-limitation spirit as
+        last_gate_reached itself: classification is derived from (a) the
+        exception's own type/module (network/broker-shaped errors are
+        identifiable regardless of when they hit) and (b) how far the
+        diff-based trace got before failing (see _record_signal_trace) --
+        not from tagging the actual raise site, which would mean
+        instrumenting _process_signal's internals (deliberately avoided,
+        see SignalDecisionTrace's model docstring).
+        """
+        exc_type = type(exc).__name__
+        exc_module = type(exc).__module__ or ""
+        if (
+            isinstance(exc, (ConnectionError, TimeoutError, OSError))
+            or "kite" in exc_module.lower() or "kiteconnect" in exc_module.lower()
+            or "Kite" in exc_type or "Broker" in exc_type
+        ):
+            return "BROKER_ERROR"
+        if last_gate is None:
+            # Failed before even signal_generated -- market-data fetch/
+            # parse, or a bug inside generate_signal() itself. Can't
+            # distinguish the two without instrumenting _process_signal's
+            # internals (see docstring above).
+            return "DATA_OR_STRATEGY_ERROR"
+        if last_gate in ("dte_passed", "rvol_passed", "adx_passed", "rs_passed", "mtf_passed",
+                          "lot_size_passed", "vix_passed", "iv_rank_passed", "direction_passed",
+                          "event_calendar_passed"):
+            return "GATE_ERROR"
+        if last_gate in ("lot_passed", "contract_resolved"):
+            return "OPTION_CHAIN_ERROR"
+        if last_gate == "margin_passed":
+            return "RISK_ERROR"
+        return "UNKNOWN_ERROR"
+
     async def _record_signal_trace(
         self, strategy_name: str, symbol: str, regime: Optional[str],
-        gates_before: Dict[str, int], exception: Optional[str] = None,
+        gates_before: Dict[str, int], exception: Optional[Exception] = None,
     ) -> None:
         """
         Persist ONE signal_decision_trace row for (strategy_name, symbol)
@@ -2318,7 +2376,8 @@ class LiveTradingEngine:
             if exception is not None:
                 final_decision = "ERROR"
                 last_gate = max(reached, key=_CANONICAL_GATE_ORDER.index) if reached else None
-                detail = exception[:255]
+                _category = self._classify_signal_error(exception, last_gate)
+                detail = f"[{_category}] {exception}"[:255]
             elif not reached:
                 # Strategy didn't act on this symbol at all this cycle --
                 # generate_signal() returned HOLD, the strategy is currently
@@ -6239,6 +6298,7 @@ class LiveTradingEngine:
         try:
             positions = await self.broker.get_positions()
             self._broker_position_state_known = True
+            self._position_fetch_stats["success"] += 1
             return positions
         except Exception as exc:
             logger.error(f"Failed to fetch positions: {exc}")
@@ -6250,7 +6310,14 @@ class LiveTradingEngine:
             # run_signal_cycle() checks this flag separately to block new
             # entries specifically.
             self._broker_position_state_known = False
+            self._position_fetch_stats["failure"] += 1
             return []
+
+    def get_position_fetch_stats(self) -> Dict[str, int]:
+        """Cumulative (since process start) counts of _safe_get_positions()
+        outcomes -- see self._position_fetch_stats' docstring in __init__
+        for why this exists."""
+        return dict(self._position_fetch_stats)
 
     # Market data is considered stale if older than this many seconds.
     # Prevents entries when the LTP poller has fallen behind (e.g., Zerodha API lag).

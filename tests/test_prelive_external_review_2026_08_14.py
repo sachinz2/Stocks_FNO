@@ -44,12 +44,19 @@ async def test_safe_get_positions_marks_state_unknown_on_broker_failure():
         async def get_positions(self):
             raise RuntimeError("Zerodha API timeout")
 
-    stub = SimpleNamespace(broker=_FailingBroker(), _broker_position_state_known=True)
+    stub = SimpleNamespace(
+        broker=_FailingBroker(), _broker_position_state_known=True,
+        _position_fetch_stats={"success": 0, "failure": 0, "entry_cycles_blocked": 0},
+    )
 
     result = await LiveTradingEngine._safe_get_positions(stub)
 
     assert result == []
     assert stub._broker_position_state_known is False
+    # Fixed 2026-09-15 (external review, "broker position-state
+    # visibility"): a failed fetch must be counted, not just flagged.
+    assert stub._position_fetch_stats["failure"] == 1
+    assert stub._position_fetch_stats["success"] == 0
 
 
 @pytest.mark.asyncio
@@ -59,12 +66,16 @@ async def test_safe_get_positions_marks_state_known_on_confirmed_zero():
             return []
 
     # Simulate a prior failure to prove success actually flips it back.
-    stub = SimpleNamespace(broker=_OkBroker(), _broker_position_state_known=False)
+    stub = SimpleNamespace(
+        broker=_OkBroker(), _broker_position_state_known=False,
+        _position_fetch_stats={"success": 0, "failure": 1, "entry_cycles_blocked": 0},
+    )
 
     result = await LiveTradingEngine._safe_get_positions(stub)
 
     assert result == []
     assert stub._broker_position_state_known is True
+    assert stub._position_fetch_stats["success"] == 1
 
 
 def test_run_signal_cycle_blocks_new_entries_when_broker_state_unknown():
