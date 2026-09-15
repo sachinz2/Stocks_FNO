@@ -33,6 +33,7 @@ def _bare_ticker():
     t._connected_at = None
     t._last_tick_at = None
     t._connect_attempted_at = None
+    t._nifty_token = None
     return t
 
 
@@ -294,3 +295,143 @@ def test_on_ticks_updates_stamp_on_every_batch(frozen_now, monkeypatch):
 
     stored = json.loads(t._redis.store["tick:RELIANCE"])
     assert stored["_ws_last_tick_at"] == frozen_now["t"].isoformat()
+
+
+# ── NIFTY 50 index subscription (2026-09-15, external review global-regime) ─
+#
+# Tracked entirely separately from self._instrument_tokens/self._token_symbol
+# -- that dict is wholesale-replaced by set_instrument_tokens() every weekly
+# active-universe recompute, diffed only against its OWN previous state, so
+# an entry added there would silently vanish on the next recompute.
+
+class _FakeKiteTicker:
+    MODE_QUOTE = "quote"
+
+    def __init__(self):
+        self.subscribed = []
+        self.modes = []
+
+    def subscribe(self, tokens):
+        self.subscribed.extend(tokens)
+
+    def set_mode(self, mode, tokens):
+        self.modes.append((mode, list(tokens)))
+
+    def unsubscribe(self, tokens):
+        for t in tokens:
+            if t in self.subscribed:
+                self.subscribed.remove(t)
+
+
+def test_on_ticks_routes_nifty_token_to_its_own_key_not_the_symbol_loop(frozen_now, monkeypatch):
+    monkeypatch.setattr("src.core.utils.is_market_open", lambda: True)
+    t = _bare_ticker()
+    t._redis = _FakeSyncRedis()
+    t._token_symbol = {100: "RELIANCE"}  # NIFTY token (256265) NOT in here
+    t._nifty_token = 256265
+    frozen_now["t"] = IST.localize(dt.datetime(2026, 9, 15, 12, 0, 0))
+
+    t._on_ticks(None, [
+        {"instrument_token": 100, "last_price": 2500.0, "volume_traded": 500000},
+        {"instrument_token": 256265, "last_price": 24800.5},  # no volume_traded -- indices don't carry it
+    ])
+
+    assert "tick:RELIANCE" in t._redis.store  # existing symbol pipeline unaffected
+    nifty = json.loads(t._redis.store["market:nifty_tick"])
+    assert nifty["close"] == 24800.5
+    assert nifty["symbol"] == "NIFTY_50_INDEX"
+
+
+def test_nifty_tick_accumulates_real_bars_not_a_single_blob(frozen_now, monkeypatch):
+    # The exact defect already proven in this codebase for per-stock data
+    # (see ltp_poller.py's module docstring) -- a single "today" blob bar is
+    # too weak to move EMA20/50. NIFTY must accumulate real per-5-min bars
+    # via the same update_intraday_bar() machinery, not one static snapshot.
+    monkeypatch.setattr("src.core.utils.is_market_open", lambda: True)
+    t = _bare_ticker()
+    t._redis = _FakeSyncRedis()
+    t._token_symbol = {}
+    t._nifty_token = 256265
+
+    frozen_now["t"] = IST.localize(dt.datetime(2026, 9, 15, 9, 15, 0))
+    t._on_ticks(None, [{"instrument_token": 256265, "last_price": 24800.0}])
+
+    frozen_now["t"] = IST.localize(dt.datetime(2026, 9, 15, 9, 21, 0))  # next 5-min bucket
+    t._on_ticks(None, [{"instrument_token": 256265, "last_price": 24750.0}])
+
+    nifty = json.loads(t._redis.store["market:nifty_tick"])
+    assert len(nifty.get("bars_today", [])) == 1  # first bar finalized on rollover
+    assert nifty["close"] == 24750.0
+
+
+def test_on_connect_resubscribes_nifty_token_alongside_the_regular_universe():
+    t = _bare_ticker()
+    t._instrument_tokens = {"RELIANCE": 100}
+    t._nifty_token = 256265
+    fake_ws = _FakeKiteTicker()
+    t._ticker = fake_ws
+
+    t._on_connect(None, None)
+
+    assert 100 in fake_ws.subscribed
+    assert 256265 in fake_ws.subscribed
+
+
+def test_on_connect_does_not_error_when_no_nifty_token_set():
+    t = _bare_ticker()
+    t._instrument_tokens = {"RELIANCE": 100}
+    fake_ws = _FakeKiteTicker()
+    t._ticker = fake_ws
+
+    t._on_connect(None, None)  # must not raise
+
+    assert fake_ws.subscribed == [100]
+
+
+def test_set_nifty_token_pushes_to_an_already_connected_websocket():
+    t = _bare_ticker()
+    fake_ws = _FakeKiteTicker()
+    t._ticker = fake_ws
+
+    t.set_nifty_token(256265)
+
+    assert t._nifty_token == 256265
+    assert 256265 in fake_ws.subscribed
+
+
+def test_set_nifty_token_is_a_noop_before_start():
+    t = _bare_ticker()
+    t._ticker = None
+
+    t.set_nifty_token(256265)  # must not raise
+
+    assert t._nifty_token == 256265
+
+
+def test_set_nifty_token_ignores_none():
+    t = _bare_ticker()
+    fake_ws = _FakeKiteTicker()
+    t._ticker = fake_ws
+
+    t.set_nifty_token(None)
+
+    assert t._nifty_token is None
+    assert fake_ws.subscribed == []
+
+
+def test_set_instrument_tokens_diff_never_touches_the_separately_tracked_nifty_token():
+    # The exact bug this separation avoids: set_instrument_tokens() computes
+    # added/removed purely from self._instrument_tokens' own before/after --
+    # the NIFTY token must never appear in that dict, so a weekly
+    # active-universe recompute can never accidentally unsubscribe it.
+    t = _bare_ticker()
+    t._instrument_tokens = {"RELIANCE": 100}
+    t._token_symbol = {100: "RELIANCE"}
+    t._nifty_token = 256265
+    fake_ws = _FakeKiteTicker()
+    t._ticker = fake_ws
+
+    t.set_instrument_tokens({"RELIANCE": 100, "TCS": 200})  # universe grows
+
+    assert 256265 not in fake_ws.subscribed  # never touched by this call at all
+    assert t._nifty_token == 256265  # still tracked, unaffected

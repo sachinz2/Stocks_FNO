@@ -358,7 +358,7 @@ class _FakeRedisFull:
 
 
 @pytest.mark.asyncio
-async def test_detect_publishes_unknown_when_both_vix_and_trend_stats_missing():
+async def test_detect_publishes_unknown_when_both_vix_and_nifty_inputs_missing():
     detector = MRD(_FakeRedisFull({}))
     regime = await detector.detect()
     assert regime == "UNKNOWN"
@@ -367,10 +367,11 @@ async def test_detect_publishes_unknown_when_both_vix_and_trend_stats_missing():
 
 
 @pytest.mark.asyncio
-async def test_detect_publishes_unknown_when_only_trend_stats_missing():
-    # Real VIX present, but market:trend_stats absent (e.g. LTPPoller hasn't
-    # completed its first cycle yet this session) -- still not enough to
-    # classify confidently.
+async def test_detect_publishes_unknown_when_only_nifty_inputs_missing():
+    # Real VIX present, but market:nifty_regime_inputs absent (e.g.
+    # refresh_nifty_regime_inputs() hasn't completed its first cycle yet
+    # this session, or the NIFTY token failed to resolve) -- still not
+    # enough to classify confidently.
     detector = MRD(_FakeRedisFull({"market:india_vix": "13.5"}))
     regime = await detector.detect()
     assert regime == "UNKNOWN"
@@ -379,7 +380,7 @@ async def test_detect_publishes_unknown_when_only_trend_stats_missing():
 @pytest.mark.asyncio
 async def test_detect_publishes_unknown_when_only_vix_missing():
     detector = MRD(_FakeRedisFull({
-        "market:trend_stats": json.dumps({"n_symbols": 50, "avg_atr_pct_daily": 1.8, "avg_ema_spread_pct": 0.3}),
+        "market:nifty_regime_inputs": json.dumps({"atr_pct_daily": 1.8, "ema_spread_pct": 0.3}),
     }))
     regime = await detector.detect()
     assert regime == "UNKNOWN"
@@ -387,9 +388,12 @@ async def test_detect_publishes_unknown_when_only_vix_missing():
 
 @pytest.mark.asyncio
 async def test_detect_classifies_normally_when_both_real_inputs_present():
+    # Fixed 2026-09-15: ATR%/EMA-spread% now come from
+    # market:nifty_regime_inputs (real NIFTY 50 index data), not
+    # market:trend_stats (the old 40-stock cross-sectional average proxy).
     detector = MRD(_FakeRedisFull({
         "market:india_vix": "13.5",
-        "market:trend_stats": json.dumps({"n_symbols": 50, "avg_atr_pct_daily": 1.8, "avg_ema_spread_pct": 0.3}),
+        "market:nifty_regime_inputs": json.dumps({"atr_pct_daily": 1.8, "ema_spread_pct": 0.3}),
     }))
     regime = await detector.detect()
     assert regime == "TRENDING"  # real ATR% above threshold

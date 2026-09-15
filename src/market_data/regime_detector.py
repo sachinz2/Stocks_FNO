@@ -37,9 +37,14 @@ Usage:
 import asyncio
 import json
 import logging
+from datetime import timedelta
 from typing import Dict, Optional
 
+import pandas as pd
+
+from src.core.constants import FIVE_MIN_ATR_DAILY_SCALE
 from src.core.utils import now_ist
+from src.market_data.zerodha_ticker import REDIS_NIFTY_TICK_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -58,8 +63,12 @@ ATR_TREND_EXIT_THRESHOLD = 1.3
 EMA_FLAT_THRESHOLD   = 0.15   # EMA spread% below = range-bound / flat
 
 REDIS_REGIME_KEY      = "market:regime"
-REDIS_TREND_STATS_KEY = "market:trend_stats"  # written by LTPPoller — market-wide avg ATR%/EMA-spread%
+REDIS_TREND_STATS_KEY = "market:trend_stats"  # written by LTPPoller — market-wide avg ATR%/EMA-spread%,
+                                                # kept for api/main.py's /health F&O-universe-liveness
+                                                # reporting -- no longer the regime-classification input
+                                                # (see REDIS_NIFTY_REGIME_INPUTS_KEY / 2026-09-15 fix)
 REDIS_VIX_KEY         = "market:india_vix"    # matches option_chain.fetch_and_cache_vix()
+REDIS_NIFTY_REGIME_INPUTS_KEY = "market:nifty_regime_inputs"  # written by refresh_nifty_regime_inputs()
 
 # Strategy IDs that must exactly match what StrategyRegistry uses
 STRATEGY_EMA       = "ema_crossover_v1"
@@ -131,6 +140,103 @@ REGIME_STRATEGY_MAP: Dict[str, list] = {
     "LOW_VOL":     [STRATEGY_SPREAD],   # quiet market = premium seller heaven (credit_spread_v1 only --
                                           # iron_condor_v1's own VIX>=12 gate can never pass here, see above)
 }
+
+
+async def refresh_nifty_regime_inputs(kite, redis, nifty_token: Optional[int]) -> bool:
+    """
+    Compute real NIFTY 50 ATR14%/EMA20-50-spread% and publish to
+    REDIS_NIFTY_REGIME_INPUTS_KEY -- the real, index-specific input
+    MarketRegimeDetector._get_market_indicators() now reads for GLOBAL
+    regime classification, replacing the cross-sectional 40-stock average
+    proxy (REDIS_TREND_STATS_KEY, still published separately by LTPPoller
+    for its own unrelated F&O-universe-health purpose -- see
+    api/main.py's /health endpoint).
+
+    Blends a historical 5-min baseline (kite.historical_data() -- reliable
+    for anything not-today; Zerodha confirmed it lags same-day intraday
+    candles by 5+ hours, see ltp_poller.py's module docstring) with the
+    real, WebSocket-accumulated intraday bars in market:nifty_tick (written
+    by ZerodhaTicker._handle_nifty_tick(), same update_intraday_bar()
+    machinery used per F&O stock -- deliberately NOT a single "today" blob
+    bar, which this codebase already proved too weak to move EMA20/50
+    meaningfully, see ltp_poller.py's own historical note).
+
+    Returns True on success, False on any failure (missing token/kite,
+    insufficient bars, API error) -- deliberately does NOT publish a
+    fabricated fallback on failure. regime_detector.detect()'s UNKNOWN
+    fallback (2026-09-15 fix) already handles a missing/stale key correctly
+    by refusing to guess, which is the entire point of this being a
+    real-data-or-nothing feed.
+    """
+    if not kite or not nifty_token:
+        return False
+    try:
+        loop = asyncio.get_running_loop()
+        to_date = now_ist().replace(tzinfo=None)
+        from_date = to_date - timedelta(days=10)
+        bars = await loop.run_in_executor(
+            None,
+            lambda: kite.historical_data(nifty_token, from_date, to_date, "5minute"),
+        )
+        df = pd.DataFrame(bars) if bars else pd.DataFrame()
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"])
+            # Drop any of today's own bars historical_data() happens to
+            # return -- unreliable/lagged for the CURRENT session (see
+            # docstring above). Today's real bars come from the live-tick
+            # feed below instead, same split ltp_poller.py uses per stock.
+            today_str = now_ist().date().isoformat()
+            df = df[df["date"].apply(lambda d: d.date().isoformat() != today_str)]
+
+        raw = await redis.get(REDIS_NIFTY_TICK_KEY)
+        live = json.loads(raw) if raw else None
+        live_rows = []
+        if live:
+            for bar in (live.get("bars_today") or []):
+                live_rows.append({
+                    "date": bar["date"], "open": bar["open"],
+                    "high": bar["high"], "low": bar["low"], "close": bar["close"],
+                })
+            if live.get("cur_bar_open") is not None:
+                live_rows.append({
+                    "date": now_ist().isoformat(),
+                    "open": live.get("cur_bar_open"), "high": live.get("cur_bar_high"),
+                    "low": live.get("cur_bar_low"), "close": live.get("close"),
+                })
+        if live_rows:
+            df = pd.concat([df, pd.DataFrame(live_rows)], ignore_index=True)
+
+        if len(df) < 50:
+            logger.warning(
+                f"NIFTY regime feed: insufficient bars ({len(df)}, need 50) "
+                "-- not publishing, global regime stays UNKNOWN until this resolves."
+            )
+            return False
+
+        close, high, low = df["close"], df["high"], df["low"]
+        ema20 = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
+        ema50 = float(close.ewm(span=50, adjust=False).mean().iloc[-1])
+        tr = pd.concat([
+            high - low,
+            (high - close.shift()).abs(),
+            (low  - close.shift()).abs(),
+        ], axis=1).max(axis=1)
+        atr14 = float(tr.ewm(alpha=1.0 / 14, adjust=False).mean().iloc[-1])
+        last_close = float(close.iloc[-1])
+
+        atr_pct_daily = round((atr14 / last_close * 100) * FIVE_MIN_ATR_DAILY_SCALE, 4) if last_close > 0 else 0.0
+        ema_spread_pct = round(abs(ema20 - ema50) / ema50 * 100, 4) if ema50 > 0 else 0.0
+
+        await redis.set(REDIS_NIFTY_REGIME_INPUTS_KEY, json.dumps({
+            "atr_pct_daily":  atr_pct_daily,
+            "ema_spread_pct": ema_spread_pct,
+            "close":          last_close,
+            "timestamp":      now_ist().replace(tzinfo=None).isoformat(),
+        }), ex=180)
+        return True
+    except Exception as e:
+        logger.warning(f"NIFTY regime feed refresh failed (non-critical, global regime stays UNKNOWN): {e}")
+        return False
 
 
 class MarketRegimeDetector:
@@ -305,29 +411,39 @@ class MarketRegimeDetector:
 
     async def _get_market_indicators(self):
         """Return (vix, market_atr_pct, market_ema_spread_pct, data_known).
-        Falls back to safe mid-zone defaults if LTPPoller hasn't published
-        market:trend_stats yet (e.g. market just opened, or market is
-        closed) -- but data_known is False whenever EITHER real VIX or real
-        trend_stats couldn't be read, so detect() can tell a genuine
-        classification apart from one built on fill-in defaults (see
-        detect()'s 2026-09-15 fix for why that distinction matters)."""
+
+        Fixed 2026-09-15 (external review, "replace the 40-stock average
+        proxy with actual NIFTY"): ATR%/EMA-spread% now come from
+        REDIS_NIFTY_REGIME_INPUTS_KEY -- real NIFTY 50 index indicators (see
+        refresh_nifty_regime_inputs()) -- instead of REDIS_TREND_STATS_KEY,
+        a cross-sectional average across ~130+ F&O stocks. That average was
+        never actually NIFTY: on 2026-09-15 itself, Nifty fell ~1.19% while
+        IT stocks rose strongly the same session -- a broad average can sit
+        near-flat while the index it was standing in for moves sharply.
+        REDIS_TREND_STATS_KEY is untouched and still published by LTPPoller
+        for its own, unrelated purpose (api/main.py's /health F&O-universe-
+        liveness reporting).
+
+        data_known is False whenever EITHER real VIX or real NIFTY inputs
+        couldn't be read, so detect() can tell a genuine classification
+        apart from one built on fill-in defaults (see detect()'s 2026-09-15
+        UNKNOWN-regime fix for why that distinction matters)."""
         vix, vix_known = await self._get_vix()
         atr_pct      = 1.0   # safe default = mid-zone
         ema_spread   = 0.15
-        trend_known  = False
+        nifty_known  = False
 
         try:
-            raw = await self._redis.get(REDIS_TREND_STATS_KEY)
+            raw = await self._redis.get(REDIS_NIFTY_REGIME_INPUTS_KEY)
             if raw:
                 stats = json.loads(raw)
-                if stats.get("n_symbols", 0) > 0:
-                    atr_pct    = stats.get("avg_atr_pct_daily", atr_pct)
-                    ema_spread = stats.get("avg_ema_spread_pct", ema_spread)
-                    trend_known = True
+                atr_pct     = stats.get("atr_pct_daily", atr_pct)
+                ema_spread  = stats.get("ema_spread_pct", ema_spread)
+                nifty_known = True
         except Exception as e:
-            logger.debug(f"RegimeDetector: trend stats read error: {e}")
+            logger.debug(f"RegimeDetector: NIFTY regime inputs read error: {e}")
 
-        return vix, round(atr_pct, 3), round(ema_spread, 3), (vix_known and trend_known)
+        return vix, round(atr_pct, 3), round(ema_spread, 3), (vix_known and nifty_known)
 
     async def _get_vix(self):
         """Read VIX from Redis (written by ZerodhaLTPPoller or engine).

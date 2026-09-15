@@ -14,7 +14,7 @@ run_in_executor), and is trivially unit-testable against a fixed instrument
 dump/kite fake without any live network or event loop.
 """
 import logging
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +58,27 @@ def resolve_nse_tokens(nse_instruments: list, symbols) -> Dict[str, int]:
         if sym in symbol_set:
             tokens[sym] = inst["instrument_token"]
     return tokens
+
+
+# Zerodha's NSE instrument dump lists the index itself with this exact
+# tradingsymbol (segment "INDICES") -- same dump _provision_kite() already
+# fetches for resolve_nse_tokens(), no extra API call needed.
+NIFTY_50_TRADINGSYMBOL = "NIFTY 50"
+
+
+def resolve_nifty_token(nse_instruments: list) -> Optional[int]:
+    """
+    NIFTY 50 index instrument_token from a raw kite.instruments("NSE") dump
+    -- used to subscribe the index on the live WebSocket ticker and fetch
+    its historical OHLC baseline for the real, NIFTY-based global regime
+    (see regime_detector.py's 2026-09-15 fix). Returns None if not found
+    (e.g. a malformed/partial instrument dump) -- callers must treat that as
+    "global regime stays UNKNOWN until this resolves", never guess a token.
+    """
+    for inst in nse_instruments:
+        if inst.get("tradingsymbol") == NIFTY_50_TRADINGSYMBOL:
+            return inst.get("instrument_token")
+    return None
 
 
 def compute_liquidity_turnover(kite, tokens: Dict[str, int], lookback_days: int = 30) -> Dict[str, float]:

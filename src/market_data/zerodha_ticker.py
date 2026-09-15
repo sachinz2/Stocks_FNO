@@ -38,6 +38,13 @@ REDIS_TOKEN_KEY = "zerodha:access_token"  # written by scripts/zerodha_auto_auth
 TOKEN_REFRESH_CHECK_INTERVAL_SECONDS = 60
 TOKEN_REFRESH_CHECK_MAX_ATTEMPTS     = 480
 
+# Separate key namespace from tick:{symbol} (REDIS_TICK_PREFIX) -- NIFTY 50
+# isn't an F&O underlying and must never be picked up by any code that
+# iterates FNO_SYMBOLS and looks up tick:{symbol} per symbol (LTPPoller,
+# RSRanker, etc.). Matches the market: prefix already used for
+# market:regime/market:breadth/market:trend_stats/market:india_vix.
+REDIS_NIFTY_TICK_KEY = "market:nifty_tick"
+
 
 class ZerodhaTicker:
     """Real-time NSE equity LTP via Zerodha KiteTicker WebSocket."""
@@ -78,6 +85,17 @@ class ZerodhaTicker:
         # nothing able to detect or recover from it -- only an unrelated
         # manual deploy at 12:07 happened to restart the process and fix it.
         self._connect_attempted_at = None
+        # Fixed 2026-09-15 (external review, global-regime NIFTY subscription):
+        # deliberately kept OUT of self._instrument_tokens/self._token_symbol
+        # -- that dict gets wholesale-replaced by set_instrument_tokens()
+        # every weekly active-universe recompute (diffed against its own
+        # previous state only), so an entry added there would silently drop
+        # out and never get re-added on the next recompute. Tracked
+        # separately with its own explicit subscribe call in _on_connect()
+        # (every reconnect) and set_nifty_token() (already-connected case),
+        # matching set_instrument_tokens()'s own "push to the live
+        # connection immediately, not just local bookkeeping" pattern.
+        self._nifty_token: Optional[int] = None
 
     def fetch_instrument_tokens(self) -> int:
         """
@@ -151,6 +169,31 @@ class ZerodhaTicker:
                 )
         except Exception as e:
             logger.error(f"ZerodhaTicker: failed to update live WebSocket subscription: {e}")
+
+    def set_nifty_token(self, token: Optional[int]) -> None:
+        """
+        Track the NIFTY 50 index instrument token for real-time global-regime
+        indicators (see regime_detector.py's 2026-09-15 fix) and push the
+        subscription to the LIVE connection immediately if already connected
+        -- same "don't wait for the next reconnect" pattern as
+        set_instrument_tokens(). No-op if token is None or unchanged.
+
+        Deliberately does NOT go through self._instrument_tokens/
+        set_instrument_tokens() -- see self._nifty_token's docstring in
+        __init__ for why that dict isn't safe for a token that must survive
+        weekly active-universe recomputes untouched.
+        """
+        if token is None or token == self._nifty_token:
+            return
+        self._nifty_token = token
+        if self._ticker is None:
+            return  # not started yet -- _on_connect() will subscribe it fresh
+        try:
+            self._ticker.subscribe([token])
+            self._ticker.set_mode(self._ticker.MODE_QUOTE, [token])
+            logger.info(f"ZerodhaTicker: live-subscribed NIFTY 50 index (token={token})")
+        except Exception as e:
+            logger.error(f"ZerodhaTicker: failed to subscribe NIFTY 50 index: {e}")
 
     def start(self) -> None:
         """Start KiteTicker in a background daemon thread (non-blocking)."""
@@ -262,6 +305,14 @@ class ZerodhaTicker:
         logger.info(
             f"ZerodhaTicker: WebSocket connected — subscribed {len(tokens)} symbols in QUOTE mode"
         )
+        # A fresh connection drops every prior subscription -- the NIFTY
+        # token (tracked separately, see set_nifty_token()'s docstring) must
+        # be re-subscribed here too, same as set_instrument_tokens()'s
+        # tokens, or a reconnect would silently stop updating it.
+        if self._nifty_token is not None:
+            self._ticker.subscribe([self._nifty_token])
+            self._ticker.set_mode(self._ticker.MODE_QUOTE, [self._nifty_token])
+            logger.info(f"ZerodhaTicker: re-subscribed NIFTY 50 index on connect (token={self._nifty_token})")
 
     def _on_ticks(self, ws, ticks) -> None:
         """Called on every tick. Updates 'close' plus the running day range
@@ -288,6 +339,16 @@ class ZerodhaTicker:
         self._last_tick_at = now_ist()
         for tick in ticks:
             token = tick.get("instrument_token")
+            # Fixed 2026-09-15 (external review, global-regime NIFTY
+            # subscription): the NIFTY 50 index isn't an F&O underlying, so
+            # it's never in self._token_symbol -- handled as its own small,
+            # additive branch (separate Redis key, no volume field since
+            # indices don't carry traded volume) rather than folded into the
+            # symbol loop below, so a bug here cannot affect the existing
+            # 200+-symbol F&O tick pipeline.
+            if self._nifty_token is not None and token == self._nifty_token:
+                self._handle_nifty_tick(tick)
+                continue
             symbol = self._token_symbol.get(token)
             if not symbol:
                 continue
@@ -323,6 +384,32 @@ class ZerodhaTicker:
                 self._redis.set(redis_key, json.dumps(data))
             except Exception as e:
                 logger.debug(f"ZerodhaTicker: Redis write failed [{symbol}]: {e}")
+
+    def _handle_nifty_tick(self, tick: dict) -> None:
+        """
+        Accumulate NIFTY 50 index ticks into REDIS_NIFTY_TICK_KEY using the
+        SAME update_intraday_bar() bar-accumulation machinery used per F&O
+        symbol -- real per-5-min-bar intraday data, not a single "today"
+        blob bar (a single blob was already proven too weak to move EMA20/50
+        meaningfully -- see ltp_poller.py's module docstring, "zero EMA
+        crossover entries for two weeks"). Indices carry no traded volume,
+        so volume_traded is always None here -- update_intraday_bar()
+        already has a tested, defined path for that (see
+        test_volume_none_rest_fallback_path_unaffected).
+        """
+        from src.core.utils import update_intraday_bar
+        ltp = tick.get("last_price", 0)
+        if ltp <= 0:
+            return
+        try:
+            raw = self._redis.get(REDIS_NIFTY_TICK_KEY)
+            data = json.loads(raw) if raw else {"symbol": "NIFTY_50_INDEX"}
+            data["close"] = ltp
+            data["_ws_last_tick_at"] = self._last_tick_at.isoformat()
+            update_intraday_bar(data, ltp, volume_traded=None)
+            self._redis.set(REDIS_NIFTY_TICK_KEY, json.dumps(data))
+        except Exception as e:
+            logger.debug(f"ZerodhaTicker: NIFTY Redis write failed: {e}")
 
     def _on_disconnect(self, ws, code, reason) -> None:
         logger.warning(f"ZerodhaTicker: disconnected (code={code}): {reason}")

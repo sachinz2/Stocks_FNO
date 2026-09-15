@@ -1,7 +1,7 @@
 """src/market_data/fno_universe.py -- pure-function unit tests."""
 from src.market_data.fno_universe import (
     INDEX_NAMES, MIN_ADTV_CR,
-    extract_stock_underlyings, resolve_nse_tokens,
+    extract_stock_underlyings, resolve_nse_tokens, resolve_nifty_token,
     compute_liquidity_turnover, qualifying_symbols,
 )
 
@@ -38,6 +38,24 @@ def test_resolve_nse_tokens_filters_to_requested_symbols():
     ]
     tokens = resolve_nse_tokens(nse_dump, {"RELIANCE", "TCS"})
     assert tokens == {"RELIANCE": 111, "TCS": 222}
+
+
+def test_resolve_nifty_token_finds_the_index_in_the_nse_dump():
+    nse_dump = [
+        {"tradingsymbol": "RELIANCE", "instrument_token": 111},
+        {"tradingsymbol": "NIFTY 50", "instrument_token": 256265},
+    ]
+    assert resolve_nifty_token(nse_dump) == 256265
+
+
+def test_resolve_nifty_token_returns_none_when_not_found():
+    # Callers must treat this as "stay UNKNOWN", never guess a token.
+    nse_dump = [{"tradingsymbol": "RELIANCE", "instrument_token": 111}]
+    assert resolve_nifty_token(nse_dump) is None
+
+
+def test_resolve_nifty_token_handles_empty_dump():
+    assert resolve_nifty_token([]) is None
 
 
 def test_compute_liquidity_turnover_averages_volume_times_close():

@@ -234,6 +234,13 @@ class LiveTradingEngine:
         # broker's real position state is unknown, rather than silently treating
         # a fetch failure as "nothing open, safe to enter more."
         self._broker_position_state_known: bool = True
+        # Fixed 2026-09-15 (external review, global-regime NIFTY
+        # subscription): resolved once in main.py's kite provisioning (see
+        # fno_universe.resolve_nifty_token()), attached here via
+        # set_nifty_instrument_token() the same way attach_kite() wires in
+        # the kite client itself. Used to lazily refresh
+        # market:nifty_regime_inputs -- see _maybe_refresh_nifty_regime_inputs().
+        self._nifty_instrument_token: Optional[int] = None
 
         logger.info(f"LiveTradingEngine initialised — mode: {self.mode.value.upper()}")
 
@@ -248,6 +255,12 @@ class LiveTradingEngine:
     def attach_kite(self, kite: Any) -> None:
         """Attach a live KiteConnect instance for real option quotes + VIX."""
         self._kite = kite
+
+    def set_nifty_instrument_token(self, token: Optional[int]) -> None:
+        """Attach the resolved NIFTY 50 index instrument token (see
+        fno_universe.resolve_nifty_token()) for the real global-regime feed
+        -- see _maybe_refresh_nifty_regime_inputs()."""
+        self._nifty_instrument_token = token
 
     def attach_ltp_poller(self, poller: Any) -> None:
         """Attach ZerodhaLTPPoller so the engine can register/unregister active
@@ -541,6 +554,7 @@ class LiveTradingEngine:
         regime = None
         if self.regime_detector:
             try:
+                await self._maybe_refresh_nifty_regime_inputs()
                 regime = await self.regime_detector.detect()
                 await self.regime_detector.enforce_regime_switching()
             except Exception as exc:
@@ -5938,6 +5952,29 @@ class LiveTradingEngine:
             )
             return False
         return True
+
+    async def _maybe_refresh_nifty_regime_inputs(self) -> None:
+        """
+        Lazily refresh market:nifty_regime_inputs (real NIFTY 50 ATR%/EMA-
+        spread% -- see regime_detector.refresh_nifty_regime_inputs()) only
+        when the cache has expired, same "check first, refresh on miss"
+        pattern _get_cached_vix() already uses for VIX (that one leans on
+        get_india_vix()'s own cache check; this one checks explicitly since
+        refresh_nifty_regime_inputs() has no free-standing read-only getter
+        of its own). Avoids a kite.historical_data() call every single
+        1-minute signal cycle for a value that's still valid for
+        refresh_nifty_regime_inputs()'s own 180s Redis TTL.
+        """
+        redis = getattr(self, "_redis", None)
+        if not redis or not self._kite or not self._nifty_instrument_token:
+            return
+        from src.market_data.regime_detector import (
+            refresh_nifty_regime_inputs, REDIS_NIFTY_REGIME_INPUTS_KEY,
+        )
+        cached = await redis.get(REDIS_NIFTY_REGIME_INPUTS_KEY)
+        if cached:
+            return
+        await refresh_nifty_regime_inputs(self._kite, redis, self._nifty_instrument_token)
 
     async def _get_cached_vix(self) -> Optional[float]:
         from src.market_data.option_chain import get_india_vix, fetch_and_cache_vix

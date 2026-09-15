@@ -102,6 +102,7 @@ async def lifespan(app: FastAPI):
     # trading on live market data without risking real money.
     mode           = TradingMode(settings.TRADING_MODE)
     zerodha_ticker = None
+    app.state.nifty_instrument_token = None  # resolved inside _provision_kite() once a kite session exists
 
     async def _provision_kite():
         """
@@ -133,7 +134,7 @@ async def lifespan(app: FastAPI):
             # to re-cover it. Resolve against the full real F&O stock
             # universe instead, a superset that always covers whatever the
             # dynamic active list currently contains.
-            from src.market_data.fno_universe import extract_stock_underlyings
+            from src.market_data.fno_universe import extract_stock_underlyings, resolve_nifty_token
             nfo_instruments = await loop.run_in_executor(None, kite.instruments, "NFO")
             full_universe = set(extract_stock_underlyings(nfo_instruments))
             nse_instruments = await loop.run_in_executor(None, kite.instruments, "NSE")
@@ -142,6 +143,18 @@ async def lifespan(app: FastAPI):
                 if sym in full_universe:
                     tokens[sym] = inst["instrument_token"]
             logger.info(f"Instrument tokens loaded: {len(tokens)}/{len(full_universe)} F&O stock symbols.")
+            # Fixed 2026-09-15 (external review, global-regime NIFTY
+            # subscription): resolved from this SAME already-fetched NSE
+            # dump, no extra API call. Stored on app.state (not returned --
+            # would mean changing this function's signature at both call
+            # sites) so both the initial startup path and the self-heal
+            # retry path below can read it once resolved.
+            app.state.nifty_instrument_token = resolve_nifty_token(nse_instruments)
+            if app.state.nifty_instrument_token is None:
+                logger.warning(
+                    "NIFTY 50 instrument token not found in NSE instrument dump -- "
+                    "global regime will stay UNKNOWN until this resolves."
+                )
         except Exception as e:
             logger.warning(f"Instrument token fetch failed: {e}")
         return kite, tokens, token
@@ -161,6 +174,7 @@ async def lifespan(app: FastAPI):
             # Re-use already-fetched tokens to avoid a second instruments API call
             zerodha_ticker._instrument_tokens = instrument_tokens.copy()
             zerodha_ticker._token_symbol      = {v: k for k, v in instrument_tokens.items()}
+            zerodha_ticker.set_nifty_token(app.state.nifty_instrument_token)
             if instrument_tokens:
                 zerodha_ticker.start()
                 logger.info(f"ZerodhaTicker: live stream started for {len(instrument_tokens)} symbols.")
@@ -337,6 +351,7 @@ async def lifespan(app: FastAPI):
     engine.set_symbols(PHASE1_SYMBOLS)
     if kite_instance:
         engine.attach_kite(kite_instance)   # enables real VIX + option quotes
+        engine.set_nifty_instrument_token(app.state.nifty_instrument_token)
     await engine.start()
 
     ltp_poller = LTPPoller(redis_client, kite=kite_instance, instrument_tokens=instrument_tokens)
@@ -664,6 +679,7 @@ async def lifespan(app: FastAPI):
             ltp_poller.set_kite(kite, tokens)
             rs_ranker.set_kite(kite, tokens)
             engine.attach_kite(kite)
+            engine.set_nifty_instrument_token(app.state.nifty_instrument_token)
             app.state.kite              = kite
             app.state.instrument_tokens = tokens
             app.state.last_kite_token   = tok
@@ -680,6 +696,7 @@ async def lifespan(app: FastAPI):
                 # weekly-refresh call site below, which DOES need the live
                 # WebSocket push this same method provides once started.
                 zt.set_instrument_tokens(tokens)
+                zt.set_nifty_token(app.state.nifty_instrument_token)
                 zt.start()
                 app.state.zerodha_ticker = zt
                 logger.info(f"ZerodhaTicker: live stream started late ({len(tokens)} symbols) after kite recovery.")
