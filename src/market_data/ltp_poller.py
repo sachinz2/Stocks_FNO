@@ -96,6 +96,20 @@ _FLAT_EMA_THRESHOLD = 0.1  # EMA spread below = EMAs are flat (no direction)
 # strategy's sign-change detection structurally cannot fire again without a reversal.
 _EMA_PROXIMITY_CAP = 0.5
 
+# Fixed 2026-09-15 (external review, "EMA event watchlist"): _get_active_symbols()
+# reads whatever's in the top-N pool at the EXACT instant it's called, with no
+# memory of who was a candidate a cycle ago. ema_score's proximity term
+# (_EMA_PROXIMITY_CAP above) drives a stock's score toward its ATR-only floor
+# within a cycle or two of actually crossing -- the spread widens past the
+# proximity cap the moment the cross happens. A stock can therefore cross,
+# then fall out of the top-N before the engine's next ~1-min signal cycle
+# ever evaluates it -- the exact event the strategy exists to detect,
+# disappearing from its own candidate pool as a side effect of detecting it.
+# A symbol within this band gets watchlisted and kept in the published pool
+# for _EMA_WATCHLIST_BARS cycles regardless of what its score does next.
+_EMA_WATCHLIST_ENTRY_THRESHOLD = 0.20
+_EMA_WATCHLIST_BARS = 4
+
 
 class LTPPoller:
     """
@@ -147,6 +161,9 @@ class LTPPoller:
         self._no_token_warned: set = set()    # suppress repeat "no token" warnings per symbol
         self._no_history_warned: set = set()  # suppress repeat "not enough history" warnings
         self._no_live_data_warned: set = set()  # suppress repeat "no live tick data yet" warnings
+        # symbol -> poll cycles remaining on the EMA crossover watchlist --
+        # see _EMA_WATCHLIST_ENTRY_THRESHOLD's docstring.
+        self._ema_watchlist: Dict[str, int] = {}
 
     def register_underlying(self, symbol: str) -> None:
         """
@@ -219,15 +236,25 @@ class LTPPoller:
                 logger.error(f"LTPPoller: failed to publish ERROR pool status for {key}: {exc}")
 
     async def _publish_pool(self, key: str, scores: Dict[str, float], n: int,
-                             empty_reason: str) -> None:
+                             empty_reason: str, force_include: Optional[set] = None) -> None:
         """Publish a candidate pool's top-N list (existing wire format,
         unchanged for backward compatibility) plus a companion ":status" key
         so a consumer can tell READY (n>0 candidates) apart from EMPTY (poll
         succeeded, genuinely nothing qualified today) without confusing
-        either with ERROR (poll itself failed -- see _publish_pool_error)."""
+        either with ERROR (poll itself failed -- see _publish_pool_error).
+
+        force_include (2026-09-15, external review "EMA event watchlist"):
+        symbols that must stay in the published list even if they fell out
+        of the natural top-N by score -- see self._ema_watchlist's docstring
+        for why a stock that just crossed can otherwise vanish from the pool
+        before the engine's next cycle evaluates it. Appended AFTER the
+        natural top-N (not competing for rank), deduped, so this can never
+        crowd out an unrelated stronger candidate."""
         generated_at = now_ist().replace(tzinfo=None).isoformat()
         if scores:
             top = sorted(scores, key=scores.__getitem__, reverse=True)[:n]
+            if force_include:
+                top = top + [s for s in force_include if s not in top and s in scores]
             await self._redis.set(key, json.dumps(top))
             status = {"status": "READY", "symbols_count": len(top), "generated_at": generated_at}
         else:
@@ -273,6 +300,12 @@ class LTPPoller:
             logger.error(f"LTPPoller: poll() setup failed, marking all pools ERROR: {exc}")
             await self._publish_pool_error(str(exc))
             raise
+
+        # Age out the EMA watchlist one cycle before this cycle's scoring
+        # re-populates it -- see _EMA_WATCHLIST_ENTRY_THRESHOLD's docstring.
+        self._ema_watchlist = {
+            sym: bars - 1 for sym, bars in self._ema_watchlist.items() if bars - 1 > 0
+        }
 
         ema_scores: Dict[str, float] = {}
         spread_scores: Dict[str, float] = {}
@@ -357,6 +390,14 @@ class LTPPoller:
                         condor_scores[symbol] = c
                     if m > 0:
                         momentum_scores[symbol] = m
+                    # Fixed 2026-09-15 (external review, "EMA event
+                    # watchlist"): refresh (not just add) on every cycle the
+                    # symbol stays within the entry band -- a stock hovering
+                    # near a cross for several bars keeps its full window
+                    # each time, rather than the clock silently running out
+                    # while it's still genuinely close.
+                    if tick.get("ema_spread_pct", 999) < _EMA_WATCHLIST_ENTRY_THRESHOLD:
+                        self._ema_watchlist[symbol] = _EMA_WATCHLIST_BARS
 
                 logger.debug(
                     f"Tick: {symbol} ltp={ltp:.2f} "
@@ -433,8 +474,9 @@ class LTPPoller:
         status = await self._publish_pool(
             REDIS_TOP_SYMBOLS_KEY, ema_scores, n,
             empty_reason="No symbol scored (should not normally happen -- ema_score has no floor gate)",
+            force_include=set(self._ema_watchlist),
         )
-        logger.info(f"EMA pool: {status}")
+        logger.info(f"EMA pool: {status} (watchlist: {sorted(self._ema_watchlist)})")
 
         status = await self._publish_pool(
             REDIS_TOP_SYMBOLS_CREDIT_SPREAD, spread_scores, n,
