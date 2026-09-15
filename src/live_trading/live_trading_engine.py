@@ -2747,60 +2747,88 @@ class LiveTradingEngine:
         # cache entry, JSON parse failure. Same fail-closed reasoning as the
         # RS filter above: this is an explicitly-chosen confirmation gate,
         # not a re-validated estimate, so "can't confirm" should block the
-        # entry, not silently skip the check. A missing/not-yet-populated
-        # tick15 cache (e.g. right after market open) is not an exception --
-        # `if _raw15:` already handles that case by simply not entering the
-        # inner block, which correctly proceeds without the filter (there's
-        # nothing to contradict yet); only genuine failures to read/parse
-        # data that IS present now block the entry.
+        # entry, not silently skip the check.
+        #
+        # Fixed 2026-09-15 (external review, "NO-DATA vs BAD-DATA
+        # inconsistency"): a missing tick15 cache used to be treated as
+        # "nothing to contradict yet, proceed" while a PRESENT-but-corrupt
+        # or present-but-zero-EMA cache failed closed -- backwards from
+        # every other "can't confirm" gate in this codebase (RS, RVOL
+        # validity), which all treat missing data as unconfirmed, not as a
+        # free pass. "No data" and "corrupt/incomplete data" both now fail
+        # closed uniformly; in practice tick15 populates within the first
+        # 1-2 poll cycles after startup (well inside the existing entry
+        # warm-up window), so this should be a no-op most sessions -- the
+        # asymmetry mattered only for the rare mid-day cache gap (a Redis
+        # blip, a restart) that the exception path already caught, just
+        # inconsistently with the missing-key case.
         _redis_mtf = getattr(self, "_redis", None)
         if _redis_mtf:
             try:
                 _raw15 = await _redis_mtf.get(f"tick15:{symbol}")
-                if _raw15:
-                    _d15       = json.loads(_raw15)
-                    _ema20_15  = float(_d15.get("ema20", 0))
-                    _ema50_15  = float(_d15.get("ema50", 0))
-                    if _ema20_15 > 0 and _ema50_15 > 0:
-                        _tf15_bull = _ema20_15 > _ema50_15
-                        _tf5_bull  = signal_str == "BUY"
-                        if _tf15_bull != _tf5_bull:
-                            # Fixed 2026-08-21 (external review of
-                            # ema_crossover_v1): binary reject-on-
-                            # disagreement replaced with a graduated check
-                            # for strategies that set mtf_strict=False --
-                            # only a STRONGLY opposing 15m trend (spread
-                            # magnitude >= mtf_strong_opposition_pct) still
-                            # blocks the entry; a weakly opposing or turning
-                            # 15m trend is allowed, since that's precisely
-                            # the "higher timeframe weakening into a
-                            # reversal" setup a crossover strategy should be
-                            # able to catch. Default stays True (strict,
-                            # unchanged behavior) for anything that doesn't
-                            # opt out, e.g. momentum_v1.
-                            if getattr(strategy, "mtf_strict", True):
-                                logger.info(
-                                    f"[{strategy.name}] {symbol} skipped — "
-                                    f"15-min EMA trend ({'bullish' if _tf15_bull else 'bearish'}) "
-                                    f"contradicts 5-min signal ({signal_str})"
-                                )
-                                return
-                            _spread15_pct = abs(_ema20_15 - _ema50_15) / _ema50_15 * 100
-                            _strong_opp = getattr(strategy, "mtf_strong_opposition_pct", 0.3)
-                            if _spread15_pct >= _strong_opp:
-                                logger.info(
-                                    f"[{strategy.name}] {symbol} skipped — "
-                                    f"15-min EMA trend ({'bullish' if _tf15_bull else 'bearish'}) "
-                                    f"STRONGLY contradicts 5-min signal ({signal_str}), "
-                                    f"spread={_spread15_pct:.2f}% >= {_strong_opp}%"
-                                )
-                                return
-                            logger.info(
-                                f"[{strategy.name}] {symbol} 15-min trend "
-                                f"({'bullish' if _tf15_bull else 'bearish'}) weakly opposes "
-                                f"5-min signal ({signal_str}), spread={_spread15_pct:.2f}% "
-                                f"< {_strong_opp}% -- allowing (possible reversal setup)."
-                            )
+            except Exception as _mtf_exc:
+                logger.info(
+                    f"[{strategy.name}] {symbol} skipped — 15-min MTF data "
+                    f"unreadable ({_mtf_exc}), failing closed on this entry filter."
+                )
+                return
+            if not _raw15:
+                logger.info(
+                    f"[{strategy.name}] {symbol} skipped — 15-min MTF data not yet "
+                    "available, failing closed on this entry filter."
+                )
+                return
+            try:
+                _d15       = json.loads(_raw15)
+                _ema20_15  = float(_d15.get("ema20", 0))
+                _ema50_15  = float(_d15.get("ema50", 0))
+                if _ema20_15 <= 0 or _ema50_15 <= 0:
+                    logger.info(
+                        f"[{strategy.name}] {symbol} skipped — 15-min EMA data not yet "
+                        f"valid (ema20={_ema20_15}, ema50={_ema50_15}), failing closed "
+                        "on this entry filter."
+                    )
+                    return
+                _tf15_bull = _ema20_15 > _ema50_15
+                _tf5_bull  = signal_str == "BUY"
+                if _tf15_bull != _tf5_bull:
+                    # Fixed 2026-08-21 (external review of
+                    # ema_crossover_v1): binary reject-on-
+                    # disagreement replaced with a graduated check
+                    # for strategies that set mtf_strict=False --
+                    # only a STRONGLY opposing 15m trend (spread
+                    # magnitude >= mtf_strong_opposition_pct) still
+                    # blocks the entry; a weakly opposing or turning
+                    # 15m trend is allowed, since that's precisely
+                    # the "higher timeframe weakening into a
+                    # reversal" setup a crossover strategy should be
+                    # able to catch. Default stays True (strict,
+                    # unchanged behavior) for anything that doesn't
+                    # opt out -- both single-leg strategies opt out
+                    # as of 2026-09-15 (see momentum.py's matching fix).
+                    if getattr(strategy, "mtf_strict", True):
+                        logger.info(
+                            f"[{strategy.name}] {symbol} skipped — "
+                            f"15-min EMA trend ({'bullish' if _tf15_bull else 'bearish'}) "
+                            f"contradicts 5-min signal ({signal_str})"
+                        )
+                        return
+                    _spread15_pct = abs(_ema20_15 - _ema50_15) / _ema50_15 * 100
+                    _strong_opp = getattr(strategy, "mtf_strong_opposition_pct", 0.3)
+                    if _spread15_pct >= _strong_opp:
+                        logger.info(
+                            f"[{strategy.name}] {symbol} skipped — "
+                            f"15-min EMA trend ({'bullish' if _tf15_bull else 'bearish'}) "
+                            f"STRONGLY contradicts 5-min signal ({signal_str}), "
+                            f"spread={_spread15_pct:.2f}% >= {_strong_opp}%"
+                        )
+                        return
+                    logger.info(
+                        f"[{strategy.name}] {symbol} 15-min trend "
+                        f"({'bullish' if _tf15_bull else 'bearish'}) weakly opposes "
+                        f"5-min signal ({signal_str}), spread={_spread15_pct:.2f}% "
+                        f"< {_strong_opp}% -- allowing (possible reversal setup)."
+                    )
             except Exception as _mtf_exc:
                 logger.info(
                     f"[{strategy.name}] {symbol} skipped — 15-min MTF data "

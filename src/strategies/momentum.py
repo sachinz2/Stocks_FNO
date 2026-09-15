@@ -294,6 +294,23 @@ class MomentumStrategy(StrategyBase):
         self.enable_breakdown_continuation = self.parameters.get("enable_breakdown_continuation", True)
         self.breakdown_min_established_bars = self.parameters.get("breakdown_min_established_bars", 3)
         self.breakdown_rvol_min = self.parameters.get("breakdown_rvol_min", 1.5)
+        # Fixed 2026-09-15 (external review, "MTF can block a fresh
+        # reversal"): momentum_v1 used to leave the engine's 15-min MTF
+        # filter at its default binary mtf_strict=True (unlike
+        # ema_crossover_v1, which already graduated this on 2026-08-21) --
+        # a genuinely fresh reversal (the market turns hard, ADX rises fast
+        # and momentum_v1's own quality gates -- ADX>=threshold, ADX rising,
+        # EMA slope -- already confirm it) still has a 15-min EMA trend that
+        # structurally hasn't flipped yet, since it lags the 5-min move by
+        # definition. Binary MTF rejection there discards exactly the
+        # signal this strategy exists to catch on the day it matters most.
+        # By the time raw qualifies here, momentum_v1 has already cleared a
+        # stricter internal quality bar than ema_crossover_v1's fresh-cross
+        # thesis (ADX + slope + RVOL, not just "a cross just happened"), so
+        # the same graduated leniency (only a STRONGLY opposing 15m trend
+        # still blocks) is at least as justified here as it was there.
+        self.mtf_strict = self.parameters.get("mtf_strict", False)
+        self.mtf_strong_opposition_pct = self.parameters.get("mtf_strong_opposition_pct", 0.3)
         self.min_dte: int = self.parameters.get("min_dte", 10)
         # Fixed 2026-08-20: 25 left a structural monthly dead zone -- see
         # EMACrossoverStrategy.initialize()'s matching comment for the full
@@ -375,6 +392,9 @@ class MomentumStrategy(StrategyBase):
             f"(max_bars={self.max_pullback_bars}, breakout_RVOL>={self.breakout_rvol_min} "
             f"after contraction<{self.pullback_rvol_low}) | "
             f"ConfirmBars={self.signal_confirm_bars} (legacy path only) | "
+            f"MTF strict={self.mtf_strict} strong_opposition>={self.mtf_strong_opposition_pct}% | "
+            f"BreakdownContinuation={self.enable_breakdown_continuation} "
+            f"(min_bars={self.breakdown_min_established_bars}, RVOL>={self.breakdown_rvol_min}) | "
             f"ProfitBooking: giveback {self.profit_booking_giveback_pct:.0%} of peak "
             f"once profit crosses engine activation floor"
         )

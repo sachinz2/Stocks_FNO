@@ -212,14 +212,29 @@ def test_ema_crossover_defaults_to_soft_rvol_and_asymmetric_mtf():
     assert strat.mtf_strong_opposition_pct == 0.3
 
 
-def test_momentum_v1_keeps_strict_defaults_unaffected():
-    """Guard against over-fixing -- momentum_v1 never set rvol_hard_gate/
-    mtf_strict, so getattr's own defaults (True) must still apply to it."""
+def test_momentum_v1_keeps_rvol_hard_gate_strict():
+    """Guard against over-fixing -- momentum_v1 never set rvol_hard_gate,
+    so getattr's own default (True) must still apply to it. mtf_strict is
+    NOT included here anymore -- see test_momentum_v1_graduates_mtf_strict_
+    2026_09_15 for why that one flipped."""
     mom = MomentumStrategy("momentum_v1", {})
     mom.initialize()
     assert getattr(mom, "rvol_hard_gate", True) is True
-    assert getattr(mom, "mtf_strict", True) is True
     assert mom.adx_checked_internally is True
+
+
+def test_momentum_v1_graduates_mtf_strict_2026_09_15():
+    # Fixed 2026-09-15 (external review, "MTF can block a fresh reversal"):
+    # momentum_v1 used to leave mtf_strict at the engine's default (True,
+    # binary reject-on-disagreement) -- a genuinely fresh reversal has a
+    # 15-min EMA trend that structurally hasn't flipped yet, since it lags
+    # the 5-min move by definition, discarding exactly the signal this
+    # strategy exists to catch. Now graduated the same way ema_crossover_v1
+    # already was (2026-08-21): only a STRONGLY opposing 15m trend blocks.
+    mom = MomentumStrategy("momentum_v1", {})
+    mom.initialize()
+    assert mom.mtf_strict is False
+    assert mom.mtf_strong_opposition_pct == 0.3
 
 
 # ── EMA candidate pool re-weighting ──────────────────────────────────────────

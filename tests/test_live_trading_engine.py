@@ -5,6 +5,7 @@ engine needs a live DB/broker/redis stack) -- this exercises the actual
 production code, not a reimplementation of it.
 """
 import inspect
+import json
 import types
 import asyncio
 from decimal import Decimal
@@ -588,6 +589,93 @@ async def test_sell_rs_gate_fails_closed_when_ranks_unavailable():
 
     stats = fake._signal_gate_stats.get("momentum_v1", {})
     assert "rs_passed" not in stats
+
+
+class _FakeMtfRedis:
+    def __init__(self, tick15_value=None, raise_exc=None):
+        self._value = tick15_value
+        self._raise_exc = raise_exc
+
+    async def get(self, key):
+        if self._raise_exc:
+            raise self._raise_exc
+        return self._value
+
+
+class _FakeMtfGateEngine(_FakeRvolGateEngine):
+    """Valid RVOL/ADX (isolating the test to the MTF gate specifically) plus
+    a controllable fake _redis for tick15:{symbol} -- 2026-09-15,
+    "NO-DATA vs BAD-DATA inconsistency"."""
+    def __init__(self, redis):
+        super().__init__()
+        self._redis = redis
+        self.rs_ranker = None  # short-circuits the RS gate (require_rs=False on the strategy too)
+        self._get_market_data = AsyncMock(return_value={
+            "close": 1200.0, "ltp_source": "live_tick",
+            "rvol": 2.0, "rvol_valid": True,
+            "adx14": 30.0, "adx_valid": True,
+        })
+        self._get_lot_size = AsyncMock(return_value=None)  # stop gracefully right after mtf_passed
+
+
+def _mtf_strategy(**overrides):
+    defaults = dict(
+        name="momentum_v1", is_active=True, min_dte=0, max_dte=999,
+        rvol_checked_internally=True, adx_checked_internally=True,
+        require_rs=False,
+        generate_signal=lambda market_data: SignalType.BUY,
+    )
+    defaults.update(overrides)
+    return SimpleNamespace(**defaults)
+
+
+@pytest.mark.asyncio
+async def test_mtf_gate_fails_closed_when_tick15_key_is_entirely_missing():
+    # Fixed 2026-09-15: a missing tick15 cache used to silently proceed
+    # ("nothing to contradict yet") -- now fails closed, consistent with
+    # every other "can't confirm" gate in this codebase (RS, RVOL validity).
+    fake = _FakeMtfGateEngine(_FakeMtfRedis(tick15_value=None))
+    strategy = _mtf_strategy()
+
+    await LiveTradingEngine._process_signal(fake, strategy, "SBIN", vix=15.0, regime="TRENDING")
+
+    stats = fake._signal_gate_stats.get("momentum_v1", {})
+    assert "mtf_passed" not in stats
+
+
+@pytest.mark.asyncio
+async def test_mtf_gate_fails_closed_on_unreadable_data_same_as_missing():
+    fake = _FakeMtfGateEngine(_FakeMtfRedis(raise_exc=ConnectionError("redis down")))
+    strategy = _mtf_strategy()
+
+    await LiveTradingEngine._process_signal(fake, strategy, "SBIN", vix=15.0, regime="TRENDING")
+
+    stats = fake._signal_gate_stats.get("momentum_v1", {})
+    assert "mtf_passed" not in stats
+
+
+@pytest.mark.asyncio
+async def test_mtf_gate_fails_closed_on_zero_ema_values_present_but_not_yet_valid():
+    tick15 = json.dumps({"ema20": 0, "ema50": 0})
+    fake = _FakeMtfGateEngine(_FakeMtfRedis(tick15_value=tick15))
+    strategy = _mtf_strategy()
+
+    await LiveTradingEngine._process_signal(fake, strategy, "SBIN", vix=15.0, regime="TRENDING")
+
+    stats = fake._signal_gate_stats.get("momentum_v1", {})
+    assert "mtf_passed" not in stats
+
+
+@pytest.mark.asyncio
+async def test_mtf_gate_passes_with_genuinely_valid_agreeing_data():
+    tick15 = json.dumps({"ema20": 105.0, "ema50": 100.0})  # bullish, agrees with BUY
+    fake = _FakeMtfGateEngine(_FakeMtfRedis(tick15_value=tick15))
+    strategy = _mtf_strategy()
+
+    await LiveTradingEngine._process_signal(fake, strategy, "SBIN", vix=15.0, regime="TRENDING")
+
+    stats = fake._signal_gate_stats.get("momentum_v1", {})
+    assert stats.get("mtf_passed", 0) >= 1
 
 
 def test_credit_spread_adx_gate_checks_validity_flag_and_blocks():
