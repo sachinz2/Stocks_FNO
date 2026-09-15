@@ -2416,7 +2416,25 @@ class LiveTradingEngine:
         # should block until it can, like every other unconfirmed-data case.
         _rvol = float(market_data.get("rvol", 0))
         _rvol_valid = bool(market_data.get("rvol_valid", False))
-        if not _rvol_valid:
+        # Fixed 2026-09-15 (live incident review): this validity gate used
+        # to run unconditionally for every strategy, including ones with
+        # rvol_checked_internally=True (momentum_v1's pullback+breakout
+        # model) -- but the exemption comment a few lines below ("skip this
+        # second gate entirely") only ever wrapped the THRESHOLD check, not
+        # this validity check. `_rvol`/`_rvol_valid` here are the
+        # still-forming CURRENT bar's RVOL (market_data["rvol"]/
+        # ["rvol_valid"]) -- a completely different field from the
+        # rvol_closed_bar/rvol_closed_bar_valid momentum_v1's own
+        # generate_signal() already validated its breakout against (see
+        # momentum.py's 2026-09-04 fix). A pullback+breakout that had
+        # ALREADY fired -- a real, internally-confirmed signal, with the
+        # strategy's own pullback state already consumed/reset -- could
+        # still be silently discarded here if it happened to fire during
+        # the plain RVOL's ~100-min daily warmup window, with no way to
+        # retry (the strategy has no memory of the discarded signal once
+        # its own state is cleared). Now exempted the same way the
+        # threshold check below already is.
+        if not _rvol_valid and not getattr(strategy, "rvol_checked_internally", False):
             logger.info(
                 f"[{strategy.name}] {symbol} skipped — RVOL not yet computable "
                 "(insufficient volume history; cannot confirm breakout strength)"

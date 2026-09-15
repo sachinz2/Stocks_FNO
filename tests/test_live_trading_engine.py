@@ -398,9 +398,89 @@ async def test_rebuild_paper_broker_positions_is_idempotent_across_a_restart_cra
 def test_momentum_ema_entry_gates_check_validity_flags_and_block():
     src = inspect.getsource(LiveTradingEngine._process_signal)
     assert '_rvol_valid = bool(market_data.get("rvol_valid"' in src
-    assert "if not _rvol_valid:" in src
+    # Fixed 2026-09-15: this validity gate is now exempted for strategies
+    # with rvol_checked_internally=True (momentum_v1's pullback+breakout
+    # model already validates its own breakout via rvol_closed_bar) -- see
+    # test_rvol_valid_gate_exempts_strategies_with_rvol_checked_internally.
+    assert 'if not _rvol_valid and not getattr(strategy, "rvol_checked_internally", False):' in src
     assert '_adx_ema_valid = bool(market_data.get("adx_valid"' in src
     assert "if not _adx_ema_valid:" in src
+
+
+class _FakeRvolGateEngine:
+    """Minimal real-method-bound stand-in to drive _process_signal() far
+    enough to reach the RVOL-validity gate, per test_real_contract_
+    resolution.py's documented rationale for why these deep engine methods
+    get source-inspection tests for the full precondition chain but a real
+    behavioral harness for a specific, isolated gate like this one."""
+    _audit_gate = LiveTradingEngine._audit_gate
+    _has_active_multi_leg_structure = LiveTradingEngine._has_active_multi_leg_structure
+
+    def __init__(self):
+        self._active_spreads = {}
+        self._active_condors = {}
+        self._single_leg_journals = {}
+        self._exited_today = set()
+        self._max_daily_orders = 0
+        self._max_concurrent_intraday = 999
+        self._last_signal_date = {}
+        self._signal_gate_stats = {}
+        self._close_option_positions = AsyncMock()
+        self._has_open_option = AsyncMock(return_value=False)
+        # rvol_valid=False -- still-forming bar's RVOL not yet measurable
+        # this cycle -- is the exact condition under test. adx_valid=False
+        # too, so a strategy that gets PAST the RVOL gate stops at the very
+        # next one (adx validity) instead of proceeding further, keeping
+        # this test tightly isolated to the RVOL gate specifically.
+        self._get_market_data = AsyncMock(return_value={
+            "close": 1200.0, "ltp_source": "live_tick",
+            "rvol": 0.0, "rvol_valid": False,
+            "adx14": 0.0, "adx_valid": False,
+        })
+
+
+@pytest.mark.asyncio
+async def test_rvol_valid_gate_exempts_strategies_with_rvol_checked_internally():
+    """Fixed 2026-09-15 (live incident review): momentum_v1's pullback+
+    breakout model already validates its own breakout via rvol_closed_bar
+    inside generate_signal() -- by the time it returns BUY/SELL here, that
+    decision is final and the strategy's own pullback state has already
+    been consumed. This separate, unrelated plain-rvol validity gate must
+    not re-litigate and discard that already-confirmed signal just because
+    the STILL-FORMING current bar's RVOL isn't measurable yet."""
+    fake = _FakeRvolGateEngine()
+    strategy = SimpleNamespace(
+        name="momentum_v1", is_active=True, min_dte=0, max_dte=999,
+        rvol_checked_internally=True,
+        generate_signal=lambda market_data: SignalType.SELL,
+    )
+
+    await LiveTradingEngine._process_signal(fake, strategy, "SBIN", vix=15.0, regime="TRENDING")
+
+    stats = fake._signal_gate_stats.get("momentum_v1", {})
+    assert stats.get("rvol_passed", 0) >= 1, (
+        "a strategy with rvol_checked_internally=True must not be blocked "
+        "by the plain-rvol validity gate -- it already validated its own "
+        "breakout internally"
+    )
+
+
+@pytest.mark.asyncio
+async def test_rvol_valid_gate_still_blocks_strategies_without_internal_check():
+    """Guard against over-fixing: ema_crossover_v1 (rvol_checked_internally
+    unset/False) has no internal RVOL validation of its own -- it must
+    still be blocked by this gate exactly as before."""
+    fake = _FakeRvolGateEngine()
+    strategy = SimpleNamespace(
+        name="ema_crossover_v1", is_active=True, min_dte=0, max_dte=999,
+        generate_signal=lambda market_data: SignalType.SELL,
+    )
+
+    await LiveTradingEngine._process_signal(fake, strategy, "SBIN", vix=15.0, regime="TRENDING")
+
+    stats = fake._signal_gate_stats.get("ema_crossover_v1", {})
+    assert "rvol_passed" not in stats
+    assert stats.get("dte_passed", 0) >= 1  # got that far, blocked right after
 
 
 def test_credit_spread_adx_gate_checks_validity_flag_and_blocks():
