@@ -153,16 +153,29 @@ def check_dte_rollover_exists(repo: Path) -> Result:
 
 
 def check_regime_uses_real_market_data(repo: Path) -> Result:
-    name = "Regime detector reads live market-wide stats, not the dead NIFTY50 tick"
+    name = "Regime detector reads live market-wide stats, not a dead/unwritten tick key"
     src = _read(repo, "src/market_data/regime_detector.py")
-    if "tick:NIFTY50" in src or "REDIS_NIFTY_TICK" in src:
-        return FAIL, name, "Still references the NIFTY50 tick key that nothing ever writes — regime will silently default to flat/quiet again."
+    # Fixed 2026-09-15: this used to hard-fail on ANY reference to
+    # "REDIS_NIFTY_TICK" -- a substring match meant for a specific old dead
+    # key that nothing ever wrote. That's now a false positive: regime
+    # detection was redesigned this same day to read REAL NIFTY 50 index
+    # data (REDIS_NIFTY_REGIME_INPUTS_KEY, built from REDIS_NIFTY_TICK_KEY
+    # -- see refresh_nifty_regime_inputs()), replacing the cross-sectional
+    # 40-stock average (market:trend_stats) as the actual classification
+    # input. The real invariant to protect is "whatever key regime_detector
+    # depends on is genuinely written somewhere" -- checked explicitly
+    # below instead of banning a name pattern.
+    if "REDIS_NIFTY_REGIME_INPUTS_KEY" not in src:
+        return FAIL, name, "regime_detector no longer references REDIS_NIFTY_REGIME_INPUTS_KEY — lost its real NIFTY-based data source."
+    ticker_src = _read(repo, "src/market_data/zerodha_ticker.py")
+    if "REDIS_NIFTY_TICK_KEY" not in ticker_src or "_handle_nifty_tick" not in ticker_src:
+        return FAIL, name, "regime_detector depends on REDIS_NIFTY_TICK_KEY, but zerodha_ticker.py no longer writes it — regime will silently starve of real NIFTY data again."
     if "REDIS_TREND_STATS_KEY" not in src or "market:trend_stats" not in src:
-        return FAIL, name, "market:trend_stats key not referenced — regime detector has no live data source."
+        return WARN, name, "market:trend_stats no longer referenced in regime_detector.py -- fine if intentionally fully replaced by NIFTY-based inputs, worth confirming it wasn't lost by accident."
     poller_src = _read(repo, "src/market_data/ltp_poller.py")
     if "market:trend_stats" not in poller_src or "FIVE_MIN_ATR_DAILY_SCALE" not in poller_src:
-        return FAIL, name, "LTPPoller no longer publishes market:trend_stats with the daily-ATR scale applied."
-    return PASS, name, "regime_detector reads market:trend_stats; LTPPoller publishes it with daily-ATR scaling."
+        return FAIL, name, "LTPPoller no longer publishes market:trend_stats with the daily-ATR scale applied (still used for api/main.py's /health F&O-universe-liveness reporting)."
+    return PASS, name, "regime_detector reads real NIFTY 50 data (REDIS_NIFTY_REGIME_INPUTS_KEY, sourced from a tick key zerodha_ticker.py actually writes); LTPPoller still publishes market:trend_stats for its own separate health-reporting purpose."
 
 
 def check_kill_switch_has_reset_path(repo: Path) -> Result:
