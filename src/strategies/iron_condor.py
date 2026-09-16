@@ -26,6 +26,7 @@ Exit triggers (managed by engine's _check_condor_exits):
 import logging
 from typing import Any, Dict, Optional
 
+from src.core.constants import FIVE_MIN_ATR_DAILY_SCALE
 from src.strategies.base import StrategyBase, StrategyRegistry
 
 logger = logging.getLogger(__name__)
@@ -37,7 +38,8 @@ class IronCondorStrategy(StrategyBase):
     def initialize(self):
         self.fast_period = self.parameters.get("fast_period", 20)
         self.slow_period = self.parameters.get("slow_period", 50)
-        # Below this ATR% the market is not making explosive moves
+        # Below this ATR% (DAILY-equivalent scale, see FIVE_MIN_ATR_DAILY_SCALE
+        # below) the market is not making explosive moves
         self.low_vol_threshold = self.parameters.get("low_vol_threshold", 1.2)
         # Below this EMA spread% the trend is flat — condor is appropriate
         self.flat_threshold = self.parameters.get("flat_threshold", 0.1)
@@ -97,7 +99,11 @@ class IronCondorStrategy(StrategyBase):
         ):
             return "HOLD"
 
-        atr_pct = (atr / close * 100) if close > 0 else 0
+        # Fixed 2026-09-16 (deep review): same unscaled-5-min-ATR bug as
+        # credit_spread.py -- see its matching comment for the full failure
+        # scenario. This strategy's "range-bound, low volatility" thesis was
+        # equally unenforced.
+        atr_pct = (atr / close * 100 * FIVE_MIN_ATR_DAILY_SCALE) if close > 0 else 0
         ema_spread_pct = abs(fast_ema - slow_ema) / slow_ema * 100 if slow_ema > 0 else 0
 
         if atr_pct >= self.low_vol_threshold:

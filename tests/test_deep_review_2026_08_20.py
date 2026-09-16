@@ -399,8 +399,10 @@ def test_credit_spread_still_fires_on_valid_low_atr():
     fire a directional signal as before."""
     strat = CreditSpreadStrategy("credit_spread_v1", {})
     strat.initialize()
+    # atr14=0.3 on close=500 -> daily-equivalent ATR% (see FIVE_MIN_ATR_DAILY_SCALE,
+    # 2026-09-16 deep review fix) ~= 0.52%, comfortably under low_vol_threshold=1.2%.
     signal = strat.generate_signal({
-        "ema20": 105.0, "ema50": 100.0, "close": 500.0, "atr14": 2.0,  # 0.4% of close
+        "ema20": 105.0, "ema50": 100.0, "close": 500.0, "atr14": 0.3,
     })
     assert signal == "BULL_PUT_SPREAD"
 

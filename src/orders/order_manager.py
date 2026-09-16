@@ -58,6 +58,16 @@ class OrderManager:
         self.risk_manager = risk_manager
         self.order_repo   = order_repo
         self.audit_repo   = audit_repo
+        # Fixed 2026-09-16 (deep review): sync_orders() is reachable from two
+        # independent triggers -- the scheduler's own 30s JOB_ORDER_SYNC, and
+        # expire_stale_orders()'s internal call to it every 60s from the
+        # signal cycle -- with no coordination between them, unlike the
+        # exit-check path's _exit_cycle_lock. Both take an "OPEN" snapshot,
+        # await broker.get_orders(), and on discovering the same
+        # REJECTED/CANCELLED transition would each independently call
+        # _release_capital_if_was_deployed() for the same order, double-
+        # releasing its reserved capital. This lock serializes the two.
+        self._sync_orders_lock = asyncio.Lock()
 
     # ── Audit helper ─────────────────────────────────────────────────────────
 
@@ -262,7 +272,23 @@ class OrderManager:
             # add_deployed_capital() call for those two structures (found
             # 2026-07-30) — the two mechanisms stacked instead of one owning it.
             if side == "BUY" and strategy_name and not is_spread_leg:
-                self.risk_manager.add_deployed_capital(strategy_name, quantity * price)
+                # Fixed 2026-09-16 (deep review): this used to always reserve
+                # capital at `price` -- the pre-slippage quote passed in by
+                # the caller -- while every exit path releases it using the
+                # position's REAL average fill price (see
+                # live_trading_engine.py's release_deployed_capital() calls,
+                # which all read entry_p from pos["avg_price"]). PaperBroker
+                # fills synchronously and the immediate-fill-reconciliation
+                # block just above already knows the real fill_price by this
+                # point (in `updates`, not yet necessarily round-tripped onto
+                # db_order) -- use it when available so reserve and release
+                # use the same basis. For a real broker still genuinely
+                # pending (fill_price not yet known), `price` remains the
+                # correct estimate until sync_orders() discovers the real
+                # fill -- unchanged from before for that case.
+                _fill_p = updates.get("fill_price")
+                _capital_basis = float(_fill_p) if _fill_p is not None else price
+                self.risk_manager.add_deployed_capital(strategy_name, quantity * _capital_basis)
 
             # Fixed 2026-08-21 (deep review): risk_manager.current_open_positions
             # was only refreshed from the broker once per cycle, BEFORE the
@@ -675,8 +701,16 @@ class OrderManager:
 
         success = await self.broker.cancel_order(db_order.broker_order_id)
         if success:
-            await self.order_repo.update(db_order, {"order_status": "CANCELLED"})
+            db_order = await self.order_repo.update(db_order, {"order_status": "CANCELLED"})
             await self._audit("ORDER_CANCELLED", {"order_id": db_order.id})
+            # Fixed 2026-09-16 (deep review): unlike expire_stale_orders()
+            # and sync_orders() (both of which release capital on the exact
+            # same OPEN -> CANCELLED transition), this manual/admin cancel
+            # path never released the capital add_deployed_capital() reserved
+            # when the order first went OPEN -- it stayed stuck against the
+            # strategy's daily budget for the rest of the session. Same
+            # helper those two paths already use.
+            await self._release_capital_if_was_deployed(db_order)
         return success
 
     # ── Sync ─────────────────────────────────────────────────────────────────
@@ -735,7 +769,18 @@ class OrderManager:
         return updates
 
     async def sync_orders(self) -> None:
-        """Reconcile OPEN orders with live broker status, including fill_price and slippage."""
+        """Reconcile OPEN orders with live broker status, including fill_price and slippage.
+
+        Serialized via _sync_orders_lock -- see its __init__ comment. Without
+        this, the scheduler's 30s JOB_ORDER_SYNC and expire_stale_orders()'s
+        own internal call to this method (every 60s from the signal cycle)
+        could both observe the same OPEN->REJECTED/CANCELLED transition for
+        the same order and both release its deployed capital.
+        """
+        async with self._sync_orders_lock:
+            await self._sync_orders_locked()
+
+    async def _sync_orders_locked(self) -> None:
         open_db_orders = await self.order_repo.filter(order_status="OPEN")
         if not open_db_orders:
             return

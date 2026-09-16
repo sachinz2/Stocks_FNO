@@ -20,6 +20,7 @@ Exit rules (managed by the engine's _check_spread_exits):
 import logging
 from typing import Any, Dict, Optional
 
+from src.core.constants import FIVE_MIN_ATR_DAILY_SCALE
 from src.strategies.base import StrategyBase, StrategyRegistry
 
 logger = logging.getLogger(__name__)
@@ -31,7 +32,8 @@ class CreditSpreadStrategy(StrategyBase):
     def initialize(self):
         self.fast_period = self.parameters.get("fast_period", 20)
         self.slow_period = self.parameters.get("slow_period", 50)
-        # ATR as % of price — below this we use credit spreads, above we hold
+        # ATR as % of price, DAILY-equivalent scale (see FIVE_MIN_ATR_DAILY_SCALE
+        # below) — below this we use credit spreads, above we hold.
         self.low_vol_threshold = self.parameters.get("low_vol_threshold", 1.2)
         # Below this EMA spread% the trend is flat -- iron_condor_v1's territory,
         # not ours (see generate_signal()'s 2026-08-20 fix note). Same default as
@@ -80,7 +82,17 @@ class CreditSpreadStrategy(StrategyBase):
         ):
             return "HOLD"
 
-        atr_pct = (atr / close * 100) if close > 0 else 0
+        # Fixed 2026-09-16 (deep review): atr14 is the raw 5-min-bar ATR --
+        # unscaled, it runs ~0.2-0.4% even on genuinely volatile days (an
+        # order of magnitude below low_vol_threshold's daily-scale default
+        # of 1.2%), so `atr_pct >= self.low_vol_threshold` almost never
+        # fired -- the volatility circuit-breaker this strategy's whole
+        # thesis depends on ("only sell premium when vol is low") was
+        # structurally a no-op; it entered in any volatility regime.
+        # FIVE_MIN_ATR_DAILY_SCALE (same conversion regime_detector.py and
+        # the engine's own entry-ATR sigma computation already use) brings
+        # it onto the same daily-equivalent scale low_vol_threshold expects.
+        atr_pct = (atr / close * 100 * FIVE_MIN_ATR_DAILY_SCALE) if close > 0 else 0
 
         # High volatility → long options are better, we step aside
         if atr_pct >= self.low_vol_threshold:

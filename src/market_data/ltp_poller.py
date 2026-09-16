@@ -1024,7 +1024,25 @@ class LTPPoller:
         ema50 = tick.get("ema50", close)
         adx = tick.get("adx14", 0)
 
+        # atr_pct stays RAW (5-min-bar scale, ~0.2-0.4% typical) -- ema_score's
+        # weighting below (atr_pct * 0.3) was calibrated to that small
+        # magnitude by the 2026-08-21 proximity-dominant redesign, comparable
+        # to the 0-0.5% proximity term it's added to. It is never compared
+        # against _LOW_VOL_THRESHOLD, so it does NOT need daily scaling.
+        #
+        # atr_pct_daily is the DAILY-equivalent figure (see the module-level
+        # FIVE_MIN_ATR_DAILY_SCALE import and its use a few hundred lines up
+        # in the market-wide trend stats block, which already applies this
+        # same conversion) -- _LOW_VOL_THRESHOLD is a daily-scale threshold,
+        # so only the spread_score/condor_score branches below, which compare
+        # directly against it, need this. Fixed 2026-09-16 (deep review):
+        # these two branches used to compare the RAW atr_pct against
+        # _LOW_VOL_THRESHOLD directly -- an order of magnitude too small to
+        # ever clear 1.2, so `atr_pct < _LOW_VOL_THRESHOLD` was true almost
+        # always regardless of real volatility, silently collapsing both
+        # scores toward their low-vol-bonus ceiling on every candidate.
         atr_pct = (atr / close) * 100
+        atr_pct_daily = atr_pct * FIVE_MIN_ATR_DAILY_SCALE
         ema_spread_pct = abs(ema20 - ema50) / ema50 * 100 if ema50 > 0 else 0.0
 
         # Regime 1: EMA crossover — always gets a score
@@ -1035,17 +1053,17 @@ class LTPPoller:
         )
 
         # Regime 2: Credit spread — only when low vol
-        if atr_pct < _LOW_VOL_THRESHOLD:
+        if atr_pct_daily < _LOW_VOL_THRESHOLD:
             spread_score = round(
-                ((_LOW_VOL_THRESHOLD - atr_pct) * 0.4) + (ema_spread_pct * 0.6), 4
+                ((_LOW_VOL_THRESHOLD - atr_pct_daily) * 0.4) + (ema_spread_pct * 0.6), 4
             )
         else:
             spread_score = 0.0
 
         # Regime 3: Iron condor — only when low vol AND flat EMA
-        if atr_pct < _LOW_VOL_THRESHOLD and ema_spread_pct < _FLAT_EMA_THRESHOLD:
+        if atr_pct_daily < _LOW_VOL_THRESHOLD and ema_spread_pct < _FLAT_EMA_THRESHOLD:
             condor_score = round(
-                ((_LOW_VOL_THRESHOLD - atr_pct) * 0.6)
+                ((_LOW_VOL_THRESHOLD - atr_pct_daily) * 0.6)
                 + ((_FLAT_EMA_THRESHOLD - ema_spread_pct) * 0.4), 4
             )
         else:

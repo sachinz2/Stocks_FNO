@@ -5589,7 +5589,11 @@ class LiveTradingEngine:
         fixed earlier that day), AND no trade_journal write at all, which
         is worse -- a position closed this way would show as permanently
         open (exit_time/exit_price/pnl all NULL) forever, not just
-        mispriced.
+        mispriced. Fixed 2026-09-16 (deep review): a third bug in the same
+        family -- an active spread/condor on this underlying used to be
+        silently dropped from tracking (no close order, no journal, no
+        capital release) at the bottom of this function. Now left tracked
+        instead of discarded; see the comment there.
         """
         from src.market_data.option_chain import get_option_quote
         positions = await self._safe_get_positions()
@@ -5670,10 +5674,29 @@ class LiveTradingEngine:
                 self.risk_manager.release_deployed_capital(
                     _jrnl_info.get("strategy_name", "ema_crossover_v1"), entry_p * abs(pos["quantity"]),
                 )
-        if underlying in self._active_spreads:
-            del self._active_spreads[underlying]
-        if underlying in self._active_condors:
-            del self._active_condors[underlying]
+        # Fixed 2026-09-16 (deep review): this used to unconditionally `del`
+        # any active spread/condor tracked on this underlying here -- with
+        # no closing order, no trade_journal write, and no
+        # release_deployed_capital() call. The real multi-leg position (in
+        # live mode, real short options with an armed GTT) would stay open
+        # at the broker while the engine's own book of record silently
+        # forgot it existed: no further exit-rule evaluation, no GTT
+        # cancellation, deployed capital never freed. This function only
+        # ever built the machinery to close SINGLE-LEG longs (see loop
+        # above) -- it has no business discarding multi-leg state it never
+        # actually closed. Leave it tracked instead: _check_spread_exits()/
+        # _check_condor_exits() keep evaluating it every cycle exactly as
+        # if this EXIT signal had never fired, so nothing is lost, just not
+        # force-closed by this specific path.
+        if underlying in self._active_spreads or underlying in self._active_condors:
+            logger.critical(
+                f"EXIT signal on {underlying}: single-leg long position(s) closed, "
+                "but an active credit_spread/iron_condor structure on this underlying "
+                "was left OPEN and still tracked -- _exit_all_options_for() only closes "
+                "single-leg longs. It will keep being managed by the normal spread/condor "
+                "exit checks; force-close it manually if the EXIT signal was meant to "
+                "cover it too."
+            )
         self._exited_today.add(underlying)
         await self._persist_state()
 

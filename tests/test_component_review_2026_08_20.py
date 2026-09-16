@@ -103,8 +103,11 @@ def test_credit_spread_still_fires_outside_the_flat_zone():
     strat.initialize()
 
     # ema_spread_pct = |105-100|/100*100 = 5% -- well above flat_threshold
+    # atr14=0.3 on close=500 -> daily-equivalent ATR% (see FIVE_MIN_ATR_DAILY_SCALE,
+    # 2026-09-16 deep review fix) = 0.06% * 8.66 ~= 0.52%, comfortably under
+    # low_vol_threshold=1.2%.
     signal = strat.generate_signal({
-        "ema20": 105.0, "ema50": 100.0, "close": 500.0, "atr14": 2.0,
+        "ema20": 105.0, "ema50": 100.0, "close": 500.0, "atr14": 0.3,
     })
     assert signal == "BULL_PUT_SPREAD"
 

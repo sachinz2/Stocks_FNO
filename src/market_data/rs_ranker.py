@@ -50,7 +50,16 @@ NIFTY_SYMBOL       = "NIFTY50"
 NIFTY_50_TOKEN     = 256265   # Zerodha NSE instrument token for NIFTY 50 index (stable)
 
 # How many days of history to download for RS calculation
-_RS_HISTORY_DAYS = 32   # days of daily candles
+# Fixed 2026-09-16 (deep review): was 32 calendar days (~22 trading days) --
+# rank()'s ema_bonus component needs a genuine 50-bar EMA (`s.ewm(span=50)`)
+# to compare against the 20-bar one; with only ~22 bars available,
+# `len(s) >= 50` was never true, so ema50_d silently fell back to ema20_d and
+# `ema20_d > ema50_d` compared a value to itself -- always False. 25% of the
+# documented RS score (the "EMA20>EMA50 trend structure" bonus) was dead
+# code for every symbol, every cycle. 80 calendar days comfortably clears 50
+# trading-day bars even across NSE holiday clusters; one historical_data()
+# call per symbol regardless of day count, so this doesn't add API calls.
+_RS_HISTORY_DAYS = 80   # days of daily candles
 _RS_HISTORY_TTL  = 300  # refresh every 5 minutes
 
 
