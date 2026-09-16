@@ -21,10 +21,18 @@ class SignalDecisionTrace(Base):
     of gates whose count incremented during one call IS that candidate's
     passed-gate prefix, with zero risk of altering which trades get taken.
 
-    Trade-off: this gives the STAGE a candidate died at (e.g. "rvol_passed"
-    never incremented -> died at/before RVOL), not the specific numeric
-    reason (e.g. "RVOL=1.1 < 1.3") -- that finer detail still requires
-    grepping the adjacent log line for now. final_decision is one of
+    Trade-off: the diff alone gives the STAGE a candidate died at (e.g.
+    "rvol_passed" never incremented -> died at/before RVOL), not the
+    specific numeric reason. Fixed 2026-09-16 (external review round 2,
+    "make SignalDecisionTrace more granular"): for the four gates with a
+    real value-vs-threshold comparison (rvol_passed/adx_passed/rs_passed/
+    mtf_passed), the check itself now sets
+    LiveTradingEngine._last_gate_rejection {gate, value, threshold, reason}
+    immediately before its own `return` (additive only -- no condition or
+    control flow changed), which _record_signal_trace() folds into `detail`
+    -- e.g. "MTF_STRONG_OPPOSITION value=0.42 threshold=0.3". DTE/lot/
+    contract/margin rejections still stay stage-only; that detail still
+    requires grepping the adjacent log line. final_decision is one of
     NO_SIGNAL (strategy didn't act -- HOLD, inactive, or missing data),
     REJECTED (a real BUY/SELL/spread/condor signal died at rejected_at_gate),
     ENTERED, or ERROR (an exception during processing).
@@ -41,4 +49,4 @@ class SignalDecisionTrace(Base):
     regime           = Column(String(20), nullable=True)
     final_decision   = Column(String(20), nullable=False)   # NO_SIGNAL / REJECTED / ENTERED / ERROR
     last_gate_reached = Column(String(50), nullable=True)   # None for NO_SIGNAL
-    detail           = Column(String(255), nullable=True)   # exception text for ERROR, else None
+    detail           = Column(String(255), nullable=True)   # exception/rejection detail, else None

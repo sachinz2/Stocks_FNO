@@ -36,6 +36,10 @@ class _FakeTraceEngine:
 
     def __init__(self, stats):
         self._signal_gate_stats = stats
+        # 2026-09-16: set by the RVOL/ADX/RS/MTF threshold checks
+        # themselves inside the real _process_signal() -- absent here since
+        # these tests drive _record_signal_trace() directly.
+        self._last_gate_rejection = None
 
 
 @pytest.fixture(autouse=True)

@@ -247,6 +247,12 @@ class LiveTradingEngine:
         self._position_fetch_stats: Dict[str, int] = {
             "success": 0, "failure": 0, "entry_cycles_blocked": 0,
         }
+        # Fixed 2026-09-16 (external review round 2, "make SignalDecisionTrace
+        # more granular"): most-recent gate-failure detail (value/threshold/
+        # reason) for the candidate _process_signal() is currently
+        # evaluating -- see _process_signal()'s reset of this at the top of
+        # every call for the full docstring/reasoning.
+        self._last_gate_rejection: Optional[Dict[str, Any]] = None
         # Fixed 2026-09-15 (external review, global-regime NIFTY
         # subscription): resolved once in main.py's kite provisioning (see
         # fno_universe.resolve_nifty_token()), attached here via
@@ -2400,7 +2406,20 @@ class LiveTradingEngine:
             else:
                 final_decision = "REJECTED"
                 last_gate = max(reached, key=_CANONICAL_GATE_ORDER.index)
-                detail = None
+                # Fixed 2026-09-16 (external review round 2, "make
+                # SignalDecisionTrace more granular"): _last_gate_rejection
+                # (set by the RVOL/ADX/RS/MTF threshold checks themselves,
+                # right before their own `return` -- see _process_signal's
+                # docstring on it) carries the actual value/threshold/reason
+                # for the gate that just failed. Still a best-effort, not
+                # every gate is instrumented (DTE/lot/contract/margin
+                # rejections stay stage-only) -- see the model docstring's
+                # accepted limitation for what's still missing.
+                _rej = self._last_gate_rejection
+                if _rej and _rej.get("gate") == last_gate:
+                    detail = f"{_rej['reason']} value={_rej['value']} threshold={_rej['threshold']}"[:255]
+                else:
+                    detail = None
 
             from src.database.connection import AsyncSessionLocal
             from src.database.models.signal_decision_trace import SignalDecisionTrace
@@ -2422,6 +2441,20 @@ class LiveTradingEngine:
         self, strategy, symbol: str, vix: Optional[float] = None,
         regime: Optional[str] = None,
     ) -> None:
+        # Fixed 2026-09-16 (external review round 2, "make SignalDecisionTrace
+        # more granular"): cleared at the top of every call (not just after a
+        # trace record is built) so a rejection detail from a PREVIOUS
+        # symbol's call can never leak into a later candidate that doesn't
+        # hit any gate-failure branch itself (e.g. one that ends NO_SIGNAL
+        # or ENTERED). Set by the RVOL/ADX/MTF threshold checks below, right
+        # before their own `return` -- additive only, changes no condition
+        # or control flow. See _record_signal_trace()'s consumption of this
+        # for why it's a single scratch dict rather than a trace object
+        # threaded through the whole function: only ONE _process_signal call
+        # is ever in flight per engine instance (the signal cycle awaits
+        # each symbol sequentially), so there's no concurrent-overwrite risk.
+        self._last_gate_rejection: Optional[Dict[str, Any]] = None
+
         market_data = await self._get_market_data(symbol)
         if not market_data:
             return
@@ -2690,6 +2723,10 @@ class LiveTradingEngine:
                         f"[{strategy.name}] {symbol} skipped — RVOL={_rvol:.2f} < {_rvol_threshold} "
                         "(below-average volume; weak breakout confirmation)"
                     )
+                    self._last_gate_rejection = {
+                        "gate": "rvol_passed", "value": round(_rvol, 4),
+                        "threshold": _rvol_threshold, "reason": "RVOL_BELOW_THRESHOLD",
+                    }
                     return
                 logger.info(
                     f"[{strategy.name}] {symbol} RVOL={_rvol:.2f} < {_rvol_threshold} "
@@ -2733,6 +2770,10 @@ class LiveTradingEngine:
                     f"[{strategy.name}] {symbol} skipped — ADX={_adx_ema:.1f} < 25 "
                     "(trend not strong enough for momentum entry)"
                 )
+                self._last_gate_rejection = {
+                    "gate": "adx_passed", "value": round(_adx_ema, 2),
+                    "threshold": 25, "reason": "ADX_BELOW_THRESHOLD",
+                }
                 return
         self._audit_gate(strategy.name, "adx_passed")
 
@@ -2790,6 +2831,7 @@ class LiveTradingEngine:
                     "closed on this entry filter."
                 )
                 return
+            _rs_own_rank = next((e.get("rank") for e in _rs_ranks if e["symbol"] == symbol), None)
             if signal_str == "BUY":
                 _rs_top_syms = {e["symbol"] for e in _rs_ranks[:10]}
                 if symbol not in _rs_top_syms:
@@ -2797,6 +2839,10 @@ class LiveTradingEngine:
                         f"[{strategy.name}] {symbol} skipped — not in RS top-10 "
                         "vs NIFTY (relative strength too weak for a long entry)"
                     )
+                    self._last_gate_rejection = {
+                        "gate": "rs_passed", "value": _rs_own_rank,
+                        "threshold": "top-10", "reason": "NOT_IN_RS_TOP_10",
+                    }
                     return
             else:
                 _rs_bottom_syms = {e["symbol"] for e in _rs_ranks[-10:]}
@@ -2805,6 +2851,10 @@ class LiveTradingEngine:
                         f"[{strategy.name}] {symbol} skipped — not in RS bottom-10 "
                         "vs NIFTY (relative strength too strong for a short entry)"
                     )
+                    self._last_gate_rejection = {
+                        "gate": "rs_passed", "value": _rs_own_rank,
+                        "threshold": "bottom-10", "reason": "NOT_IN_RS_BOTTOM_10",
+                    }
                     return
         self._audit_gate(strategy.name, "rs_passed")
 
@@ -2881,6 +2931,10 @@ class LiveTradingEngine:
                             f"15-min EMA trend ({'bullish' if _tf15_bull else 'bearish'}) "
                             f"contradicts 5-min signal ({signal_str})"
                         )
+                        self._last_gate_rejection = {
+                            "gate": "mtf_passed", "value": "bullish" if _tf15_bull else "bearish",
+                            "threshold": signal_str, "reason": "MTF_STRICT_DISAGREEMENT",
+                        }
                         return
                     _spread15_pct = abs(_ema20_15 - _ema50_15) / _ema50_15 * 100
                     _strong_opp = getattr(strategy, "mtf_strong_opposition_pct", 0.3)
@@ -2891,6 +2945,13 @@ class LiveTradingEngine:
                             f"STRONGLY contradicts 5-min signal ({signal_str}), "
                             f"spread={_spread15_pct:.2f}% >= {_strong_opp}%"
                         )
+                        # This is the PDF's own worked example (external
+                        # review round 2, section 7): MTF_STRONG_OPPOSITION
+                        # with value=spread%, threshold=mtf_strong_opposition_pct%.
+                        self._last_gate_rejection = {
+                            "gate": "mtf_passed", "value": round(_spread15_pct, 4),
+                            "threshold": _strong_opp, "reason": "MTF_STRONG_OPPOSITION",
+                        }
                         return
                     logger.info(
                         f"[{strategy.name}] {symbol} 15-min trend "

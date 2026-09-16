@@ -472,14 +472,17 @@ async def get_signal_trace(
     inactive, or missing data), REJECTED (a real signal died at
     last_gate_reached), ENTERED, or ERROR. See
     LiveTradingEngine._record_signal_trace()'s docstring for exactly how
-    last_gate_reached is derived and its accepted limitation (stage, not the
-    specific numeric reason -- e.g. "died at rvol_passed", not "RVOL=1.1 <
-    1.3"; that detail is still only in the adjacent log line for now). For
-    final_decision=ERROR, `detail` is prefixed with a best-effort category
-    -- BROKER_ERROR / GATE_ERROR / OPTION_CHAIN_ERROR / RISK_ERROR /
-    DATA_OR_STRATEGY_ERROR / UNKNOWN_ERROR (see
-    LiveTradingEngine._classify_signal_error(); "external review,
-    structured error classification").
+    last_gate_reached is derived. For final_decision=REJECTED at rvol_passed/
+    adx_passed/rs_passed/mtf_passed specifically, `detail` also carries the
+    real value/threshold/reason that gate computed (2026-09-16, external
+    review round 2, "make SignalDecisionTrace more granular" -- e.g. "MTF_
+    STRONG_OPPOSITION value=0.42 threshold=0.3", the review's own worked
+    example) -- other gates (DTE/lot/contract/margin) stay stage-only for
+    now, still only in the adjacent log line. For final_decision=ERROR,
+    `detail` is prefixed with a best-effort category -- BROKER_ERROR /
+    GATE_ERROR / OPTION_CHAIN_ERROR / RISK_ERROR / DATA_OR_STRATEGY_ERROR /
+    UNKNOWN_ERROR (see LiveTradingEngine._classify_signal_error();
+    "external review, structured error classification").
 
     Optional filters: strategy, symbol, decision (NO_SIGNAL/REJECTED/
     ENTERED/ERROR). limit caps rows returned, most recent first (default
