@@ -114,6 +114,19 @@ def schedule_trading_jobs(engine) -> None:
         misfire_grace_time=15,
     )
 
+    # Rejected-signal outcome backfill — every 5 minutes ("Trade Quality
+    # Layer" v1, 2026-09-16). Fills in RejectedSignalOutcome's forward-price
+    # checkpoints (5/15/30/60 min after a rejection) as they come due.
+    # Read-only with respect to trading; only writes to the analytics table.
+    scheduler.add_job(
+        engine._backfill_rejected_outcomes,
+        IntervalTrigger(minutes=5),
+        id="rejected_outcome_backfill",
+        name="Rejected Signal Outcome Backfill",
+        replace_existing=True,
+        misfire_grace_time=60,
+    )
+
     # Fixed 2026-08-21 (deep review): the cron-triggered jobs below had no
     # explicit misfire_grace_time, unlike the interval jobs above which all
     # set one -- APScheduler's own default is 1 SECOND, so a briefly-busy

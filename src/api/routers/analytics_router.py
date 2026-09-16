@@ -488,6 +488,11 @@ async def get_signal_trace(
     ENTERED/ERROR). limit caps rows returned, most recent first (default
     200, since candidate pools are small -- this is minutes, not days, of
     history at max).
+
+    quality_score (2026-09-16, "Trade Quality Layer" v1 of 3): a 0-100
+    diagnostic score, populated only for REJECTED/ENTERED rows -- see
+    LiveTradingEngine._compute_trade_quality_score()'s docstring for the
+    component breakdown. Purely observational, does not gate any trade.
     """
     try:
         from sqlalchemy import select
@@ -511,11 +516,120 @@ async def get_signal_trace(
                 "final_decision":    r.final_decision,
                 "last_gate_reached": r.last_gate_reached,
                 "detail":            r.detail,
+                "quality_score":     r.quality_score,
             }
             for r in rows
         ]
     except Exception as e:
         logger.error(f"Analytics /signal-trace error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get("/rejected-outcomes")
+async def get_rejected_outcomes(
+    strategy: str = None, symbol: str = None, gate: str = None, limit: int = 200,
+):
+    """
+    Counterfactual outcome tracking for rejected signals -- what did the
+    underlying actually do after a candidate was turned away? Added
+    2026-09-16 ("Trade Quality Layer" v1 of 3, external review round 2 Part
+    2, "rejected-signal outcome tracking"). Complements /signal-trace: that
+    table records WHY a candidate was rejected, this one records WHAT
+    HAPPENED NEXT, joined implicitly on (strategy_name, symbol, timestamp,
+    rejected_at_gate).
+
+    close_5m/15m/30m/60m are filled in progressively by
+    LiveTradingEngine._backfill_rejected_outcomes() (every 5 min) as each
+    checkpoint comes due -- None until then. outcome_complete=False means
+    still filling in; True means either all four are populated or the row
+    aged out (see _REJECTED_OUTCOME_GIVE_UP_MIN).
+
+    Optional filters: strategy, symbol, gate (rejected_at_gate, e.g.
+    "mtf_passed"). limit caps rows returned, most recent first (default
+    200).
+    """
+    try:
+        from sqlalchemy import select
+        from src.database.models.rejected_signal_outcome import RejectedSignalOutcome
+        async with AsyncSessionLocal() as session:
+            stmt = select(RejectedSignalOutcome).order_by(RejectedSignalOutcome.timestamp.desc())
+            if strategy:
+                stmt = stmt.where(RejectedSignalOutcome.strategy_name == strategy)
+            if symbol:
+                stmt = stmt.where(RejectedSignalOutcome.symbol == symbol)
+            if gate:
+                stmt = stmt.where(RejectedSignalOutcome.rejected_at_gate == gate)
+            stmt = stmt.limit(min(limit, 1000))
+            rows = (await session.execute(stmt)).scalars().all()
+        return [
+            {
+                "timestamp":           r.timestamp.isoformat(),
+                "strategy_name":       r.strategy_name,
+                "symbol":              r.symbol,
+                "signal":              r.signal,
+                "rejected_at_gate":    r.rejected_at_gate,
+                "quality_score":       r.quality_score,
+                "close_at_rejection":  r.close_at_rejection,
+                "close_5m":            r.close_5m,
+                "close_15m":           r.close_15m,
+                "close_30m":           r.close_30m,
+                "close_60m":           r.close_60m,
+                "outcome_complete":    r.outcome_complete,
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        logger.error(f"Analytics /rejected-outcomes error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get("/rejected-outcomes-summary")
+async def get_rejected_outcomes_summary():
+    """
+    Aggregated view of /rejected-outcomes, grouped by rejected_at_gate --
+    the evidence base the PDF's "Counterfactual Trade Dataset" is meant to
+    build toward (e.g. "MTF opposition SELL trades actually work 58% of the
+    time"). Only considers rows with outcome_complete=True and a real
+    close_60m, so partial/in-progress rows don't skew the average.
+
+    directional_pct_move_60m is signed so positive always means "the
+    rejected trade would have been profitable in its own direction" --
+    for a BUY it's the raw underlying % move; for a SELL it's inverted,
+    since a SELL candidate profits when the underlying falls.
+    """
+    try:
+        from sqlalchemy import select
+        from src.database.models.rejected_signal_outcome import RejectedSignalOutcome
+        async with AsyncSessionLocal() as session:
+            stmt = select(RejectedSignalOutcome).where(
+                RejectedSignalOutcome.outcome_complete == True,  # noqa: E712
+                RejectedSignalOutcome.close_60m.isnot(None),
+            )
+            rows = (await session.execute(stmt)).scalars().all()
+
+        by_gate: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            pct_move = (r.close_60m - r.close_at_rejection) / r.close_at_rejection * 100
+            directional_pct_move = pct_move if r.signal == "BUY" else -pct_move
+            bucket = by_gate.setdefault(r.rejected_at_gate or "unknown", {
+                "count": 0, "would_have_profited": 0, "_sum_pct_move": 0.0,
+            })
+            bucket["count"] += 1
+            bucket["_sum_pct_move"] += directional_pct_move
+            if directional_pct_move > 0:
+                bucket["would_have_profited"] += 1
+
+        summary = {}
+        for gate_name, bucket in by_gate.items():
+            count = bucket["count"]
+            summary[gate_name] = {
+                "count": count,
+                "would_have_profited_pct": round(bucket["would_have_profited"] / count * 100, 1),
+                "avg_directional_pct_move_60m": round(bucket["_sum_pct_move"] / count, 3),
+            }
+        return summary
+    except Exception as e:
+        logger.error(f"Analytics /rejected-outcomes-summary error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 

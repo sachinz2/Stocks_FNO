@@ -33,6 +33,10 @@ class _FakeTraceEngine:
     # itself doesn't need this since Python resolves @staticmethod there
     # directly, but re-assigning the already-unwrapped function here does.
     _classify_signal_error = staticmethod(LiveTradingEngine._classify_signal_error)
+    # 2026-09-16 ("Trade Quality Layer" v1): quality_score is computed on
+    # every call now -- reuse the real method rather than stub it out, same
+    # as _classify_signal_error above.
+    _compute_trade_quality_score = LiveTradingEngine._compute_trade_quality_score
 
     def __init__(self, stats):
         self._signal_gate_stats = stats
@@ -40,6 +44,14 @@ class _FakeTraceEngine:
         # themselves inside the real _process_signal() -- absent here since
         # these tests drive _record_signal_trace() directly.
         self._last_gate_rejection = None
+        # 2026-09-16: same reasoning -- populated inline by _process_signal(),
+        # empty here since these tests skip straight to _record_signal_trace().
+        self._last_signal_metrics = {}
+
+    async def _record_rejected_outcome(self, strategy_name, symbol, last_gate, quality_score):
+        # Pure side-effect hook for RejectedSignalOutcome -- not under test
+        # in this file (see test_trade_quality_layer_2026_09_16.py for that).
+        pass
 
 
 @pytest.fixture(autouse=True)

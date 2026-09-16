@@ -36,6 +36,7 @@ def _fake_engine(with_poller=True):
         _check_gap_opens=lambda: None,
         _run_exit_checks_only=lambda: None,
         sync_orders=lambda: None,
+        _backfill_rejected_outcomes=lambda: None,
         risk_manager=object(),
         _symbol_poller=SimpleNamespace(poll=lambda: None) if with_poller else None,
     )

@@ -489,6 +489,58 @@ async def get_option_quote(contract: str, kite, redis) -> Optional[float]:
     return None
 
 
+async def get_option_quality_metrics(contract: str, kite) -> Optional[Dict[str, Optional[float]]]:
+    """
+    Fetch a fresh Zerodha quote for `contract` and return execution-quality
+    metrics -- bid/ask spread %, open interest, today's traded volume.
+
+    Added 2026-09-16 ("Trade Quality Layer" v1 of 3, option-quality filter,
+    external review round 2 Part 2): distinct from get_option_quote() above
+    (which only needs a single trustworthy PRICE and prefers the cheap
+    Redis caches first) -- this always makes its own fresh kite.quote()
+    call, since only the raw quote's depth/oi/volume fields carry this
+    data, and the Redis price caches (optltp/optq) don't persist them.
+    Intentionally NOT folded into get_option_quote() itself to avoid
+    touching that already-well-tested cache-priority logic. Called once per
+    candidate, right before order placement (see
+    LiveTradingEngine._process_signal()) -- same bounded per-entry cost
+    get_option_quote()'s own kite.quote() fallback already accepts.
+
+    Returns None if kite is unavailable or the quote call fails -- caller
+    decides how to fail (see LiveTradingEngine's option_quality_check,
+    which fails OPEN when spread_pct can't be computed at all and CLOSED
+    only when it's computable and too wide).
+    """
+    if kite is None:
+        return None
+    try:
+        import asyncio
+        loop = asyncio.get_running_loop()
+        nfo_sym = f"NFO:{contract}"
+        data = await loop.run_in_executor(None, lambda: kite.quote([nfo_sym]))
+        quote = data.get(nfo_sym, {})
+    except Exception as e:
+        logger.debug(f"Option quality metrics fetch failed [{contract}]: {e}")
+        return None
+
+    depth = quote.get("depth") or {}
+    best_bid = next((lvl["price"] for lvl in depth.get("buy", []) if lvl.get("price", 0) > 0), None)
+    best_ask = next((lvl["price"] for lvl in depth.get("sell", []) if lvl.get("price", 0) > 0), None)
+    spread_pct = None
+    if best_bid and best_ask:
+        mid = (best_bid + best_ask) / 2
+        if mid > 0:
+            spread_pct = round((best_ask - best_bid) / mid * 100, 4)
+
+    return {
+        "bid": float(best_bid) if best_bid else None,
+        "ask": float(best_ask) if best_ask else None,
+        "spread_pct": spread_pct,
+        "oi": quote.get("oi"),
+        "volume": quote.get("volume"),
+    }
+
+
 # ── Delta-based strike selection ──────────────────────────────────────────────
 
 def find_delta_strike(

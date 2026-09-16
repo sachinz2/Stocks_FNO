@@ -1,4 +1,4 @@
-from sqlalchemy import Column, BigInteger, String, TIMESTAMP, Index
+from sqlalchemy import Column, BigInteger, Integer, String, TIMESTAMP, Index
 from src.database.base import Base
 
 
@@ -50,3 +50,9 @@ class SignalDecisionTrace(Base):
     final_decision   = Column(String(20), nullable=False)   # NO_SIGNAL / REJECTED / ENTERED / ERROR
     last_gate_reached = Column(String(50), nullable=True)   # None for NO_SIGNAL
     detail           = Column(String(255), nullable=True)   # exception/rejection detail, else None
+    # Added 2026-09-16 ("Trade Quality Layer" v1, external review round 2
+    # Part 2): 0-100 diagnostic score, only populated for REJECTED/ENTERED
+    # (a real BUY/SELL candidate). See LiveTradingEngine.
+    # _compute_trade_quality_score() for the component breakdown -- purely
+    # observational, does NOT gate any trade.
+    quality_score    = Column(Integer, nullable=True)

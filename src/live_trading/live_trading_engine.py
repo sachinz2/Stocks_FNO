@@ -87,6 +87,7 @@ _CANONICAL_GATE_ORDER = [
     "event_calendar_passed",                                         # spread/condor only
     "rs_passed", "mtf_passed", "lot_passed",                         # single-leg only
     "contract_resolved",                                             # shared
+    "option_quality_passed",                                         # single-leg only, added 2026-09-16
     "margin_passed",                                                 # spread/condor only
     "trade_placed",                                                  # shared, terminal
 ]
@@ -253,6 +254,13 @@ class LiveTradingEngine:
         # evaluating -- see _process_signal()'s reset of this at the top of
         # every call for the full docstring/reasoning.
         self._last_gate_rejection: Optional[Dict[str, Any]] = None
+        # Added 2026-09-16 ("Trade Quality Layer" v1 -- external review round
+        # 2, Part 2): same scratch-dict pattern as _last_gate_rejection just
+        # above -- populated inline by the RVOL/ADX/RS/MTF checks in
+        # _process_signal() as each is actually reached, consumed by
+        # _compute_trade_quality_score() after the call. See that method's
+        # docstring for why this is observational-only, not a new gate.
+        self._last_signal_metrics: Dict[str, Any] = {}
         # Fixed 2026-09-15 (external review, global-regime NIFTY
         # subscription): resolved once in main.py's kite provisioning (see
         # fno_universe.resolve_nifty_token()), attached here via
@@ -2366,6 +2374,72 @@ class LiveTradingEngine:
             return "RISK_ERROR"
         return "UNKNOWN_ERROR"
 
+    def _compute_trade_quality_score(self) -> Optional[int]:
+        """
+        0-100 diagnostic score for the candidate _process_signal() just
+        finished evaluating (REJECTED or ENTERED only -- see
+        _record_signal_trace()'s caller). Added 2026-09-16 ("Trade Quality
+        Layer" v1 of 3, external review round 2 Part 2).
+
+        Reads self._last_signal_metrics, populated inline by the RVOL/ADX/
+        RS/MTF checks in _process_signal() as each is actually reached --
+        same scratch-dict pattern as _last_gate_rejection (see that
+        attribute's docstring: only one _process_signal() call is ever in
+        flight per engine instance, so there's no concurrent-overwrite
+        risk). A candidate rejected early (e.g. at RVOL) never reaches
+        ADX/RS/MTF, so those components score at a neutral midpoint rather
+        than zero -- "never checked" is not the same as "failed."
+
+        Deliberately NOT a gate: the PDF's own worked example uses a 55/100
+        cutoff, but that number isn't backtested against this system's real
+        candidates. Recording it on every REJECTED/ENTERED trace row lets
+        score-vs-actual-outcome be studied first (paired with
+        RejectedSignalOutcome's forward-return tracking) before any future
+        decision to use it to block a trade outright.
+        """
+        m = self._last_signal_metrics
+        if not m.get("signal"):
+            return None
+
+        adx = m.get("adx")
+        adx_score = 12.0 if adx is None else max(0.0, min(25.0, (adx - 15.0) / 25.0 * 25.0))
+
+        rvol = m.get("rvol")
+        rvol_score = 10.0 if rvol is None else max(0.0, min(20.0, (rvol - 0.5) / 2.0 * 20.0))
+
+        _REGIME_SCORE = {"TRENDING": 20.0, "VOLATILE": 12.0, "RANGE_BOUND": 10.0, "LOW_VOL": 10.0}
+        regime_score = _REGIME_SCORE.get(m.get("regime"), 5.0)
+
+        rs_rank = m.get("rs_rank")
+        rs_total = m.get("rs_total")
+        # BUY wants rank near 1 (strongest vs NIFTY); SELL wants rank near
+        # rs_total (weakest vs NIFTY) -- mirror it onto the same 1=best scale.
+        if rs_rank is not None and m.get("signal") == "SELL" and rs_total:
+            rs_rank = rs_total - rs_rank + 1
+        if rs_rank is None:
+            rs_score = 10.0
+        elif rs_rank <= 5:
+            rs_score = 20.0
+        elif rs_rank <= 10:
+            rs_score = 15.0
+        elif rs_rank <= 20:
+            rs_score = 10.0
+        else:
+            rs_score = 5.0
+
+        mtf_agree = m.get("mtf_agree")
+        mtf_spread = m.get("mtf_spread_pct")
+        if mtf_agree is None:
+            mtf_score = 8.0
+        elif mtf_agree:
+            mtf_score = 15.0
+        elif mtf_spread is not None and mtf_spread < 0.3:
+            mtf_score = 7.0  # weak opposition, allowed through -- partial credit
+        else:
+            mtf_score = 0.0
+
+        return round(adx_score + rvol_score + regime_score + rs_score + mtf_score)
+
     async def _record_signal_trace(
         self, strategy_name: str, symbol: str, regime: Optional[str],
         gates_before: Dict[str, int], exception: Optional[Exception] = None,
@@ -2389,6 +2463,14 @@ class LiveTradingEngine:
                 g for g in gates_after
                 if gates_after.get(g, 0) > gates_before.get(g, 0)
             ]
+            # Trade Quality Score (2026-09-16) -- only meaningful for a real
+            # BUY/SELL candidate that actually reached generate_signal();
+            # _compute_trade_quality_score() itself returns None otherwise.
+            # Computed once here (rather than per-branch) so both the
+            # REJECTED branch's RejectedSignalOutcome row and the trace row
+            # below use the identical value. See that method's docstring
+            # for why this is observational, not a gate.
+            quality_score = self._compute_trade_quality_score()
             if exception is not None:
                 final_decision = "ERROR"
                 last_gate = max(reached, key=_CANONICAL_GATE_ORDER.index) if reached else None
@@ -2420,6 +2502,9 @@ class LiveTradingEngine:
                     detail = f"{_rej['reason']} value={_rej['value']} threshold={_rej['threshold']}"[:255]
                 else:
                     detail = None
+                await self._record_rejected_outcome(strategy_name, symbol, last_gate, quality_score)
+            if final_decision not in ("REJECTED", "ENTERED"):
+                quality_score = None
 
             from src.database.connection import AsyncSessionLocal
             from src.database.models.signal_decision_trace import SignalDecisionTrace
@@ -2433,9 +2518,98 @@ class LiveTradingEngine:
                 "final_decision":    final_decision,
                 "last_gate_reached": last_gate,
                 "detail":            detail,
+                "quality_score":     quality_score,
             })
         except Exception as exc:
             logger.debug(f"[SignalTrace] record failed (non-critical): {exc}")
+
+    async def _record_rejected_outcome(
+        self, strategy_name: str, symbol: str, last_gate: Optional[str],
+        quality_score: Optional[int],
+    ) -> None:
+        """
+        Write the initial RejectedSignalOutcome row for a just-rejected BUY/
+        SELL candidate -- see that model's docstring for the full design.
+        Pure observability, same "never affect trading" convention as
+        _record_signal_trace() (called from inside its own try/except).
+
+        Only a real directional candidate gets a row: signal/close must both
+        be present in self._last_signal_metrics, which they are for every
+        rejection from dte_passed onward (underlying_price is captured
+        before the DTE check -- see _process_signal()). A handful of very
+        early rejections (VOLATILE-regime BUY skip, daily order limit)
+        return before that point and are silently skipped here -- there's no
+        meaningful "what would have happened" baseline price for those.
+        """
+        m = self._last_signal_metrics
+        signal_str = m.get("signal")
+        close = m.get("close")
+        if not signal_str or close is None:
+            return
+        try:
+            from src.database.connection import AsyncSessionLocal
+            from src.database.models.rejected_signal_outcome import RejectedSignalOutcome
+            from src.database.repositories.base import BaseRepository
+            repo = BaseRepository(RejectedSignalOutcome, AsyncSessionLocal)
+            await repo.create({
+                "timestamp":          now_ist().replace(tzinfo=None),
+                "strategy_name":      strategy_name,
+                "symbol":             symbol,
+                "signal":             signal_str,
+                "rejected_at_gate":   last_gate,
+                "quality_score":      quality_score,
+                "close_at_rejection": close,
+            })
+        except Exception as exc:
+            logger.debug(f"[RejectedOutcome] record failed (non-critical): {exc}")
+
+    async def _backfill_rejected_outcomes(self) -> None:
+        """
+        Periodic job (see src/core/scheduler.py, every 5 min) filling in
+        RejectedSignalOutcome's forward-price snapshots as each due offset
+        (_REJECTED_OUTCOME_OFFSETS_MIN minutes after rejection) arrives.
+        Uses the same live tick cache _get_market_data() reads elsewhere --
+        no new data dependency, and only ever writes to this analytics
+        table, never touches trading state. Rows older than
+        _REJECTED_OUTCOME_GIVE_UP_MIN are marked complete regardless of gaps
+        so a symbol whose live tick briefly dropped out during the tracking
+        window doesn't get scanned forever.
+        """
+        from src.database.connection import AsyncSessionLocal
+        from src.database.models.rejected_signal_outcome import RejectedSignalOutcome
+        from src.database.repositories.base import BaseRepository
+        repo = BaseRepository(RejectedSignalOutcome, AsyncSessionLocal)
+        try:
+            pending = await repo.filter(outcome_complete=False, limit=200)
+        except Exception as exc:
+            logger.debug(f"[RejectedOutcome] backfill scan failed (non-critical): {exc}")
+            return
+
+        now = now_ist().replace(tzinfo=None)
+        for row in pending:
+            try:
+                age_min = (now - row.timestamp).total_seconds() / 60.0
+                due_cols = [
+                    f"close_{m}m" for m in self._REJECTED_OUTCOME_OFFSETS_MIN
+                    if age_min >= m and getattr(row, f"close_{m}m") is None
+                ]
+                updates: Dict[str, Any] = {}
+                if due_cols:
+                    market_data = await self._get_market_data(row.symbol)
+                    if market_data and market_data.get("close"):
+                        _close = float(market_data["close"])
+                        for col in due_cols:
+                            updates[col] = _close
+                all_filled = all(
+                    (updates.get(f"close_{m}m") is not None or getattr(row, f"close_{m}m") is not None)
+                    for m in self._REJECTED_OUTCOME_OFFSETS_MIN
+                )
+                if all_filled or age_min > self._REJECTED_OUTCOME_GIVE_UP_MIN:
+                    updates["outcome_complete"] = True
+                if updates:
+                    await repo.update(row, updates)
+            except Exception as exc:
+                logger.debug(f"[RejectedOutcome] backfill row {row.id} failed (non-critical): {exc}")
 
     async def _process_signal(
         self, strategy, symbol: str, vix: Optional[float] = None,
@@ -2454,6 +2628,9 @@ class LiveTradingEngine:
         # is ever in flight per engine instance (the signal cycle awaits
         # each symbol sequentially), so there's no concurrent-overwrite risk.
         self._last_gate_rejection: Optional[Dict[str, Any]] = None
+        # Reset alongside _last_gate_rejection, same leakage concern -- see
+        # _compute_trade_quality_score()'s docstring.
+        self._last_signal_metrics: Dict[str, Any] = {}
 
         market_data = await self._get_market_data(symbol)
         if not market_data:
@@ -2530,6 +2707,8 @@ class LiveTradingEngine:
             return
 
         self._audit_gate(strategy.name, "signal_generated")
+        self._last_signal_metrics["signal"] = signal_str
+        self._last_signal_metrics["regime"] = regime
 
         # VOLATILE (VIX>20) crash-catching gate — added 2026-07-31. VIX is a
         # fear/uncertainty gauge, not a directional one: a spike overwhelmingly
@@ -2553,6 +2732,7 @@ class LiveTradingEngine:
         underlying_price = float(market_data.get("close", 0))
         if underlying_price <= 0:
             return
+        self._last_signal_metrics["close"] = underlying_price
 
         option_type = "CE" if signal_str == "BUY" else "PE"
         opposite    = "PE" if option_type == "CE" else "CE"
@@ -2644,6 +2824,7 @@ class LiveTradingEngine:
         # should block until it can, like every other unconfirmed-data case.
         _rvol = float(market_data.get("rvol", 0))
         _rvol_valid = bool(market_data.get("rvol_valid", False))
+        self._last_signal_metrics["rvol"] = _rvol if _rvol_valid else None
         # Fixed 2026-09-15 (live incident review): this validity gate used
         # to run unconditionally for every strategy, including ones with
         # rvol_checked_internally=True (momentum_v1's pullback+breakout
@@ -2745,6 +2926,7 @@ class LiveTradingEngine:
         # strategy-specific threshold decision.
         _adx_ema = float(market_data.get("adx14", 0))
         _adx_ema_valid = bool(market_data.get("adx_valid", False))
+        self._last_signal_metrics["adx"] = _adx_ema if _adx_ema_valid else None
         if not _adx_ema_valid:
             logger.info(
                 f"[{strategy.name}] {symbol} skipped — ADX not yet computable "
@@ -2832,6 +3014,8 @@ class LiveTradingEngine:
                 )
                 return
             _rs_own_rank = next((e.get("rank") for e in _rs_ranks if e["symbol"] == symbol), None)
+            self._last_signal_metrics["rs_rank"] = _rs_own_rank
+            self._last_signal_metrics["rs_total"] = len(_rs_ranks)
             if signal_str == "BUY":
                 _rs_top_syms = {e["symbol"] for e in _rs_ranks[:10]}
                 if symbol not in _rs_top_syms:
@@ -2910,6 +3094,10 @@ class LiveTradingEngine:
                     return
                 _tf15_bull = _ema20_15 > _ema50_15
                 _tf5_bull  = signal_str == "BUY"
+                self._last_signal_metrics["mtf_agree"] = (_tf15_bull == _tf5_bull)
+                self._last_signal_metrics["mtf_spread_pct"] = round(
+                    abs(_ema20_15 - _ema50_15) / _ema50_15 * 100, 4
+                )
                 if _tf15_bull != _tf5_bull:
                     # Fixed 2026-08-21 (external review of
                     # ema_crossover_v1): binary reject-on-
@@ -3053,6 +3241,39 @@ class LiveTradingEngine:
             )
             return
         option_p = _real_p
+
+        # Option-quality filter (2026-09-16, "Trade Quality Layer" v1 of 3,
+        # external review round 2 Part 2): a directionally-correct signal can
+        # still be a bad TRADE if the actual contract is illiquid -- a wide
+        # bid-ask spread means a LIMIT order at option_p either won't fill or
+        # fills far from the price this decision was based on. Strategy-
+        # overridable (option_quality_check, default True) the same way
+        # rvol_hard_gate/mtf_strict are. Deliberately fails OPEN only when
+        # spread genuinely can't be computed (no live depth data -- e.g. an
+        # illiquid contract with a one-sided or empty order book, which is
+        # itself already a liquidity signal but not one this v1 scores) and
+        # fails CLOSED only when it's computable and too wide -- see
+        # get_option_quality_metrics()'s docstring for why this needs its
+        # own fresh kite.quote() call rather than reusing get_option_quote().
+        if getattr(strategy, "option_quality_check", True):
+            from src.market_data.option_chain import get_option_quality_metrics
+            _quality = await get_option_quality_metrics(contract, getattr(self, "_kite", None))
+            _spread_pct = _quality.get("spread_pct") if _quality else None
+            self._last_signal_metrics["option_spread_pct"] = _spread_pct
+            self._last_signal_metrics["option_oi"] = _quality.get("oi") if _quality else None
+            self._last_signal_metrics["option_volume"] = _quality.get("volume") if _quality else None
+            if _spread_pct is not None and _spread_pct > self._OPTION_MAX_SPREAD_PCT:
+                logger.info(
+                    f"[{strategy.name}] {symbol} skipped — {contract} bid-ask spread "
+                    f"{_spread_pct:.2f}% > {self._OPTION_MAX_SPREAD_PCT}% (illiquid contract, "
+                    "LIMIT order unlikely to fill near the quoted price)."
+                )
+                self._last_gate_rejection = {
+                    "gate": "option_quality_passed", "value": _spread_pct,
+                    "threshold": self._OPTION_MAX_SPREAD_PCT, "reason": "OPTION_SPREAD_TOO_WIDE",
+                }
+                return
+        self._audit_gate(strategy.name, "option_quality_passed")
 
         order = await self.order_manager.place_order(
             contract, "BUY", lot_size, option_p,
@@ -6462,6 +6683,22 @@ class LiveTradingEngine:
     # waiting for enough individual symbols to age past 90s. 75s matches
     # the external review's suggested threshold (poll runs every 60s).
     _MARKET_DATA_SNAPSHOT_MAX_AGE_SECONDS = 75
+
+    # RejectedSignalOutcome forward-price checkpoints (2026-09-16, "Trade
+    # Quality Layer" v1 of 3) -- minutes after rejection at which
+    # _backfill_rejected_outcomes() snapshots the underlying's close.
+    _REJECTED_OUTCOME_OFFSETS_MIN = (5, 15, 30, 60)
+    # Rows older than this are marked complete regardless of gaps, so a
+    # symbol whose live tick briefly dropped out during the tracking window
+    # doesn't get scanned forever.
+    _REJECTED_OUTCOME_GIVE_UP_MIN = 75
+
+    # Option-quality filter (2026-09-16, "Trade Quality Layer" v1 of 3) --
+    # reject a resolved contract whose live bid-ask spread, as a % of mid,
+    # exceeds this. A wide spread means the entry's LIMIT order either won't
+    # fill or fills far from option_p, independent of whether the underlying
+    # direction call was correct.
+    _OPTION_MAX_SPREAD_PCT = 8.0
 
     async def _get_market_data(self, symbol: str) -> Optional[Dict[str, Any]]:
         redis = getattr(self, "_redis", None)
