@@ -65,6 +65,44 @@ async def test_publishes_real_atr_and_ema_spread_from_historical_baseline():
     assert "timestamp" in published
 
 
+# ── market_direction (2026-09-16, external review round 2) ─────────────────
+# atr_pct_daily/ema_spread_pct only ever measure magnitude -- a strongly
+# bullish and a strongly bearish NIFTY produce the identical classification
+# inputs. market_direction answers the separate question of which way.
+
+@pytest.mark.asyncio
+async def test_market_direction_is_bullish_when_price_above_both_emas_in_order():
+    kite = _FakeKite(_historical_bars(n=60, trend_per_bar=3.0))  # steadily rising
+    redis = _FakeRedis({})
+
+    await refresh_nifty_regime_inputs(kite, redis, nifty_token=256265)
+
+    published = json.loads(redis.store[REDIS_NIFTY_REGIME_INPUTS_KEY])
+    assert published["market_direction"] == "BULLISH"
+
+
+@pytest.mark.asyncio
+async def test_market_direction_is_bearish_when_price_below_both_emas_in_order():
+    kite = _FakeKite(_historical_bars(n=60, trend_per_bar=-3.0))  # steadily falling
+    redis = _FakeRedis({})
+
+    await refresh_nifty_regime_inputs(kite, redis, nifty_token=256265)
+
+    published = json.loads(redis.store[REDIS_NIFTY_REGIME_INPUTS_KEY])
+    assert published["market_direction"] == "BEARISH"
+
+
+@pytest.mark.asyncio
+async def test_market_direction_is_neutral_when_flat():
+    kite = _FakeKite(_historical_bars(n=60, trend_per_bar=0.0))  # flat -- close ~= ema20 ~= ema50
+    redis = _FakeRedis({})
+
+    await refresh_nifty_regime_inputs(kite, redis, nifty_token=256265)
+
+    published = json.loads(redis.store[REDIS_NIFTY_REGIME_INPUTS_KEY])
+    assert published["market_direction"] == "NEUTRAL"
+
+
 @pytest.mark.asyncio
 async def test_blends_live_tick_accumulated_bars_not_ignored():
     # market:nifty_tick (written by ZerodhaTicker) carries real intraday

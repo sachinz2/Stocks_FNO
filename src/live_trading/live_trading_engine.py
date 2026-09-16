@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import time
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -612,6 +613,15 @@ class LiveTradingEngine:
                 f"({self._position_fetch_stats['entry_cycles_blocked']} cycle(s) "
                 "blocked this way since process start.)"
             )
+            await self._persist_ema_state()
+            await self._persist_momentum_state()
+            return
+
+        # Fixed 2026-09-16 (external review round 2, "LTP -> signal-cycle
+        # dependency ordering"): see _market_data_snapshot_is_stale()'s
+        # docstring for the full reasoning and its deliberate scope
+        # (staleness only, not a strict monotonic-snapshot-id gate).
+        if await self._market_data_snapshot_is_stale():
             await self._persist_ema_state()
             await self._persist_momentum_state()
             return
@@ -6319,9 +6329,78 @@ class LiveTradingEngine:
         for why this exists."""
         return dict(self._position_fetch_stats)
 
+    async def _market_data_snapshot_is_stale(self) -> bool:
+        """
+        True if new entries should be skipped this cycle because
+        market:universe_health (LTPPoller's per-cycle completion marker,
+        see its poll_seq/poll_epoch fields) is missing, unreadable, or
+        older than _MARKET_DATA_SNAPSHOT_MAX_AGE_SECONDS -- 2026-09-16
+        (external review round 2, "LTP -> signal-cycle dependency
+        ordering"): LTPPoller and this engine run on independent scheduler
+        timers with no hard dependency between them, so a fully-stalled
+        poller could otherwise go undetected at the CYCLE level until
+        enough individual symbols aged past _get_market_data()'s own
+        per-symbol 90s check.
+
+        Deliberately a STALENESS check only, not a strict "poll_seq must be
+        newer than the last one this engine processed" gate. The two run on
+        independent ~60s timers with no phase lock; requiring a strictly
+        newer poll_seq every single signal cycle would false-positive block
+        entries whenever poll() completes even slightly slower than the
+        signal cycle for one tick, for no real safety benefit over the
+        staleness check alone (which already catches genuinely stalled data
+        -- the actual failure mode this guards against).
+
+        No redis wired at all fails OPEN here (matches
+        _get_active_symbols()'s existing "no redis -> fall back gracefully"
+        convention) -- a missing/unreadable/stale market:universe_health
+        KEY fails CLOSED (matches this codebase's convention for
+        entry-blocking data that's expected to exist, e.g. RS/RVOL/MTF).
+        """
+        redis = getattr(self, "_redis", None)
+        if not redis:
+            return False
+        try:
+            raw = await redis.get("market:universe_health")
+        except Exception as exc:
+            logger.warning(f"Market-data snapshot check failed ({exc}) — failing closed on new entries this cycle.")
+            return True
+        if not raw:
+            logger.warning("Market-data snapshot (market:universe_health) not yet published — failing closed on new entries this cycle.")
+            return True
+        try:
+            health = json.loads(raw)
+            poll_epoch = health.get("poll_epoch")
+            if poll_epoch is None:
+                # Older/degenerate payload without poll_epoch -- don't block
+                # on missing instrumentation itself.
+                return False
+            age = time.time() - float(poll_epoch)
+            if age > self._MARKET_DATA_SNAPSHOT_MAX_AGE_SECONDS:
+                logger.warning(
+                    f"Market-data snapshot is {age:.0f}s old "
+                    f"(> {self._MARKET_DATA_SNAPSHOT_MAX_AGE_SECONDS}s) -- "
+                    "LTPPoller may have stalled. Failing closed on new entries this cycle."
+                )
+                return True
+        except Exception as exc:
+            logger.warning(f"Market-data snapshot unreadable ({exc}) — failing closed on new entries this cycle.")
+            return True
+        return False
+
     # Market data is considered stale if older than this many seconds.
     # Prevents entries when the LTP poller has fallen behind (e.g., Zerodha API lag).
     _MARKET_DATA_MAX_AGE_SECONDS = 90
+
+    # Fixed 2026-09-16 (external review round 2, "LTP -> signal-cycle
+    # dependency ordering"): coarser, poll-CYCLE-level companion to
+    # _MARKET_DATA_MAX_AGE_SECONDS above (which already checks each
+    # individual symbol's own tick timestamp on every read) -- this one
+    # checks whether the LTPPoller cycle AS A WHOLE completed recently, so
+    # a fully-stalled poller is caught even faster/more visibly than
+    # waiting for enough individual symbols to age past 90s. 75s matches
+    # the external review's suggested threshold (poll runs every 60s).
+    _MARKET_DATA_SNAPSHOT_MAX_AGE_SECONDS = 75
 
     async def _get_market_data(self, symbol: str) -> Optional[Dict[str, Any]]:
         redis = getattr(self, "_redis", None)

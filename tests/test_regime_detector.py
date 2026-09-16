@@ -414,3 +414,34 @@ async def test_unknown_regime_blocks_all_new_entries_but_is_not_a_special_case_i
         assert inst.paused_by == "regime"
     finally:
         del StrategyRegistry._active_instances[sid]
+
+
+# ── market_direction propagates through detect()'s published payload ───────
+# 2026-09-16, external review round 2: "NIFTY regime uses direction" --
+# atr_pct/ema_spread alone can't distinguish TRENDING+BULLISH from
+# TRENDING+BEARISH. Classification (_classify()) is intentionally
+# unchanged; this is an additive field on the payload only.
+
+@pytest.mark.asyncio
+async def test_detect_propagates_market_direction_into_the_regime_payload():
+    detector = MRD(_FakeRedisFull({
+        "market:india_vix": "13.5",
+        "market:nifty_regime_inputs": json.dumps({
+            "atr_pct_daily": 1.8, "ema_spread_pct": 0.3, "market_direction": "BEARISH",
+        }),
+    }))
+    regime = await detector.detect()
+    assert regime == "TRENDING"
+    published = json.loads(detector._redis.store["market:regime"])
+    assert published["market_direction"] == "BEARISH"
+
+
+@pytest.mark.asyncio
+async def test_detect_market_direction_defaults_to_unknown_when_nifty_inputs_lack_it():
+    detector = MRD(_FakeRedisFull({
+        "market:india_vix": "13.5",
+        "market:nifty_regime_inputs": json.dumps({"atr_pct_daily": 1.8, "ema_spread_pct": 0.3}),
+    }))
+    await detector.detect()
+    published = json.loads(detector._redis.store["market:regime"])
+    assert published["market_direction"] == "UNKNOWN"

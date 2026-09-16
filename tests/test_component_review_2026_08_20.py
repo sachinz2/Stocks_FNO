@@ -143,6 +143,9 @@ async def test_expire_stale_orders_failure_does_not_block_exit_checks():
         _flush_gate_audit_snapshot=AsyncMock(),
         _ENTRY_WARMUP_MINUTES=0,
         _get_active_symbols=AsyncMock(return_value=[]),
+        # 2026-09-16: unrelated to what this test checks -- must not block
+        # entries so the rest of run_signal_cycle proceeds as before.
+        _market_data_snapshot_is_stale=AsyncMock(return_value=False),
     )
 
     import src.live_trading.live_trading_engine as lte_module

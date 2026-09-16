@@ -226,12 +226,31 @@ async def refresh_nifty_regime_inputs(kite, redis, nifty_token: Optional[int]) -
 
         atr_pct_daily = round((atr14 / last_close * 100) * FIVE_MIN_ATR_DAILY_SCALE, 4) if last_close > 0 else 0.0
         ema_spread_pct = round(abs(ema20 - ema50) / ema50 * 100, 4) if ema50 > 0 else 0.0
+        # Fixed 2026-09-16 (external review round 2, "NIFTY regime uses
+        # direction"): atr_pct_daily/ema_spread_pct only ever measure
+        # MAGNITUDE (abs(ema20-ema50)) -- a strongly bullish and a strongly
+        # bearish NIFTY produce the identical TRENDING classification, with
+        # no signal for which direction is trending. That's fine for
+        # strategy ACTIVATION (EMA/momentum determine their own trade
+        # direction independently), but it means the regime payload itself
+        # can't answer "is this a bullish or bearish trending day" -- the
+        # exact question at the heart of "the whole market is falling but
+        # the system doesn't trade." market_direction is a separate,
+        # additive field -- classification (_classify()) is intentionally
+        # unchanged, this doesn't gate anything on its own.
+        if last_close > ema20 > ema50:
+            market_direction = "BULLISH"
+        elif last_close < ema20 < ema50:
+            market_direction = "BEARISH"
+        else:
+            market_direction = "NEUTRAL"
 
         await redis.set(REDIS_NIFTY_REGIME_INPUTS_KEY, json.dumps({
-            "atr_pct_daily":  atr_pct_daily,
-            "ema_spread_pct": ema_spread_pct,
-            "close":          last_close,
-            "timestamp":      now_ist().replace(tzinfo=None).isoformat(),
+            "atr_pct_daily":    atr_pct_daily,
+            "ema_spread_pct":   ema_spread_pct,
+            "close":            last_close,
+            "market_direction": market_direction,
+            "timestamp":        now_ist().replace(tzinfo=None).isoformat(),
         }), ex=180)
         return True
     except Exception as e:
@@ -274,7 +293,7 @@ class MarketRegimeDetector:
         its own docstring) until real data resumes -- no separate wiring
         needed anywhere else.
         """
-        vix, atr_pct, ema_spread_pct, data_known = await self._get_market_indicators()
+        vix, atr_pct, ema_spread_pct, data_known, market_direction = await self._get_market_indicators()
         prev_regime = await self.get_cached_regime()
         if not data_known:
             regime = "UNKNOWN"
@@ -292,6 +311,16 @@ class MarketRegimeDetector:
             "vix":               vix,
             "market_atr_pct":    atr_pct,
             "market_ema_spread": ema_spread_pct,
+            # Fixed 2026-09-16 (external review round 2, "NIFTY regime uses
+            # direction"): _classify() itself is intentionally UNCHANGED --
+            # it only ever needed MAGNITUDE (is NIFTY trending) to decide
+            # strategy activation, since EMA/momentum determine their own
+            # trade direction independently. market_direction is additive,
+            # answering the separate, previously-unanswered question "is
+            # today's trending market bullish or bearish" -- e.g.
+            # TRENDING + BEARISH vs merely TRENDING. Gates nothing on its
+            # own; a consumer that wants to act on it opts in explicitly.
+            "market_direction":  market_direction,
             # IST-naive (was datetime.utcnow() until 2026-08-06) — the
             # dashboard's Strategies page displays this labelled "IST"
             # (app.py: f"...as of {regime_ts} IST") with no conversion, so it
@@ -302,7 +331,7 @@ class MarketRegimeDetector:
         }
         await self._redis.set(REDIS_REGIME_KEY, json.dumps(payload))
         logger.info(
-            f"Market regime: {regime} | VIX={vix:.1f} "
+            f"Market regime: {regime} ({market_direction}) | VIX={vix:.1f} "
             f"ATR%={atr_pct:.2f} EMA_spread%={ema_spread_pct:.2f}"
         )
         return regime
@@ -410,7 +439,8 @@ class MarketRegimeDetector:
     # ── Internal ──────────────────────────────────────────────────────────────
 
     async def _get_market_indicators(self):
-        """Return (vix, market_atr_pct, market_ema_spread_pct, data_known).
+        """Return (vix, market_atr_pct, market_ema_spread_pct, data_known,
+        market_direction).
 
         Fixed 2026-09-15 (external review, "replace the 40-stock average
         proxy with actual NIFTY"): ATR%/EMA-spread% now come from
@@ -427,11 +457,19 @@ class MarketRegimeDetector:
         data_known is False whenever EITHER real VIX or real NIFTY inputs
         couldn't be read, so detect() can tell a genuine classification
         apart from one built on fill-in defaults (see detect()'s 2026-09-15
-        UNKNOWN-regime fix for why that distinction matters)."""
+        UNKNOWN-regime fix for why that distinction matters).
+
+        Fixed 2026-09-16 (external review round 2): market_direction
+        (BULLISH/BEARISH/NEUTRAL, computed in refresh_nifty_regime_inputs())
+        is read through here too -- see detect()'s matching note for why
+        atr_pct/ema_spread alone can't tell "NIFTY trending" from "NIFTY
+        trending DOWN". "UNKNOWN" (not a guess) when nifty inputs aren't
+        known."""
         vix, vix_known = await self._get_vix()
         atr_pct      = 1.0   # safe default = mid-zone
         ema_spread   = 0.15
         nifty_known  = False
+        market_direction = "UNKNOWN"
 
         try:
             raw = await self._redis.get(REDIS_NIFTY_REGIME_INPUTS_KEY)
@@ -439,11 +477,12 @@ class MarketRegimeDetector:
                 stats = json.loads(raw)
                 atr_pct     = stats.get("atr_pct_daily", atr_pct)
                 ema_spread  = stats.get("ema_spread_pct", ema_spread)
+                market_direction = stats.get("market_direction", "UNKNOWN")
                 nifty_known = True
         except Exception as e:
             logger.debug(f"RegimeDetector: NIFTY regime inputs read error: {e}")
 
-        return vix, round(atr_pct, 3), round(ema_spread, 3), (vix_known and nifty_known)
+        return vix, round(atr_pct, 3), round(ema_spread, 3), (vix_known and nifty_known), market_direction
 
     async def _get_vix(self):
         """Read VIX from Redis (written by ZerodhaLTPPoller or engine).

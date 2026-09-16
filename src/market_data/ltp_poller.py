@@ -56,6 +56,7 @@ Why today's bars never come from historical_data() (2026-07-18 → 2026-07-27):
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -168,6 +169,9 @@ class LTPPoller:
         # symbol -> poll cycles remaining on the EMA crossover watchlist --
         # see _EMA_WATCHLIST_ENTRY_THRESHOLD's docstring.
         self._ema_watchlist: Dict[str, int] = {}
+        # Monotonic per-process poll counter -- see market:universe_health's
+        # poll_seq/poll_epoch fields, published at the end of poll().
+        self._poll_seq: int = 0
 
     def register_underlying(self, symbol: str) -> None:
         """
@@ -496,6 +500,21 @@ class LTPPoller:
         # len(ema_scores) -- EMA always scores every symbol with valid
         # history (no floor gate, see _score_all's docstring), so it's the
         # accurate "how many symbols were even considered this cycle" count.
+        # Fixed 2026-09-16 (external review round 2, "LTP -> signal-cycle
+        # dependency ordering"): poll_seq/poll_epoch mark the exact moment
+        # THIS cycle's tick:{symbol} writes are all complete -- LTPPoller
+        # and LiveTradingEngine run on independent scheduler timers with no
+        # hard dependency between them, so the signal cycle could otherwise
+        # read Redis mid-poll (some symbols this cycle's data, some the
+        # prior cycle's) or read a poll that stalled minutes ago with no
+        # way to tell. See LiveTradingEngine._maybe_skip_entries_for_stale_
+        # market_data() for the consumer side (a staleness check only --
+        # NOT a strict "must be a newer poll_seq than last time" gate; see
+        # that method's docstring for why the stricter version was
+        # deliberately not built). poll_epoch is a plain time.time() float,
+        # not an ISO string -- avoids any IST/local-time ambiguity for a
+        # same-process age comparison.
+        self._poll_seq += 1
         await self._redis.set(
             "market:universe_health",
             json.dumps({
@@ -503,6 +522,8 @@ class LTPPoller:
                 "history_valid":   _history_valid_count,
                 "live_data_valid": len(self.symbols) - len(self._no_live_data_warned),
                 "candidate_count": len(ema_scores),
+                "poll_seq":        self._poll_seq,
+                "poll_epoch":      time.time(),
                 "timestamp":       datetime.now().isoformat(),
             }),
             ex=120,  # 2-min TTL — poll runs every 60 s
