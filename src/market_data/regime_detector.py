@@ -133,12 +133,29 @@ REGIME_STRATEGY_MAP: Dict[str, list] = {
     # ZERO minutes of RANGE_BOUND, during which 96% of iron_condor_v1's
     # skip-log lines were exactly this VIX-too-low block. RANGE_BOUND (VIX
     # >= 12, ATR% low) is the only regime where iron_condor_v1's own gate can
-    # actually pass, so it's the only one listed now. credit_spread_v1 has
-    # the same VIX>=12 entry gate but doesn't have this problem -- it's also
-    # eligible in TRENDING/VOLATILE, where VIX tends to sit >=12 anyway, so
-    # it has regimes to fall back on that iron_condor_v1 structurally lacks.
-    "LOW_VOL":     [STRATEGY_SPREAD],   # quiet market = premium seller heaven (credit_spread_v1 only --
-                                          # iron_condor_v1's own VIX>=12 gate can never pass here, see above)
+    # actually pass, so it's the only one listed now.
+    #
+    # Fixed 2026-09-18 (live incident, user-reported "still zero trades" on
+    # a day that was LOW_VOL most of the session): the fix above left
+    # credit_spread_v1 listed here on the reasoning "it has regimes to fall
+    # back on that iron_condor_v1 structurally lacks" -- true, but irrelevant
+    # to THIS entry specifically. credit_spread_v1 has the exact same
+    # vix_allows_selling() >= 12.0 gate, so it is EQUALLY unable to ever pass
+    # its own entry check while regime == LOW_VOL (vix < 12.0), for the
+    # identical mutually-exclusive-by-construction reason. "Eligible in
+    # LOW_VOL" was fiction here too -- confirmed live 2026-09-18: with VIX
+    # sitting at 11.6, every single candidate that cycle logged "VIX=11.6 too
+    # low (need >=12.0 for rich premium). Not worth selling spreads." Having
+    # "other regimes to fall back on" means credit_spread_v1 still trades
+    # fine on days that aren't LOW_VOL -- it does not rescue this specific
+    # mapping, which was purely wasted signal-generation cycles pretending a
+    # structurally-impossible entry was being considered. LOW_VOL is now
+    # correctly empty: a sufficiently quiet market (by this system's own
+    # definition of "quiet") is one where none of the 4 current strategies
+    # have a real edge, not a bug to patch around -- see
+    # docs/LIVE_TRADING_CHECKLIST.md if a LOW_VOL-appropriate strategy is
+    # ever added.
+    "LOW_VOL":     [],
 }
 
 

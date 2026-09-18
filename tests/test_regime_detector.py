@@ -43,17 +43,25 @@ def test_high_vix_always_volatile_regardless_of_atr():
     assert MRD._classify(vix=25.0, atr_pct=0.5, ema_spread_pct=0.05) == "VOLATILE"
 
 
-def test_low_vol_excludes_iron_condor_its_own_vix_gate_can_never_pass_there():
+def test_low_vol_is_empty_no_strategy_can_pass_its_own_vix_gate_there():
     # Fixed 2026-09-03 (live incident): LOW_VOL is defined as vix < 12.0, but
     # iron_condor_v1's own entry gate requires vix >= 12.0 -- mutually
     # exclusive by construction. Confirmed live: 8 days of logs with
     # substantial LOW_VOL time and zero RANGE_BOUND minutes, during which 96%
     # of iron_condor_v1's skip lines were exactly this VIX-too-low block.
-    # credit_spread_v1 has the same VIX gate but also runs in TRENDING/
-    # VOLATILE, where VIX tends to sit >=12 anyway, so it keeps LOW_VOL as a
-    # (largely theoretical, but not self-contradicting) eligible regime.
+    #
+    # Fixed 2026-09-18 (live incident, user-reported zero trades on a
+    # LOW_VOL-heavy day): credit_spread_v1 was left here on the reasoning "it
+    # has other regimes to fall back on" -- true, but that doesn't rescue
+    # THIS mapping. credit_spread_v1 has the exact same vix_allows_selling()
+    # >= 12.0 gate, so it is equally unable to ever pass its own entry check
+    # while regime == LOW_VOL. Confirmed live 2026-09-18 at VIX=11.6: every
+    # candidate that cycle logged "VIX=11.6 too low ... Not worth selling
+    # spreads." LOW_VOL is now correctly empty -- no currently-registered
+    # strategy has a real edge in a genuinely quiet market.
     assert STRATEGY_CONDOR not in REGIME_STRATEGY_MAP["LOW_VOL"]
-    assert STRATEGY_SPREAD in REGIME_STRATEGY_MAP["LOW_VOL"]
+    assert STRATEGY_SPREAD not in REGIME_STRATEGY_MAP["LOW_VOL"]
+    assert REGIME_STRATEGY_MAP["LOW_VOL"] == []
 
 
 def test_range_bound_is_the_only_regime_iron_condor_can_actually_trade_in():
