@@ -696,6 +696,21 @@ def check_low_vol_regime_has_no_structurally_impossible_strategy(repo: Path) -> 
     return PASS, name, f"LOW_VOL maps to {body!r} -- no VIX>=12-gated strategy listed."
 
 
+def check_gate_bottleneck_alerting_is_wired(repo: Path) -> Result:
+    name = "Daily report watches for a sustained gate-to-gate conversion bottleneck, not just total silence"
+    src = _read(repo, "src/live_trading/live_trading_engine.py")
+    if "_detect_gate_bottlenecks" not in src:
+        return FAIL, name, "_detect_gate_bottlenecks() missing -- _check_signal_staleness() alone doesn't catch a strategy that signals constantly while every candidate dies at the same downstream gate (the exact shape of the LOW_VOL/credit_spread_v1 and momentum_v1 RVOL-bias incidents), added 2026-09-18."
+    if "_check_gate_bottleneck_anomalies" not in src:
+        return FAIL, name, "_check_gate_bottleneck_anomalies() missing."
+    idx = src.find("await self._check_signal_staleness()")
+    if idx == -1:
+        return FAIL, name, "Could not locate send_daily_report()'s call to _check_signal_staleness() to anchor the wiring check."
+    if "_check_gate_bottleneck_anomalies()" not in src[idx:idx + 200]:
+        return FAIL, name, "_check_gate_bottleneck_anomalies() is defined but not called from send_daily_report() -- it would never actually run."
+    return PASS, name, "Gate-bottleneck detection is defined and wired into the daily report alongside signal staleness."
+
+
 def check_strategy_health_reads_the_real_pause_reason(repo: Path) -> Result:
     name = "/analytics/strategy-health surfaces the real pause reason, not always null"
     src = _read(repo, "src/risk/strategy_monitor.py")
@@ -756,6 +771,7 @@ STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_exit_all_options_for_preserves_multileg_tracking,
     check_low_vol_regime_has_no_structurally_impossible_strategy,
     check_strategy_health_reads_the_real_pause_reason,
+    check_gate_bottleneck_alerting_is_wired,
 ]
 
 

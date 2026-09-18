@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.brokers.base import AbstractBroker
@@ -766,6 +766,7 @@ class LiveTradingEngine:
             logger.info("EOD: no trades today and no open positions, skipping report.")
 
         await self._check_signal_staleness()
+        await self._check_gate_bottleneck_anomalies()
         await self._persist_state()
         self._today_order_count = 0
         self._peak_premiums.clear()
@@ -830,6 +831,134 @@ class LiveTradingEngine:
                     f"same failure signature as the 2026-07-27..07-29 DTE-window "
                     f"incident. Worth a quick sanity check."
                 )
+
+    # Added 2026-09-18 (user-reported live incident, "find more bugs before
+    # going live"): _check_signal_staleness() above catches a strategy that
+    # stops signaling entirely, but several of this project's real incidents
+    # (the LOW_VOL/credit_spread_v1 contradiction, momentum_v1's RVOL-
+    # measurement-bias dead period) had generate_signal() firing normally the
+    # whole time -- the candidate died at one specific, LATER gate, every
+    # single time, for days to weeks, before anyone happened to notice. This
+    # complements signal staleness by watching gate-to-gate conversion
+    # specifically: how many days of history establish "this gate is
+    # normally reached at all" (_GATE_HEALTH_LOOKBACK_DAYS) vs. how many
+    # consecutive recent days of a dead NEXT gate trigger an alert
+    # (_GATE_HEALTH_ALERT_DAYS). Deliberately conservative on both knobs --
+    # a false-positive alert here is cheap; a silent multi-week outage
+    # (confirmed, twice, in this project's own history) is not.
+    _GATE_HEALTH_LOOKBACK_DAYS = 14
+    _GATE_HEALTH_ALERT_DAYS = 3
+    _GATE_HEALTH_MIN_DAILY_PASSES = 5
+
+    @staticmethod
+    def _detect_gate_bottlenecks(
+        daily_max: Dict[tuple, int], recent_days: list,
+        min_daily_passes: int, alert_days: int,
+    ) -> List[Tuple[str, str, str]]:
+        """
+        Pure detection logic, split out from _check_gate_bottleneck_anomalies()
+        so it's testable without mocking a DB session -- mirrors
+        StrategyMonitor's _profit_factor()/_rolling_drawdown() pattern
+        (fed pre-built data, no I/O of their own).
+
+        daily_max: {(strategy_name, gate, day): that day's final pass_count}.
+        Returns a list of (strategy_name, gate_a, gate_b) where gate_a is
+        being reached at least min_daily_passes/day on EVERY one of
+        recent_days, gate_b (the next gate in _CANONICAL_GATE_ORDER that
+        this strategy has ever actually reached) is at exactly 0 on every
+        one of recent_days, and gate_b has a real track record (reached at
+        least once somewhere in daily_max) -- so a gate that was simply
+        never part of this strategy's pipeline is never flagged.
+        """
+        anomalies: List[Tuple[str, str, str]] = []
+        if len(recent_days) < alert_days:
+            return anomalies  # not enough recent trading-day history yet to judge
+
+        strategies = {s for (s, _, _) in daily_max}
+        for strategy_name in sorted(strategies):
+            gates_for_strategy = sorted(
+                {g for (s, g, _) in daily_max if s == strategy_name},
+                key=lambda g: _CANONICAL_GATE_ORDER.index(g) if g in _CANONICAL_GATE_ORDER else len(_CANONICAL_GATE_ORDER),
+            )
+            for gate_a, gate_b in zip(gates_for_strategy, gates_for_strategy[1:]):
+                ever_reached_b = any(
+                    v > 0 for (s, g, _d), v in daily_max.items() if s == strategy_name and g == gate_b
+                )
+                if not ever_reached_b:
+                    continue
+                a_active_recent = all(
+                    daily_max.get((strategy_name, gate_a, d), 0) >= min_daily_passes for d in recent_days
+                )
+                b_dead_recent = all(
+                    daily_max.get((strategy_name, gate_b, d), 0) == 0 for d in recent_days
+                )
+                if a_active_recent and b_dead_recent:
+                    anomalies.append((strategy_name, gate_a, gate_b))
+                    break  # one anomaly per strategy is enough
+        return anomalies
+
+    async def _check_gate_bottleneck_anomalies(self) -> None:
+        """
+        Alerts once per trading day (called from send_daily_report) if a
+        gate that was reached on past days for a given strategy has gone to
+        zero for _GATE_HEALTH_ALERT_DAYS+ consecutive recent trading days,
+        while the gate immediately before it in _CANONICAL_GATE_ORDER is
+        still being reached _GATE_HEALTH_MIN_DAILY_PASSES+ times/day. This
+        is the exact signature behind real incidents in this project that
+        each took days to weeks to notice, because nothing was watching
+        per-gate conversion -- only "did the strategy trade today" (already
+        covered by _check_signal_staleness above, which this doesn't
+        replace: a strategy can signal constantly while every single
+        candidate dies at the same downstream gate). Detection itself lives
+        in the pure, testable _detect_gate_bottlenecks() above; this method
+        is just the DB fetch + notify.
+        """
+        try:
+            from src.database.connection import AsyncSessionLocal
+            from src.database.models.gate_audit import GateAuditSnapshot
+            from sqlalchemy import select
+            cutoff = now_ist().replace(tzinfo=None) - timedelta(days=self._GATE_HEALTH_LOOKBACK_DAYS)
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    select(GateAuditSnapshot).where(GateAuditSnapshot.snapshot_time >= cutoff)
+                )
+                rows = result.scalars().all()
+        except Exception as exc:
+            logger.debug(f"[GateHealth] history query failed (non-critical): {exc}")
+            return
+        if not rows:
+            return
+
+        # (strategy, gate, day) -> that day's max pass_count (snapshots are
+        # cumulative for the day, so the max across the day's snapshots IS
+        # the day's final count).
+        daily_max: Dict[tuple, int] = {}
+        for r in rows:
+            key = (r.strategy_name, r.gate, r.snapshot_time.date())
+            daily_max[key] = max(daily_max.get(key, 0), r.pass_count)
+
+        today = now_ist().date()
+        recent_days = sorted({d for (_, _, d) in daily_max if (today - d).days < self._GATE_HEALTH_ALERT_DAYS})
+
+        anomalies = self._detect_gate_bottlenecks(
+            daily_max, recent_days, self._GATE_HEALTH_MIN_DAILY_PASSES, self._GATE_HEALTH_ALERT_DAYS,
+        )
+        for strategy_name, gate_a, gate_b in anomalies:
+            logger.warning(
+                f"[GateHealth] {strategy_name}: '{gate_a}' passed but "
+                f"'{gate_b}' stuck at 0 for {self._GATE_HEALTH_ALERT_DAYS}+ "
+                f"consecutive days"
+            )
+            await self._notify(
+                f"WARNING: {strategy_name} -- '{gate_a}' is being reached "
+                f"regularly ({self._GATE_HEALTH_MIN_DAILY_PASSES}+/day), but "
+                f"the next gate '{gate_b}' has had ZERO passes for "
+                f"{self._GATE_HEALTH_ALERT_DAYS}+ consecutive days (previously "
+                f"reached at least once in the last {self._GATE_HEALTH_LOOKBACK_DAYS} "
+                f"days). This is the exact signature of a silent total "
+                f"blockage at one specific gate -- worth checking whether "
+                f"this is a real market condition or a bug."
+            )
 
     # ── State persistence ─────────────────────────────────────────────────────
 
