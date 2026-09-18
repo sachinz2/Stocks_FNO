@@ -558,6 +558,167 @@ def check_weekly_universe_refresh_fails_safe(repo: Path) -> Result:
     return PASS, name, "recompute_active_universe() fails safe on both coverage stages, pushes tokens before the skip-check, and ZerodhaTicker's update actually reaches the live WebSocket connection."
 
 
+# ── Checks added 2026-09-18 (3-way parallel deep review + user-reported ────
+# "why is nothing trading" live incident) — see each fix's own dated comment
+# in its source file for the full failure-scenario writeup.
+
+def check_low_vol_gate_atr_is_daily_scaled(repo: Path) -> Result:
+    name = "credit_spread_v1/iron_condor_v1/candidate-pool low-vol gates use daily-scaled ATR%"
+    findings = []
+    for rel_path, ctx_len in (
+        ("src/strategies/credit_spread.py", 400),
+        ("src/strategies/iron_condor.py", 400),
+        ("src/market_data/ltp_poller.py", 600),
+    ):
+        src = _read(repo, rel_path)
+        if "FIVE_MIN_ATR_DAILY_SCALE" not in src:
+            findings.append(f"{rel_path}: FIVE_MIN_ATR_DAILY_SCALE not imported/used at all.")
+            continue
+        idx = src.find("atr_pct = (atr")
+        if idx == -1:
+            idx = src.find("atr_pct = (atr14")
+        if idx == -1:
+            idx = src.find('atr_pct = (atr / close')
+        if idx == -1:
+            findings.append(f"{rel_path}: couldn't locate the atr_pct computation line to verify scaling.")
+            continue
+        window = src[idx:idx + ctx_len]
+        if "FIVE_MIN_ATR_DAILY_SCALE" not in src[max(0, idx - 50):idx + 120]:
+            findings.append(
+                f"{rel_path}: atr_pct is computed without FIVE_MIN_ATR_DAILY_SCALE nearby -- "
+                "raw 5-min-bar ATR% (~0.2-0.4% typical) compared against a daily-scale "
+                "low_vol_threshold (~1.2%) would almost never trip, silently disabling the "
+                "volatility gate again (found and fixed 2026-09-18)."
+            )
+    if findings:
+        return FAIL, name, " | ".join(findings)
+    return PASS, name, "All three low-vol gate sites (credit_spread, iron_condor, ltp_poller pre-filter) apply FIVE_MIN_ATR_DAILY_SCALE before comparing against the daily-scale threshold."
+
+
+def check_ema_score_atr_term_stays_unscaled(repo: Path) -> Result:
+    name = "ltp_poller's ema_score ATR term stays at RAW (not daily-scaled) magnitude"
+    # Companion to the check above -- the fix intentionally does NOT scale
+    # ema_score's own atr_pct * 0.3 weighting, which was independently
+    # calibrated to raw 5-min-bar magnitude by the 2026-08-21 proximity-
+    # dominant redesign. Scaling it too would let the ATR term swamp the
+    # proximity term (confirmed live 2026-09-18: a regression test caught
+    # this exact over-fix before it shipped).
+    src = _read(repo, "src/market_data/ltp_poller.py")
+    m = re.search(r"ema_score\s*=\s*round\(\s*\n?\s*atr_pct\s*\*\s*0\.3", src)
+    if not m:
+        return WARN, name, "Could not locate ema_score's formula to confirm it still reads the raw (unscaled) atr_pct variable -- check manually."
+    return PASS, name, "ema_score's formula still references the raw atr_pct variable, not a daily-scaled one."
+
+
+def check_single_leg_capital_reserved_at_real_fill_when_known(repo: Path) -> Result:
+    name = "Single-leg entry reserves capital at the real fill price when already known, not always the quote"
+    src = _read(repo, "src/orders/order_manager.py")
+    # Anchor on the main success-path call site specifically -- a separate,
+    # legitimate mirror branch (the timeout-reconciliation path a few dozen
+    # lines later) correctly still uses the raw quote, since it has no
+    # access to the immediate post-routing fill reconciliation either.
+    idx = src.find('await self._audit("ORDER_ROUTED"')
+    if idx == -1:
+        return FAIL, name, "Could not locate the ORDER_ROUTED audit call that anchors the main success-path capital-reservation block."
+    window = src[idx:idx + 2200]
+    if "add_deployed_capital(strategy_name, quantity * price)" in window:
+        return FAIL, name, "Main success-path capital reservation is back to always using the pre-slippage quote -- every exit path releases at the real fill price (pos[\"avg_price\"]), so this drifts _strategy_deployed on every round trip with nonzero slippage (found and fixed 2026-09-18)."
+    if "_capital_basis" not in window or 'updates.get("fill_price")' not in window:
+        return FAIL, name, "Main success-path add_deployed_capital() call no longer prefers the real fill_price (from the immediate post-routing reconciliation) over the raw quote."
+    return PASS, name, "Capital reservation prefers the real fill price when already known, falling back to the quote only while a real broker fill is still pending."
+
+
+def check_cancel_order_releases_deployed_capital(repo: Path) -> Result:
+    name = "Manually cancelling a resting order releases its reserved capital"
+    src = _read(repo, "src/orders/order_manager.py")
+    idx = src.find("async def cancel_order(")
+    if idx == -1:
+        return FAIL, name, "cancel_order() method not found."
+    body = src[idx:idx + 1800]
+    if "_release_capital_if_was_deployed" not in body:
+        return FAIL, name, "cancel_order() no longer calls _release_capital_if_was_deployed() -- capital reserved at entry stays permanently counted against the strategy's daily budget after a manual cancel (found and fixed 2026-09-18; expire_stale_orders()/sync_orders() already do this on the identical transition)."
+    return PASS, name, "cancel_order() releases deployed capital on a successful cancel, same as the two automatic paths."
+
+
+def check_sync_orders_is_serialized(repo: Path) -> Result:
+    name = "sync_orders() is serialized against its own concurrent invocation"
+    src = _read(repo, "src/orders/order_manager.py")
+    if "_sync_orders_lock" not in src:
+        return FAIL, name, "_sync_orders_lock missing -- the scheduler's 30s JOB_ORDER_SYNC and expire_stale_orders()'s internal 60s call to sync_orders() have no coordination, and could both observe the same OPEN->REJECTED/CANCELLED transition and double-release capital for the same order (found and fixed 2026-09-18)."
+    if "async with self._sync_orders_lock" not in src:
+        return FAIL, name, "_sync_orders_lock is declared but sync_orders() doesn't actually acquire it."
+    if "asyncio.Lock()" not in src:
+        return FAIL, name, "_sync_orders_lock is not an asyncio.Lock -- verify it actually provides mutual exclusion."
+    return PASS, name, "sync_orders() acquires _sync_orders_lock (an asyncio.Lock) before running its body."
+
+
+def check_rs_ranker_history_covers_ema50(repo: Path) -> Result:
+    name = "RS Ranker's history window is long enough for a genuine 50-bar EMA"
+    src = _read(repo, "src/market_data/rs_ranker.py")
+    m = re.search(r"_RS_HISTORY_DAYS\s*=\s*(\d+)", src)
+    if not m:
+        return FAIL, name, "_RS_HISTORY_DAYS constant not found."
+    days = int(m.group(1))
+    if days < 60:
+        return FAIL, name, f"_RS_HISTORY_DAYS={days} -- at ~5 trading days/7 calendar days, this may not reliably clear the 50 trading-day bars _compute_rs()'s ema50_d needs; below 60 the 2026-08-26 dead-code bug (ema50_d silently falling back to ema20_d, making the EMA-stack bonus always 0) can reoccur on any week with extra NSE holidays. Fixed 2026-09-18 by widening to 80."
+    return PASS, name, f"_RS_HISTORY_DAYS={days}, comfortably clears 50 trading-day bars even across holiday clusters."
+
+
+def check_exit_all_options_for_preserves_multileg_tracking(repo: Path) -> Result:
+    name = "_exit_all_options_for() does not silently discard tracked spread/condor state"
+    src = _read(repo, "src/live_trading/live_trading_engine.py")
+    idx = src.find("async def _exit_all_options_for(")
+    if idx == -1:
+        return FAIL, name, "_exit_all_options_for() method not found."
+    body = src[idx:idx + 9000]
+    if re.search(r"if underlying in self\._active_spreads:\s*\n\s*del self\._active_spreads\[underlying\]", body):
+        return FAIL, name, "Unconditional `del self._active_spreads[underlying]` is back -- an active spread/condor on this underlying would be dropped from tracking with no closing order, no journal write, and no capital release (found and fixed 2026-09-18)."
+    if "left OPEN and still tracked" not in body and "still tracked" not in body:
+        return WARN, name, "Could not confirm the loud CRITICAL log for the leave-it-tracked path -- check manually that active multi-leg state is preserved, not silently dropped."
+    return PASS, name, "An active spread/condor on the underlying is left tracked (with a loud log) instead of being silently discarded."
+
+
+def check_low_vol_regime_has_no_structurally_impossible_strategy(repo: Path) -> Result:
+    name = "LOW_VOL regime doesn't list a strategy whose own VIX gate can never pass there"
+    src = _read(repo, "src/market_data/regime_detector.py")
+    m = re.search(r'"LOW_VOL":\s*\[([^\]]*)\]', _strip_comments(src))
+    if not m:
+        return FAIL, name, "REGIME_STRATEGY_MAP[\"LOW_VOL\"] entry not found."
+    body = m.group(1).strip()
+    if "STRATEGY_SPREAD" in body or "STRATEGY_CONDOR" in body:
+        return FAIL, name, (
+            f"LOW_VOL lists {body!r} -- both credit_spread_v1 and iron_condor_v1 require "
+            "vix_allows_selling() (VIX >= 12.0) to enter at all, while LOW_VOL is DEFINED as "
+            "VIX < VIX_LOW_THRESHOLD (12.0). Listing either here is a structural impossibility, "
+            "not a real eligibility (found live 2026-09-18 for credit_spread_v1, after the "
+            "identical bug was already found and fixed for iron_condor_v1 on 2026-09-03)."
+        )
+    return PASS, name, f"LOW_VOL maps to {body!r} -- no VIX>=12-gated strategy listed."
+
+
+def check_strategy_health_reads_the_real_pause_reason(repo: Path) -> Result:
+    name = "/analytics/strategy-health surfaces the real pause reason, not always null"
+    src = _read(repo, "src/risk/strategy_monitor.py")
+    idx = src.find("async def get_report(")
+    if idx == -1:
+        return FAIL, name, "get_report() method not found."
+    body = src[idx:idx + 2200]
+    if '"paused_reason":' not in body:
+        return FAIL, name, "get_report() no longer returns a paused_reason field."
+    if 'self._pause_reasons.get(strategy_id)' in body and 'getattr(instance, "paused_reason"' not in body:
+        return FAIL, name, (
+            "paused_reason reads ONLY self._pause_reasons (written exclusively by the "
+            "now-permanently-no-op _evaluate_strategy(), removed 2026-09-10) -- this field "
+            "has shown null for every strategy regardless of the real, active pause reason "
+            "since that removal (found live 2026-09-18, 8 days after the fact). Must also "
+            "read instance.paused_reason, the real source of truth written by "
+            "StrategyRegistry.pause_strategy()."
+        )
+    if 'getattr(instance, "paused_reason", None)' not in body:
+        return FAIL, name, "get_report() does not read instance.paused_reason -- the real pause reason (regime/monitor/manual) won't surface."
+    return PASS, name, "get_report() reads the real paused_reason/paused_by from the strategy instance, not a stale internal dict."
+
+
 STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_exit_classification_by_pnl,
     check_capital_allocation_keys,
@@ -586,6 +747,15 @@ STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_dynamic_active_universe_wired,
     check_force_tracked_symbols_cannot_enter_entry_pools,
     check_weekly_universe_refresh_fails_safe,
+    check_low_vol_gate_atr_is_daily_scaled,
+    check_ema_score_atr_term_stays_unscaled,
+    check_single_leg_capital_reserved_at_real_fill_when_known,
+    check_cancel_order_releases_deployed_capital,
+    check_sync_orders_is_serialized,
+    check_rs_ranker_history_covers_ema50,
+    check_exit_all_options_for_preserves_multileg_tracking,
+    check_low_vol_regime_has_no_structurally_impossible_strategy,
+    check_strategy_health_reads_the_real_pause_reason,
 ]
 
 
