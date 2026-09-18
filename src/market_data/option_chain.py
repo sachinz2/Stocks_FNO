@@ -53,7 +53,17 @@ def bs_price(S: float, K: float, T: float, sigma: float, option_type: str = "CE"
 
 def bs_delta(S: float, K: float, T: float, sigma: float, option_type: str = "CE") -> float:
     """Black-Scholes delta."""
-    if T <= 0 or sigma <= 0:
+    # Fixed 2026-09-18 (deep review): bs_price() (above) already guards
+    # S<=0/K<=0 alongside T<=0/sigma<=0, but this function only ever checked
+    # the latter two -- math.log(S/K) inside _bs_d1() raises ValueError on a
+    # non-positive S (domain error) or ZeroDivisionError on K==0. Not
+    # currently reachable from any live call site (find_delta_strike()
+    # filters K<=0 before calling this, and both engine call sites guard
+    # current_price>0 first) -- fixed anyway so a future call site without
+    # that same guard fails safe (a sane intrinsic-based delta) instead of
+    # raising. Same intrinsic-value convention as the T<=0/sigma<=0 branch
+    # just below.
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         # Fixed 2026-08-28 (metrics-calculation audit): a deep-ITM PE used
         # to fall through to 0.0 here (as if OTM) instead of -1.0 -- this
         # branch is reachable pre-expiry whenever atr_to_annualised_vol()
@@ -142,7 +152,8 @@ async def get_iv_rank(symbol: str, redis) -> Optional[float]:
     """
     Returns IV Rank ∈ [0, 1] for a symbol.
     IV Rank = (current_iv - 52w_low) / (52w_high - 52w_low)
-    Returns None if history is too short (< 20 days) to be meaningful.
+    Returns None if history is too short (< 20 days) to be meaningful, or if
+    the most recent reading itself isn't valid.
     """
     key = _IV_HISTORY_KEY.format(symbol=symbol)
     try:
@@ -152,10 +163,26 @@ async def get_iv_rank(symbol: str, redis) -> Optional[float]:
         history = json.loads(raw)
         if len(history) < 20:
             return None
+        # Fixed 2026-09-18 (deep review): "current" used to be ivs[-1] --
+        # the last entry of the POSITIVE-only-filtered list, not the actual
+        # most recent day's reading. update_iv_history() can persist a
+        # genuine 0.0 (e.g. atr_to_annualised_vol() got atr==0 on a thin/
+        # gapped session), which the filter below correctly drops from the
+        # 52w range -- but silently made "current" whatever the last VALID
+        # day happened to be, however many days stale, with nothing to flag
+        # that this had happened. A gate consuming this (iv_rank_allows_
+        # selling()) would then be scoring "is today's premium rich" against
+        # a number that wasn't actually today's. Fail closed instead, same
+        # convention as every other "can't confirm" entry-blocking gate in
+        # this codebase -- an invalid latest reading means IV rank can't be
+        # confirmed right now, not "reuse the last time it was."
+        latest_iv = history[-1].get("iv", 0)
+        if not latest_iv or latest_iv <= 0:
+            return None
         ivs = [h["iv"] for h in history if h.get("iv", 0) > 0]
         if not ivs:
             return None
-        current = ivs[-1]
+        current = latest_iv
         lo, hi = min(ivs), max(ivs)
         if hi <= lo:
             return 0.5
