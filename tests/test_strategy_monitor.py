@@ -102,6 +102,36 @@ async def test_get_report_still_shows_rolling_pf_and_drawdown_for_monitoring():
         del StrategyRegistry._active_instances[sid]
 
 
+@pytest.mark.asyncio
+async def test_get_report_surfaces_the_real_pause_reason_not_always_null():
+    """Fixed 2026-09-18 (user-reported live incident, "why is nothing
+    trading"): get_report()'s paused_reason/paused_at used to read this
+    class's OWN _pause_reasons/_paused_at dicts, which only _evaluate_
+    strategy() ever wrote to -- a no-op since the 2026-09-10 auto-pause
+    removal. So paused_reason showed null for EVERY strategy from that day
+    forward, even while a real, active pause (e.g. regime-ineligibility) was
+    the actual reason it wasn't trading -- the one dashboard built to answer
+    "why is this strategy inactive" always said "no idea." The real reason
+    lives on the strategy instance itself (set by StrategyRegistry.
+    pause_strategy(), already correctly exposed by GET /strategies) and just
+    needed to be read from there instead."""
+    sid = "ema_crossover_v1"
+    StrategyRegistry._active_instances[sid] = _FakeStrategy(sid, {})
+    StrategyRegistry.pause_strategy(
+        sid, reason="Regime is LOW_VOL — strategy not active in this regime", source="regime",
+    )
+    try:
+        monitor = StrategyMonitor(_FakeRepo([]))
+
+        report = await monitor.get_report()
+
+        assert report[sid]["is_active"] is False
+        assert report[sid]["paused_reason"] == "Regime is LOW_VOL — strategy not active in this regime"
+        assert report[sid]["paused_by"] == "regime"
+    finally:
+        del StrategyRegistry._active_instances[sid]
+
+
 # ── Manual-resume grace period (2026-08-27, live incident) ──────────────────
 # A restart wiped ema_crossover_v1's in-memory auto-pause state, and a
 # subsequent manual /activate was found to be immediately undone by the very

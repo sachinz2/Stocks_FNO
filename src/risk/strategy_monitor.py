@@ -159,6 +159,19 @@ class StrategyMonitor:
             dd     = self._rolling_drawdown(trades)
             exp_dd = self.expected_drawdown.get(strategy_id, DEFAULT_EXPECTED_DRAWDOWN.get(strategy_id, 0))
             resumed_at = self._resumed_at.get(strategy_id)
+            # Fixed 2026-09-18 (user-reported live incident, "why is nothing
+            # trading"): paused_reason/paused_at here read this class's OWN
+            # _pause_reasons/_paused_at dicts, which are ONLY ever written by
+            # _evaluate_strategy() -- a no-op since the 2026-09-10 auto-pause
+            # removal (see that method's docstring). Every strategy's
+            # paused_reason has shown null here ever since, even while
+            # regime-switching or a manual pause was actively holding it
+            # inactive for a real, nameable reason -- the actual reason lives
+            # on the strategy instance itself (instance.paused_reason,
+            # written by StrategyRegistry.pause_strategy(), already correctly
+            # exposed by GET /strategies) and was just never read here. This
+            # masked a real regime-driven pause as an unexplained one on the
+            # one dashboard built to show WHY a strategy isn't trading.
             report[strategy_id] = {
                 "is_active":        instance.is_active,
                 "trades_in_window": len(trades),
@@ -167,7 +180,8 @@ class StrategyMonitor:
                 "expected_drawdown": exp_dd,
                 "pf_floor":         self.pf_floor,
                 "dd_threshold":     round(exp_dd * self.dd_multiplier, 2),
-                "paused_reason":    self._pause_reasons.get(strategy_id),
+                "paused_reason":    getattr(instance, "paused_reason", None),
+                "paused_by":        getattr(instance, "paused_by", None),
                 "paused_at":        self._paused_at.get(strategy_id),
                 "resumed_at":       resumed_at.isoformat() if resumed_at else None,
             }
