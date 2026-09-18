@@ -46,6 +46,14 @@ REDIS_RS_TOP10_KEY = "nfo:rs_top10"
 # that gap: trend-following on the SELL side works best on stocks already
 # UNDERPERFORMING NIFTY, the mirror of "buy calls on strength."
 REDIS_RS_BOTTOM10_KEY = "nfo:rs_bottom10"
+# Added 2026-09-18 ("Trade Quality Layer" follow-up -- RS-sustained-streak
+# shadow override): tracks how many CONSECUTIVE CALENDAR DAYS a symbol has
+# held a top-N/bottom-N RS rank, not just today's snapshot. See
+# _update_sustained_streak()'s docstring for why this exists -- it's what
+# actually distinguished PAYTM (RS rank #1 for 7 straight days) from an
+# ordinary stock that happens to be in today's top-3 by chance.
+REDIS_RS_SUSTAINED_STREAK_KEY = "nfo:rs_sustained_streak"
+_SUSTAINED_STREAK_TOP_N = 3
 NIFTY_SYMBOL       = "NIFTY50"
 NIFTY_50_TOKEN     = 256265   # Zerodha NSE instrument token for NIFTY 50 index (stable)
 
@@ -159,6 +167,7 @@ class RSRanker:
         await self._redis.set(REDIS_RS_RANKS_KEY, json.dumps(scores), ex=900)
         await self._redis.set(REDIS_RS_TOP10_KEY, json.dumps(top10), ex=900)
         await self._redis.set(REDIS_RS_BOTTOM10_KEY, json.dumps(bottom10), ex=900)
+        await self._update_sustained_streak(scores)
 
         if scores:
             logger.info(
@@ -166,6 +175,79 @@ class RSRanker:
                 f"| bottom-3 = {[s['symbol'] for s in scores[-3:]]}"
             )
         return scores
+
+    async def _update_sustained_streak(self, scores: List[dict]) -> None:
+        """
+        Track how many CONSECUTIVE CALENDAR DAYS each symbol has held a
+        top-_SUSTAINED_STREAK_TOP_N or bottom-_SUSTAINED_STREAK_TOP_N RS
+        rank. Added 2026-09-18: this is what actually distinguished PAYTM
+        (RS rank #1 in ~100% of cycles for 7 straight trading days,
+        confirmed live via log history) from an ordinary stock that happens
+        to sit in today's top-3 by noise -- a per-cycle snapshot alone can't
+        tell the two apart, only a multi-day streak can. Feeds
+        LiveTradingEngine's shadow-mode override for regime-paused
+        directional strategies (see get_sustained_streak()).
+
+        Idempotent per calendar day -- rank() calls this every 5 minutes,
+        but the streak only actually advances once, on the first call of a
+        new day; every other call this same day is a no-op read-through.
+        This intentionally uses whatever top-N/bottom-N snapshot happens to
+        be current at the FIRST call of the day (near market open) as that
+        day's determination -- not "was it in the top-N at any point
+        today," which would make every streak trivially easy to extend.
+        """
+        try:
+            today = datetime.now().date().isoformat()
+            raw = await self._redis.get(REDIS_RS_SUSTAINED_STREAK_KEY)
+            prior = json.loads(raw) if raw else {"date": None, "streaks": {}}
+            if prior.get("date") == today:
+                return  # already updated today -- no-op
+
+            prior_streaks = prior.get("streaks", {})
+            n = _SUSTAINED_STREAK_TOP_N
+            today_top = {e["symbol"] for e in scores[:n]}
+            today_bottom = {e["symbol"] for e in scores[-n:]} if scores else set()
+
+            new_streaks: Dict[str, dict] = {}
+            for symbol in today_top:
+                prev = prior_streaks.get(symbol)
+                count = prev["count"] + 1 if prev and prev.get("side") == "top" else 1
+                new_streaks[symbol] = {"side": "top", "count": count}
+            for symbol in today_bottom:
+                if symbol in new_streaks:
+                    continue  # can't be in both top-N and bottom-N with a sane N
+                prev = prior_streaks.get(symbol)
+                count = prev["count"] + 1 if prev and prev.get("side") == "bottom" else 1
+                new_streaks[symbol] = {"side": "bottom", "count": count}
+
+            await self._redis.set(
+                REDIS_RS_SUSTAINED_STREAK_KEY,
+                json.dumps({"date": today, "streaks": new_streaks}),
+                ex=86400 * 10,  # survives a weekend/short outage; a real gap still resets naturally (date mismatch -> no matching prior entry)
+            )
+        except Exception as exc:
+            logger.debug(f"RSRanker: sustained-streak update failed (non-critical): {exc}")
+
+    async def get_sustained_streak(self) -> Dict[str, dict]:
+        """
+        Return today's {symbol: {"side": "top"/"bottom", "count": N}} streak
+        map -- see _update_sustained_streak()'s docstring. Empty dict (not
+        an exception) on any read failure or missing/stale data -- callers
+        gating an entry-eligibility override on this must fail closed
+        (treat "can't confirm a sustained streak" as "no override"), same
+        convention as get_bottom_n().
+        """
+        try:
+            raw = await self._redis.get(REDIS_RS_SUSTAINED_STREAK_KEY)
+            if not raw:
+                return {}
+            data = json.loads(raw)
+            if data.get("date") != datetime.now().date().isoformat():
+                return {}  # stale (e.g. RS ranker hasn't run yet today)
+            return data.get("streaks", {})
+        except Exception as exc:
+            logger.debug(f"RSRanker: sustained-streak read failed (non-critical): {exc}")
+            return {}
 
     async def get_top_n(self, n: int = 10) -> List[str]:
         """Return cached top-N symbols by RS. Falls back to all symbols if no data."""

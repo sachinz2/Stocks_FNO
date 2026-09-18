@@ -1679,6 +1679,9 @@ class _FakeCollisionEngine:
     _has_active_multi_leg_structure = LiveTradingEngine._has_active_multi_leg_structure
     _has_open_single_leg_position   = LiveTradingEngine._has_open_single_leg_position
     _audit_gate                     = LiveTradingEngine._audit_gate
+    _maybe_record_shadow_candidate  = LiveTradingEngine._maybe_record_shadow_candidate
+    _SHADOW_ELIGIBLE_STRATEGIES     = LiveTradingEngine._SHADOW_ELIGIBLE_STRATEGIES
+    _SHADOW_MIN_STREAK_DAYS         = LiveTradingEngine._SHADOW_MIN_STREAK_DAYS
 
     def __init__(self, active_spreads=None, active_condors=None, single_leg_journals=None):
         self._active_spreads = active_spreads or {}
@@ -1689,6 +1692,9 @@ class _FakeCollisionEngine:
         self._last_signal_date = {}
         self._signal_gate_stats = {}
         self.order_manager = None  # must never be touched if the guard fires first
+        # 2026-09-18: _maybe_record_shadow_candidate() short-circuits
+        # safely to a no-op when rs_ranker isn't attached.
+        self.rs_ranker = None
 
 
 @pytest.mark.asyncio

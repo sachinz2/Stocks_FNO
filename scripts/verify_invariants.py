@@ -711,6 +711,26 @@ def check_gate_bottleneck_alerting_is_wired(repo: Path) -> Result:
     return PASS, name, "Gate-bottleneck detection is defined and wired into the daily report alongside signal staleness."
 
 
+def check_shadow_observation_never_reaches_real_order_placement(repo: Path) -> Result:
+    name = "Shadow-mode RS-streak observation is positioned before any state-mutating call, not after"
+    src = _read(repo, "src/live_trading/live_trading_engine.py")
+    shadow_idx = src.find("await self._maybe_record_shadow_candidate(")
+    if shadow_idx == -1:
+        return FAIL, name, "_maybe_record_shadow_candidate() call site not found in _process_signal()."
+    close_idx = src.find("await self._close_option_positions(", shadow_idx)
+    if close_idx == -1:
+        return FAIL, name, "_close_option_positions() call not found after the shadow hook -- could not verify ordering."
+    if not (shadow_idx < close_idx):
+        return FAIL, name, "_maybe_record_shadow_candidate() is no longer positioned before _close_option_positions() (a real, order-placing reversal-exit call) -- a shadow observation could now reach real state-mutating code. This must stay strictly BEFORE the is_active gate's downstream pipeline."
+    # The shadow call must be immediately followed by `return` -- i.e. it's
+    # inside the `if not strategy.is_active:` branch and execution stops
+    # right there, never falling through into the real pipeline below.
+    between = src[shadow_idx:close_idx]
+    if "return" not in between.split("\n")[1]:
+        return WARN, name, "Could not confirm `return` immediately follows the shadow-record call -- check manually that execution still stops there for a paused strategy."
+    return PASS, name, "Shadow observation is positioned before any state-mutating call and returns immediately after recording."
+
+
 def check_strategy_health_reads_the_real_pause_reason(repo: Path) -> Result:
     name = "/analytics/strategy-health surfaces the real pause reason, not always null"
     src = _read(repo, "src/risk/strategy_monitor.py")
@@ -772,6 +792,7 @@ STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_low_vol_regime_has_no_structurally_impossible_strategy,
     check_strategy_health_reads_the_real_pause_reason,
     check_gate_bottleneck_alerting_is_wired,
+    check_shadow_observation_never_reaches_real_order_placement,
 ]
 
 

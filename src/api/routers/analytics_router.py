@@ -633,6 +633,56 @@ async def get_rejected_outcomes_summary():
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+@router.get("/shadow-signals")
+async def get_shadow_signals(strategy: str = None, symbol: str = None, limit: int = 200):
+    """
+    ShadowSignalObservation rows -- real BUY/SELL signals from a
+    regime-paused, shadow-eligible strategy (currently only
+    ema_crossover_v1) on a symbol holding a sustained RS-rank streak.
+    "Would have been a real candidate if this strategy's regime gate
+    weren't excluding it right now" -- see the model's docstring for the
+    full design rationale (the live validation companion to the 2026-09-18
+    PAYTM backtest: 18 trades, 50% win rate, replayed against real
+    historical bars with no regime gate at all).
+
+    No order is ever placed for these -- pure observation, recorded the
+    moment generate_signal() fires, before any downstream engine gate
+    (RVOL/RS/MTF/lot size/contract resolution/option quality) is even
+    checked. Use this to judge whether the RS-sustained-streak override is
+    firing sensibly in real live conditions before ever promoting it to
+    real (paper) order placement.
+
+    Optional filters: strategy, symbol. limit caps rows returned, most
+    recent first (default 200).
+    """
+    try:
+        from sqlalchemy import select
+        from src.database.models.shadow_signal_observation import ShadowSignalObservation
+        async with AsyncSessionLocal() as session:
+            stmt = select(ShadowSignalObservation).order_by(ShadowSignalObservation.timestamp.desc())
+            if strategy:
+                stmt = stmt.where(ShadowSignalObservation.strategy_name == strategy)
+            if symbol:
+                stmt = stmt.where(ShadowSignalObservation.symbol == symbol)
+            stmt = stmt.limit(min(limit, 1000))
+            rows = (await session.execute(stmt)).scalars().all()
+        return [
+            {
+                "timestamp":       r.timestamp.isoformat(),
+                "strategy_name":   r.strategy_name,
+                "symbol":          r.symbol,
+                "signal":          r.signal,
+                "regime":          r.regime,
+                "rs_streak_days":  r.rs_streak_days,
+                "rs_streak_side":  r.rs_streak_side,
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        logger.error(f"Analytics /shadow-signals error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
 @router.get("/rs-ranks")
 async def get_rs_ranks(request: Request, top: int = Query(10, le=40)):
     """

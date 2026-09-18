@@ -2652,6 +2652,97 @@ class LiveTradingEngine:
         except Exception as exc:
             logger.debug(f"[SignalTrace] record failed (non-critical): {exc}")
 
+    # Added 2026-09-18 (user-authorized: "safest place to loosen the gates"
+    # -> observe-only live trial before any real capital risk). Only
+    # ema_crossover_v1 -- of the two regime-gated directional strategies,
+    # it backtested meaningfully better on PAYTM's real history (50% win
+    # rate vs momentum_v1's 37.5%), and its own thesis (the crossover
+    # MOMENT, not a continuously-held trend) is naturally self-limiting in
+    # frequency, unlike momentum_v1's "already-strong established trend"
+    # thesis, which philosophically argues FOR staying regime-gated.
+    _SHADOW_ELIGIBLE_STRATEGIES = {"ema_crossover_v1"}
+    # How many consecutive days a symbol must hold its RS streak before a
+    # regime-paused shadow candidate is worth recording -- matches the
+    # scale of evidence that actually distinguished PAYTM (7 straight days)
+    # from an ordinary stock; 3 is a deliberately conservative floor, not
+    # tuned to any backtest.
+    _SHADOW_MIN_STREAK_DAYS = 3
+
+    async def _maybe_record_shadow_candidate(
+        self, strategy, symbol: str, signal, regime: Optional[str],
+    ) -> None:
+        """
+        Pure observability, zero interaction with real trading state: when
+        a regime-paused, shadow-eligible strategy's generate_signal() fires
+        a real BUY/SELL for a symbol currently on a sustained RS-rank streak
+        (see RSRanker.get_sustained_streak()), record that this WOULD have
+        been a real candidate if the regime gate weren't excluding this
+        strategy right now. See ShadowSignalObservation's model docstring
+        for the full design rationale.
+
+        Deliberately stops here -- does NOT replicate the downstream
+        engine-level gates (RVOL/RS/MTF/lot size/contract resolution/option
+        quality) or call ANY state-mutating method. In particular, this
+        must NEVER be extended to continue further into _process_signal's
+        pipeline: _close_option_positions() (a real, order-placing
+        reversal-exit call reached later in the real pipeline, before the
+        DTE gate) is reachable from a live strategy.is_active=True path but
+        must never be reached from a shadow observation. generate_signal()
+        already reflects this strategy's own internal ADX/gap confirmation;
+        for ema_crossover_v1's current config (rvol_hard_gate=False,
+        require_rs=False, mtf_strict=False) none of the external engine
+        gates this stops short of would actually block a real entry
+        anyway, so this captures the real determining signal without the
+        added risk of a second, parallel reimplementation of the entry
+        pipeline that could drift from the real one or, worse, accidentally
+        touch real position/order state.
+        """
+        if strategy.name not in self._SHADOW_ELIGIBLE_STRATEGIES:
+            return
+        signal_str = signal.value if hasattr(signal, "value") else str(signal)
+        if signal_str not in ("BUY", "SELL"):
+            return
+        if not self.rs_ranker:
+            return
+        try:
+            streaks = await self.rs_ranker.get_sustained_streak()
+        except Exception:
+            return
+        info = streaks.get(symbol)
+        if not info or info.get("count", 0) < self._SHADOW_MIN_STREAK_DAYS:
+            return
+        # A BUY needs sustained RELATIVE STRENGTH (top-N); a SELL needs
+        # sustained relative WEAKNESS (bottom-N) -- a stock streaking on the
+        # wrong side for this signal's direction isn't the PAYTM-shaped
+        # case this exists to observe.
+        expected_side = "top" if signal_str == "BUY" else "bottom"
+        if info.get("side") != expected_side:
+            return
+
+        logger.info(
+            f"[ShadowRS] {strategy.name} {symbol}: {signal_str} signal fired "
+            f"while regime-paused ({regime}) -- {symbol} on a {info['count']}-day "
+            f"{info['side']} RS streak. Would have been a real candidate if this "
+            f"strategy's regime gate weren't excluding it right now. Recording "
+            f"for review, no order placed."
+        )
+        try:
+            from src.database.connection import AsyncSessionLocal
+            from src.database.models.shadow_signal_observation import ShadowSignalObservation
+            from src.database.repositories.base import BaseRepository
+            repo = BaseRepository(ShadowSignalObservation, AsyncSessionLocal)
+            await repo.create({
+                "timestamp":      now_ist().replace(tzinfo=None),
+                "strategy_name":  strategy.name,
+                "symbol":         symbol,
+                "signal":         signal_str,
+                "regime":         regime,
+                "rs_streak_days": info["count"],
+                "rs_streak_side": info["side"],
+            })
+        except Exception as exc:
+            logger.debug(f"[ShadowRS] record failed (non-critical): {exc}")
+
     async def _record_rejected_outcome(
         self, strategy_name: str, symbol: str, last_gate: Optional[str],
         quality_score: Optional[int],
@@ -2806,6 +2897,7 @@ class LiveTradingEngine:
         # trailing-stop/underlying-based) are unaffected -- those run via
         # the separate, unconditional _check_open_option_exits(), not here.
         if not strategy.is_active:
+            await self._maybe_record_shadow_candidate(strategy, symbol, signal, regime)
             return
         if not signal or signal == SignalType.HOLD:
             return
