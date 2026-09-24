@@ -731,6 +731,34 @@ def check_shadow_observation_never_reaches_real_order_placement(repo: Path) -> R
     return PASS, name, "Shadow observation is positioned before any state-mutating call and returns immediately after recording."
 
 
+def check_signal_staleness_watches_paused_strategies_too(repo: Path) -> Result:
+    name = "Signal-staleness alert still watches regime/circuit-breaker-paused strategies, not just active ones"
+    src = _read(repo, "src/live_trading/live_trading_engine.py")
+    idx = src.find("async def _check_signal_staleness(")
+    if idx == -1:
+        return FAIL, name, "_check_signal_staleness() not found."
+    end = src.find("\n    async def ", idx + 10)
+    body = src[idx: end if end != -1 else idx + 3000]
+    if "if not strategy.is_active:\n                continue" in body or "if not strategy.is_active: continue" in body:
+        return FAIL, name, (
+            "_check_signal_staleness() skips any strategy with is_active=False -- exactly "
+            "backwards, since a multi-day regime pause with zero trades is precisely the "
+            "'haven't traded in days' scenario this check exists to surface. Confirmed live "
+            "2026-09-24: all 4 strategies sat regime-paused (LOW_VOL) for 3 straight trading "
+            "days with zero alert."
+        )
+    # _last_signal_date must be updated BEFORE the is_active early-return in
+    # _process_signal(), or a paused strategy's date freezes at pause time
+    # and this (now paused-inclusive) check would false-alarm on a strategy
+    # that is actually still signaling normally, just not acting on it.
+    ps_src = _read(repo, "src/live_trading/live_trading_engine.py")
+    signal_str_idx = ps_src.find('signal_str = signal.value if hasattr(signal, "value") else str(signal) if signal else None')
+    active_check_idx = ps_src.find("if not strategy.is_active:")
+    if signal_str_idx == -1 or active_check_idx == -1 or not (signal_str_idx < active_check_idx):
+        return FAIL, name, "_last_signal_date's update no longer precedes the is_active check in _process_signal() -- a paused strategy's staleness date would freeze at pause time."
+    return PASS, name, "Staleness check evaluates paused strategies too, and _last_signal_date updates before the is_active gate so it can't false-alarm on a genuinely-still-signaling paused strategy."
+
+
 def check_strategy_health_reads_the_real_pause_reason(repo: Path) -> Result:
     name = "/analytics/strategy-health surfaces the real pause reason, not always null"
     src = _read(repo, "src/risk/strategy_monitor.py")
@@ -793,6 +821,7 @@ STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_strategy_health_reads_the_real_pause_reason,
     check_gate_bottleneck_alerting_is_wired,
     check_shadow_observation_never_reaches_real_order_placement,
+    check_signal_staleness_watches_paused_strategies_too,
 ]
 
 

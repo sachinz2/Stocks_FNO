@@ -141,18 +141,26 @@ async def test_signal_staleness_does_not_alert_a_recently_active_strategy():
 
 
 @pytest.mark.asyncio
-async def test_signal_staleness_skips_paused_strategies():
-    """A strategy paused by StrategyMonitor/regime-switching legitimately
-    produces zero signals -- must not spam an alert for an intentional pause."""
+async def test_signal_staleness_still_alerts_a_paused_strategy():
+    """Fixed 2026-09-24 (live incident): a strategy paused by
+    StrategyMonitor/regime-switching used to be silently exempted from this
+    check entirely -- exactly backwards, since a multi-day regime pause with
+    zero trades is precisely the scenario this check exists to surface (see
+    this project's own real 3-day LOW_VOL pause that produced no alert at
+    all). The alert still fires, but names the pause reason so it reads as
+    an explanation rather than a false alarm."""
     stale_date = (now_ist().date() - timedelta(days=10)).isoformat()
     notifications = []
     fake = SimpleNamespace(
         _last_signal_date={"credit_spread_v1": stale_date},
         _notify=AsyncMock(side_effect=lambda m: notifications.append(m)),
+        _SIGNAL_STALENESS_DAYS=LiveTradingEngine._SIGNAL_STALENESS_DAYS,
     )
 
     class _FakePausedStrategy:
         is_active = False
+        paused_by = "regime"
+        paused_reason = "Regime is LOW_VOL — strategy not active in this regime"
 
     import unittest.mock as _mock
     with _mock.patch(
@@ -161,7 +169,33 @@ async def test_signal_staleness_skips_paused_strategies():
     ):
         await LiveTradingEngine._check_signal_staleness(fake)
 
-    assert notifications == []
+    assert len(notifications) == 1
+    assert "credit_spread_v1" in notifications[0]
+    assert "Currently paused (regime: Regime is LOW_VOL" in notifications[0]
+
+
+@pytest.mark.asyncio
+async def test_process_signal_records_last_signal_date_even_while_paused():
+    """Fixed 2026-09-24: _last_signal_date must update on a real signal
+    BEFORE the is_active early-return, or a regime-paused strategy's date
+    freezes at pause time and the (now paused-inclusive) staleness check
+    would wrongly alert on a strategy that is actually still signaling
+    normally, just not acting on it."""
+    from src.core.enums import SignalType
+
+    strategy = SimpleNamespace(
+        name="ema_crossover_v1", is_active=False,
+        generate_signal=lambda md: SignalType.BUY,
+    )
+    fake = SimpleNamespace(
+        _last_signal_date={},
+        _get_market_data=AsyncMock(return_value={"ltp_source": "zerodha_live_ticks", "close": 100.0}),
+        _maybe_record_shadow_candidate=AsyncMock(),
+    )
+
+    await LiveTradingEngine._process_signal(fake, strategy, "RELIANCE", vix=15.0, regime="LOW_VOL")
+
+    assert fake._last_signal_date["ema_crossover_v1"] == now_ist().date().isoformat()
 
 
 @pytest.mark.asyncio

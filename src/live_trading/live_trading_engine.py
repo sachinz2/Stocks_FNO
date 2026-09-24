@@ -791,19 +791,30 @@ class LiveTradingEngine:
 
     async def _check_signal_staleness(self) -> None:
         """
-        Alerts once per trading day (called from send_daily_report) if an
-        active strategy has produced zero non-HOLD signals for
+        Alerts once per trading day (called from send_daily_report) if a
+        strategy has produced zero non-HOLD signals for
         _SIGNAL_STALENESS_DAYS+ calendar days. This measures the strategy's
         OWN generate_signal() logic still being capable of firing at all --
-        independent of whether any resulting order succeeds, and independent
-        of _process_signal()'s per-symbol try/except in run_signal_cycle
-        (which would have silently swallowed the DTE-window bug the same way
-        it swallows everything else, by design).
+        independent of whether any resulting order succeeds, independent of
+        _process_signal()'s per-symbol try/except in run_signal_cycle (which
+        would have silently swallowed the DTE-window bug the same way it
+        swallows everything else, by design), and independent of whether the
+        strategy is currently regime/circuit-breaker paused.
+
+        Fixed 2026-09-24 (live incident: 3 straight trading days of zero
+        trades across all 4 strategies during a LOW_VOL regime pause
+        produced no alert at all). This used to skip any strategy with
+        is_active=False -- exactly backwards, since a multi-day regime pause
+        is precisely the "haven't traded in days, is something wrong?"
+        scenario this check exists to surface, not exempt. generate_signal()
+        runs and _last_signal_date is updated even while paused (see
+        _process_signal's 2026-09-03/2026-09-24 comments), so a genuinely
+        quiet pause (signal keeps firing, just not being acted on) and a
+        silently broken generate_signal() (no signal at all) are still told
+        apart correctly whether or not the strategy is currently active.
         """
         today = now_ist().date()
         for strategy_id, strategy in StrategyRegistry.get_active_strategies().items():
-            if not strategy.is_active:
-                continue
             last_str = self._last_signal_date.get(strategy_id)
             if last_str is None:
                 # First time this check has seen this strategy -- establish a
@@ -819,13 +830,17 @@ class LiveTradingEngine:
                 continue
             days_silent = (today - last_date).days
             if days_silent >= self._SIGNAL_STALENESS_DAYS:
+                paused_note = (
+                    f" Currently paused ({strategy.paused_by}: {strategy.paused_reason})."
+                    if not strategy.is_active else ""
+                )
                 logger.warning(
                     f"[SignalStaleness] {strategy_id}: no non-HOLD signal for "
-                    f"{days_silent} day(s) (last: {last_str})"
+                    f"{days_silent} day(s) (last: {last_str}).{paused_note}"
                 )
                 await self._notify(
                     f"WARNING: {strategy_id} has produced ZERO trading signals for "
-                    f"{days_silent} day(s) (last signal: {last_str}).\n"
+                    f"{days_silent} day(s) (last signal: {last_str}).{paused_note}\n"
                     f"This may be normal (quiet market conditions for this strategy's "
                     f"regime) or may indicate a silent logic bug blocking entries -- "
                     f"same failure signature as the 2026-07-27..07-29 DTE-window "
@@ -2896,22 +2911,27 @@ class LiveTradingEngine:
         # circuit-breaker gated). Routine position exits (stop-loss/target/
         # trailing-stop/underlying-based) are unaffected -- those run via
         # the separate, unconditional _check_open_option_exits(), not here.
+        # Fixed 2026-08-20 (component review), widened 2026-09-24 (live
+        # incident -- 3 straight days of zero trades during a regime pause
+        # produced no alert): recorded regardless of what happens further
+        # down (is_active gating, a collision guard, order rejected, etc.)
+        # -- this measures "the strategy's own logic is still capable of
+        # producing a real signal," the exact thing that silently broke for
+        # 3 days in the original DTE-window incident. Must be updated BEFORE
+        # the is_active check below, or a regime-paused strategy's date
+        # freezes at pause time and _check_signal_staleness (which now also
+        # watches paused strategies) would alert on a strategy that is
+        # actually still signaling normally, just not acting on it. See
+        # _check_signal_staleness()'s docstring.
+        signal_str = signal.value if hasattr(signal, "value") else str(signal) if signal else None
+        if signal_str and signal_str != "HOLD":
+            self._last_signal_date[strategy.name] = now_ist().date().isoformat()
+
         if not strategy.is_active:
             await self._maybe_record_shadow_candidate(strategy, symbol, signal, regime)
             return
         if not signal or signal == SignalType.HOLD:
             return
-        signal_str = signal.value if hasattr(signal, "value") else str(signal)
-        if signal_str == "HOLD":
-            return
-
-        # Fixed 2026-08-20 (component review): recorded regardless of what
-        # happens further down (entry blocked by a collision guard, order
-        # rejected, etc.) -- this measures "the strategy's own logic is
-        # still capable of producing a real signal," the exact thing that
-        # silently broke for 3 days in the DTE-window incident. See
-        # _check_signal_staleness()'s docstring.
-        self._last_signal_date[strategy.name] = now_ist().date().isoformat()
 
         logger.info(f"Signal [{strategy.name}] {signal_str} {symbol}")
 
