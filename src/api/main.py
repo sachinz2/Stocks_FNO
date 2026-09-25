@@ -394,6 +394,28 @@ async def lifespan(app: FastAPI):
         name="Daily Zerodha Reconciliation",
         replace_existing=True,
     )
+
+    # Intraday Zerodha order reconciliation -- 11:45 and 13:45 IST, Mon-Fri.
+    # Fixed 2026-09-25 (audit finding): the 8:45am run above only ever
+    # checked ONCE a day, before market open -- a GTT-triggered order or a
+    # manual trade placed directly in the Zerodha app mid-session (see
+    # sync_orders_from_zerodha()'s own docstring for why this class of order
+    # exists) had no same-day detection path; it would only surface the
+    # FOLLOWING morning. sync_orders_from_zerodha() is a passive, idempotent
+    # DB reconciliation (matches by broker_order_id, inserts/corrects rows --
+    # never places or closes anything), so running it more often during the
+    # day is safe -- deliberately reuses the same _run_daily_zerodha_sync
+    # closure/mode-guard rather than the position-level orphan-auto-close
+    # path (_reconcile_broker_positions()), which is NOT safe to run on a
+    # tight interval mid-session (see its own docstring -- designed and
+    # tested for the "engine restarted, tracking lost" case only).
+    scheduler.add_job(
+        _run_daily_zerodha_sync,
+        CronTrigger(hour="11,13", minute=45, day_of_week="mon-fri", timezone="Asia/Kolkata"),
+        id="intraday_zerodha_sync",
+        name="Intraday Zerodha Order Reconciliation",
+        replace_existing=True,
+    )
     # ltp_poll is now registered inside schedule_trading_jobs() above (via
     # engine._symbol_poller), anchored to the same epoch as the signal-cycle
     # job so the two have a guaranteed ordering -- see

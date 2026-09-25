@@ -41,7 +41,18 @@ def mock_order_repo():
         return obj
     repo.update.side_effect = _update
 
-    repo.filter.return_value = [db_order]
+    # Fixed 2026-09-25: needs to be argument-aware, not a single static
+    # return_value -- sync_orders() calls filter(order_status="OPEN") and
+    # needs [db_order] back (test_sync_orders below relies on this), but
+    # place_order()'s new duplicate-order guard (2026-09-25 audit finding)
+    # calls filter(order_status="OPEN", symbol=...) and must see [] (no
+    # pre-existing resting order) for the ordinary "place a new order"
+    # tests to still reach the broker.
+    def _filter(*args, **kwargs):
+        if "symbol" in kwargs:
+            return []
+        return [db_order]
+    repo.filter.side_effect = _filter
     return repo
 
 @pytest.fixture

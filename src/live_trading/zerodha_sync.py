@@ -81,6 +81,38 @@ async def sync_orders_from_zerodha(kite, order_repo) -> Dict[str, int]:
             existing = matches[0] if matches else None
 
             if existing is None:
+                # Fixed 2026-09-25 (audit finding): before assuming this
+                # broker order truly has no local record at all, check for a
+                # row order_manager.py's place_order() already knows about
+                # but couldn't finish writing -- broker_order_id stays NULL
+                # forever there (its own CRITICAL-escalation comment
+                # explains why: the broker call succeeded but the DB write
+                # failed 3 retries in a row, so it deliberately does NOT
+                # touch order_status, leaving it stuck at "PENDING" rather
+                # than guess). Without this, that already-tracked order gets
+                # a SECOND, separate row inserted here instead of the
+                # original one being healed -- Zerodha is still the source
+                # of truth for its real state, this just attaches it to the
+                # existing row rather than duplicating bookkeeping.
+                stuck = await order_repo.filter(
+                    order_status="PENDING", symbol=symbol, side=side, quantity=quantity,
+                )
+                stuck = [o for o in stuck if not o.broker_order_id]
+                if stuck:
+                    healed = stuck[0]
+                    await order_repo.update(healed, {
+                        "broker_order_id": broker_id,
+                        "order_status": status,
+                        "fill_price": fill_price,
+                    })
+                    corrected += 1
+                    logger.warning(
+                        f"[ZerodhaSync] Healed stuck PENDING order {healed.id} ({side} "
+                        f"{quantity} {symbol}) -- attached broker_order_id={broker_id} "
+                        "instead of inserting a duplicate row."
+                    )
+                    continue
+
                 await order_repo.create({
                     "broker_order_id": broker_id,
                     "symbol": symbol, "side": side, "quantity": quantity,

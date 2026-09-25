@@ -787,6 +787,86 @@ def check_iv_history_refresh_decoupled_from_vix_gate(repo: Path) -> Result:
     return PASS, name, "IV history refresh is scheduled daily for the full universe, independent of any strategy's VIX gate."
 
 
+def check_place_order_refuses_a_duplicate_resting_order(repo: Path) -> Result:
+    name = "place_order() refuses a new entry when one is already resting OPEN for the same contract"
+    src = _read(repo, "src/orders/order_manager.py")
+    idx = src.find("async def place_order(")
+    if idx == -1:
+        return FAIL, name, "place_order() not found."
+    body = src[idx: idx + 4000]
+    if 'existing_open = await self.order_repo.filter(order_status="OPEN", symbol=symbol)' not in body:
+        return FAIL, name, (
+            "The duplicate-order guard is missing from place_order() -- every upstream "
+            "'already have a position?' check (e.g. _has_open_option()) only looks at FILLED "
+            "broker positions, never outstanding orders. An abrupt restart (the scheduler "
+            "dead-man's-switch's os._exit(1), which bypasses _persist_state()) between an "
+            "order being accepted by the broker and it filling could otherwise let the next "
+            "cycle place a second order for the same contract, doubling the position."
+        )
+    if "if not is_exit_order:" not in body:
+        return WARN, name, "Could not confirm the guard is scoped to is_exit_order=False -- check manually that exits are never blocked."
+    return PASS, name, "place_order() refuses a duplicate entry on a contract with a resting OPEN order, exits unaffected."
+
+
+def check_capital_release_uses_unfilled_remainder_not_full_quantity(repo: Path) -> Result:
+    name = "Capital release on a cancelled/rejected order accounts for any partial fill, not the full original quantity"
+    src = _read(repo, "src/orders/order_manager.py")
+    idx = src.find("async def _release_capital_if_was_deployed(")
+    if idx == -1:
+        return FAIL, name, "_release_capital_if_was_deployed() not found."
+    body = src[idx: idx + 2200]
+    if "filled = getattr(db_order, \"filled_quantity\", None) or 0" not in body:
+        return FAIL, name, (
+            "_release_capital_if_was_deployed() no longer accounts for filled_quantity -- "
+            "releasing the FULL originally-requested quantity on a partially-filled cancelled "
+            "order double-counts the already-filled portion's capital as 'available' (it's a "
+            "real open position that will correctly release its own capital again on its "
+            "normal exit)."
+        )
+    if "remaining_qty * price" not in body:
+        return FAIL, name, "_release_capital_if_was_deployed() no longer releases based on the unfilled remainder."
+    # The sync_orders() call site must also capture update()'s return value --
+    # otherwise this fix is fed a stale pre-sync filled_quantity anyway.
+    sync_idx = src.find("async def _sync_orders_locked(")
+    if sync_idx == -1:
+        return FAIL, name, "_sync_orders_locked() not found -- could not verify the call site feeds fresh data into the release fix."
+    sync_body = src[sync_idx: sync_idx + 2500]
+    if "db_order = await self.order_repo.update(db_order, updates)" not in sync_body:
+        return FAIL, name, (
+            "_sync_orders_locked() discards order_repo.update()'s return value -- "
+            "_release_capital_if_was_deployed() downstream would read filled_quantity off a "
+            "stale pre-update object even though this fix computes the remainder correctly."
+        )
+    return PASS, name, "Capital release accounts for partial fills, fed by a freshly-synced order object."
+
+
+def check_stale_order_retry_resyncs_before_computing_remainder(repo: Path) -> Result:
+    name = "Stale-order retry re-syncs filled_quantity after cancel succeeds, before computing the retry remainder"
+    src = _read(repo, "src/orders/order_manager.py")
+    idx = src.find("async def expire_stale_orders(")
+    if idx == -1:
+        return FAIL, name, "expire_stale_orders() not found."
+    body = src[idx: idx + 9000]
+    filled_idx = body.find('_filled = getattr(order, "filled_quantity", None) or 0')
+    if filled_idx == -1:
+        return FAIL, name, "Could not locate the remainder-computation code."
+    before_remainder = body[:filled_idx]
+    # Two "await self.sync_orders()" calls are expected in this method: one
+    # in the cancel_ok=False (failed cancel) branch, and a second -- the fix
+    # being checked for here -- on the successful-cancel path, positioned
+    # after the cancel succeeds but before the remainder is computed below.
+    if before_remainder.count("await self.sync_orders()") < 2:
+        return FAIL, name, (
+            "expire_stale_orders() no longer re-syncs the order on the successful-cancel path "
+            "before computing the retry/release remainder -- filled_quantity would be a stale "
+            "snapshot taken before THIS specific order's own cancel round-trip, wrong if a "
+            "partial fill landed in that window (real for thin F&O contracts)."
+        )
+    if "order = refreshed" not in before_remainder:
+        return FAIL, name, "expire_stale_orders() no longer re-fetches the order after the post-cancel re-sync."
+    return PASS, name, "The order is re-synced and re-fetched after a successful cancel, before the remainder is computed."
+
+
 def check_strategy_health_reads_the_real_pause_reason(repo: Path) -> Result:
     name = "/analytics/strategy-health surfaces the real pause reason, not always null"
     src = _read(repo, "src/risk/strategy_monitor.py")
@@ -851,6 +931,9 @@ STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_shadow_observation_never_reaches_real_order_placement,
     check_signal_staleness_watches_paused_strategies_too,
     check_iv_history_refresh_decoupled_from_vix_gate,
+    check_place_order_refuses_a_duplicate_resting_order,
+    check_capital_release_uses_unfilled_remainder_not_full_quantity,
+    check_stale_order_retry_resyncs_before_computing_remainder,
 ]
 
 

@@ -241,6 +241,9 @@ class _ImmediateFillOrderRepo:
         merged.update(data)
         return _FakeOrderObj(**merged)
 
+    async def filter(self, limit=None, order_by=None, **kwargs):
+        return []  # no pre-existing orders -- these tests never place two for the same symbol
+
 
 class _FakeAuditRepo:
     async def create(self, data):

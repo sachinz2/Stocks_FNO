@@ -273,7 +273,7 @@ async def test_kill_switch_trips_mid_sequence_blocks_entries_not_exits():
             return obj
 
         async def filter(self, **kw):
-            return [r for r in self.rows if getattr(r, "order_status", None) == kw.get("order_status")]
+            return [r for r in self.rows if all(getattr(r, k, None) == v for k, v in kw.items())]
 
         async def get_by_id(self, oid):
             for r in self.rows:

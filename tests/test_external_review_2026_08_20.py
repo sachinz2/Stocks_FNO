@@ -142,6 +142,9 @@ async def test_place_order_timeout_reconciles_and_finds_the_order_was_live():
                 setattr(obj, k, v)
             return obj
 
+        async def filter(self, limit=None, order_by=None, **kwargs):
+            return []  # no pre-existing orders
+
     class _TimeoutThenFoundBroker:
         """place_order() times out client-side, but the order actually WAS
         accepted by the broker -- get_orders() shows it, tagged correctly."""
@@ -191,6 +194,9 @@ async def test_place_order_timeout_marks_failed_when_broker_genuinely_never_got_
             for k, v in updates.items():
                 setattr(obj, k, v)
             return obj
+
+        async def filter(self, limit=None, order_by=None, **kwargs):
+            return []  # no pre-existing orders
 
     class _TimeoutAndNeverFoundBroker:
         async def place_order(self, *a, **kw):

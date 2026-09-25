@@ -1615,6 +1615,23 @@ def test_credit_spread_entry_uses_real_fill_not_quote():
     assert "_place_gtt_backstop(short_contract, lot_size, short_fill)" in src
 
 
+def test_single_leg_entry_seeds_peak_premium_from_real_fill_not_quote():
+    """Fixed 2026-09-25 (audit finding): _peak_premiums[contract] used to be
+    seeded from option_p (the pre-fill LIMIT quote) BEFORE _entry_fill was
+    even computed. A live BUY LIMIT order can only fill at-or-below its
+    limit price, so peak >= the real entry_p from the very first tick -- an
+    artificial 'already up from entry' state that manage_position()'s
+    trailing-stop/breakeven checks (gated on peak > entry_premium) could
+    act on. Must seed from the same real-fill basis entry_p itself uses."""
+    src = inspect.getsource(LiveTradingEngine._process_signal)
+    fill_idx = src.find("_entry_fill = self._real_fill(order, option_p)")
+    peak_idx = src.find("self._peak_premiums[contract] = _entry_fill")
+    assert fill_idx != -1, "_entry_fill computation not found"
+    assert peak_idx != -1, "_peak_premiums must be seeded from _entry_fill, not option_p"
+    assert peak_idx > fill_idx, "_peak_premiums must be seeded AFTER _entry_fill is computed"
+    assert "self._peak_premiums[contract] = option_p" not in src
+
+
 # ── Cross-strategy contract-collision guard (2026-08-13) ─────────────────────
 #
 # Confirmed live: ema_crossover_v1 independently bought and sold

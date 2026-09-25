@@ -125,6 +125,34 @@ class OrderManager:
                         product string straight from the broker's own
                         position record instead. See ZerodhaBroker._product_for().
         """
+        # 0. Refuse a duplicate NEW order on a contract that already has one
+        # resting OPEN. Fixed 2026-09-25 (audit finding): every "already have
+        # a position?" guard upstream (e.g. _has_open_option()) only checks
+        # FILLED broker positions, never outstanding orders. If the process
+        # is abruptly killed (the scheduler dead-man's-switch's os._exit(1),
+        # which bypasses the normal shutdown/_persist_state() path entirely)
+        # right after an order is accepted by the broker but before it
+        # fills, the next cycle after restart has no record of it -- neither
+        # a filled position nor persisted journal entry -- and would
+        # otherwise place a second order for the same contract, potentially
+        # doubling the position once both fill. Scoped to is_exit_order=False
+        # only: an exit must always be allowed to proceed (e.g. closing an
+        # already-filled portion while a resting remainder of the SAME
+        # original order is still outstanding is legitimate, not a
+        # duplicate). Retries (is_retry=True) are also covered by this check
+        # -- safe, since the original order is always marked EXPIRED/
+        # CANCELLED before a retry is submitted, so it won't self-block.
+        if not is_exit_order:
+            existing_open = await self.order_repo.filter(order_status="OPEN", symbol=symbol)
+            if existing_open:
+                logger.warning(
+                    f"place_order: refusing to place a new order for {symbol} -- "
+                    f"{len(existing_open)} OPEN order(s) already resting "
+                    f"(id(s): {[o.id for o in existing_open]}). Let it fill, get "
+                    "cancelled, or expire before submitting another."
+                )
+                return None
+
         # 1. Create PENDING record in DB
         db_order = await self.order_repo.create({
             "symbol":       symbol,
@@ -603,6 +631,22 @@ class OrderManager:
                 )
                 continue
 
+            # Fixed 2026-09-25 (audit finding): re-sync and re-fetch before
+            # computing the retry/release remainder below -- `order` here is
+            # still the snapshot taken at the top of this method (before the
+            # cancel round-trip for THIS specific order, a separate broker
+            # call from the other orders potentially ahead of it in this
+            # same loop). A partial fill landing in that window -- real for
+            # thin F&O contracts -- would otherwise compute the wrong
+            # remainder from a stale filled_quantity, over-releasing capital
+            # and/or resubmitting more than what's genuinely still
+            # outstanding. Same fix shape as the cancel_ok=False branch
+            # above, just for the success path.
+            await self.sync_orders()
+            refreshed = await self.order_repo.get_by_id(order.id)
+            if refreshed:
+                order = refreshed
+
             await self.order_repo.update(order, {
                 "order_status": "EXPIRED",
                 "updated_at":   now_ist().replace(tzinfo=None),
@@ -809,7 +853,17 @@ class OrderManager:
                 ))
 
                 if updates:
-                    await self.order_repo.update(db_order, updates)
+                    # Fixed 2026-09-25 (audit finding): the return value used
+                    # to be discarded -- BaseRepository.update() returns a
+                    # NEW merged object, the original db_order stays
+                    # detached/stale. _release_capital_if_was_deployed()
+                    # below reads db_order.filled_quantity to compute how
+                    # much capital to release; without capturing this, it
+                    # always saw the pre-sync filled_quantity (None/stale)
+                    # even though `updates` (built from _extract_fill_updates
+                    # just above) may carry the broker's real, just-synced
+                    # value for this exact transition.
+                    db_order = await self.order_repo.update(db_order, updates)
                     if "order_status" in updates:
                         await self._audit("ORDER_STATUS_SYNC", {
                             "order_id": db_order.id, "new_status": new_status,
@@ -844,6 +898,19 @@ class OrderManager:
         actually failed at the broker rather than filled. Looked up via the
         ORDER_RECEIVED audit context rather than new columns, matching the
         existing _get_retry_context() pattern.
+
+        Fixed 2026-09-25 (audit finding): used to release
+        db_order.quantity * price -- the FULL originally-requested size --
+        regardless of how much had actually filled. A resting LIMIT order
+        can be partially filled while still OPEN (same fact
+        expire_stale_orders() was fixed for on 2026-08-21), and this helper
+        is reachable on exactly that transition: a manual/admin cancel
+        (cancel_order()) or sync_orders() discovering an OPEN->CANCELLED
+        transition on a partially-filled order. Releasing the full quantity
+        double-counts the already-filled portion's capital as "available"
+        -- it stays a real open position that will correctly release its
+        own capital again on its eventual normal exit. Only the UNFILLED
+        remainder was ever "reserved and not going to happen."
         """
         if getattr(db_order, "side", None) != "BUY":
             return
@@ -854,7 +921,9 @@ class OrderManager:
         is_spread_leg = ctx.get("is_spread_leg", False)
         if strategy_name and not is_spread_leg:
             price = float(db_order.price) if db_order.price else 0.0
-            self.risk_manager.release_deployed_capital(strategy_name, db_order.quantity * price)
+            filled = getattr(db_order, "filled_quantity", None) or 0
+            remaining_qty = max(0, db_order.quantity - filled)
+            self.risk_manager.release_deployed_capital(strategy_name, remaining_qty * price)
 
     async def _add_capital_if_should_have_been_deployed(self, db_order: Order) -> None:
         """

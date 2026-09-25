@@ -57,6 +57,9 @@ async def test_place_order_db_persist_failure_after_broker_success_does_not_mark
             # reached the broker.
             raise RuntimeError("simulated DB outage")
 
+        async def filter(self, limit=None, order_by=None, **kwargs):
+            return []  # no pre-existing orders
+
     class _Broker:
         async def place_order(self, *a, **kw):
             return "broker-order-live-1"

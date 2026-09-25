@@ -322,6 +322,8 @@ def test_order_manager_appends_new_entry_to_current_open_positions():
             for k, v in data.items():
                 setattr(obj, k, v)
             return obj
+        async def filter(self, limit=None, order_by=None, **kwargs):
+            return []  # no pre-existing orders
 
     class _FakeAuditRepo:
         async def create(self, data):
@@ -359,6 +361,8 @@ def test_order_manager_does_not_track_exit_or_spread_leg_orders_as_new_positions
             for k, v in data.items():
                 setattr(obj, k, v)
             return obj
+        async def filter(self, limit=None, order_by=None, **kwargs):
+            return []  # no pre-existing orders
 
     class _FakeAuditRepo:
         async def create(self, data):

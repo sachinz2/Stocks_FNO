@@ -86,6 +86,63 @@ async def test_inserts_broker_order_with_no_matching_db_record():
 
 
 @pytest.mark.asyncio
+async def test_heals_a_stuck_pending_row_instead_of_inserting_a_duplicate():
+    """Fixed 2026-09-25 (audit finding): order_manager.py's place_order()
+    can leave a row permanently at order_status='PENDING' with
+    broker_order_id=NULL if the broker call succeeds but the DB write
+    fails all 3 retries (escalated via a CRITICAL log -- see its own
+    comment). Without this fix, the row's real broker order would show up
+    here with no broker_order_id match and get inserted as a SECOND,
+    duplicate row instead of healing the original."""
+    repo = _FakeRepo()
+    stuck = await repo.create({
+        "broker_order_id": None, "symbol": "RELIANCE26SEP2900CE", "side": "BUY",
+        "quantity": 500, "price": 42.0, "fill_price": None,
+        "order_status": "PENDING",
+    })
+    kite = _FakeKite(orders=[{
+        "order_id": "BR-9", "order_timestamp": _today_ts(),
+        "status": "COMPLETE", "tradingsymbol": "RELIANCE26SEP2900CE",
+        "transaction_type": "BUY", "quantity": 500,
+        "price": 42.0, "average_price": 41.75,
+    }])
+
+    result = await sync_orders_from_zerodha(kite, repo)
+
+    assert result == {"checked": 1, "inserted": 0, "corrected": 1, "failed": 0}
+    assert len(repo.rows) == 1  # healed in place, not duplicated
+    assert stuck.broker_order_id == "BR-9"
+    assert stuck.order_status == "COMPLETED"
+    assert stuck.fill_price == 41.75
+
+
+@pytest.mark.asyncio
+async def test_does_not_heal_a_pending_row_with_a_different_symbol_or_quantity():
+    """A stuck PENDING row must only be healed by a broker order matching
+    symbol/side/quantity -- otherwise a genuinely-unrelated stuck row could
+    get incorrectly attached to the wrong broker order."""
+    repo = _FakeRepo()
+    unrelated = await repo.create({
+        "broker_order_id": None, "symbol": "INFY26SEP1900PE", "side": "BUY",
+        "quantity": 300, "price": 20.0, "fill_price": None,
+        "order_status": "PENDING",
+    })
+    kite = _FakeKite(orders=[{
+        "order_id": "BR-10", "order_timestamp": _today_ts(),
+        "status": "COMPLETE", "tradingsymbol": "RELIANCE26SEP2900CE",
+        "transaction_type": "BUY", "quantity": 500,
+        "price": 42.0, "average_price": 41.75,
+    }])
+
+    result = await sync_orders_from_zerodha(kite, repo)
+
+    assert result == {"checked": 1, "inserted": 1, "corrected": 0, "failed": 0}
+    assert len(repo.rows) == 2  # unrelated row untouched, new row inserted
+    assert unrelated.broker_order_id is None
+    assert unrelated.order_status == "PENDING"
+
+
+@pytest.mark.asyncio
 async def test_corrects_fill_price_mismatch_zerodha_wins():
     repo = _FakeRepo()
     existing = await repo.create({

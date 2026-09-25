@@ -2067,6 +2067,21 @@ class LiveTradingEngine:
                 if _jrnl_date and _jrnl_date != now_ist().date().isoformat():
                     exit_reason = f"Restored from a previous day ({_jrnl_date}) — overnight position, force-closing"
                 elif dte < 4:
+                    # Note (2026-09-25 audit): currently unreachable in
+                    # practice -- `expiry`/`dte` above come from
+                    # get_near_month_expiry(), which guarantees dte >= 7 by
+                    # rolling to next month itself once fewer than 7 days
+                    # remain (see its docstring in core/utils.py). Since
+                    # single-leg positions always close same-day (the
+                    # _jrnl_date branch above already force-closes anything
+                    # that somehow survives past today), this branch would
+                    # only ever fire if that 7-day rollover floor were
+                    # independently lowered below 4 in the future. Left in
+                    # place deliberately as dormant defense-in-depth for that
+                    # scenario rather than removed, but flagging explicitly
+                    # here (rather than leaving the coupling unstated) so a
+                    # future change to that floor doesn't silently and
+                    # unexpectedly activate or deactivate this path.
                     exit_reason = f"DTE={dte} — entering illiquid expiry window"
 
                 # Resolve the strategy that actually OPENED this position (via the
@@ -3524,7 +3539,6 @@ class LiveTradingEngine:
         if order and order.order_status == "OPEN":
             self._audit_gate(strategy.name, "trade_placed")
             self._today_order_count += 1
-            self._peak_premiums[contract] = option_p
             # Fixed 2026-08-06: was entry_price=option_p (the pre-slippage
             # quoted price) -- record the real PaperBroker fill instead, same
             # fix as the exit-side fill_price bug above, so entry_price
@@ -3533,6 +3547,16 @@ class LiveTradingEngine:
             # float() cast: db_order.fill_price is Decimal (SQLAlchemy Numeric
             # column) -- see the 2026-08-12 fix note in _execute_single_leg_exit.
             _entry_fill = self._real_fill(order, option_p)
+            # Fixed 2026-09-25 (audit finding): this was seeded from option_p
+            # (the pre-fill LIMIT quote) BEFORE _entry_fill above was even
+            # computed. A live BUY LIMIT order can only fill at-or-below its
+            # limit price, so peak_premiums[contract] >= the real entry_p
+            # (pos["avg_price"], read from _entry_fill) from the very first
+            # tick -- an artificial "already up from entry" state that isn't
+            # a real market move, which manage_position()'s trailing-stop/
+            # breakeven checks (gated on peak > entry_premium) could act on.
+            # Must seed from the same real-fill basis entry_p itself uses.
+            self._peak_premiums[contract] = _entry_fill
             journal_id = await self._log_trade_open(
                 strategy=strategy.name, underlying=symbol,
                 structure_type="SINGLE_LEG", contracts=[contract],
