@@ -759,6 +759,34 @@ def check_signal_staleness_watches_paused_strategies_too(repo: Path) -> Result:
     return PASS, name, "Staleness check evaluates paused strategies too, and _last_signal_date updates before the is_active gate so it can't false-alarm on a genuinely-still-signaling paused strategy."
 
 
+def check_iv_history_refresh_decoupled_from_vix_gate(repo: Path) -> Result:
+    name = "IV history refresh runs daily for the whole universe, independent of the VIX>=12 gate"
+    engine_src = _read(repo, "src/live_trading/live_trading_engine.py")
+    idx = engine_src.find("async def _refresh_iv_history_for_universe(")
+    if idx == -1:
+        return FAIL, name, (
+            "_refresh_iv_history_for_universe() missing -- update_iv_history() was previously "
+            "only reached from inside the VIX>=12-gated credit_spread_v1/iron_condor_v1 "
+            "pipeline, so a multi-day LOW_VOL stretch silently starved IV history for the "
+            "whole universe (confirmed live 2026-09-25: 5 straight zero-trade days, most "
+            "symbols under get_iv_rank()'s 20-entry minimum when VIX finally allowed trading)."
+        )
+    body = engine_src[idx: idx + 3000]
+    if "self._symbols" not in body:
+        return FAIL, name, "_refresh_iv_history_for_universe() no longer iterates the full tracked universe (self._symbols)."
+    if "live_sigma=" in body:
+        return WARN, name, "_refresh_iv_history_for_universe() now passes live_sigma= -- confirm this is intentional (was deliberately ATR-fallback-only to avoid ~130 live option-quote fetches once daily)."
+
+    sched_src = _read(repo, "src/core/scheduler.py")
+    if "_refresh_iv_history_for_universe" not in sched_src:
+        return FAIL, name, "_refresh_iv_history_for_universe() exists but is not wired into schedule_trading_jobs() -- it would never actually run."
+    sched_idx = sched_src.find("_refresh_iv_history_for_universe")
+    window = sched_src[max(0, sched_idx - 400): sched_idx + 100]
+    if "day_of_week=\"mon-fri\"" not in window:
+        return WARN, name, "Could not confirm the IV history refresh job is scheduled Mon-Fri -- check manually."
+    return PASS, name, "IV history refresh is scheduled daily for the full universe, independent of any strategy's VIX gate."
+
+
 def check_strategy_health_reads_the_real_pause_reason(repo: Path) -> Result:
     name = "/analytics/strategy-health surfaces the real pause reason, not always null"
     src = _read(repo, "src/risk/strategy_monitor.py")
@@ -822,6 +850,7 @@ STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_gate_bottleneck_alerting_is_wired,
     check_shadow_observation_never_reaches_real_order_placement,
     check_signal_staleness_watches_paused_strategies_too,
+    check_iv_history_refresh_decoupled_from_vix_gate,
 ]
 
 

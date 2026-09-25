@@ -180,6 +180,23 @@ def schedule_trading_jobs(engine) -> None:
         misfire_grace_time=_DAILY_JOB_MISFIRE_GRACE_SEC,
     )
 
+    # IV history universe refresh — 15:20 IST, Mon-Fri (before market close,
+    # while today's market data is still live). Fixed 2026-09-25 (live
+    # incident): see _refresh_iv_history_for_universe()'s docstring -- this
+    # was previously only ever updated from inside the VIX>=12-gated
+    # credit_spread_v1/iron_condor_v1 pipeline, so a multi-day LOW_VOL
+    # stretch silently starved IV history for the whole universe, leaving
+    # get_iv_rank()'s <20-day fail-closed check blocking almost every
+    # candidate the moment VIX allowed trading again.
+    scheduler.add_job(
+        engine._refresh_iv_history_for_universe,
+        CronTrigger(hour=15, minute=20, day_of_week="mon-fri", timezone="Asia/Kolkata"),
+        id="iv_history_refresh",
+        name="IV History Universe Refresh (15:20 IST)",
+        replace_existing=True,
+        misfire_grace_time=_DAILY_JOB_MISFIRE_GRACE_SEC,
+    )
+
     # Capital period rollover — 08:00 IST, Mon–Fri (before market open at 09:15
     # and before the day's first signal cycle), so any expiry that passed
     # closes out and compounds into the new period's starting_capital before

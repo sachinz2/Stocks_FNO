@@ -37,6 +37,7 @@ def _fake_engine(with_poller=True):
         _run_exit_checks_only=lambda: None,
         sync_orders=lambda: None,
         _backfill_rejected_outcomes=lambda: None,
+        _refresh_iv_history_for_universe=lambda: None,
         risk_manager=object(),
         _symbol_poller=SimpleNamespace(poll=lambda: None) if with_poller else None,
     )
@@ -95,3 +96,20 @@ def test_signal_cycle_interval_is_60_seconds():
 
     signal_job = scheduler.get_job("signal_generation")
     assert signal_job.trigger.interval.total_seconds() == 60
+
+
+def test_iv_history_refresh_registered_before_market_close_on_weekdays():
+    """Fixed 2026-09-25 (live incident): must run DAILY regardless of
+    regime/VIX, and before the 15:30 market close so market data is still
+    live -- see _refresh_iv_history_for_universe()'s docstring."""
+    _reset_scheduler()
+    engine = _fake_engine()
+    schedule_trading_jobs(engine)
+    scheduler = get_scheduler()
+
+    job = scheduler.get_job("iv_history_refresh")
+    assert job is not None
+    fields = {f.name: f for f in job.trigger.fields}
+    assert str(fields["hour"]) == "15"
+    assert str(fields["minute"]) == "20"
+    assert str(fields["day_of_week"]) == "mon-fri"

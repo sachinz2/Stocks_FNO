@@ -7162,3 +7162,58 @@ class LiveTradingEngine:
                 logger.warning("[EventCalendar] Weekly refresh returned empty — keeping existing calendar")
         except Exception as exc:
             logger.error(f"[EventCalendar] Weekly refresh failed: {exc}")
+
+    async def _refresh_iv_history_for_universe(self) -> None:
+        """
+        Daily job (scheduled 15:20 IST Mon-Fri, see schedule_trading_jobs()):
+        seed/refresh IV history for every symbol in the tracked universe via
+        _get_iv_rank()'s ATR-sigma fallback, independent of any strategy's
+        VIX>=12 gate.
+
+        Fixed 2026-09-25 (live incident: 5 straight trading days of zero
+        credit_spread_v1/iron_condor_v1 trades). update_iv_history() was
+        previously only ever reached from deep inside _process_credit_spread()/
+        _process_iron_condor(), both gated behind VIX>=12
+        (vix_allows_selling()). During a multi-day LOW_VOL stretch (VIX<12,
+        confirmed live 09-21 through 09-24), IV history for most of the
+        132-symbol universe never advanced. The moment VIX crossed back
+        above 12 and both strategies regime-reactivated (09-24 afternoon),
+        get_iv_rank()'s own <20-day fail-closed check (its 2026-09-18 fix)
+        then blocked nearly every real candidate anyway -- confirmed live
+        09-25: BHARTIARTL sat at 19/20 accumulated entries, JIOFIN at 2,
+        BEL at 4 with multi-week gaps. Reactivating the STRATEGY doesn't
+        mean its DATA is ready -- every LOW_VOL stretch was silently
+        resetting this clock for the whole universe. This job guarantees at
+        least one entry per symbol per day regardless of regime/VIX, so a
+        reactivation is never starting from a near-empty history again.
+
+        Deliberately uses the ATR-derived sigma fallback (no live_sigma
+        passed) rather than a live option-quote fetch for all ~130 symbols
+        -- this is a once-daily floor-fill, not a trading-decision-quality
+        signal. The real VIX-gated path still overwrites today's entry with
+        the higher-quality live_sigma reading (update_iv_history()'s
+        same-day overwrite) whenever a symbol actually clears that gate the
+        same day.
+        """
+        symbols = list(self._symbols)
+        seeded, skipped, failed = 0, 0, 0
+        for symbol in symbols:
+            try:
+                market_data = await self._get_market_data(symbol)
+                if not market_data:
+                    skipped += 1
+                    continue
+                price = market_data.get("close")
+                atr14 = market_data.get("atr14")
+                if not price or price <= 0 or not atr14:
+                    skipped += 1
+                    continue
+                await self._get_iv_rank(symbol, price, atr14, dte=0)
+                seeded += 1
+            except Exception as exc:
+                failed += 1
+                logger.debug(f"[IVHistoryRefresh] {symbol} failed (non-critical): {exc}")
+        logger.info(
+            f"[IVHistoryRefresh] Seeded/refreshed IV history for {seeded}/{len(symbols)} "
+            f"symbols ({skipped} skipped — no market data, {failed} failed)."
+        )
