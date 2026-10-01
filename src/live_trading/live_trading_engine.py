@@ -2656,8 +2656,29 @@ class LiveTradingEngine:
                 # every gate is instrumented (DTE/lot/contract/margin
                 # rejections stay stage-only) -- see the model docstring's
                 # accepted limitation for what's still missing.
+                #
+                # Fixed 2026-10-01 (external review, demonstrated with a real
+                # end-to-end repro rather than taken on faith): this used to
+                # additionally require _rej.get("gate") == last_gate before
+                # trusting it -- but last_gate is, by this method's own
+                # design and its own test suite (see
+                # test_rejected_reports_the_last_single_leg_gate_reached),
+                # always the LAST-PASSED gate (e.g. "dte_passed"), while
+                # _rej["gate"] is always set to the gate that just FAILED
+                # (e.g. "rvol_passed", one step further down the pipeline).
+                # Those two names can never be equal by construction, so this
+                # condition was always False -- `detail` has been silently
+                # None for every rejected candidate, on every strategy, since
+                # this feature was added, despite _last_gate_rejection itself
+                # being populated correctly the whole time (confirmed via a
+                # real _process_signal() -> _record_signal_trace() repro).
+                # _last_gate_rejection is reset to None at the very top of
+                # every _process_signal() call and only ever set by the exact
+                # gate that terminates THIS candidate's processing this
+                # cycle -- its mere presence here already IS the correct
+                # signal, no name match needed.
                 _rej = self._last_gate_rejection
-                if _rej and _rej.get("gate") == last_gate:
+                if _rej:
                     detail = f"{_rej['reason']} value={_rej['value']} threshold={_rej['threshold']}"[:255]
                 else:
                     detail = None
@@ -3937,21 +3958,33 @@ class LiveTradingEngine:
             # skip this branch entirely).
             if vix is None:
                 logger.info(f"[CreditSpread] {symbol} skipped — VIX unavailable (fail-closed, can't confirm premium is worth selling).")
+                self._last_gate_rejection = {
+                    "gate": "vix_passed", "value": None, "threshold": 12.0, "reason": "VIX_UNAVAILABLE",
+                }
             else:
                 logger.info(
                     f"[CreditSpread] {symbol} skipped — VIX={vix:.1f} too low "
                     f"(need ≥12.0 for rich premium). Not worth selling spreads."
                 )
+                self._last_gate_rejection = {
+                    "gate": "vix_passed", "value": round(vix, 2), "threshold": 12.0, "reason": "VIX_TOO_LOW",
+                }
             return
         self._audit_gate(strategy.name, "vix_passed")
         if not iv_rank_allows_selling(iv_rank):
             if iv_rank is None:
                 logger.info(f"[CreditSpread] {symbol} skipped — IV Rank unavailable (fail-closed, can't confirm premium is worth selling).")
+                self._last_gate_rejection = {
+                    "gate": "iv_rank_passed", "value": None, "threshold": 0.30, "reason": "IV_RANK_UNAVAILABLE",
+                }
             else:
                 logger.info(
                     f"[CreditSpread] {symbol} skipped — IV Rank={iv_rank:.2f} too low "
                     f"(need ≥0.30). Premium too cheap."
                 )
+                self._last_gate_rejection = {
+                    "gate": "iv_rank_passed", "value": round(iv_rank, 2), "threshold": 0.30, "reason": "IV_RANK_TOO_LOW",
+                }
             return
         self._audit_gate(strategy.name, "iv_rank_passed")
 
@@ -3993,12 +4026,20 @@ class LiveTradingEngine:
                     f"[CreditSpread] {symbol} BULL_PUT skipped — price Rs{underlying_price:.2f} "
                     f"below VWAP Rs{vwap:.2f} (intraday bearish momentum)"
                 )
+                self._last_gate_rejection = {
+                    "gate": "direction_passed", "value": round(underlying_price, 2),
+                    "threshold": round(vwap, 2), "reason": "BULL_PUT_BELOW_VWAP",
+                }
                 return
             if spread_type == "BEAR_CALL_SPREAD" and underlying_price > vwap * (1 + _vwap_buffer):
                 logger.info(
                     f"[CreditSpread] {symbol} BEAR_CALL skipped — price Rs{underlying_price:.2f} "
                     f"above VWAP Rs{vwap:.2f} (intraday bullish momentum)"
                 )
+                self._last_gate_rejection = {
+                    "gate": "direction_passed", "value": round(underlying_price, 2),
+                    "threshold": round(vwap, 2), "reason": "BEAR_CALL_ABOVE_VWAP",
+                }
                 return
         self._audit_gate(strategy.name, "direction_passed")
 
@@ -4039,18 +4080,27 @@ class LiveTradingEngine:
                 f"[CreditSpread] {symbol} skipped — ADX not yet computable "
                 "(insufficient history; cannot confirm trend is in the safe zone)"
             )
+            self._last_gate_rejection = {
+                "gate": "adx_passed", "value": None, "threshold": "15-30", "reason": "ADX_UNAVAILABLE",
+            }
             return
         if _adx_cs < 15:
             logger.info(
                 f"[CreditSpread] {symbol} skipped — ADX={_adx_cs:.1f} < 15 "
                 "(no trend; condor regime)"
             )
+            self._last_gate_rejection = {
+                "gate": "adx_passed", "value": round(_adx_cs, 2), "threshold": 15, "reason": "ADX_TOO_LOW_CONDOR_TERRITORY",
+            }
             return
         if _adx_cs > 30:
             logger.info(
                 f"[CreditSpread] {symbol} skipped — ADX={_adx_cs:.1f} > 30 "
                 "(trend too strong; blowthrough risk)"
             )
+            self._last_gate_rejection = {
+                "gate": "adx_passed", "value": round(_adx_cs, 2), "threshold": 30, "reason": "ADX_TOO_HIGH_BLOWTHROUGH_RISK",
+            }
             return
         self._audit_gate(strategy.name, "adx_passed")
 
@@ -4061,6 +4111,9 @@ class LiveTradingEngine:
             logger.info(
                 f"[CreditSpread] {symbol} skipped — earnings or NSE event within 5 days"
             )
+            self._last_gate_rejection = {
+                "gate": "event_calendar_passed", "value": True, "threshold": False, "reason": "EVENT_WITHIN_5_DAYS",
+            }
             return
         self._audit_gate(strategy.name, "event_calendar_passed")
 
@@ -4225,6 +4278,10 @@ class LiveTradingEngine:
                 f"too low (min ₹{MIN_SPREAD_NET_CREDIT:.0f} after fees). "
                 f"SELL@{short_p} BUY@{long_p} x {lot_size} lots."
             )
+            self._last_gate_rejection = {
+                "gate": "min_credit", "value": round(total_credit, 2),
+                "threshold": MIN_SPREAD_NET_CREDIT, "reason": "NET_CREDIT_BELOW_FEE_FLOOR",
+            }
             return
 
         # Risk/reward check: net credit must be ≥ 20% of wing width.
@@ -4238,6 +4295,10 @@ class LiveTradingEngine:
                 f"20% of wing width ({spread_width_pts} pts × 20% = ₹{spread_width_pts * MIN_CREDIT_PCT_OF_WING:.2f}). "
                 f"R/R too poor."
             )
+            self._last_gate_rejection = {
+                "gate": "min_credit", "value": round(net_credit, 2),
+                "threshold": round(spread_width_pts * MIN_CREDIT_PCT_OF_WING, 2), "reason": "RISK_REWARD_TOO_POOR",
+            }
             return
 
         # Margin check — in live mode verify we have enough balance before placing.
@@ -4255,6 +4316,10 @@ class LiveTradingEngine:
                 f"[CreditSpread] {symbol} skipped — insufficient margin "
                 f"(need ~Rs{required_margin:,.0f})"
             )
+            self._last_gate_rejection = {
+                "gate": "margin_passed", "value": None, "threshold": round(required_margin, 2),
+                "reason": "INSUFFICIENT_MARGIN",
+            }
             return
         self._audit_gate(strategy.name, "margin_passed")
 
@@ -5036,21 +5101,33 @@ class LiveTradingEngine:
             # credit_spread call site -- vix=None is now reachable here too.
             if vix is None:
                 logger.info(f"[IronCondor] {symbol} skipped — VIX unavailable (fail-closed, can't confirm premium is worth selling).")
+                self._last_gate_rejection = {
+                    "gate": "vix_passed", "value": None, "threshold": 12.0, "reason": "VIX_UNAVAILABLE",
+                }
             else:
                 logger.info(
                     f"[IronCondor] {symbol} skipped — VIX={vix:.1f} too low "
                     f"(need ≥12.0 for rich premium). Not worth selling condors."
                 )
+                self._last_gate_rejection = {
+                    "gate": "vix_passed", "value": round(vix, 2), "threshold": 12.0, "reason": "VIX_TOO_LOW",
+                }
             return
         self._audit_gate(strategy.name, "vix_passed")
         if not iv_rank_allows_selling(iv_rank):
             if iv_rank is None:
                 logger.info(f"[IronCondor] {symbol} skipped — IV Rank unavailable (fail-closed, can't confirm premium is worth selling).")
+                self._last_gate_rejection = {
+                    "gate": "iv_rank_passed", "value": None, "threshold": 0.30, "reason": "IV_RANK_UNAVAILABLE",
+                }
             else:
                 logger.info(
                     f"[IronCondor] {symbol} skipped — IV Rank={iv_rank:.2f} too low "
                     f"(need ≥0.30). Premium too cheap."
                 )
+                self._last_gate_rejection = {
+                    "gate": "iv_rank_passed", "value": round(iv_rank, 2), "threshold": 0.30, "reason": "IV_RANK_TOO_LOW",
+                }
             return
         self._audit_gate(strategy.name, "iv_rank_passed")
 
@@ -5074,6 +5151,9 @@ class LiveTradingEngine:
                 f"[IronCondor] {symbol} skipped — PCR={pcr:.2f} is extreme "
                 f"(need 0.7–1.4 for neutral condor). Market too directional."
             )
+            self._last_gate_rejection = {
+                "gate": "direction_passed", "value": round(pcr, 2), "threshold": "0.7-1.4", "reason": "PCR_TOO_DIRECTIONAL",
+            }
             return
         self._audit_gate(strategy.name, "direction_passed")
 
@@ -5105,12 +5185,18 @@ class LiveTradingEngine:
                 f"[IronCondor] {symbol} skipped — ADX not yet computable "
                 "(insufficient history; cannot confirm market is range-bound)"
             )
+            self._last_gate_rejection = {
+                "gate": "adx_passed", "value": None, "threshold": 20, "reason": "ADX_UNAVAILABLE",
+            }
             return
         if _adx_ic >= 20:
             logger.info(
                 f"[IronCondor] {symbol} skipped — ADX={_adx_ic:.1f} >= 20 "
                 "(market trending; range-bound thesis invalid)"
             )
+            self._last_gate_rejection = {
+                "gate": "adx_passed", "value": round(_adx_ic, 2), "threshold": 20, "reason": "ADX_TOO_HIGH_TRENDING",
+            }
             return
         self._audit_gate(strategy.name, "adx_passed")
 
@@ -5120,6 +5206,9 @@ class LiveTradingEngine:
             logger.info(
                 f"[IronCondor] {symbol} skipped — earnings or NSE event within 5 days"
             )
+            self._last_gate_rejection = {
+                "gate": "event_calendar_passed", "value": True, "threshold": False, "reason": "EVENT_WITHIN_5_DAYS",
+            }
             return
         self._audit_gate(strategy.name, "event_calendar_passed")
 
@@ -5270,6 +5359,10 @@ class LiveTradingEngine:
                 f"too low (min ₹{MIN_CONDOR_NET_CREDIT:.0f} after fees). "
                 f"PS@{put_short_p} PL@{put_long_p} CS@{call_short_p} CL@{call_long_p} x {lot_size} lots."
             )
+            self._last_gate_rejection = {
+                "gate": "min_credit", "value": round(total_credit, 2),
+                "threshold": MIN_CONDOR_NET_CREDIT, "reason": "NET_CREDIT_BELOW_FEE_FLOOR",
+            }
             return
 
         # Risk/reward check: each wing's net credit must be ≥ 20% of that wing's width.
@@ -5284,12 +5377,20 @@ class LiveTradingEngine:
                 f"[IronCondor] {symbol} skipped — put wing credit ₹{put_wing_credit:.2f} < "
                 f"20% of wing ({put_wing_width} pts × 20% = ₹{put_wing_width * MIN_WING_CREDIT_PCT:.2f})."
             )
+            self._last_gate_rejection = {
+                "gate": "min_credit", "value": round(put_wing_credit, 2),
+                "threshold": round(put_wing_width * MIN_WING_CREDIT_PCT, 2), "reason": "PUT_WING_RISK_REWARD_TOO_POOR",
+            }
             return
         if call_wing_credit < call_wing_width * MIN_WING_CREDIT_PCT:
             logger.info(
                 f"[IronCondor] {symbol} skipped — call wing credit ₹{call_wing_credit:.2f} < "
                 f"20% of wing ({call_wing_width} pts × 20% = ₹{call_wing_width * MIN_WING_CREDIT_PCT:.2f})."
             )
+            self._last_gate_rejection = {
+                "gate": "min_credit", "value": round(call_wing_credit, 2),
+                "threshold": round(call_wing_width * MIN_WING_CREDIT_PCT, 2), "reason": "CALL_WING_RISK_REWARD_TOO_POOR",
+            }
             return
 
         # Margin check — condor requires margin for the wider of the two wings
@@ -5300,6 +5401,10 @@ class LiveTradingEngine:
                 f"[IronCondor] {symbol} skipped — insufficient margin "
                 f"(need ~Rs{required_margin:,.0f})"
             )
+            self._last_gate_rejection = {
+                "gate": "margin_passed", "value": None, "threshold": round(required_margin, 2),
+                "reason": "INSUFFICIENT_MARGIN",
+            }
             return
         self._audit_gate(strategy.name, "margin_passed")
 

@@ -160,6 +160,61 @@ async def test_mtf_strict_disagreement_captures_direction_detail():
 
 
 @pytest.mark.asyncio
+async def test_rvol_rejection_detail_actually_reaches_the_persisted_trace_row():
+    """Fixed 2026-10-01: this file previously only asserted
+    fake._last_gate_rejection was set correctly, never that
+    _record_signal_trace() actually persists it -- the one place a real
+    end-to-end bug was hiding (the gate-name match in
+    _record_signal_trace() could never succeed, since last_gate_reached is
+    always the last-PASSED gate while _last_gate_rejection["gate"] is
+    always the gate that just FAILED). Drives the real _process_signal()
+    AND the real _record_signal_trace() together, same as live traffic
+    does each cycle, to close that gap."""
+    from src.database.models.signal_decision_trace import SignalDecisionTrace
+    from src.database.repositories.base import BaseRepository
+
+    class _FakeRepo:
+        created = []
+
+        def __init__(self, model, session):
+            pass
+
+        async def create(self, obj_in):
+            _FakeRepo.created.append(obj_in)
+            return obj_in
+
+    fake = _FakeEngine({
+        "close": 1200.0, "ltp_source": "live_tick",
+        "rvol": 0.9, "rvol_valid": True,       # below threshold
+        "adx14": 30.0, "adx_valid": True,
+    })
+    fake._record_signal_trace = LiveTradingEngine._record_signal_trace.__get__(fake)
+    fake._classify_signal_error = staticmethod(LiveTradingEngine._classify_signal_error)
+    fake._compute_trade_quality_score = LiveTradingEngine._compute_trade_quality_score.__get__(fake)
+    fake._record_rejected_outcome = LiveTradingEngine._record_rejected_outcome.__get__(fake)
+    fake._last_signal_metrics = {}
+    strategy = SimpleNamespace(
+        name="ema_crossover_v1", is_active=True, min_dte=0, max_dte=999,
+        rvol_hard_gate=True, rvol_entry_threshold=1.3,
+        generate_signal=lambda market_data: SignalType.SELL,
+    )
+
+    import unittest.mock as _mock
+    import src.database.repositories.base as base_mod
+    with _mock.patch.object(base_mod, "BaseRepository", _FakeRepo):
+        _FakeRepo.created = []
+        gates_before = dict(fake._signal_gate_stats.get("ema_crossover_v1", {}))
+        await LiveTradingEngine._process_signal(fake, strategy, "SBIN", vix=15.0, regime="TRENDING")
+        await fake._record_signal_trace("ema_crossover_v1", "SBIN", "TRENDING", gates_before)
+
+    trace_rows = [r for r in _FakeRepo.created if "last_gate_reached" in r]
+    assert len(trace_rows) == 1
+    row = trace_rows[0]
+    assert row["final_decision"] == "REJECTED"
+    assert row["detail"] == "RVOL_BELOW_THRESHOLD value=0.9 threshold=1.3"
+
+
+@pytest.mark.asyncio
 async def test_rejection_detail_is_cleared_between_calls_on_the_same_engine():
     # A rejection recorded for one symbol must never leak into a later
     # candidate that doesn't hit any gate-failure branch itself.

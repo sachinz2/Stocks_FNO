@@ -101,6 +101,31 @@ async def test_rejected_reports_the_last_single_leg_gate_reached():
 
 
 @pytest.mark.asyncio
+async def test_rejected_detail_populates_from_last_gate_rejection_despite_name_mismatch():
+    """Fixed 2026-10-01 (external review, demonstrated with a real repro):
+    last_gate_reached is ALWAYS the last-PASSED gate (e.g. "dte_passed" when
+    RVOL causes rejection -- see the test above), while
+    _last_gate_rejection["gate"] is ALWAYS the gate that just FAILED (e.g.
+    "rvol_passed"). Those two names can never be equal by construction --
+    requiring them to match (the pre-fix behavior) meant `detail` was
+    silently None for every single rejected candidate, on every strategy,
+    since this feature was added on 2026-09-16, despite
+    _last_gate_rejection itself always being populated correctly."""
+    gates_before = {"signal_generated": 3, "dte_passed": 3}
+    gates_after = {"signal_generated": 4, "dte_passed": 4}  # rvol_passed never incremented
+    fake = _FakeTraceEngine({"ema_crossover_v1": gates_after})
+    fake._last_gate_rejection = {
+        "gate": "rvol_passed", "value": 0.9, "threshold": 1.3, "reason": "RVOL_BELOW_THRESHOLD",
+    }
+
+    await fake._record_signal_trace("ema_crossover_v1", "PAYTM", "TRENDING", gates_before)
+
+    row = _FakeTraceRepo.created[0]
+    assert row["last_gate_reached"] == "dte_passed"  # unchanged, correct as-is
+    assert row["detail"] == "RVOL_BELOW_THRESHOLD value=0.9 threshold=1.3"
+
+
+@pytest.mark.asyncio
 async def test_rejected_reports_the_last_spread_pipeline_gate_reached():
     # credit_spread_v1's own pipeline (dte -> lot_size -> vix -> iv_rank ->
     # direction -> adx -> event_calendar -> contract_resolved -> margin ->

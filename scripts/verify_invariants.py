@@ -741,6 +741,55 @@ def check_low_vol_regime_has_no_structurally_impossible_strategy(repo: Path) -> 
     return PASS, name, f"LOW_VOL maps to {body!r} -- no VIX>=12-gated strategy listed."
 
 
+def check_rejected_outcome_detail_actually_matches(repo: Path) -> Result:
+    name = "SignalDecisionTrace's rejection detail isn't dead code -- the gate-name match that always failed is gone"
+    src = _read(repo, "src/live_trading/live_trading_engine.py")
+    idx = src.find('final_decision = "REJECTED"')
+    if idx == -1:
+        return FAIL, name, "Could not locate the REJECTED branch in _record_signal_trace()."
+    body = src[idx: idx + 2500]
+    if 'if _rej and _rej.get("gate") == last_gate:' in body:
+        return FAIL, name, (
+            "_record_signal_trace() still requires _rej.get('gate') == last_gate before trusting "
+            "_last_gate_rejection -- last_gate_reached is ALWAYS the last-PASSED gate (e.g. "
+            "'dte_passed' when RVOL causes rejection -- this is correct, tested behavior) while "
+            "_last_gate_rejection['gate'] is ALWAYS the gate that just FAILED (e.g. 'rvol_passed'). "
+            "Those names can never be equal by construction, so this condition is always False -- "
+            "`detail` silently stays None for every rejected candidate, on every strategy, "
+            "regardless of how well-instrumented the gate check itself is. Confirmed live "
+            "2026-10-01 via a real _process_signal()->_record_signal_trace() repro."
+        )
+    if "if _rej:" not in body:
+        return FAIL, name, "Could not confirm the simplified 'if _rej:' check is present."
+    return PASS, name, "Rejection detail is trusted on its mere presence this cycle, not an impossible gate-name match."
+
+
+def check_spread_condor_have_granular_rejection_detail(repo: Path) -> Result:
+    name = "credit_spread_v1/iron_condor_v1 set _last_gate_rejection at their own gates too, not just single-leg's RVOL/ADX/RS/MTF"
+    src = _read(repo, "src/live_trading/live_trading_engine.py")
+    for method_name, min_sites in (
+        ("async def _process_credit_spread(", 11),
+        ("async def _process_iron_condor(", 11),
+    ):
+        idx = src.find(method_name)
+        if idx == -1:
+            return FAIL, name, f"{method_name} not found."
+        end = src.find("\n    async def ", idx + 10)
+        body = src[idx: end if end != -1 else idx + 20000]
+        count = body.count("self._last_gate_rejection = {")
+        if count < min_sites:
+            return FAIL, name, (
+                f"{method_name.split('(')[0].replace('async def ', '')} only sets "
+                f"_last_gate_rejection at {count} site(s), expected >= {min_sites} -- confirmed "
+                "live 2026-10-01 (external review push-back on an earlier 'already satisfied by "
+                "existing infrastructure' claim) that these two strategies' own gates (VIX, IV "
+                "Rank, VWAP/PCR direction, ADX, event calendar, net credit, margin) never set "
+                "it at all, unlike the single-leg pipeline's RVOL/ADX/RS/MTF checks -- rejections "
+                "had a gate NAME (last_gate_reached) but no specific numeric reason."
+            )
+    return PASS, name, "Both spread/condor strategies set granular rejection detail at their own gates."
+
+
 def check_gate_bottleneck_alerting_is_wired(repo: Path) -> Result:
     name = "Daily report watches for a sustained gate-to-gate conversion bottleneck, not just total silence"
     src = _read(repo, "src/live_trading/live_trading_engine.py")
@@ -1011,6 +1060,8 @@ STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_paused_signal_outcome_tracking_covers_both_single_leg_strategies,
     check_spread_entry_prices_fail_closed_on_missing_quote,
     check_momentum_trend_validity_survives_an_adx_dip,
+    check_rejected_outcome_detail_actually_matches,
+    check_spread_condor_have_granular_rejection_detail,
 ]
 
 
