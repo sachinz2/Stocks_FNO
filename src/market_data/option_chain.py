@@ -656,38 +656,54 @@ async def get_entry_prices_for_spread(
     long_otm_intervals: int = 2,
 ) -> Optional[Tuple[float, float]]:
     """
-    Get short + long leg prices.
-    Tries real Zerodha quotes first; falls back to ATR-based estimate only
-    for a leg whose real quote is genuinely unavailable.
-    Returns (short_price, long_price), or None if the resulting prices are
+    Get short + long leg prices. Returns (short_price, long_price), or None
+    if either leg's real quote is unavailable or the resulting prices are
     inverted (short <= long) -- a real credit spread cannot have a negative
     net credit, and this shape almost always means at least one quote is
     stale/thin/unreliable rather than that the market is genuinely priced
     that way.
 
-    Fixed 2026-08-21 (deep review): the inversion branch used to discard
-    BOTH legs' prices -- including a perfectly good real quote -- and
-    substitute fabricated ATR estimates for both, which the caller then
-    used directly as the real LIMIT order price. That contradicts the
-    fail-closed convention already established for the single-leg entry
-    path in the engine (skip the entry rather than place a LIMIT order on a
-    guessed price) -- extended here: an inversion now fails closed (returns
-    None, caller skips the entry) instead of fabricating a tradeable price.
-    """
-    from src.core.utils import estimate_option_premium
+    Fixed 2026-10-01 (external review, confirmed against the actual code):
+    this used to silently substitute an ATR-based ESTIMATE
+    (estimate_option_premium()) for whichever leg's real quote was
+    unavailable, and only failed closed on the resulting INVERSION edge
+    case -- a single missing quote whose estimate still happened to produce
+    a non-inverted pair sailed through as if both legs were real. That
+    directly contradicted the caller's own log message ("fail-closed, not
+    placing a LIMIT order on a guessed price") -- the guarantee only
+    actually covered the inversion case, not "a quote was genuinely
+    missing," the much more common failure mode. Matches the identical
+    fail-open gap already fixed in vix_allows_selling()/
+    iv_rank_allows_selling() on 2026-08-28 for the same reason: a data
+    outage is a data outage regardless of paper vs. live mode -- paper
+    trading validates what live behavior would be, not a looser mode with
+    weaker gates. atr/dte/*_otm_intervals are no longer used for pricing
+    (kept in the signature -- harmless, call sites already compute them for
+    other purposes) now that there's no estimate fallback to feed.
 
+    Fixed 2026-08-21 (deep review, superseded by the above but kept for
+    context): the inversion branch used to discard BOTH legs' prices --
+    including a perfectly good real quote -- and substitute fabricated ATR
+    estimates for both; an inversion fails closed instead of fabricating a
+    tradeable price.
+    """
     short_real = await get_option_quote(short_contract, kite, redis)
     long_real = await get_option_quote(long_contract, kite, redis)
 
-    short_price = short_real if short_real and short_real > 0 else estimate_option_premium(atr, dte, short_otm_intervals)
-    long_price = long_real if long_real and long_real > 0 else estimate_option_premium(atr, dte, long_otm_intervals)
-
-    # Sanity check: net credit must be positive
-    if short_price <= long_price:
+    if not short_real or short_real <= 0 or not long_real or long_real <= 0:
         logger.warning(
-            f"Spread prices inverted ({short_contract}=₹{short_price} <= {long_contract}=₹{long_price}). "
-            "Fail-closed: not placing a LIMIT order on a guessed/unreliable price -- skipping entry."
+            f"Real quote unavailable for {short_contract}=₹{short_real} / "
+            f"{long_contract}=₹{long_real}. Fail-closed: not placing a LIMIT "
+            "order on an estimated price -- skipping entry."
         )
         return None
 
-    return round(short_price, 2), round(long_price, 2)
+    # Sanity check: net credit must be positive
+    if short_real <= long_real:
+        logger.warning(
+            f"Spread prices inverted ({short_contract}=₹{short_real} <= {long_contract}=₹{long_real}). "
+            "Fail-closed: not placing a LIMIT order on an unreliable price -- skipping entry."
+        )
+        return None
+
+    return round(short_real, 2), round(long_real, 2)

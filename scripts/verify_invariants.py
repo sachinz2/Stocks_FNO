@@ -384,6 +384,51 @@ def check_stale_option_price_resolved(repo: Path) -> Result:
     return PASS, name, "resolve_reliable_option_price() present and wired into the LTP poller."
 
 
+def check_spread_entry_prices_fail_closed_on_missing_quote(repo: Path) -> Result:
+    name = "get_entry_prices_for_spread() fails closed on ANY missing real quote, not just an inverted estimate"
+    src = _read(repo, "src/market_data/option_chain.py")
+    idx = src.find("async def get_entry_prices_for_spread(")
+    if idx == -1:
+        return FAIL, name, "get_entry_prices_for_spread() not found."
+    body = src[idx: idx + 3500]
+    if "else estimate_option_premium(" in body:
+        return FAIL, name, (
+            "get_entry_prices_for_spread() references estimate_option_premium() again -- it used "
+            "to silently substitute an ATR-based ESTIMATE for whichever leg's real quote was "
+            "unavailable, and only failed closed on the resulting INVERSION edge case. A single "
+            "missing quote whose estimate still produced a non-inverted pair sailed through as a "
+            "real tradeable price, contradicting the caller's own 'fail-closed, not placing a "
+            "LIMIT order on a guessed price' log message. Confirmed live 2026-10-01 (external review)."
+        )
+    if "if not short_real or short_real <= 0 or not long_real or long_real <= 0" not in body:
+        return FAIL, name, "The explicit missing-quote guard (both legs must be real and positive) is missing."
+    return PASS, name, "Both legs require a real, positive quote; no ATR estimate can produce a tradeable spread price."
+
+
+def check_momentum_trend_validity_survives_an_adx_dip(repo: Path) -> Result:
+    name = "Momentum's pullback tracking survives an ADX dip above the exit floor, doesn't wipe on any raw=None"
+    src = _read(repo, "src/strategies/momentum.py")
+    if "trend_still_valid" not in src:
+        return FAIL, name, (
+            "trend_still_valid is missing -- _pullback_continuation_signal() used to fully reset "
+            "ESTABLISHED/PULLBACK tracking (_trend_state, _pullback_ref) the instant `raw` went "
+            "None, and raw requires ADX to be higher than the immediately preceding bar on EVERY "
+            "bar (adx_rising_required), not just the first. A still-strong trend (e.g. ADX "
+            "50->49) got its tracked state -- including _pullback_ref, the level a later breakout "
+            "needs to break out from -- wiped the moment ADX merely stopped increasing. Confirmed "
+            "live 2026-10-01 (external review)."
+        )
+    idx = src.find("def _pullback_continuation_signal(")
+    if idx == -1:
+        return FAIL, name, "_pullback_continuation_signal() not found."
+    body = src[idx: idx + 9000]
+    if "trend_still_valid: Optional[str] = None" not in body:
+        return FAIL, name, "_pullback_continuation_signal() no longer accepts trend_still_valid as a parameter."
+    if "raw = trend_still_valid" not in body:
+        return FAIL, name, "_pullback_continuation_signal() no longer substitutes trend_still_valid for raw when continuing an already-tracked setup."
+    return PASS, name, "Already-tracked momentum setups are maintained via the looser trend_still_valid check, not reset on any raw=None."
+
+
 def check_auth_self_heal_actively_retries(repo: Path) -> Result:
     name = "Kite auth self-heal actively retries login, not just waits for the 08:30 job"
     utils_src = _read(repo, "src/core/utils.py")
@@ -964,6 +1009,8 @@ STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_capital_release_uses_unfilled_remainder_not_full_quantity,
     check_stale_order_retry_resyncs_before_computing_remainder,
     check_paused_signal_outcome_tracking_covers_both_single_leg_strategies,
+    check_spread_entry_prices_fail_closed_on_missing_quote,
+    check_momentum_trend_validity_survives_an_adx_dip,
 ]
 
 

@@ -452,6 +452,26 @@ class MomentumStrategy(StrategyBase):
         if adx >= self.adx_entry_threshold and ema_spread_pct >= self.min_ema_spread_pct:
             raw = "BUY" if fast_ema > slow_ema else "SELL"
 
+        # Fixed 2026-10-01 (external review, confirmed against the actual
+        # code): trend_still_valid is the LOOSER "is an already-tracked
+        # trend still structurally intact" check -- direction + the same
+        # adx_exit_threshold already used to decide when an OPEN position's
+        # trend has exhausted (see manage_position()) -- but NOT requiring
+        # ADX to keep rising or EMA20 to keep sloping every single bar, the
+        # way `raw` (below) does. Same separation already proven for
+        # entry_extension_ok/vwap on 2026-08-27 (see
+        # _pullback_continuation_signal()'s docstring): continuously
+        # re-demanding "trend strength is still ACCELERATING" just to
+        # MAINTAIN a setup already being tracked would wipe a perfectly
+        # good, still-intact ESTABLISHED/PULLBACK setup the moment ADX
+        # dipped even 1 point vs. 2 bars ago (e.g. 50->49) -- indistinguishable
+        # from the trend genuinely ending, destroying the exact reference
+        # level (_pullback_ref) a later breakout needs to break out from.
+        # `raw` stays reserved for the stricter FRESH-qualification moment.
+        trend_still_valid = None
+        if adx >= self.adx_exit_threshold and ema_spread_pct >= self.min_ema_spread_pct:
+            trend_still_valid = "BUY" if fast_ema > slow_ema else "SELL"
+
         # Fixed 2026-08-20 (external review integration): four additional
         # entry-quality filters -- see initialize()'s parameter comments for
         # the rationale on each. All fail CLOSED on insufficient history
@@ -539,6 +559,7 @@ class MomentumStrategy(StrategyBase):
         if self.use_pullback_continuation_model:
             return self._pullback_continuation_signal(
                 symbol, raw, data, bar_key, entry_extension_ok=(extension_ok and vwap_ok),
+                trend_still_valid=trend_still_valid,
             )
         legacy_raw = raw if (extension_ok and vwap_ok) else None
         return self._legacy_confirm_bars_signal(symbol, legacy_raw, adx, ema_spread_pct, bar_key)
@@ -625,7 +646,7 @@ class MomentumStrategy(StrategyBase):
 
     def _pullback_continuation_signal(
         self, symbol: str, raw: Optional[str], data: Dict[str, Any], bar_key: Optional[str],
-        entry_extension_ok: bool = True,
+        entry_extension_ok: bool = True, trend_still_valid: Optional[str] = None,
     ) -> str:
         """
         Event-based confirmation (external review, round 2, sections 8/9/13):
@@ -659,12 +680,15 @@ class MomentumStrategy(StrategyBase):
           PULLBACK -> fires: a later bar's close breaks back through
               _pullback_ref in the trend's direction, with RVOL confirmation
               (see the two-tier check below) -- this is the actual "event."
-          PULLBACK -> reset: quality gate drops out, direction flips, or the
+          PULLBACK -> reset: direction flips, the trend is no longer
+              structurally valid (see trend_still_valid below), or the
               pullback persists longer than max_pullback_bars without a
               qualifying breakout.
-        Fully resets (both directions) whenever `raw` is None, matching the
-        legacy model's behavior of clearing state the moment the trend
-        condition itself is no longer met.
+        Resets (both directions) when there's nothing tracked yet and `raw`
+        is None (no fresh candidate either), or when something IS tracked
+        but `trend_still_valid` no longer agrees with the tracked
+        direction -- see the 2026-10-01 fix note below for why this is
+        `trend_still_valid`, not `raw`.
 
         Fixed 2026-08-27 (live incident): entry_extension_ok used to be
         folded into `raw` itself (generate_signal() set raw=None whenever
@@ -679,6 +703,26 @@ class MomentumStrategy(StrategyBase):
         entry_extension_ok only gates the FRESH-qualification moment
         (starting to track a new setup); once already tracking, further
         extension no longer resets progress on its own.
+
+        Fixed 2026-10-01 (external review, confirmed against the actual
+        code): `raw` itself had the EXACT same class of bug the fix above
+        addresses, just via a different pair of gates (adx_rising_required/
+        ema_slope_required instead of extension/VWAP) -- this function used
+        to fully reset the moment `raw` went None, and `raw` requires ADX
+        to be higher than 2 bars ago on EVERY bar, not just the first one.
+        A perfectly good, still-strong established trend (e.g. ADX
+        50->49->48, still way above any reasonable "trend is over" bar)
+        got its tracked state wiped the instant ADX merely stopped
+        INCREASING -- destroying _pullback_ref, the exact reference level a
+        later breakout needs to break out from, even though nothing about
+        the trend itself had actually ended. `trend_still_valid` (see
+        generate_signal()) is the same direction/spread check but against
+        the looser adx_exit_threshold instead of requiring ADX to keep
+        rising -- when raw is None but trend_still_valid still agrees with
+        the already-tracked direction, `raw` is substituted with it below
+        so the rest of this function proceeds exactly as if this bar had
+        freshly qualified too. `raw` stays the sole gate for anything NOT
+        already tracked (nothing to protect yet).
         """
         close = data.get("close")
         # Fixed 2026-09-04 (live incident): this whole function only advances
@@ -711,12 +755,31 @@ class MomentumStrategy(StrategyBase):
                 self._rvol_history.setdefault(symbol, []).append(rvol)
                 self._rvol_history[symbol] = self._rvol_history[symbol][-self.max_pullback_bars:]
 
-        if raw is None or close is None:
-            if self._trend_state.get(symbol):
-                logger.info(f"[{self.name}] {symbol} pullback setup cleared — quality gate no longer met")
+        if close is None:
             self._reset_pullback_state(symbol)
             self._rvol_history.pop(symbol, None)
             return "HOLD"
+
+        if raw is None:
+            tracked_direction = self._trend_direction.get(symbol)
+            if tracked_direction is not None and trend_still_valid == tracked_direction:
+                # See the 2026-10-01 fix note above: the stricter fresh-
+                # qualification bar didn't hold this cycle, but the looser
+                # trend_still_valid check confirms the already-tracked
+                # trend is still structurally intact in the same direction
+                # -- keep tracking. Substituting raw lets everything below
+                # (which compares against raw) proceed exactly as if this
+                # bar had qualified fresh too.
+                raw = trend_still_valid
+            else:
+                if self._trend_state.get(symbol):
+                    logger.info(
+                        f"[{self.name}] {symbol} pullback setup cleared — trend no longer "
+                        "structurally valid (ADX/spread dropped below the exit floor, or direction flipped)"
+                    )
+                self._reset_pullback_state(symbol)
+                self._rvol_history.pop(symbol, None)
+                return "HOLD"
 
         state     = self._trend_state.get(symbol)
         direction = self._trend_direction.get(symbol)
