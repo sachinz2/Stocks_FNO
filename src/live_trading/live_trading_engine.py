@@ -87,7 +87,7 @@ _CANONICAL_GATE_ORDER = [
     "event_calendar_passed",                                         # spread/condor only
     "rs_passed", "mtf_passed", "lot_passed",                         # single-leg only
     "contract_resolved",                                             # shared
-    "option_quality_passed",                                         # single-leg only, added 2026-09-16
+    "option_quality_passed",                                         # shared, added 2026-09-16 (single-leg), extended to spread/condor 2026-10-01
     "margin_passed",                                                 # spread/condor only
     "trade_placed",                                                  # shared, terminal
 ]
@@ -4239,6 +4239,11 @@ class LiveTradingEngine:
             )
             return
         short_p, long_p = _entry_prices
+
+        if not await self._check_multi_leg_liquidity(strategy, "CreditSpread", [short_contract, long_contract]):
+            return
+        self._audit_gate(strategy.name, "option_quality_passed")
+
         net_credit = round(short_p - long_p, 2)
         total_credit = net_credit * lot_size
 
@@ -5347,6 +5352,11 @@ class LiveTradingEngine:
             return
         put_short_p, put_long_p = _put_prices
         call_short_p, call_long_p = _call_prices
+
+        if not await self._check_multi_leg_liquidity(strategy, "IronCondor", [psc, plc, csc, clc]):
+            return
+        self._audit_gate(strategy.name, "option_quality_passed")
+
         net_credit   = round((put_short_p - put_long_p) + (call_short_p - call_long_p), 2)
         total_credit = net_credit * lot_size
 
@@ -6734,6 +6744,53 @@ class LiveTradingEngine:
             logger.error(f"TradeJournal close log failed: {e}")
 
     # ── IV / VIX helpers ──────────────────────────────────────────────────────
+
+    async def _check_multi_leg_liquidity(self, strategy, label: str, contracts: List[str]) -> bool:
+        """
+        Bid-ask-spread liquidity check for multi-leg entries (credit_spread_v1/
+        iron_condor_v1) -- mirrors _process_signal()'s option_quality_check
+        (2026-09-16, "Trade Quality Layer" v1) for single-leg entries, which
+        this never had despite placing the exact same kind of real LIMIT
+        order against real option contracts.
+
+        Added 2026-10-01 after tracing two real catastrophic single-leg
+        losses to this exact gap: KAYNES (ema_crossover_v1, -67.2% in 38
+        minutes while the underlying moved -0.13%) and IDEA (momentum_v1, a
+        stop-loss DECIDED at -18.6% that actually FILLED at -45.7%) both
+        happened on thin, wide-bid-ask-spread contracts, both BEFORE
+        option_quality_check existed (2026-09-16) -- confirmed via git
+        history, both trades predate that commit by weeks. The filter closed
+        this gap for single-leg entries, but credit_spread_v1/iron_condor_v1
+        never got the equivalent protection, despite being just as exposed:
+        a wide spread on even one leg of a multi-leg structure means a LIMIT
+        order at the quoted price either won't fill or fills far from the
+        price the credit/margin calculation was based on.
+
+        Returns True if every contract's spread is within tolerance (or the
+        check is disabled/unmeasurable -- same fail-OPEN-when-unmeasurable,
+        fail-CLOSED-when-too-wide convention as the single-leg version, see
+        get_option_quality_metrics()'s docstring), False on the first
+        contract whose spread is confirmed too wide.
+        """
+        if not getattr(strategy, "option_quality_check", True):
+            return True
+        from src.market_data.option_chain import get_option_quality_metrics
+        kite = getattr(self, "_kite", None)
+        for contract in contracts:
+            quality = await get_option_quality_metrics(contract, kite)
+            spread_pct = quality.get("spread_pct") if quality else None
+            if spread_pct is not None and spread_pct > self._OPTION_MAX_SPREAD_PCT:
+                logger.info(
+                    f"[{label}] skipped — {contract} bid-ask spread {spread_pct:.2f}% > "
+                    f"{self._OPTION_MAX_SPREAD_PCT}% (illiquid contract, LIMIT order "
+                    "unlikely to fill near the quoted price)."
+                )
+                self._last_gate_rejection = {
+                    "gate": "option_quality_passed", "value": spread_pct,
+                    "threshold": self._OPTION_MAX_SPREAD_PCT, "reason": "OPTION_SPREAD_TOO_WIDE",
+                }
+                return False
+        return True
 
     async def _check_available_margin(self, required: float) -> bool:
         """

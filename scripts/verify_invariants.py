@@ -473,6 +473,34 @@ def check_single_leg_dte_window_covers_post_roll_dte(repo: Path) -> Result:
     return PASS, name, "Both single-leg strategies' max_dte covers the worst-case post-roll DTE (41)."
 
 
+def check_spread_condor_have_liquidity_check(repo: Path) -> Result:
+    name = "credit_spread_v1/iron_condor_v1 check bid-ask spread liquidity before entry, same as single-leg strategies"
+    src = _read(repo, "src/live_trading/live_trading_engine.py")
+    if "async def _check_multi_leg_liquidity(" not in src:
+        return FAIL, name, (
+            "_check_multi_leg_liquidity() missing -- single-leg strategies got a bid-ask-spread "
+            "liquidity check on 2026-09-16 (option_quality_check), but credit_spread_v1/"
+            "iron_condor_v1 never did, despite placing real multi-leg LIMIT orders the same way. "
+            "Confirmed live 2026-10-01: two catastrophic single-leg losses (KAYNES -67.2% on a "
+            "-0.13% underlying move, IDEA's stop-loss decided at -18.6% but filled at -45.7%) "
+            "both traced to thin, wide-spread contracts traded before that filter existed -- "
+            "the same risk was never closed for spread/condor entries."
+        )
+    cs_idx = src.find("async def _process_credit_spread(")
+    ic_idx = src.find("async def _process_iron_condor(")
+    if cs_idx == -1 or ic_idx == -1:
+        return FAIL, name, "Could not locate _process_credit_spread()/_process_iron_condor()."
+    cs_end = src.find("\n    async def ", cs_idx + 10)
+    ic_end = src.find("\n    async def ", ic_idx + 10)
+    cs_body = src[cs_idx: cs_end if cs_end != -1 else cs_idx + 6000]
+    ic_body = src[ic_idx: ic_end if ic_end != -1 else ic_idx + 6000]
+    if "_check_multi_leg_liquidity(" not in cs_body:
+        return FAIL, name, "_process_credit_spread() does not call _check_multi_leg_liquidity()."
+    if "_check_multi_leg_liquidity(" not in ic_body:
+        return FAIL, name, "_process_iron_condor() does not call _check_multi_leg_liquidity()."
+    return PASS, name, "Both spread/condor strategies check every leg's bid-ask spread before entry."
+
+
 def check_strike_interval_derived_from_real_contracts(repo: Path) -> Result:
     name = "Strike interval is derived from the real contract cache, not just the static table"
     oc_src = _read(repo, "src/market_data/option_chain.py")
@@ -1062,6 +1090,7 @@ STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_momentum_trend_validity_survives_an_adx_dip,
     check_rejected_outcome_detail_actually_matches,
     check_spread_condor_have_granular_rejection_detail,
+    check_spread_condor_have_liquidity_check,
 ]
 
 
