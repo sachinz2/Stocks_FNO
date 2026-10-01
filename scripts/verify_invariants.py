@@ -910,6 +910,46 @@ def check_paused_signal_outcome_tracking_covers_both_single_leg_strategies(repo:
     return PASS, name, "Every real paused EMA/momentum signal is recorded into RejectedSignalOutcome for forward-price tracking, independent of the RS-streak trial."
 
 
+def check_range_exception_experiment_tracks_market_direction(repo: Path) -> Result:
+    name = "Paused-signal outcomes record market_direction alongside regime, and the RANGE-exception endpoint exposes both"
+    engine_src = _read(repo, "src/live_trading/live_trading_engine.py")
+    idx = engine_src.find("async def _maybe_record_paused_signal_outcome(")
+    if idx == -1:
+        return FAIL, name, "_maybe_record_paused_signal_outcome() missing."
+    body = engine_src[idx: idx + 2500]
+    if "get_cached_market_direction" not in body:
+        return FAIL, name, (
+            "_maybe_record_paused_signal_outcome() no longer fetches market_direction -- "
+            "regime alone can't distinguish RANGE_BOUND+bullish from RANGE_BOUND+bearish, "
+            "which the 'RANGE exception experiment' (external review, 2026-10-01) needs to "
+            "build its 4-way condition table (RANGE+bullish+EMA BUY, RANGE+bearish+EMA SELL, "
+            "RANGE+bullish+Momentum BUY, RANGE+bearish+Momentum SELL)."
+        )
+
+    record_idx = engine_src.find("async def _record_rejected_outcome(")
+    if record_idx == -1:
+        return FAIL, name, "_record_rejected_outcome() missing."
+    record_body = engine_src[record_idx: record_idx + 3000]
+    if '"regime":' not in record_body or '"market_direction":' not in record_body:
+        return FAIL, name, "_record_rejected_outcome() no longer persists regime/market_direction onto the RejectedSignalOutcome row."
+
+    model_src = _read(repo, "src/database/models/rejected_signal_outcome.py")
+    if "market_direction" not in model_src or "regime" not in model_src:
+        return FAIL, name, "RejectedSignalOutcome model is missing the regime/market_direction columns -- check migration b010 was applied."
+
+    detector_src = _read(repo, "src/market_data/regime_detector.py")
+    if "async def get_cached_market_direction(" not in detector_src:
+        return FAIL, name, "MarketRegimeDetector.get_cached_market_direction() missing -- paused-signal recording has nothing to call."
+
+    router_src = _read(repo, "src/api/routers/analytics_router.py")
+    if "/range-exception-experiment" not in router_src:
+        return FAIL, name, "/analytics/range-exception-experiment endpoint missing -- the 4-way condition table has no way to be queried."
+    if "market_direction" not in router_src:
+        return WARN, name, "/analytics router doesn't appear to expose market_direction anywhere -- check /rejected-outcomes and /range-exception-experiment."
+
+    return PASS, name, "market_direction is captured alongside regime on every paused-signal outcome row, persisted via migration b010, and queryable through /analytics/range-exception-experiment."
+
+
 def check_iv_history_refresh_decoupled_from_vix_gate(repo: Path) -> Result:
     name = "IV history refresh runs daily for the whole universe, independent of the VIX>=12 gate"
     engine_src = _read(repo, "src/live_trading/live_trading_engine.py")
@@ -1086,6 +1126,7 @@ STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_capital_release_uses_unfilled_remainder_not_full_quantity,
     check_stale_order_retry_resyncs_before_computing_remainder,
     check_paused_signal_outcome_tracking_covers_both_single_leg_strategies,
+    check_range_exception_experiment_tracks_market_direction,
     check_spread_entry_prices_fail_closed_on_missing_quote,
     check_momentum_trend_validity_survives_an_adx_dip,
     check_rejected_outcome_detail_actually_matches,

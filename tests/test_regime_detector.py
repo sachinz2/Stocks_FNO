@@ -239,6 +239,35 @@ async def test_get_cached_regime_still_returns_real_value_when_cached():
     assert await detector.get_cached_regime() == "VOLATILE"
 
 
+# ── get_cached_market_direction() (2026-10-01, RANGE exception experiment) ──
+
+class _FakeRedisRegimeWithDirection:
+    def __init__(self, regime: str, market_direction: str):
+        self._regime = regime
+        self._direction = market_direction
+
+    async def get(self, key):
+        return json.dumps({"regime": self._regime, "market_direction": self._direction})
+
+
+@pytest.mark.asyncio
+async def test_get_cached_market_direction_returns_none_on_missing_key():
+    detector = MRD(_FakeRedisMissing())
+    assert await detector.get_cached_market_direction() is None
+
+
+@pytest.mark.asyncio
+async def test_get_cached_market_direction_returns_none_on_redis_error():
+    detector = MRD(_FakeRedisBroken())
+    assert await detector.get_cached_market_direction() is None
+
+
+@pytest.mark.asyncio
+async def test_get_cached_market_direction_returns_real_value_when_cached():
+    detector = MRD(_FakeRedisRegimeWithDirection("RANGE_BOUND", "BEARISH"))
+    assert await detector.get_cached_market_direction() == "BEARISH"
+
+
 @pytest.mark.asyncio
 async def test_enforce_regime_switching_skips_enforcement_when_regime_unknown():
     """The exact live risk: a total outage/blip must not silently auto-permit

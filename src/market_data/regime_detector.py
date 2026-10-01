@@ -430,6 +430,30 @@ class MarketRegimeDetector:
             pass
         return None
 
+    async def get_cached_market_direction(self) -> Optional[str]:
+        """
+        Read market_direction (BULLISH/BEARISH/NEUTRAL) from the same
+        cached regime payload get_cached_regime() reads -- separate method
+        since most callers only want one or the other, not the full report.
+        Returns None if no data yet or on error, same fail-closed-to-None
+        convention as get_cached_regime().
+
+        Added 2026-10-01 for the paused-signal outcome tracker (see
+        LiveTradingEngine._maybe_record_paused_signal_outcome()) to record
+        which NIFTY direction a regime-paused candidate fired in -- needed
+        to eventually split "RANGE_BOUND + bearish EMA SELL" from
+        "RANGE_BOUND + bullish EMA SELL" the way the external review's
+        proposed RANGE-exception experiment asked for, which regime alone
+        can't distinguish.
+        """
+        try:
+            raw = await self._redis.get(REDIS_REGIME_KEY)
+            if raw:
+                return json.loads(raw).get("market_direction")
+        except Exception:
+            pass
+        return None
+
     async def get_regime_report(self) -> dict:
         """Full regime payload for the API."""
         try:

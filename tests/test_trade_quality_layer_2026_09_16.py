@@ -148,7 +148,8 @@ class _FakeTraceEngine:
         self._last_signal_metrics = metrics or {}
         self._recorded_outcomes = []
 
-    async def _record_rejected_outcome(self, strategy_name, symbol, last_gate, quality_score):
+    async def _record_rejected_outcome(self, strategy_name, symbol, last_gate, quality_score,
+                                        regime=None, market_direction=None):
         self._recorded_outcomes.append((strategy_name, symbol, last_gate, quality_score))
 
 

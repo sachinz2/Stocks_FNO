@@ -2682,7 +2682,7 @@ class LiveTradingEngine:
                     detail = f"{_rej['reason']} value={_rej['value']} threshold={_rej['threshold']}"[:255]
                 else:
                     detail = None
-                await self._record_rejected_outcome(strategy_name, symbol, last_gate, quality_score)
+                await self._record_rejected_outcome(strategy_name, symbol, last_gate, quality_score, regime=regime)
             if final_decision not in ("REJECTED", "ENTERED"):
                 quality_score = None
 
@@ -2856,11 +2856,28 @@ class LiveTradingEngine:
             except Exception:
                 pass
         quality_score = self._compute_trade_quality_score()
-        await self._record_rejected_outcome(strategy.name, symbol, "regime_paused", quality_score)
+        # Added 2026-10-01: market_direction (BULLISH/BEARISH/NEUTRAL) is
+        # needed alongside regime for the "RANGE exception experiment" --
+        # regime alone can't tell "RANGE_BOUND while NIFTY is bearish" apart
+        # from "RANGE_BOUND while NIFTY is bullish". Read from the same
+        # cached regime payload detect() just published this cycle -- see
+        # MarketRegimeDetector.get_cached_market_direction()'s docstring.
+        market_direction = None
+        _regime_detector = getattr(self, "regime_detector", None)
+        if _regime_detector:
+            try:
+                market_direction = await _regime_detector.get_cached_market_direction()
+            except Exception:
+                pass
+        await self._record_rejected_outcome(
+            strategy.name, symbol, "regime_paused", quality_score,
+            regime=regime, market_direction=market_direction,
+        )
 
     async def _record_rejected_outcome(
         self, strategy_name: str, symbol: str, last_gate: Optional[str],
         quality_score: Optional[int],
+        regime: Optional[str] = None, market_direction: Optional[str] = None,
     ) -> None:
         """
         Write the initial RejectedSignalOutcome row for a just-rejected BUY/
@@ -2875,6 +2892,12 @@ class LiveTradingEngine:
         early rejections (VOLATILE-regime BUY skip, daily order limit)
         return before that point and are silently skipped here -- there's no
         meaningful "what would have happened" baseline price for those.
+
+        regime/market_direction (added 2026-10-01, migration b010): optional
+        -- _record_signal_trace()'s REJECTED branch passes regime (already
+        in scope there, no extra cost); market_direction is only populated
+        by _maybe_record_paused_signal_outcome() (needs an extra Redis read,
+        not worth paying on every ordinary gate rejection).
         """
         m = self._last_signal_metrics
         signal_str = m.get("signal")
@@ -2894,6 +2917,8 @@ class LiveTradingEngine:
                 "rejected_at_gate":   last_gate,
                 "quality_score":      quality_score,
                 "close_at_rejection": close,
+                "regime":             regime,
+                "market_direction":   market_direction,
             })
         except Exception as exc:
             logger.debug(f"[RejectedOutcome] record failed (non-critical): {exc}")

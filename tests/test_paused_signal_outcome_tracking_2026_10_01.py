@@ -48,9 +48,12 @@ class _FakeOutcomeEngine:
     _compute_trade_quality_score = LiveTradingEngine._compute_trade_quality_score
     _PAUSED_SIGNAL_OUTCOME_STRATEGIES = LiveTradingEngine._PAUSED_SIGNAL_OUTCOME_STRATEGIES
 
-    def __init__(self, rs_ranks=None):
+    def __init__(self, rs_ranks=None, market_direction="BEARISH"):
         self._last_signal_metrics = {}
         self.rs_ranker = SimpleNamespace(get_ranks=AsyncMock(return_value=rs_ranks or []))
+        self.regime_detector = SimpleNamespace(
+            get_cached_market_direction=AsyncMock(return_value=market_direction),
+        )
 
 
 @pytest.mark.asyncio
@@ -69,6 +72,52 @@ async def test_records_a_paused_ema_sell_signal():
     assert row["rejected_at_gate"] == "regime_paused"
     assert row["close_at_rejection"] == 1200.0
     assert row["quality_score"] is not None
+
+
+@pytest.mark.asyncio
+async def test_records_regime_and_market_direction_for_the_range_exception_experiment():
+    """2026-10-01: regime alone can't distinguish RANGE_BOUND+bullish from
+    RANGE_BOUND+bearish -- market_direction (fetched from the regime
+    detector's own cached payload) must be recorded alongside it."""
+    fake = _FakeOutcomeEngine(market_direction="BEARISH")
+    strategy = SimpleNamespace(name="ema_crossover_v1")
+    market_data = {"close": 1200.0}
+
+    await fake._maybe_record_paused_signal_outcome(strategy, "LTF", "SELL", market_data, "RANGE_BOUND")
+
+    row = _FakeRepo.created[0]
+    assert row["regime"] == "RANGE_BOUND"
+    assert row["market_direction"] == "BEARISH"
+    fake.regime_detector.get_cached_market_direction.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_market_direction_is_none_when_regime_detector_is_unavailable():
+    fake = _FakeOutcomeEngine()
+    fake.regime_detector = None
+    strategy = SimpleNamespace(name="ema_crossover_v1")
+    market_data = {"close": 1200.0}
+
+    await fake._maybe_record_paused_signal_outcome(strategy, "LTF", "SELL", market_data, "RANGE_BOUND")
+
+    row = _FakeRepo.created[0]
+    assert row["regime"] == "RANGE_BOUND"
+    assert row["market_direction"] is None
+
+
+@pytest.mark.asyncio
+async def test_market_direction_fetch_failure_does_not_block_recording():
+    fake = _FakeOutcomeEngine()
+    fake.regime_detector = SimpleNamespace(
+        get_cached_market_direction=AsyncMock(side_effect=ConnectionError("redis down")),
+    )
+    strategy = SimpleNamespace(name="ema_crossover_v1")
+    market_data = {"close": 1200.0}
+
+    await fake._maybe_record_paused_signal_outcome(strategy, "LTF", "SELL", market_data, "RANGE_BOUND")
+
+    row = _FakeRepo.created[0]
+    assert row["market_direction"] is None
 
 
 @pytest.mark.asyncio

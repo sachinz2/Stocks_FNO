@@ -575,6 +575,8 @@ async def get_rejected_outcomes(
                 "close_30m":           r.close_30m,
                 "close_60m":           r.close_60m,
                 "outcome_complete":    r.outcome_complete,
+                "regime":              r.regime,
+                "market_direction":    r.market_direction,
             }
             for r in rows
         ]
@@ -630,6 +632,75 @@ async def get_rejected_outcomes_summary():
         return summary
     except Exception as e:
         logger.error(f"Analytics /rejected-outcomes-summary error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get("/range-exception-experiment")
+async def get_range_exception_experiment():
+    """
+    The "RANGE exception experiment" condition table (external review,
+    2026-10-01): is a regime-paused EMA/Momentum candidate's direction
+    (BUY/SELL) aligned with the broader NIFTY direction worth anything?
+    Splits regime_paused RejectedSignalOutcome rows by (strategy, signal,
+    regime, market_direction) -- e.g. "ema_crossover_v1 SELL candidates
+    while RANGE_BOUND+BEARISH" as its own bucket, distinct from "...while
+    RANGE_BOUND+BULLISH" -- which plain regime alone can't tell apart.
+
+    Only rows with regime/market_direction populated (added 2026-10-01,
+    migration b010) and a complete 60m outcome are included -- updates
+    automatically as _maybe_record_paused_signal_outcome() keeps recording
+    and the existing _backfill_rejected_outcomes() job (every 5 min,
+    unmodified) keeps filling in forward prices. No action needed to keep
+    this current; just query it again later for more data.
+
+    directional_pct_move_60m is signed so positive always means "the
+    candidate would have been profitable in its own direction" -- see
+    /rejected-outcomes-summary's identical convention.
+    """
+    try:
+        from sqlalchemy import select
+        from src.database.models.rejected_signal_outcome import RejectedSignalOutcome
+        async with AsyncSessionLocal() as session:
+            stmt = select(RejectedSignalOutcome).where(
+                RejectedSignalOutcome.rejected_at_gate == "regime_paused",
+                RejectedSignalOutcome.outcome_complete == True,  # noqa: E712
+                RejectedSignalOutcome.close_60m.isnot(None),
+                RejectedSignalOutcome.regime.isnot(None),
+                RejectedSignalOutcome.market_direction.isnot(None),
+            )
+            rows = (await session.execute(stmt)).scalars().all()
+
+        by_condition: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            pct_move = (r.close_60m - r.close_at_rejection) / r.close_at_rejection * 100
+            directional_pct_move = pct_move if r.signal == "BUY" else -pct_move
+            key = f"{r.regime}+{r.market_direction}+{r.strategy_name}+{r.signal}"
+            bucket = by_condition.setdefault(key, {
+                "strategy_name": r.strategy_name, "signal": r.signal,
+                "regime": r.regime, "market_direction": r.market_direction,
+                "count": 0, "would_have_profited": 0, "_sum_pct_move": 0.0,
+            })
+            bucket["count"] += 1
+            bucket["_sum_pct_move"] += directional_pct_move
+            if directional_pct_move > 0:
+                bucket["would_have_profited"] += 1
+
+        results = []
+        for bucket in by_condition.values():
+            count = bucket["count"]
+            results.append({
+                "strategy_name": bucket["strategy_name"],
+                "signal": bucket["signal"],
+                "regime": bucket["regime"],
+                "market_direction": bucket["market_direction"],
+                "count": count,
+                "would_have_profited_pct": round(bucket["would_have_profited"] / count * 100, 1),
+                "avg_directional_pct_move_60m": round(bucket["_sum_pct_move"] / count, 3),
+            })
+        results.sort(key=lambda r: -r["count"])
+        return results
+    except Exception as e:
+        logger.error(f"Analytics /range-exception-experiment error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 

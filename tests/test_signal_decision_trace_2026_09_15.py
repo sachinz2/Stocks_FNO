@@ -48,7 +48,8 @@ class _FakeTraceEngine:
         # empty here since these tests skip straight to _record_signal_trace().
         self._last_signal_metrics = {}
 
-    async def _record_rejected_outcome(self, strategy_name, symbol, last_gate, quality_score):
+    async def _record_rejected_outcome(self, strategy_name, symbol, last_gate, quality_score,
+                                        regime=None, market_direction=None):
         # Pure side-effect hook for RejectedSignalOutcome -- not under test
         # in this file (see test_trade_quality_layer_2026_09_16.py for that).
         pass

@@ -37,6 +37,16 @@ class RejectedSignalOutcome(Base):
     rejected_at_gate    = Column(String(50), nullable=True)
     quality_score       = Column(Integer, nullable=True)
     close_at_rejection  = Column(Float, nullable=False)
+    # Added 2026-10-01 (migration b010) for the "RANGE exception experiment"
+    # (external review): regime alone can't distinguish "RANGE_BOUND while
+    # NIFTY is bearish" from "RANGE_BOUND while NIFTY is bullish" -- both are
+    # the same regime string, but the review's proposed 4-way condition
+    # table (RANGE+bullish+EMA BUY, RANGE+bearish+EMA SELL, etc.) needs both
+    # dimensions. Nullable: older rows predate this column and backfilling
+    # historical direction isn't possible (the underlying regime payload
+    # that would have had it wasn't retained).
+    regime              = Column(String(20), nullable=True)
+    market_direction    = Column(String(10), nullable=True)  # BULLISH / BEARISH / NEUTRAL
     close_5m            = Column(Float, nullable=True)
     close_15m           = Column(Float, nullable=True)
     close_30m           = Column(Float, nullable=True)
