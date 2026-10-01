@@ -1699,6 +1699,10 @@ class _FakeCollisionEngine:
     _maybe_record_shadow_candidate  = LiveTradingEngine._maybe_record_shadow_candidate
     _SHADOW_ELIGIBLE_STRATEGIES     = LiveTradingEngine._SHADOW_ELIGIBLE_STRATEGIES
     _SHADOW_MIN_STREAK_DAYS         = LiveTradingEngine._SHADOW_MIN_STREAK_DAYS
+    _maybe_record_paused_signal_outcome = LiveTradingEngine._maybe_record_paused_signal_outcome
+    _record_rejected_outcome            = LiveTradingEngine._record_rejected_outcome
+    _compute_trade_quality_score        = LiveTradingEngine._compute_trade_quality_score
+    _PAUSED_SIGNAL_OUTCOME_STRATEGIES   = LiveTradingEngine._PAUSED_SIGNAL_OUTCOME_STRATEGIES
 
     def __init__(self, active_spreads=None, active_condors=None, single_leg_journals=None):
         self._active_spreads = active_spreads or {}
@@ -1707,10 +1711,13 @@ class _FakeCollisionEngine:
         self._exited_today = set()
         self._max_daily_orders = 0
         self._last_signal_date = {}
+        self._last_signal_metrics = {}
         self._signal_gate_stats = {}
         self.order_manager = None  # must never be touched if the guard fires first
         # 2026-09-18: _maybe_record_shadow_candidate() short-circuits
-        # safely to a no-op when rs_ranker isn't attached.
+        # safely to a no-op when rs_ranker isn't attached. 2026-10-01:
+        # _maybe_record_paused_signal_outcome() fails closed the same way
+        # on a missing close/rs_ranker, see its own docstring.
         self.rs_ranker = None
 
 

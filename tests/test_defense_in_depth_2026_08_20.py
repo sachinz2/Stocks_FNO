@@ -191,6 +191,7 @@ async def test_process_signal_records_last_signal_date_even_while_paused():
         _last_signal_date={},
         _get_market_data=AsyncMock(return_value={"ltp_source": "zerodha_live_ticks", "close": 100.0}),
         _maybe_record_shadow_candidate=AsyncMock(),
+        _maybe_record_paused_signal_outcome=AsyncMock(),
     )
 
     await LiveTradingEngine._process_signal(fake, strategy, "RELIANCE", vix=15.0, regime="LOW_VOL")

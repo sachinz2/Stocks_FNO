@@ -759,6 +759,35 @@ def check_signal_staleness_watches_paused_strategies_too(repo: Path) -> Result:
     return PASS, name, "Staleness check evaluates paused strategies too, and _last_signal_date updates before the is_active gate so it can't false-alarm on a genuinely-still-signaling paused strategy."
 
 
+def check_paused_signal_outcome_tracking_covers_both_single_leg_strategies(repo: Path) -> Result:
+    name = "Every real paused EMA/Momentum signal is tracked for forward-price outcome, not just the RS-streak shadow trial"
+    src = _read(repo, "src/live_trading/live_trading_engine.py")
+    idx = src.find("async def _maybe_record_paused_signal_outcome(")
+    if idx == -1:
+        return FAIL, name, (
+            "_maybe_record_paused_signal_outcome() missing -- confirmed live 2026-10-01 that "
+            "09-28/09-29/09-30 each had 100+ real confirmed EMA/momentum signals discarded at "
+            "the is_active gate, and the RS-sustained-streak shadow trial alone (its own "
+            "deliberately narrow hypothesis test) only ever captured a handful of them, "
+            "leaving the evidence needed to judge loosening the regime gate effectively "
+            "ungatherable."
+        )
+    body = src[idx: idx + 2500]
+    if '_PAUSED_SIGNAL_OUTCOME_STRATEGIES = {"ema_crossover_v1", "momentum_v1"}' not in src:
+        return FAIL, name, "_PAUSED_SIGNAL_OUTCOME_STRATEGIES no longer covers both single-leg strategies."
+    if 'rejected_at_gate", "regime_paused"' not in body.replace("self.", "").replace("'", '"') and \
+       '"regime_paused"' not in body:
+        return FAIL, name, "_maybe_record_paused_signal_outcome() no longer tags rows with rejected_at_gate='regime_paused'."
+    # Must actually be wired into _process_signal()'s paused branch.
+    proc_idx = src.find("if not strategy.is_active:")
+    if proc_idx == -1:
+        return FAIL, name, "Could not locate _process_signal()'s is_active check to verify wiring."
+    wiring_window = src[proc_idx: proc_idx + 400]
+    if "await self._maybe_record_paused_signal_outcome(" not in wiring_window:
+        return FAIL, name, "_maybe_record_paused_signal_outcome() is defined but not called from _process_signal()'s paused branch -- it would never actually run."
+    return PASS, name, "Every real paused EMA/momentum signal is recorded into RejectedSignalOutcome for forward-price tracking, independent of the RS-streak trial."
+
+
 def check_iv_history_refresh_decoupled_from_vix_gate(repo: Path) -> Result:
     name = "IV history refresh runs daily for the whole universe, independent of the VIX>=12 gate"
     engine_src = _read(repo, "src/live_trading/live_trading_engine.py")
@@ -934,6 +963,7 @@ STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_place_order_refuses_a_duplicate_resting_order,
     check_capital_release_uses_unfilled_remainder_not_full_quantity,
     check_stale_order_retry_resyncs_before_computing_remainder,
+    check_paused_signal_outcome_tracking_covers_both_single_leg_strategies,
 ]
 
 

@@ -45,6 +45,10 @@ class _FakeShadowEngine:
     _maybe_record_shadow_candidate = LiveTradingEngine._maybe_record_shadow_candidate
     _SHADOW_ELIGIBLE_STRATEGIES = LiveTradingEngine._SHADOW_ELIGIBLE_STRATEGIES
     _SHADOW_MIN_STREAK_DAYS = LiveTradingEngine._SHADOW_MIN_STREAK_DAYS
+    _maybe_record_paused_signal_outcome = LiveTradingEngine._maybe_record_paused_signal_outcome
+    _record_rejected_outcome = LiveTradingEngine._record_rejected_outcome
+    _compute_trade_quality_score = LiveTradingEngine._compute_trade_quality_score
+    _PAUSED_SIGNAL_OUTCOME_STRATEGIES = LiveTradingEngine._PAUSED_SIGNAL_OUTCOME_STRATEGIES
 
     def __init__(self, streaks):
         self.rs_ranker = SimpleNamespace(get_sustained_streak=AsyncMock(return_value=streaks))
@@ -179,6 +183,10 @@ class _FakeProcessSignalEngine:
     _maybe_record_shadow_candidate = LiveTradingEngine._maybe_record_shadow_candidate
     _SHADOW_ELIGIBLE_STRATEGIES = LiveTradingEngine._SHADOW_ELIGIBLE_STRATEGIES
     _SHADOW_MIN_STREAK_DAYS = LiveTradingEngine._SHADOW_MIN_STREAK_DAYS
+    _maybe_record_paused_signal_outcome = LiveTradingEngine._maybe_record_paused_signal_outcome
+    _record_rejected_outcome = LiveTradingEngine._record_rejected_outcome
+    _compute_trade_quality_score = LiveTradingEngine._compute_trade_quality_score
+    _PAUSED_SIGNAL_OUTCOME_STRATEGIES = LiveTradingEngine._PAUSED_SIGNAL_OUTCOME_STRATEGIES
 
     def __init__(self, streaks):
         self._active_spreads = {}
@@ -216,8 +224,13 @@ async def test_process_signal_records_shadow_candidate_when_regime_paused():
 
     await LiveTradingEngine._process_signal(fake, strategy, "PAYTM", vix=15.0, regime="RANGE_BOUND")
 
-    assert len(_FakeRepo.created) == 1
-    assert _FakeRepo.created[0]["symbol"] == "PAYTM"
+    # Both the narrow RS-streak shadow trial AND the broad paused-signal
+    # outcome tracker (2026-10-01) record this candidate -- they write to
+    # different tables but share this test's monkeypatched BaseRepository.
+    assert len(_FakeRepo.created) == 2
+    assert all(row["symbol"] == "PAYTM" for row in _FakeRepo.created)
+    assert any(row.get("rs_streak_days") == 7 for row in _FakeRepo.created)
+    assert any(row.get("rejected_at_gate") == "regime_paused" for row in _FakeRepo.created)
     fake._close_option_positions.assert_not_awaited()  # never reached the real pipeline
     assert "signal_generated" not in fake._signal_gate_stats.get("ema_crossover_v1", {})  # no real gate progress
 

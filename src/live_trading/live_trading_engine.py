@@ -2773,6 +2773,70 @@ class LiveTradingEngine:
         except Exception as exc:
             logger.debug(f"[ShadowRS] record failed (non-critical): {exc}")
 
+    # Added 2026-10-01 (live incident + external review PDF, confirmed
+    # against the actual 09-28/09-29/09-30 logs): on each of those 3
+    # trading days the regime sat in RANGE_BOUND (mostly BEARISH direction)
+    # essentially the entire session, and ema_crossover_v1/momentum_v1
+    # generated 121, 112, and 162 real CONFIRMED signals respectively (per
+    # ema_crossover.py's own "SELL confirmed ... firing" / momentum.py's
+    # "confirmed ... firing" log lines) -- every one discarded at the
+    # is_active gate. _maybe_record_shadow_candidate() above only captured
+    # 3, 1, and 0 of those (its RS-sustained-streak filter is a deliberately
+    # narrow, specific hypothesis test -- see its own docstring -- not a
+    # general evidence-gathering mechanism). That left over 95% of real
+    # signals invisible to any analysis, including the very analysis needed
+    # to judge whether loosening the regime gate would even be profitable.
+    # Unlike the RS-streak trial, this records EVERY real signal from either
+    # strategy while paused, independent of RS streak, into the SAME
+    # RejectedSignalOutcome table/forward-price-tracking job already used
+    # for real engine-gate rejections (rejected_at_gate="regime_paused") --
+    # zero new backfill code, and /analytics/rejected-outcomes-summary
+    # immediately gives a real win-rate-after-60-minutes number for this
+    # gate once rows accumulate, exactly the evidence needed to decide
+    # whether (and how) to loosen the gate -- see the PDF's own proposed
+    # "Trade Quality" layer, which _compute_trade_quality_score() already
+    # implements (ADX/RVOL/regime/RS all scored here; MTF deliberately
+    # skipped -- a 15-min OHLC fetch for every paused signal is unjustified
+    # cost for a purely-observational feature, and the scorer already
+    # degrades MTF to a neutral midpoint when absent).
+    _PAUSED_SIGNAL_OUTCOME_STRATEGIES = {"ema_crossover_v1", "momentum_v1"}
+
+    async def _maybe_record_paused_signal_outcome(
+        self, strategy, symbol: str, signal_str: Optional[str],
+        market_data: Dict[str, Any], regime: Optional[str],
+    ) -> None:
+        """
+        Pure observability, same safety property as
+        _maybe_record_shadow_candidate(): never calls place_order() or any
+        state-mutating method, zero interaction with real trading state.
+        """
+        if strategy.name not in self._PAUSED_SIGNAL_OUTCOME_STRATEGIES:
+            return
+        if signal_str not in ("BUY", "SELL"):
+            return
+        close = market_data.get("close")
+        if close is None:
+            return
+        self._last_signal_metrics["signal"] = signal_str
+        self._last_signal_metrics["close"] = close
+        self._last_signal_metrics["regime"] = regime
+        _rvol = float(market_data.get("rvol", 0))
+        self._last_signal_metrics["rvol"] = _rvol if market_data.get("rvol_valid", False) else None
+        _adx = float(market_data.get("adx14", 0))
+        self._last_signal_metrics["adx"] = _adx if market_data.get("adx_valid", False) else None
+        if self.rs_ranker:
+            try:
+                _rs_ranks = await self.rs_ranker.get_ranks()
+                if _rs_ranks:
+                    self._last_signal_metrics["rs_rank"] = next(
+                        (e.get("rank") for e in _rs_ranks if e["symbol"] == symbol), None
+                    )
+                    self._last_signal_metrics["rs_total"] = len(_rs_ranks)
+            except Exception:
+                pass
+        quality_score = self._compute_trade_quality_score()
+        await self._record_rejected_outcome(strategy.name, symbol, "regime_paused", quality_score)
+
     async def _record_rejected_outcome(
         self, strategy_name: str, symbol: str, last_gate: Optional[str],
         quality_score: Optional[int],
@@ -2944,6 +3008,7 @@ class LiveTradingEngine:
 
         if not strategy.is_active:
             await self._maybe_record_shadow_candidate(strategy, symbol, signal, regime)
+            await self._maybe_record_paused_signal_outcome(strategy, symbol, signal_str, market_data, regime)
             return
         if not signal or signal == SignalType.HOLD:
             return
