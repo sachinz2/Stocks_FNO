@@ -43,6 +43,15 @@ def test_high_vix_always_volatile_regardless_of_atr():
     assert MRD._classify(vix=25.0, atr_pct=0.5, ema_spread_pct=0.05) == "VOLATILE"
 
 
+@pytest.mark.skip(
+    reason="EXPERIMENT (2026-10-08, explicit user instruction): "
+    "REGIME_STRATEGY_MAP now lists every strategy under every regime so "
+    "trades can be seen across all strategies and losses reviewed case-by-"
+    "case. This test's underlying reasoning (LOW_VOL mutually excludes any "
+    "currently-registered strategy's own VIX gate) is still correct -- the "
+    "VIX gate itself was ALSO loosened (0.0) as part of the same "
+    "experiment, which breaks the premise. Un-skip after reverting both."
+)
 def test_low_vol_is_empty_no_strategy_can_pass_its_own_vix_gate_there():
     # Fixed 2026-09-03 (live incident): LOW_VOL is defined as vix < 12.0, but
     # iron_condor_v1's own entry gate requires vix >= 12.0 -- mutually
@@ -64,6 +73,11 @@ def test_low_vol_is_empty_no_strategy_can_pass_its_own_vix_gate_there():
     assert REGIME_STRATEGY_MAP["LOW_VOL"] == []
 
 
+@pytest.mark.skip(
+    reason="EXPERIMENT (2026-10-08, explicit user instruction): "
+    "REGIME_STRATEGY_MAP now lists every strategy under every regime. "
+    "Un-skip after reverting the map."
+)
 def test_range_bound_is_the_only_regime_iron_condor_can_actually_trade_in():
     # RANGE_BOUND (vix >= 12, ATR% low) is the one regime where both the
     # regime gate and iron_condor_v1's own vix_allows_selling() gate can
@@ -90,6 +104,11 @@ def test_hysteresis_low_vix_alone_does_not_exit_trending():
     assert MRD._classify(vix=11.5, atr_pct=mid_atr, ema_spread_pct=0.3, prev_regime=None) == "LOW_VOL"
 
 
+@pytest.mark.skip(
+    reason="EXPERIMENT (2026-10-08, explicit user instruction): "
+    "REGIME_STRATEGY_MAP now lists every strategy under every regime. "
+    "Un-skip after reverting the map."
+)
 def test_volatile_regime_includes_ema_crash_catching_excludes_momentum():
     assert STRATEGY_EMA in REGIME_STRATEGY_MAP["VOLATILE"]
     assert STRATEGY_SPREAD in REGIME_STRATEGY_MAP["VOLATILE"]
@@ -190,13 +209,27 @@ async def test_regime_switching_does_not_resume_a_manually_paused_strategy():
 
 
 @pytest.mark.asyncio
-async def test_regime_switching_still_pauses_a_regime_ineligible_strategy():
+async def test_regime_switching_still_pauses_a_regime_ineligible_strategy(monkeypatch):
     """Guard against over-fixing -- the PAUSE side (unaffected by this fix)
-    must still work regardless of paused_by."""
+    must still work regardless of paused_by.
+
+    EXPERIMENT (2026-10-08, explicit user instruction): the real
+    REGIME_STRATEGY_MAP now lists every strategy under every regime, so
+    there's no longer a naturally-excluded case to test against with the
+    production map. Monkeypatches a reduced map for this test only so the
+    pause MECHANISM itself (not the current regime-fit design decisions,
+    which are deliberately suspended) still gets verified. Safe to drop the
+    monkeypatch and go back to the bare production-map version after
+    reviewing case-by-case losses."""
+    import src.market_data.regime_detector as regime_detector_module
+    monkeypatch.setattr(
+        regime_detector_module, "REGIME_STRATEGY_MAP",
+        {"TRENDING": [STRATEGY_EMA, STRATEGY_SPREAD, STRATEGY_MOMENTUM]},  # excludes iron_condor_v1
+    )
     sid = "iron_condor_v1"
     _register(sid, is_active=True, paused_by=None)
     try:
-        detector = MRD(_FakeRedisRegime("TRENDING"))  # excludes iron_condor_v1
+        detector = MRD(_FakeRedisRegime("TRENDING"))
         await detector.enforce_regime_switching()
         inst = StrategyRegistry._active_instances[sid]
         assert inst.is_active is False

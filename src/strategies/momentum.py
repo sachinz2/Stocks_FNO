@@ -156,6 +156,19 @@ class MomentumStrategy(StrategyBase):
         # than early.
         self.rvol_entry_threshold = self.parameters.get("rvol_entry_threshold", 1.5)
 
+        # EXPERIMENT (2026-10-08, explicit user instruction): momentum_v1 never
+        # actually exposed these two as overridable parameters the way
+        # ema_crossover_v1 does -- getattr(strategy, "rvol_hard_gate"/"require_rs",
+        # True) in live_trading_engine.py was silently falling back to its
+        # hardcoded True default because this class never set either
+        # attribute, unlike ema_crossover_v1 (see its initialize()). That made
+        # momentum_v1 run with two hard gates ema_crossover_v1 doesn't have,
+        # likely contributing to its much lower trade count. Loosened to match
+        # ema_crossover_v1's convention; revert to True (or remove, restoring
+        # the old no-attribute behavior) after reviewing case-by-case losses.
+        self.rvol_hard_gate = self.parameters.get("rvol_hard_gate", False)
+        self.require_rs = self.parameters.get("require_rs", False)
+
         # entry_option_delta: read by live_trading_engine.py's single-leg
         # entry path -- if set, buys a strike near this delta instead of ATM
         # (0.60 ~ slightly ITM). Per the review: ATM options are maximally

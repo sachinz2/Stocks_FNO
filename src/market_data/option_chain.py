@@ -241,7 +241,12 @@ def vix_allows_selling(vix: Optional[float]) -> bool:
     """
     if vix is None:
         return False
-    return vix >= 12.0
+    # EXPERIMENT (2026-10-08, explicit user instruction): threshold dropped
+    # 12.0 -> 0.0 so VIX level stops blocking credit_spread_v1/iron_condor_v1
+    # entries, to see trades across all strategies and review losses case-by-
+    # case. The None-fail-closed check above is UNCHANGED -- that's a data-
+    # outage guard, not a risk-tolerance threshold. Restore 12.0 after review.
+    return vix >= 0.0
 
 
 def iv_rank_allows_selling(iv_rank: Optional[float]) -> bool:
@@ -253,10 +258,15 @@ def iv_rank_allows_selling(iv_rank: Optional[float]) -> bool:
     vix_allows_selling() above, same rationale -- "not enough history yet"
     is exactly the kind of missing-data case this codebase's fail-closed
     convention exists for, not a reason to let the trade through anyway.
+
+    EXPERIMENT (2026-10-08, explicit user instruction): threshold dropped
+    0.30 -> 0.0 so IV rank stops blocking entries, to see trades across all
+    strategies and review losses case-by-case. The None-fail-closed check
+    below is UNCHANGED. Restore 0.30 after review.
     """
     if iv_rank is None:
         return False
-    return iv_rank >= 0.30
+    return iv_rank >= 0.0
 
 
 # ── Real contract validation ────────────────────────────────────────────────

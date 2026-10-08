@@ -213,13 +213,16 @@ def test_ema_crossover_defaults_to_soft_rvol_and_asymmetric_mtf():
 
 
 def test_momentum_v1_keeps_rvol_hard_gate_strict():
-    """Guard against over-fixing -- momentum_v1 never set rvol_hard_gate,
-    so getattr's own default (True) must still apply to it. mtf_strict is
-    NOT included here anymore -- see test_momentum_v1_graduates_mtf_strict_
-    2026_09_15 for why that one flipped."""
+    """EXPERIMENT (2026-10-08, explicit user instruction) superseded this
+    guard: momentum_v1 now explicitly sets self.rvol_hard_gate from
+    parameters (default False), matching ema_crossover_v1, instead of
+    silently falling through to the engine's getattr default (True) --
+    see momentum.py's initialize(). Restore the self.rvol_hard_gate line's
+    default to True (or remove it, restoring the old no-attribute behavior
+    this test used to guard) after reviewing case-by-case losses."""
     mom = MomentumStrategy("momentum_v1", {})
     mom.initialize()
-    assert getattr(mom, "rvol_hard_gate", True) is True
+    assert mom.rvol_hard_gate is False
     assert mom.adx_checked_internally is True
 
 
@@ -307,7 +310,9 @@ def test_main_py_wires_up_ema_crossover_v1_round2_params():
     # Fixed 2026-08-27 (trade review): adx_entry_threshold raised 18->22,
     # underlying_stop_atr_mult raised 1.0->1.4 -- see ema_crossover.py's
     # matching comments for why.
-    assert '"adx_entry_threshold": 22' in block
+    # EXPERIMENT (2026-10-08, explicit user instruction): adx_entry_threshold
+    # further lowered 22->8. Restore 22 after reviewing case-by-case losses.
+    assert '"adx_entry_threshold": 8' in block
     assert '"rvol_hard_gate": False' in block
     assert '"mtf_strict": False' in block
     assert '"ema_reversal_exit": True' in block

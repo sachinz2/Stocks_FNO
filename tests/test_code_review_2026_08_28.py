@@ -202,8 +202,10 @@ def test_vix_allows_selling_fails_closed_on_none():
 
 
 def test_vix_allows_selling_still_correct_for_real_values():
-    assert vix_allows_selling(11.9) is False
-    assert vix_allows_selling(12.0) is True
+    # EXPERIMENT (2026-10-08, explicit user instruction): threshold dropped
+    # 12.0 -> 0.0 in option_chain.py. Restore 12.0 and this test's original
+    # 11.9/False assertion after reviewing case-by-case losses.
+    assert vix_allows_selling(0.0) is True
     assert vix_allows_selling(15.0) is True
 
 
@@ -212,7 +214,10 @@ def test_iv_rank_allows_selling_fails_closed_on_none():
 
 
 def test_iv_rank_allows_selling_still_correct_for_real_values():
-    assert iv_rank_allows_selling(0.29) is False
+    # EXPERIMENT (2026-10-08, explicit user instruction): threshold dropped
+    # 0.30 -> 0.0 in option_chain.py. Restore 0.30 and this test's original
+    # 0.29/False assertion after reviewing case-by-case losses.
+    assert iv_rank_allows_selling(0.0) is True
     assert iv_rank_allows_selling(0.30) is True
 
 

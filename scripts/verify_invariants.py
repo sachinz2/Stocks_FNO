@@ -759,6 +759,22 @@ def check_low_vol_regime_has_no_structurally_impossible_strategy(repo: Path) -> 
         return FAIL, name, "REGIME_STRATEGY_MAP[\"LOW_VOL\"] entry not found."
     body = m.group(1).strip()
     if "STRATEGY_SPREAD" in body or "STRATEGY_CONDOR" in body:
+        # EXPERIMENT (2026-10-08, explicit user instruction): the mutual-
+        # exclusivity argument below only holds at the ORIGINAL vix_allows_
+        # selling() threshold (12.0, matching LOW_VOL's own < 12.0
+        # definition). That threshold was deliberately loosened to >= 0.0 as
+        # part of the same experiment, so this is no longer a structural
+        # impossibility right now -- downgraded to WARN instead of FAIL
+        # until both are reverted together.
+        oc_src = _read(repo, "src/market_data/option_chain.py")
+        if "return vix >= 0.0" in oc_src:
+            return WARN, name, (
+                f"LOW_VOL lists {body!r}, which would normally be a structural "
+                "impossibility against vix_allows_selling()'s original >=12.0 threshold -- "
+                "but that threshold is currently loosened to >=0.0 (same 2026-10-08 "
+                "experiment), so this is consistent, not a reintroduced bug. Revert "
+                "REGIME_STRATEGY_MAP and vix_allows_selling() together."
+            )
         return FAIL, name, (
             f"LOW_VOL lists {body!r} -- both credit_spread_v1 and iron_condor_v1 require "
             "vix_allows_selling() (VIX >= 12.0) to enter at all, while LOW_VOL is DEFINED as "

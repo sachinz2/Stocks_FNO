@@ -4109,22 +4109,25 @@ class LiveTradingEngine:
                 "gate": "adx_passed", "value": None, "threshold": "15-30", "reason": "ADX_UNAVAILABLE",
             }
             return
-        if _adx_cs < 15:
+        # EXPERIMENT (2026-10-08, explicit user instruction): band widened
+        # 15-30 -> 5-45 to stop blocking entries on ADX, to see trades across
+        # all strategies and review losses case-by-case. Restore 15/30 after.
+        if _adx_cs < 5:
             logger.info(
-                f"[CreditSpread] {symbol} skipped — ADX={_adx_cs:.1f} < 15 "
+                f"[CreditSpread] {symbol} skipped — ADX={_adx_cs:.1f} < 5 "
                 "(no trend; condor regime)"
             )
             self._last_gate_rejection = {
-                "gate": "adx_passed", "value": round(_adx_cs, 2), "threshold": 15, "reason": "ADX_TOO_LOW_CONDOR_TERRITORY",
+                "gate": "adx_passed", "value": round(_adx_cs, 2), "threshold": 5, "reason": "ADX_TOO_LOW_CONDOR_TERRITORY",
             }
             return
-        if _adx_cs > 30:
+        if _adx_cs > 45:
             logger.info(
-                f"[CreditSpread] {symbol} skipped — ADX={_adx_cs:.1f} > 30 "
+                f"[CreditSpread] {symbol} skipped — ADX={_adx_cs:.1f} > 45 "
                 "(trend too strong; blowthrough risk)"
             )
             self._last_gate_rejection = {
-                "gate": "adx_passed", "value": round(_adx_cs, 2), "threshold": 30, "reason": "ADX_TOO_HIGH_BLOWTHROUGH_RISK",
+                "gate": "adx_passed", "value": round(_adx_cs, 2), "threshold": 45, "reason": "ADX_TOO_HIGH_BLOWTHROUGH_RISK",
             }
             return
         self._audit_gate(strategy.name, "adx_passed")
@@ -4132,7 +4135,12 @@ class LiveTradingEngine:
         # Event/earnings calendar filter — block entries within 5 trading days.
         # Earnings and RBI events cause IV crush and gap risk that destroys spread edge.
         from src.market_data.event_calendar import has_event_within_days as _has_event
-        if await _has_event(symbol, getattr(self, "_redis", None), days=5):
+        # EXPERIMENT (2026-10-08, explicit user instruction): window shrunk
+        # 5 -> 1 trading day (not 0 -- still blocks trading directly into a
+        # same-day earnings/RBI print, which is closer to a coin-flip gap
+        # than a learnable "strategy vs. regime" data point). Restore 5 after
+        # reviewing case-by-case losses.
+        if await _has_event(symbol, getattr(self, "_redis", None), days=1):
             logger.info(
                 f"[CreditSpread] {symbol} skipped — earnings or NSE event within 5 days"
             )
@@ -5176,13 +5184,15 @@ class LiveTradingEngine:
         redis = getattr(self, "_redis", None)
         oi_data = await get_oi_data(symbol, redis, kite=self._kite) if redis else None
         pcr = market_data.get("pcr") or (oi_data.get("pcr") if oi_data else None)
-        if pcr is not None and (pcr < 0.7 or pcr > 1.4):
+        # EXPERIMENT (2026-10-08, explicit user instruction): band widened
+        # 0.7-1.4 -> 0.3-3.0 to stop blocking entries on PCR. Restore after review.
+        if pcr is not None and (pcr < 0.3 or pcr > 3.0):
             logger.info(
                 f"[IronCondor] {symbol} skipped — PCR={pcr:.2f} is extreme "
-                f"(need 0.7–1.4 for neutral condor). Market too directional."
+                f"(need 0.3–3.0 for neutral condor). Market too directional."
             )
             self._last_gate_rejection = {
-                "gate": "direction_passed", "value": round(pcr, 2), "threshold": "0.7-1.4", "reason": "PCR_TOO_DIRECTIONAL",
+                "gate": "direction_passed", "value": round(pcr, 2), "threshold": "0.3-3.0", "reason": "PCR_TOO_DIRECTIONAL",
             }
             return
         self._audit_gate(strategy.name, "direction_passed")
@@ -5219,20 +5229,24 @@ class LiveTradingEngine:
                 "gate": "adx_passed", "value": None, "threshold": 20, "reason": "ADX_UNAVAILABLE",
             }
             return
-        if _adx_ic >= 20:
+        # EXPERIMENT (2026-10-08, explicit user instruction): ceiling raised
+        # 20 -> 40 to stop blocking entries on ADX. Restore 20 after review.
+        if _adx_ic >= 40:
             logger.info(
-                f"[IronCondor] {symbol} skipped — ADX={_adx_ic:.1f} >= 20 "
+                f"[IronCondor] {symbol} skipped — ADX={_adx_ic:.1f} >= 40 "
                 "(market trending; range-bound thesis invalid)"
             )
             self._last_gate_rejection = {
-                "gate": "adx_passed", "value": round(_adx_ic, 2), "threshold": 20, "reason": "ADX_TOO_HIGH_TRENDING",
+                "gate": "adx_passed", "value": round(_adx_ic, 2), "threshold": 40, "reason": "ADX_TOO_HIGH_TRENDING",
             }
             return
         self._audit_gate(strategy.name, "adx_passed")
 
         # Event/earnings calendar filter — block entries within 5 trading days.
         from src.market_data.event_calendar import has_event_within_days as _has_event_ic
-        if await _has_event_ic(symbol, getattr(self, "_redis", None), days=5):
+        # EXPERIMENT (2026-10-08, explicit user instruction): see matching
+        # comment in _process_credit_spread() above. Restore 5 after review.
+        if await _has_event_ic(symbol, getattr(self, "_redis", None), days=1):
             logger.info(
                 f"[IronCondor] {symbol} skipped — earnings or NSE event within 5 days"
             )
@@ -7238,7 +7252,18 @@ class LiveTradingEngine:
     # exceeds this. A wide spread means the entry's LIMIT order either won't
     # fill or fills far from option_p, independent of whether the underlying
     # direction call was correct.
-    _OPTION_MAX_SPREAD_PCT = 8.0
+    #
+    # EXPERIMENT (2026-10-08, explicit user instruction): raised 8.0 -> 40.0
+    # to stop blocking entries on bid-ask spread width, to see trades across
+    # all strategies and review losses case-by-case -- this is the exact gap
+    # behind the KAYNES/IDEA catastrophic single-leg losses this check was
+    # built to close (see 33fc3e8/e20059b), so expect illiquid-contract
+    # losses to reappear while this is loosened. The real-quote requirement
+    # in _resolve_lot_and_contract() etc. (fail closed when NO quote exists
+    # at all) is UNCHANGED -- that's data integrity, not a risk-tolerance
+    # threshold, and loosening it would fabricate prices instead of just
+    # tolerating worse real ones. Restore 8.0 after reviewing losses.
+    _OPTION_MAX_SPREAD_PCT = 40.0
 
     async def _get_market_data(self, symbol: str) -> Optional[Dict[str, Any]]:
         redis = getattr(self, "_redis", None)

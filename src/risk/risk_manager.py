@@ -245,9 +245,15 @@ class RiskManager:
                     "— cannot verify premium is rich enough, skipping."
                 )
                 return False
-            if iv_rank < 0.30:
+            # EXPERIMENT (2026-10-08, explicit user instruction): both
+            # thresholds dropped to 0.0 -- these are defense-in-depth
+            # duplicates of option_chain.py's iv_rank_allows_selling()/
+            # vix_allows_selling(), loosened the same way and for the same
+            # reason there. The None-fail-closed checks above/below are
+            # UNCHANGED. Restore 0.30/12.0 after reviewing case-by-case losses.
+            if iv_rank < 0.0:
                 logger.warning(
-                    f"Risk: IV rank {iv_rank:.2f} < 0.30 for {symbol} "
+                    f"Risk: IV rank {iv_rank:.2f} < 0.0 for {symbol} "
                     f"[{strategy_name}] — options too cheap, skipping."
                 )
                 return False
@@ -257,9 +263,9 @@ class RiskManager:
                     "— cannot verify market-wide premium level, skipping."
                 )
                 return False
-            if vix < 12.0:
+            if vix < 0.0:
                 logger.warning(
-                    f"Risk: India VIX {vix:.1f} < 12 — market unusually quiet, "
+                    f"Risk: India VIX {vix:.1f} < 0 — market unusually quiet, "
                     f"premiums too cheap market-wide, skipping [{strategy_name}]."
                 )
                 return False

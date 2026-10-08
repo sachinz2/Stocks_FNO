@@ -47,11 +47,16 @@ def test_ema_crossover_defaults_require_rs_false():
 
 
 def test_momentum_keeps_the_shared_require_rs_default_true():
-    """Guard against over-fixing -- momentum_v1 never sets require_rs, so
-    getattr's own default (True, unchanged behavior) must still apply."""
+    """EXPERIMENT (2026-10-08, explicit user instruction) superseded this
+    guard: momentum_v1 now explicitly sets self.require_rs from parameters
+    (default False), matching ema_crossover_v1, instead of silently falling
+    through to the engine's getattr default (True) -- see momentum.py's
+    initialize(). Restore the self.require_rs line's default to True (or
+    remove it, restoring the old no-attribute behavior this test used to
+    guard) after reviewing case-by-case losses."""
     mom = MomentumStrategy("momentum_v1", {})
     mom.initialize()
-    assert getattr(mom, "require_rs", True) is True
+    assert mom.require_rs is False
 
 
 def test_engine_rs_gate_respects_require_rs_override():

@@ -112,7 +112,28 @@ STRATEGY_MOMENTUM  = "momentum_v1"
 # review as adequate for a moment-of-crossing signal; a trend-continuation
 # strategy on an already-extended move was not. momentum_v1 is removed from
 # VOLATILE entirely — it now only runs in TRENDING.
+# EXPERIMENT (2026-10-08, explicit user instruction): every strategy is
+# listed under every regime for now -- the regime-fit reasoning below (and
+# the whole history of fixes that built this map) is NOT wrong, it's just
+# being suspended on purpose so each strategy actually generates trades in
+# every regime and the resulting losses can be reviewed case-by-case. Revert
+# to the ORIGINAL map below once that review is done -- do not just delete
+# this comment and call it a day; actually restore the real mapping.
+#
+# ORIGINAL (pre-experiment) mapping -- restore this:
+# REGIME_STRATEGY_MAP: Dict[str, list] = {
+#     "TRENDING":    [STRATEGY_EMA, STRATEGY_SPREAD, STRATEGY_MOMENTUM],
+#     "RANGE_BOUND": [STRATEGY_CONDOR, STRATEGY_SPREAD],
+#     "VOLATILE":    [STRATEGY_SPREAD, STRATEGY_EMA],
+#     "LOW_VOL":     [],
+# }
 REGIME_STRATEGY_MAP: Dict[str, list] = {
+    "TRENDING":    [STRATEGY_EMA, STRATEGY_SPREAD, STRATEGY_MOMENTUM, STRATEGY_CONDOR],
+    "RANGE_BOUND": [STRATEGY_CONDOR, STRATEGY_SPREAD, STRATEGY_EMA, STRATEGY_MOMENTUM],
+    "VOLATILE":    [STRATEGY_SPREAD, STRATEGY_EMA, STRATEGY_MOMENTUM, STRATEGY_CONDOR],
+    "LOW_VOL":     [STRATEGY_EMA, STRATEGY_MOMENTUM, STRATEGY_SPREAD, STRATEGY_CONDOR],
+}
+_DISABLED_ORIGINAL_MAP_FOR_REFERENCE_ONLY = {
     "TRENDING":    [STRATEGY_EMA, STRATEGY_SPREAD, STRATEGY_MOMENTUM],  # spread aligned with trend = low breach risk
     "RANGE_BOUND": [STRATEGY_CONDOR, STRATEGY_SPREAD],   # both premium sellers thrive in flat market
     "VOLATILE":    [STRATEGY_SPREAD, STRATEGY_EMA],      # high IV = rich premium for spreads;

@@ -259,7 +259,11 @@ async def lifespan(app: FastAPI):
         # already-strong trend" intent (still well below the old flat-25
         # gate this strategy had before the 2026-08-21 redesign) while
         # screening out the weakest setups.
-        "adx_entry_threshold": 22,
+        # EXPERIMENT (2026-10-08, explicit user instruction): lowered 22 -> 8
+        # to stop screening out marginal crossovers on entry ADX, to see
+        # trades across all strategies and review losses case-by-case.
+        # Restore 22 after review.
+        "adx_entry_threshold": 8,
         # adx_checked_internally is hardcoded True in ema_crossover.py's
         # initialize() (not parameter-driven, unlike everything else here)
         # -- listing it would silently be a no-op, so it's intentionally
@@ -281,7 +285,11 @@ async def lifespan(app: FastAPI):
         # entry don't discriminate winners from losers in the Aug 24-26
         # sample -- the gap itself was never checked. Same 0.1% floor as the
         # exit side's ema_reversal_min_gap_pct, checked once at fire time.
-        "entry_min_gap_pct": 0.001,
+        # EXPERIMENT (2026-10-08, explicit user instruction): lowered
+        # 0.001 -> 0.0001 (entry side only; exit-side ema_reversal_min_gap_pct
+        # above is untouched so exits still reflect realistic behavior).
+        # Restore 0.001 after review.
+        "entry_min_gap_pct": 0.0001,
         "entry_option_delta": None,
     })
     StrategyRegistry.load_strategy("CREDIT_SPREAD", "credit_spread_v1", {
@@ -314,17 +322,26 @@ async def lifespan(app: FastAPI):
         # so this dict is a complete, self-documenting picture of what's
         # actually running, not something that has to be cross-referenced
         # against momentum.py to know.
-        "adx_entry_threshold": 25, "adx_exit_threshold": 22,
-        "adx_rising_required": True, "ema_slope_required": True,
-        # Fixed 2026-08-27 (trade review): raised from 1.5/1.5 -- zero
-        # momentum_v1 trades over Aug 24-26 despite hundreds of candidates
-        # that passed every other gate, because virtually all of them
-        # (median 2.69x ATR) were already past the old 1.5x extension
-        # floor -- see momentum.py's initialize() for the full evidence.
-        "extension_atr_mult": 2.5, "vwap_extension_pct": 2.5,
-        "rvol_entry_threshold": 1.5, "entry_option_delta": 0.60,
+        # EXPERIMENT (2026-10-08, explicit user instruction): every threshold
+        # in this block loosened to stop blocking momentum_v1 entries, to see
+        # trades across all strategies and review losses case-by-case.
+        # rvol_hard_gate/require_rs are NEW here -- momentum.py never
+        # actually read them from parameters before today (see its
+        # initialize()), so they were silently hard-gated (getattr default
+        # True) this whole time, unlike ema_crossover_v1 which has always
+        # overridden both. Restore the commented original values after review.
+        # Original: adx_entry_threshold=25, adx_exit_threshold=22,
+        #   adx_rising_required=True, ema_slope_required=True,
+        #   extension_atr_mult=2.5, vwap_extension_pct=2.5,
+        #   rvol_entry_threshold=1.5, min_ema_spread_pct=0.30,
+        #   rvol_hard_gate=True (undocumented default), require_rs=True (undocumented default)
+        "adx_entry_threshold": 8, "adx_exit_threshold": 8,
+        "adx_rising_required": False, "ema_slope_required": False,
+        "extension_atr_mult": 6.0, "vwap_extension_pct": 6.0,
+        "rvol_entry_threshold": 0.3, "entry_option_delta": 0.60,
+        "rvol_hard_gate": False, "require_rs": False,
         "underlying_invalidation_exit": True,
-        "min_ema_spread_pct": 0.30,
+        "min_ema_spread_pct": 0.05,
         "stop_loss_pct": 0.50, "target_pct": 1.50, "trailing_stop_pct": 0.30,
         # Round 2 (2026-08-21, same review, same "list everything explicitly"
         # convention -- see the comment above).

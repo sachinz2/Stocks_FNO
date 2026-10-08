@@ -217,8 +217,13 @@ def test_main_py_does_not_override_adx_entry_threshold_back_to_the_old_value():
     from src.api import main as main_module
     src = inspect.getsource(main_module)
     idx = src.index('StrategyRegistry.load_strategy("MOMENTUM"')
-    block = src[idx:idx + 800]
-    assert '"adx_entry_threshold": 25' in block, (
-        "main.py's momentum_v1 wiring must match momentum.py's current "
-        "adx_entry_threshold default, not a stale hardcoded value"
+    block = src[idx:idx + 2000]
+    # EXPERIMENT (2026-10-08, explicit user instruction): intentionally
+    # dropped further, 25 -> 8, to see trades across all strategies and
+    # review losses case-by-case -- a deliberate, documented deviation from
+    # momentum.py's class default, NOT the silent/accidental drift this test
+    # originally guarded against. Restore 25 after reviewing the losses.
+    assert '"adx_entry_threshold": 8' in block, (
+        "main.py's momentum_v1 wiring must match the currently-intended "
+        "adx_entry_threshold, not a stale hardcoded value"
     )
