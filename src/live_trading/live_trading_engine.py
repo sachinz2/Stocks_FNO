@@ -149,7 +149,16 @@ class LiveTradingEngine:
         # Max simultaneous open EMA Crossover (single-leg, intraday) positions across all
         # symbols. Blocks a 3rd entry while 1-2 are already open; independent of the
         # per-symbol duplicate check and the portfolio-wide daily order count.
-        self._max_concurrent_intraday: int = getattr(settings, "MAX_CONCURRENT_INTRADAY", 2)
+        # EXPERIMENT (2026-10-08, explicit user instruction): raised 2 -> 6.
+        # Discovered live: this cap is SHARED across ema_crossover_v1 and
+        # momentum_v1 (see _single_leg_journals usage below), so once
+        # ema_crossover_v1 filled both slots, momentum_v1's TITAN signal
+        # confirmed cleanly ("pullback+breakout confirmed -- firing") and
+        # was rejected purely on this cap -- not on any of the signal-
+        # quality gates loosened in be759a7. Directly blocked the "see
+        # trades across all strategies" goal, not just a tunable threshold.
+        # Restore 2 after reviewing case-by-case losses.
+        self._max_concurrent_intraday: int = getattr(settings, "MAX_CONCURRENT_INTRADAY", 6)
         self._peak_premiums:   Dict[str, float] = {}
         # Fixed 2026-09-10 (user request): peak PROFIT in rupees per
         # single-leg position, tracked ONLY once that position's profit has
