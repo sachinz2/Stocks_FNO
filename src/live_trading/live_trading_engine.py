@@ -4119,24 +4119,26 @@ class LiveTradingEngine:
             }
             return
         # EXPERIMENT (2026-10-08, explicit user instruction): band widened
-        # 15-30 -> 5-45 to stop blocking entries on ADX, to see trades across
-        # all strategies and review losses case-by-case. Restore 15/30 after.
-        if _adx_cs < 5:
+        # 15-30 -> 5-45, then further to 0-70 after ASIANPAINT (ADX=47) was
+        # the first clean credit_spread_v1 candidate of the day and still
+        # got blocked just over the 45 ceiling. Restore 15/30 after
+        # reviewing case-by-case losses.
+        if _adx_cs < 0:
             logger.info(
-                f"[CreditSpread] {symbol} skipped — ADX={_adx_cs:.1f} < 5 "
+                f"[CreditSpread] {symbol} skipped — ADX={_adx_cs:.1f} < 0 "
                 "(no trend; condor regime)"
             )
             self._last_gate_rejection = {
-                "gate": "adx_passed", "value": round(_adx_cs, 2), "threshold": 5, "reason": "ADX_TOO_LOW_CONDOR_TERRITORY",
+                "gate": "adx_passed", "value": round(_adx_cs, 2), "threshold": 0, "reason": "ADX_TOO_LOW_CONDOR_TERRITORY",
             }
             return
-        if _adx_cs > 45:
+        if _adx_cs > 70:
             logger.info(
-                f"[CreditSpread] {symbol} skipped — ADX={_adx_cs:.1f} > 45 "
+                f"[CreditSpread] {symbol} skipped — ADX={_adx_cs:.1f} > 70 "
                 "(trend too strong; blowthrough risk)"
             )
             self._last_gate_rejection = {
-                "gate": "adx_passed", "value": round(_adx_cs, 2), "threshold": 45, "reason": "ADX_TOO_HIGH_BLOWTHROUGH_RISK",
+                "gate": "adx_passed", "value": round(_adx_cs, 2), "threshold": 70, "reason": "ADX_TOO_HIGH_BLOWTHROUGH_RISK",
             }
             return
         self._audit_gate(strategy.name, "adx_passed")
@@ -4145,11 +4147,13 @@ class LiveTradingEngine:
         # Earnings and RBI events cause IV crush and gap risk that destroys spread edge.
         from src.market_data.event_calendar import has_event_within_days as _has_event
         # EXPERIMENT (2026-10-08, explicit user instruction): window shrunk
-        # 5 -> 1 trading day (not 0 -- still blocks trading directly into a
-        # same-day earnings/RBI print, which is closer to a coin-flip gap
-        # than a learnable "strategy vs. regime" data point). Restore 5 after
-        # reviewing case-by-case losses.
-        if await _has_event(symbol, getattr(self, "_redis", None), days=1):
+        # 5 -> 1 -> 0 trading days (this week's dense Q2 earnings calendar was
+        # catching nearly every candidate at 1 day). days=0 still blocks
+        # trading directly into a literal same-day earnings/RBI print --
+        # has_event_within_days()'s cutoff = today + 0 trading days = today,
+        # so today <= event_date <= today only matches today itself. Restore
+        # 5 after reviewing case-by-case losses.
+        if await _has_event(symbol, getattr(self, "_redis", None), days=0):
             logger.info(
                 f"[CreditSpread] {symbol} skipped — earnings or NSE event within 5 days"
             )
@@ -5239,14 +5243,15 @@ class LiveTradingEngine:
             }
             return
         # EXPERIMENT (2026-10-08, explicit user instruction): ceiling raised
-        # 20 -> 40 to stop blocking entries on ADX. Restore 20 after review.
-        if _adx_ic >= 40:
+        # 20 -> 40 -> 70 to stop blocking entries on ADX (matching
+        # credit_spread_v1's same further loosening). Restore 20 after review.
+        if _adx_ic >= 70:
             logger.info(
-                f"[IronCondor] {symbol} skipped — ADX={_adx_ic:.1f} >= 40 "
+                f"[IronCondor] {symbol} skipped — ADX={_adx_ic:.1f} >= 70 "
                 "(market trending; range-bound thesis invalid)"
             )
             self._last_gate_rejection = {
-                "gate": "adx_passed", "value": round(_adx_ic, 2), "threshold": 40, "reason": "ADX_TOO_HIGH_TRENDING",
+                "gate": "adx_passed", "value": round(_adx_ic, 2), "threshold": 70, "reason": "ADX_TOO_HIGH_TRENDING",
             }
             return
         self._audit_gate(strategy.name, "adx_passed")
@@ -5254,8 +5259,9 @@ class LiveTradingEngine:
         # Event/earnings calendar filter — block entries within 5 trading days.
         from src.market_data.event_calendar import has_event_within_days as _has_event_ic
         # EXPERIMENT (2026-10-08, explicit user instruction): see matching
-        # comment in _process_credit_spread() above. Restore 5 after review.
-        if await _has_event_ic(symbol, getattr(self, "_redis", None), days=1):
+        # comment in _process_credit_spread() above -- shrunk further to 0.
+        # Restore 5 after review.
+        if await _has_event_ic(symbol, getattr(self, "_redis", None), days=0):
             logger.info(
                 f"[IronCondor] {symbol} skipped — earnings or NSE event within 5 days"
             )
