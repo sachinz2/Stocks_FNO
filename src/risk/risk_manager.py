@@ -291,8 +291,24 @@ class RiskManager:
 
         # ── 5. Per-strategy capital allocation ────────────────────────────────
         if strategy_name and strategy_name in STRATEGY_CAPITAL_ALLOCATION:
-            alloc_pct = STRATEGY_CAPITAL_ALLOCATION[strategy_name]
-            budget = self.initial_capital * alloc_pct
+            # EXPERIMENT (2026-10-08, explicit user instruction: "bump the
+            # budget to 10 lakhs... we want as much trades as possible"):
+            # flat Rs10,00,000 per strategy, replacing the normal
+            # initial_capital * alloc_pct formula. Found live: momentum_v1's
+            # % share of the capital-period-compounded initial_capital (down
+            # to ~Rs2,23,000 after cumulative paper losses) had shrunk its
+            # budget to just Rs44,681, blocking every confirmed signal that
+            # cycle even though no momentum_v1 position was actually open --
+            # the % model couples "how much room a strategy gets to trade"
+            # to "how much it has already lost," which fights directly
+            # against this experiment's goal of generating enough case-by-
+            # case data to evaluate the strategies at all. The real hard
+            # ceiling is unchanged: the paper broker's own cash balance and
+            # _check_available_margin() still cap what can physically be
+            # deployed -- this only removes an additional, now-undersized
+            # soft cap on top of that. Restore `self.initial_capital *
+            # alloc_pct` after reviewing case-by-case losses.
+            budget = 1_000_000.0
             deployed = self._strategy_deployed.get(strategy_name, 0.0)
             if capital_at_risk is not None:
                 # Explicit max-loss figure from the caller (credit spreads/condors —
