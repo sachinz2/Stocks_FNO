@@ -294,7 +294,22 @@ async def lifespan(app: FastAPI):
     })
     StrategyRegistry.load_strategy("CREDIT_SPREAD", "credit_spread_v1", {
         "fast_period": 20, "slow_period": 50,
-        "low_vol_threshold": 1.2,
+        # EXPERIMENT (2026-10-08, explicit user instruction): low_vol_threshold
+        # raised 1.2 -> 5.0 (must match ltp_poller.py's _LOW_VOL_THRESHOLD,
+        # which gates pool admission before this is ever reached). flat_threshold
+        # added explicitly and LOWERED 0.1 -> 0.02 -- credit_spread.py skips a
+        # candidate when ema_spread_pct < flat_threshold ("too flat, condor
+        # territory instead"), so loosening this means fewer candidates get
+        # excluded as not-directional-enough. This was previously silently
+        # relying on credit_spread.py's class default (0.1), never listed here
+        # -- now explicit per this file's own "list everything" convention.
+        # Note: credit_spread_v1 and iron_condor_v1 normally share one
+        # flat_threshold value as a deliberate market-partition boundary (see
+        # credit_spread.py's comment) -- that partition is intentionally
+        # broken for this experiment so both can pull from overlapping
+        # candidates instead of competing for a nonexistent few. Restore
+        # 1.2/0.1 (shared) after reviewing case-by-case losses.
+        "low_vol_threshold": 5.0, "flat_threshold": 0.02,
         # Fixed 2026-08-28 (code review): removed the dead spread_width
         # config knob (used to default to 2) -- actual spread width has
         # always been fully delta-driven
@@ -305,7 +320,16 @@ async def lifespan(app: FastAPI):
     })
     StrategyRegistry.load_strategy("IRON_CONDOR", "iron_condor_v1", {
         "fast_period": 20, "slow_period": 50,
-        "low_vol_threshold": 1.2, "flat_threshold": 0.1,
+        # EXPERIMENT (2026-10-08, explicit user instruction): low_vol_threshold
+        # raised 1.2 -> 5.0 (must match ltp_poller.py's _LOW_VOL_THRESHOLD).
+        # flat_threshold RAISED 0.1 -> 1.0 -- iron_condor.py skips a candidate
+        # when ema_spread_pct >= flat_threshold ("too directional for a
+        # condor"), so loosening this means fewer candidates get excluded as
+        # not-flat-enough. See credit_spread_v1's matching comment above for
+        # why this value now differs from credit_spread_v1's flat_threshold
+        # (the shared-partition-boundary design is intentionally suspended).
+        # Restore 1.2/0.1 (shared) after reviewing case-by-case losses.
+        "low_vol_threshold": 5.0, "flat_threshold": 1.0,
         # Fixed 2026-09-04: short_offset/hedge_offset removed -- dead config,
         # never consulted by _process_iron_condor()'s actual (delta-based)
         # strike selection. See iron_condor.py's matching fix note.

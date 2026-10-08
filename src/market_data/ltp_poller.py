@@ -94,8 +94,19 @@ HISTORY_REFRESH_SECONDS      = 300  # reload 5-min OHLC baseline every 5 min
 _HISTORY_15M_REFRESH_SECONDS = 900  # reload 15-min OHLC baseline every 15 min
 
 # ATR% thresholds that must match strategy parameters
-_LOW_VOL_THRESHOLD = 1.2   # below = low volatility regime
-_FLAT_EMA_THRESHOLD = 0.1  # EMA spread below = EMAs are flat (no direction)
+# EXPERIMENT (2026-10-08, explicit user instruction): raised 1.2 -> 5.0 and
+# 0.1 -> 1.0. Found live: this pre-filter runs upstream of every gate
+# loosened in be759a7/028d018/09bfd5f -- credit_spread_v1/iron_condor_v1's
+# candidate pools had been EMPTY all session ("ATR% all >= 1.2%") because
+# almost no symbol's daily-scaled ATR% clears 1.2% (normal for NSE F&O
+# names, which commonly run 1.5-3%), so none of those other fixes could
+# matter -- the pool itself never had a candidate to hand them. Must stay
+# in sync with credit_spread.py's/iron_condor.py's own low_vol_threshold
+# (main.py wiring) -- see those files' matching comments. Restore 1.2/0.1
+# (and the main.py low_vol_threshold/flat_threshold values) together after
+# reviewing case-by-case losses.
+_LOW_VOL_THRESHOLD = 5.0   # below = low volatility regime
+_FLAT_EMA_THRESHOLD = 1.0  # EMA spread below = EMAs are flat (no direction)
 # EMA crossover candidates should be NEAR a cross, not deep in an already-established
 # trend — once EMA20/50 have diverged past this, the cross happened bars ago and the
 # strategy's sign-change detection structurally cannot fire again without a reversal.
