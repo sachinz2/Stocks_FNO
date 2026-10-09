@@ -45,7 +45,15 @@ class Settings(BaseSettings):
     # Trading
     INITIAL_CAPITAL: float = 300000.0
     MAX_OPEN_POSITIONS: int = 5
-    MAX_DAILY_LOSS_PCT: float = 0.05
+    # EXPERIMENT (2026-10-09, explicit user instruction): raised 0.05 -> 0.20
+    # for a bounded 1-week window -- "we want trades in all 4 strategies...
+    # we will do this for 1 more week, then we will start tightening the
+    # gates based on our observations and learnings from these trades." The
+    # kill switch mechanism itself, the daily reset, and every other risk
+    # check (sector concentration, margin, exit-bypass) are UNCHANGED --
+    # this only resizes how much a single day can lose before the breaker
+    # trips, not whether one exists. Restore 0.05 after the 1-week review.
+    MAX_DAILY_LOSS_PCT: float = 0.20
     MAX_EXPOSURE_PCT: float = 0.30
     TRADING_MODE: str = "paper"  # paper | live
 
