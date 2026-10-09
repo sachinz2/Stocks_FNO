@@ -6119,6 +6119,17 @@ class LiveTradingEngine:
                 continue
             contract = pos["symbol"]
             entry_p = float(pos.get("avg_price") or 0)
+            # Fixed 2026-10-09 (same live incident/bug class as
+            # _square_off_all()'s avg_price fix): `pos` is a LIVE reference
+            # into PaperBroker._positions, and place_order() below (a full
+            # close) mutates this exact dict's quantity to 0 the moment it
+            # fills. The pnl/capital-release reads further down used to
+            # re-read pos["quantity"] AFTER that mutation, silently computing
+            # abs(0) -- turning every "EXIT" signal close into a recorded
+            # pnl=0 AND releasing zero deployed capital back to the owning
+            # strategy's budget (a real leak, not just a wrong number).
+            # Capture the real quantity now, before the close order runs.
+            _qty = abs(pos["quantity"])
             md = await self._get_market_data(underlying)
             atr = float(md.get("atr14", 0)) if md else 0
             _live_p = await get_option_quote(contract, getattr(self, "_kite", None), getattr(self, "_redis", None))
@@ -6150,7 +6161,7 @@ class LiveTradingEngine:
 
             if _ex_order is None:
                 _ex_order = await self.order_manager.place_order(
-                    contract, "SELL", abs(pos["quantity"]), exit_p,
+                    contract, "SELL", _qty, exit_p,
                     is_exit_order=True, strategy_name=_ex_owner_strategy,
                 )
                 if _ex_order is not None and getattr(_ex_order, "order_status", "") == "PENDING_VERIFICATION":
@@ -6174,7 +6185,7 @@ class LiveTradingEngine:
 
             _jrnl_info = self._single_leg_journals.pop(contract, None)
             if _jrnl_info:
-                _pnl = round((_ex_fill_p - entry_p) * abs(pos["quantity"]), 2)
+                _pnl = round((_ex_fill_p - entry_p) * _qty, 2)
                 await self._log_trade_close(
                     journal_id=_jrnl_info.get("journal_id"),
                     exit_price=_ex_fill_p,
@@ -6187,7 +6198,7 @@ class LiveTradingEngine:
                     option_mae_pct=_jrnl_info.get("mae_option_pct"),
                 )
                 self.risk_manager.release_deployed_capital(
-                    _jrnl_info.get("strategy_name", "ema_crossover_v1"), entry_p * abs(pos["quantity"]),
+                    _jrnl_info.get("strategy_name", "ema_crossover_v1"), entry_p * _qty,
                 )
         # Fixed 2026-09-16 (deep review): this used to unconditionally `del`
         # any active spread/condor tracked on this underlying here -- with
@@ -6405,7 +6416,25 @@ class LiveTradingEngine:
                 # Write exit to trade journal so EOD/expiry closes appear in PnL analytics
                 _jrnl_info = self._single_leg_journals.pop(contract, None)
                 if _jrnl_info:
-                    _entry_p = float(pos.get("avg_price") or 0)
+                    # Fixed 2026-10-09 (live incident): this used to re-read
+                    # pos.get("avg_price") here -- but `pos` is a LIVE
+                    # reference into PaperBroker._positions (get_positions()
+                    # returns the actual mutable dicts, not copies), and
+                    # place_order() above already executed the closing SELL,
+                    # which mutates this exact position's avg_price to 0.0
+                    # the moment quantity nets to zero (see PaperBroker.
+                    # _update_position()'s "elif new_qty == 0: avg_price =
+                    # 0.0" branch). Re-reading after the close order ran
+                    # silently replaced the real entry price with 0.0,
+                    # turning every EOD-square-off pnl into exit_price * qty
+                    # (the position's gross notional value) instead of the
+                    # real (exit-entry)*qty -- confirmed live 2026-10-09:
+                    # KALYANKJIL showed pnl=+Rs20,169 for a real Rs1,525.50
+                    # LOSS, reported as a huge fake profit. Reuse entry_p,
+                    # captured above at the top of this loop iteration
+                    # BEFORE the closing order was placed -- the only
+                    # correct value.
+                    _entry_p = entry_p
                     _signed  = 1 if qty > 0 else -1
                     _pnl     = round((_sq_fill_p - _entry_p) * abs(qty) * _signed, 2)
                     # Per-CONTRACT classification (falls back to the global

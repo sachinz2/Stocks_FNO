@@ -1149,6 +1149,44 @@ def check_daily_loss_bypass_has_an_expiry_and_does_not_touch_the_manual_kill_swi
     return PASS, name, "Daily-loss auto-trip bypass has a hard-coded 2026-10-23 expiry and the manual kill-switch flag/API are untouched."
 
 
+def check_square_off_and_exit_signal_pnl_use_the_pre_close_position_values(repo: Path) -> Result:
+    name = "EOD square-off / EXIT-signal pnl use the position's PRE-close entry price and quantity, not a post-close live-dict read"
+    src = _read(repo, "src/live_trading/live_trading_engine.py")
+
+    idx = src.find("async def _square_off_all(")
+    if idx == -1:
+        return FAIL, name, "_square_off_all() missing."
+    body = src[idx: idx + 13000]
+    if '_entry_p = entry_p' not in body:
+        return FAIL, name, (
+            "_square_off_all() no longer reuses the pre-close `entry_p` for the trade-journal "
+            "pnl/capital-release write -- confirmed live 2026-10-09: pos.get('avg_price') is a "
+            "LIVE reference into PaperBroker._positions, and place_order() (the closing SELL) "
+            "mutates that exact dict's avg_price to 0.0 the instant the position nets to zero. "
+            "Re-reading it after the close silently turned every EOD-square-off pnl into "
+            "exit_price * qty (gross notional) instead of (exit-entry)*qty -- KALYANKJIL showed "
+            "+Rs20,169 for a real Rs1,525.50 LOSS."
+        )
+
+    idx2 = src.find("async def _exit_all_options_for(")
+    if idx2 == -1:
+        return FAIL, name, "_exit_all_options_for() missing."
+    body2 = src[idx2: idx2 + 4000]
+    if "_qty = abs(pos[" not in body2:
+        return FAIL, name, (
+            "_exit_all_options_for() no longer captures _qty before the closing order runs -- "
+            "same bug class as _square_off_all() above, but on quantity instead of avg_price: "
+            "place_order() zeroes pos['quantity'] on a full close, so re-reading it afterward for "
+            "pnl/capital-release silently computed abs(0) -- every 'EXIT signal' single-leg close "
+            "recorded pnl=0 AND leaked the strategy's deployed capital (never released)."
+        )
+    _qty_capture_idx = body2.find("_qty = abs(")
+    after_capture = body2[_qty_capture_idx + len("_qty = abs(pos[\"quantity\"])"):]
+    if 'pos["quantity"]' in after_capture:
+        return FAIL, name, "_exit_all_options_for() still re-reads pos['quantity'] somewhere after capturing _qty -- check every use was switched to _qty."
+    return PASS, name, "Both EOD square-off and EXIT-signal close paths use position values captured BEFORE the closing order runs, not re-read from the (by-then-mutated) live position dict."
+
+
 STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_exit_classification_by_pnl,
     check_capital_allocation_keys,
@@ -1202,6 +1240,7 @@ STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_rejected_outcome_detail_actually_matches,
     check_spread_condor_have_granular_rejection_detail,
     check_spread_condor_have_liquidity_check,
+    check_square_off_and_exit_signal_pnl_use_the_pre_close_position_values,
 ]
 
 
