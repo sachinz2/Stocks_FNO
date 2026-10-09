@@ -4335,15 +4335,23 @@ class LiveTradingEngine:
             }
             return
 
-        # Risk/reward check: net credit must be ≥ 20% of wing width.
+        # Risk/reward check: net credit must be ≥ MIN_CREDIT_PCT_OF_WING of wing width.
         # A ₹50 spread collecting only ₹5 has a 1:9 risk/reward — not viable.
-        # Minimum 20% means: at worst a ₹50 wing collects ₹10, giving 1:4 risk/reward.
+        # At the original 20% floor: a ₹50 wing must collect ≥₹10 (1:4 R/R).
+        #
+        # EXPERIMENT (2026-10-09, explicit user instruction: "loosen it a
+        # little bit"): lowered 0.20 -> 0.10, a deliberately modest cut (not
+        # the aggressive multi-x jumps used for the other gates this
+        # session) -- this is a risk/reward floor, not a liquidity or
+        # contract-resolution check, so a smaller nudge was asked for.
+        # Restore 0.20 after reviewing case-by-case losses.
         spread_width_pts = abs(short_strike - long_strike)
-        MIN_CREDIT_PCT_OF_WING = 0.20
+        MIN_CREDIT_PCT_OF_WING = 0.10
         if net_credit < spread_width_pts * MIN_CREDIT_PCT_OF_WING:
             logger.info(
                 f"[CreditSpread] {symbol} skipped — net credit ₹{net_credit:.2f} < "
-                f"20% of wing width ({spread_width_pts} pts × 20% = ₹{spread_width_pts * MIN_CREDIT_PCT_OF_WING:.2f}). "
+                f"{MIN_CREDIT_PCT_OF_WING:.0%} of wing width ({spread_width_pts} pts × "
+                f"{MIN_CREDIT_PCT_OF_WING:.0%} = ₹{spread_width_pts * MIN_CREDIT_PCT_OF_WING:.2f}). "
                 f"R/R too poor."
             )
             self._last_gate_rejection = {
@@ -5429,17 +5437,24 @@ class LiveTradingEngine:
             }
             return
 
-        # Risk/reward check: each wing's net credit must be ≥ 20% of that wing's width.
-        # A 50-point wing collecting only 4 points per share gives 1:11.5 risk/reward — not viable.
+        # Risk/reward check: each wing's net credit must be ≥ MIN_WING_CREDIT_PCT
+        # of that wing's width. A 50-point wing collecting only 4 points per
+        # share gives 1:11.5 risk/reward at the original 20% floor — not viable.
+        #
+        # EXPERIMENT (2026-10-09, explicit user instruction: "loosen it a
+        # little bit"): see matching comment in _process_credit_spread()
+        # above -- same deliberately modest 0.20 -> 0.10 cut. Restore 0.20
+        # after reviewing case-by-case losses.
         put_wing_width  = abs(put_short_strike  - put_long_strike)
         call_wing_width = abs(call_short_strike - call_long_strike)
         put_wing_credit  = put_short_p  - put_long_p
         call_wing_credit = call_short_p - call_long_p
-        MIN_WING_CREDIT_PCT = 0.20
+        MIN_WING_CREDIT_PCT = 0.10
         if put_wing_credit < put_wing_width * MIN_WING_CREDIT_PCT:
             logger.info(
                 f"[IronCondor] {symbol} skipped — put wing credit ₹{put_wing_credit:.2f} < "
-                f"20% of wing ({put_wing_width} pts × 20% = ₹{put_wing_width * MIN_WING_CREDIT_PCT:.2f})."
+                f"{MIN_WING_CREDIT_PCT:.0%} of wing ({put_wing_width} pts × "
+                f"{MIN_WING_CREDIT_PCT:.0%} = ₹{put_wing_width * MIN_WING_CREDIT_PCT:.2f})."
             )
             self._last_gate_rejection = {
                 "gate": "min_credit", "value": round(put_wing_credit, 2),
@@ -5449,7 +5464,8 @@ class LiveTradingEngine:
         if call_wing_credit < call_wing_width * MIN_WING_CREDIT_PCT:
             logger.info(
                 f"[IronCondor] {symbol} skipped — call wing credit ₹{call_wing_credit:.2f} < "
-                f"20% of wing ({call_wing_width} pts × 20% = ₹{call_wing_width * MIN_WING_CREDIT_PCT:.2f})."
+                f"{MIN_WING_CREDIT_PCT:.0%} of wing ({call_wing_width} pts × "
+                f"{MIN_WING_CREDIT_PCT:.0%} = ₹{call_wing_width * MIN_WING_CREDIT_PCT:.2f})."
             )
             self._last_gate_rejection = {
                 "gate": "min_credit", "value": round(call_wing_credit, 2),
