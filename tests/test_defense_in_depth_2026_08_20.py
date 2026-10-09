@@ -234,13 +234,22 @@ async def test_last_signal_date_persists_and_restores_across_restart():
 # ── 3. Kill switch / daily-loss limit: realistic multi-trade sequence ───────
 
 @pytest.mark.asyncio
-async def test_kill_switch_trips_mid_sequence_blocks_entries_not_exits():
+async def test_kill_switch_trips_mid_sequence_blocks_entries_not_exits(monkeypatch):
     """A realistic sequence: several entries succeed, losses accumulate,
     the daily-loss limit trips the kill switch mid-sequence -- subsequent
     entries must be blocked while an exit for an existing position still
     goes through, and deployed capital tracking stays consistent throughout."""
     from src.orders.order_manager import OrderManager
     from src.risk.risk_manager import RiskManager
+
+    # EXPERIMENT (2026-10-09, explicit user instruction): the daily-loss
+    # auto-trip is bypassed through 2026-10-23 ("deactivate the kill switch
+    # for 2 weeks") -- monkeypatch past that date so this test still
+    # exercises the real trip logic. Remove once the bypass itself is
+    # removed from risk_manager.py.
+    import datetime as _dt
+    import src.risk.risk_manager as rm_module
+    monkeypatch.setattr(rm_module, "now_ist", lambda: _dt.datetime(2026, 11, 1))
 
     class _Row:
         _next_id = 1

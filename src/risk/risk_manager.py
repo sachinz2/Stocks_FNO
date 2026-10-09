@@ -8,6 +8,7 @@ from src.core.constants import (
     MAX_SECTOR_POSITIONS,
     STRATEGY_CAPITAL_ALLOCATION,
 )
+from src.core.utils import now_ist
 
 logger = logging.getLogger(__name__)
 
@@ -212,15 +213,32 @@ class RiskManager:
             return False
 
         # ── 2. Daily loss limit ───────────────────────────────────────────────
-        total_daily_pnl = self.daily_realized_pnl + self.daily_unrealized_pnl
-        max_allowed_loss = -(self.initial_capital * self.rules["max_daily_loss_pct"])
-        if total_daily_pnl <= max_allowed_loss:
-            logger.error(
-                f"Risk: daily loss limit reached — PnL {total_daily_pnl:.2f} "
-                f"<= limit {max_allowed_loss:.2f}"
-            )
-            self.activate_kill_switch("Max Daily Loss Reached")
-            return False
+        # EXPERIMENT (2026-10-09, explicit user instruction): fully deactivated
+        # through 2026-10-23 (2 weeks) -- "I asked you to deactivate the kill
+        # switch for 2 weeks." This supersedes the earlier same-day
+        # MAX_DAILY_LOSS_PCT 5%->20% resize (a4be7e7/a6be7e7), which has been
+        # reverted back to the original 5% -- that value only matters again
+        # once this bypass expires, so it resumes at the conservative
+        # default, not a still-loosened one, consistent with the "then we
+        # start tightening" plan. Flagged plainly before making this change:
+        # unlike every other gate in this experiment, there is now NO daily
+        # loss circuit breaker at all during this window -- a bad day (or a
+        # bug) has nothing automatic stopping it short of this date. The
+        # kill switch FLAG and its manual activate/deactivate API (layer 1
+        # above) are UNCHANGED -- a manual override is still possible.
+        # Self-reactivates on the date below without needing a manual revert.
+        from datetime import date as _date
+        _DAILY_LOSS_AUTO_TRIP_DISABLED_UNTIL = _date(2026, 10, 23)
+        if now_ist().date() >= _DAILY_LOSS_AUTO_TRIP_DISABLED_UNTIL:
+            total_daily_pnl = self.daily_realized_pnl + self.daily_unrealized_pnl
+            max_allowed_loss = -(self.initial_capital * self.rules["max_daily_loss_pct"])
+            if total_daily_pnl <= max_allowed_loss:
+                logger.error(
+                    f"Risk: daily loss limit reached — PnL {total_daily_pnl:.2f} "
+                    f"<= limit {max_allowed_loss:.2f}"
+                )
+                self.activate_kill_switch("Max Daily Loss Reached")
+                return False
 
         # Spread legs bypass entry-only checks (but kill switch above still applies).
         # By the time leg 2-4 is placed, leg 1 has already executed — blocking the

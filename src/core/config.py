@@ -45,15 +45,13 @@ class Settings(BaseSettings):
     # Trading
     INITIAL_CAPITAL: float = 300000.0
     MAX_OPEN_POSITIONS: int = 5
-    # EXPERIMENT (2026-10-09, explicit user instruction): raised 0.05 -> 0.20
-    # for a bounded 1-week window -- "we want trades in all 4 strategies...
-    # we will do this for 1 more week, then we will start tightening the
-    # gates based on our observations and learnings from these trades." The
-    # kill switch mechanism itself, the daily reset, and every other risk
-    # check (sector concentration, margin, exit-bypass) are UNCHANGED --
-    # this only resizes how much a single day can lose before the breaker
-    # trips, not whether one exists. Restore 0.05 after the 1-week review.
-    MAX_DAILY_LOSS_PCT: float = 0.20
+    # Reverted back to 0.05 (2026-10-09): the earlier same-day 0.05->0.20
+    # resize (a6be7e7) is superseded by a full, date-bounded bypass of the
+    # daily-loss check itself in risk_manager.validate_trade() -- "I asked
+    # you to deactivate the kill switch for 2 weeks." This value only
+    # matters again once that bypass expires (2026-10-23), so it resumes at
+    # the original conservative default rather than a still-loosened one.
+    MAX_DAILY_LOSS_PCT: float = 0.05
     MAX_EXPOSURE_PCT: float = 0.30
     TRADING_MODE: str = "paper"  # paper | live
 

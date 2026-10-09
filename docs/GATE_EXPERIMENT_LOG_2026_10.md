@@ -8,6 +8,11 @@ each strategy on its own merits. Plan (user's own words, 2026-10-09): *"we
 will do this for 1 more week, then we will start tightening the gates, based
 on our observations and learnings from these trades."*
 
+**⚠️ Update, same day:** the daily-loss circuit breaker has since been
+**fully deactivated** (not just resized) through **2026-10-23** — see item
+13. That's a bigger, separate risk step than the rest of this log; the
+1-week plan above still stands for everything else.
+
 This is the single source of truth for **every original value**, so
 tightening back up later is a checklist, not an archaeology project. Each row
 links to the commit that made the change — `git show <hash>` for the full
@@ -175,17 +180,28 @@ bug fix, not a loosened gate. Keep it regardless of what else gets reverted.
 | **Revert note:** `STRATEGY_CAPITAL_ALLOCATION` itself (`src/core/constants.py` — 0.30/0.35/0.15/0.20 for the 4 strategies) was never touched; only the formula that *uses* it in `risk_manager.py` was swapped out. Revert by restoring the original formula line (kept as a comment in the diff). |
 | **Tests touched:** `test_risk_manager.py` (2 tests) — fixture budgets changed from the percentage formula to the flat 10L figure. |
 
-## 12. Daily-loss circuit breaker (kill switch threshold)
+## 12. Daily-loss circuit breaker — threshold resize (SUPERSEDED, see item 13)
 
 | | |
 |---|---|
 | **File** | `src/core/config.py` — `MAX_DAILY_LOSS_PCT`, **plus the server's `.env` file**, which had its own separate hardcoded `MAX_DAILY_LOSS_PCT=0.05` override that would have silently kept the old limit if left alone |
 | **Original** | `0.05` (5% of capital) |
-| **Loosened to** | `0.20` (20% of capital) |
-| **Commit** | `a6be7e7` |
-| **Explicitly bounded:** user's own words — *"we will do this for 1 more week."* This should be one of the first things reverted when that week is up, alongside item 6 (liquidity). |
-| **What did NOT change:** the kill switch mechanism itself, the 09:15 IST daily reset (`reset_daily_state()`), and every other risk check (sector concentration, margin sufficiency, exit-order bypass) are all exactly as before — only the loss % that trips the breaker is bigger. |
-| **Revert note:** must update **both** `src/core/config.py` (code default) **and** the server's `/home/falcon/trading/.env` line — they're independent, and `.env` wins if they disagree. |
+| **Loosened to, then reverted** | `0.20` (20%) in `a6be7e7`, same day — then **reverted back to `0.05`** in the same commit as item 13's full bypass, once that made the resize moot. Kept at the conservative default so the check resumes correctly once the item-13 bypass expires. |
+| **Status: superseded by item 13 below, same day.** The kill switch trapped at least 2 trading days short with the 20% version still in place, and the user asked for something bigger. |
+
+## 13. Daily-loss circuit breaker — fully deactivated for 2 weeks (supersedes item 12)
+
+| | |
+|---|---|
+| **File** | `src/risk/risk_manager.py` — `validate_trade()`, "2. Daily loss limit" section |
+| **Original behavior** | Checks `total_daily_pnl <= -(initial_capital * max_daily_loss_pct)` on every entry; trips the kill switch if breached. |
+| **Changed to** | The entire check is skipped — no daily-loss auto-trip at all — **while `now_ist().date() < date(2026, 10, 23)`**. On or after that date it resumes automatically, using the value in item 12 (`0.05`, the original). |
+| **Explicit user instruction:** *"i asked you to deactivate the kill switch for 2 weeks."* (Note: this is a bigger step than what was first asked for on 2026-10-09 — "change it... we will do this for 1 more week" — and item 12's 20% resize is what was actually built from that. When this discrepancy was flagged back, the user explicitly confirmed "fully deactivate for 2 weeks" over the smaller alternative offered.) |
+| **⚠️ Flagged plainly before implementing:** unlike every other item in this log, there is now **no daily-loss circuit breaker of any kind** during this window. A bad day — or a bug — has nothing automatic stopping it short of 2026-10-23. This is a materially bigger risk step than anything else in this document. Still paper money throughout. |
+| **What did NOT change — this is the one safety net still standing:** the **manual** kill switch (the `kill_switch_active`/`circuit_breaker_active` flags, checked as layer 1, *before* the now-bypassed layer 2) and its `/admin/kill-switch` activate/deactivate API are completely untouched. If something looks wrong during these 2 weeks, flipping the kill switch on manually still immediately blocks all new entries — it just won't happen *automatically* from daily P&L anymore. |
+| **Self-expiring by design:** the bypass is a hard-coded date check (`_DAILY_LOSS_AUTO_TRIP_DISABLED_UNTIL = date(2026, 10, 23)`), not an indefinite flag — it cannot silently stay disabled past the 2 weeks even if nobody remembers to revert it manually. A `verify_invariants.py` check (`check_daily_loss_bypass_has_an_expiry_and_does_not_touch_the_manual_kill_switch`) guards both that this date exists and that the manual kill switch stays independent of it. |
+| **Tests touched:** `test_risk_manager.py` (2 tests), `test_defense_in_depth_2026_08_20.py` (1 test) — each now monkeypatches `now_ist()` to a date after 2026-10-23 so the underlying trip logic is still verified as correct, rather than the tests silently passing (or failing) for the wrong reason. |
+| **To revert early** (before 2026-10-23, if needed): change the date comparison to always take the "else" branch, or just set `_DAILY_LOSS_AUTO_TRIP_DISABLED_UNTIL` to today. **To revert permanently** at or after the 2-week mark: delete the bypass's `if` entirely (the original unconditional check is preserved in the diff), and decide fresh what `MAX_DAILY_LOSS_PCT` should be given everything learned in the interim — don't just assume 0.05 is still right. |
 
 ---
 

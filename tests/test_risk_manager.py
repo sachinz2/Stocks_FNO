@@ -20,7 +20,17 @@ def test_validate_trade_max_exposure_violation(risk_manager):
     passed = risk_manager.validate_trade("RELIANCE", "BUY", 50, 1000.0)
     assert passed is False
 
-def test_validate_trade_max_daily_loss_violation(risk_manager):
+def test_validate_trade_max_daily_loss_violation(risk_manager, monkeypatch):
+    # EXPERIMENT (2026-10-09, explicit user instruction): the daily-loss
+    # auto-trip is bypassed through 2026-10-23 ("deactivate the kill switch
+    # for 2 weeks") -- monkeypatch past that date so this test still
+    # exercises the real trip logic rather than silently passing for the
+    # wrong reason (bypass window, not a real pass). Remove the monkeypatch
+    # once the bypass itself is removed from risk_manager.py.
+    import datetime as _dt
+    import src.risk.risk_manager as rm_module
+    monkeypatch.setattr(rm_module, "now_ist", lambda: _dt.datetime(2026, 11, 1))
+
     # Max loss is 5% of 100k = -5000
     risk_manager.update_state([], -6000.0, 0.0) # We are down 6k today
 
@@ -80,7 +90,13 @@ def test_orders_router_reuses_the_live_engines_risk_manager_not_its_own():
     assert "engine.order_manager" in src
 
 
-def test_max_daily_loss_pct_is_configurable():
+def test_max_daily_loss_pct_is_configurable(monkeypatch):
+    # EXPERIMENT (2026-10-09, explicit user instruction): see matching
+    # comment on test_validate_trade_max_daily_loss_violation above.
+    import datetime as _dt
+    import src.risk.risk_manager as rm_module
+    monkeypatch.setattr(rm_module, "now_ist", lambda: _dt.datetime(2026, 11, 1))
+
     rm = RiskManager(initial_capital=100_000.0, max_daily_loss_pct=0.02)
     assert rm.rules["max_daily_loss_pct"] == 0.02
     # Max loss is 2% of 100k = -2000; down 2500 must trip it.

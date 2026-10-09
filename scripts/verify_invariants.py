@@ -1120,6 +1120,35 @@ def check_real_contract_snaps_an_unlisted_expiry_too(repo: Path) -> Result:
     return PASS, name, "An unlisted expiry snaps to the nearest real listed one (within tolerance), the same fail-closed-but-smart pattern already used for an unlisted strike."
 
 
+def check_daily_loss_bypass_has_an_expiry_and_does_not_touch_the_manual_kill_switch(repo: Path) -> Result:
+    name = "The 2-week daily-loss-breaker bypass self-expires and doesn't disable the MANUAL kill switch"
+    src = _read(repo, "src/risk/risk_manager.py")
+    idx = src.find("_DAILY_LOSS_AUTO_TRIP_DISABLED_UNTIL")
+    if idx == -1:
+        return WARN, name, (
+            "The explicit 2026-10-09 2-week daily-loss bypass ('I asked you to deactivate the "
+            "kill switch for 2 weeks') is gone -- either it was reverted (fine, update/remove "
+            "this check) or the bypass logic was refactored without its expiry date (not fine, "
+            "check it didn't become a silent permanent disable)."
+        )
+    body = src[max(0, idx - 200): idx + 400]
+    if "date(2026, 10, 23)" not in body:
+        return FAIL, name, (
+            "The daily-loss bypass's hard-coded expiry date changed or was removed -- this check "
+            "exists specifically so a 2-week experiment can't silently become permanent. Confirm "
+            "the new date is intentional before updating this check to match."
+        )
+    # Layer 1 (the manual kill-switch flag + activate/deactivate API) must be
+    # completely unaffected -- this bypass is scoped to layer 2 only.
+    layer1_idx = src.find("1. Kill switch / circuit breaker")
+    if layer1_idx == -1 or layer1_idx > idx:
+        return FAIL, name, "Could not confirm layer 1 (manual kill switch check) still precedes and is independent of the daily-loss bypass."
+    layer1_body = src[layer1_idx: idx]
+    if '"kill_switch_active"' not in layer1_body or '"circuit_breaker_active"' not in layer1_body:
+        return FAIL, name, "Manual kill-switch/circuit-breaker flag check appears to have been altered alongside the daily-loss bypass -- these must stay independent."
+    return PASS, name, "Daily-loss auto-trip bypass has a hard-coded 2026-10-23 expiry and the manual kill-switch flag/API are untouched."
+
+
 STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_exit_classification_by_pnl,
     check_capital_allocation_keys,
@@ -1158,6 +1187,7 @@ STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_low_vol_regime_has_no_structurally_impossible_strategy,
     check_strategy_health_reads_the_real_pause_reason,
     check_real_contract_snaps_an_unlisted_expiry_too,
+    check_daily_loss_bypass_has_an_expiry_and_does_not_touch_the_manual_kill_switch,
     check_gate_bottleneck_alerting_is_wired,
     check_shadow_observation_never_reaches_real_order_placement,
     check_signal_staleness_watches_paused_strategies_too,
