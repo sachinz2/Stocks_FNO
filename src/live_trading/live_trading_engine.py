@@ -2426,7 +2426,7 @@ class LiveTradingEngine:
     @staticmethod
     def _resolved_strike_delta_ok(
         strike: float, opt: str, target_delta: float,
-        underlying_price: float, dte: int, sigma: float, delta_tol: float = 0.08,
+        underlying_price: float, dte: int, sigma: float, delta_tol: float = 0.15,
     ) -> bool:
         """
         Fixed 2026-08-21 (external review): _resolve_contract() can itself
@@ -2441,6 +2441,15 @@ class LiveTradingEngine:
         "what we computed" and "what we actually sold." Verifies the actual
         resolved strike's real Black-Scholes delta is still within
         delta_tol of the original target.
+
+        EXPERIMENT (2026-10-09, explicit user instruction: "iron_condor &
+        credit_spread are my main strategies... we need trades in
+        iron_condor"): widened 0.08 -> 0.15. Confirmed live: GAIL's
+        resolved put-short strike was rejected here right after clearing
+        every other iron_condor_v1 gate (pool, ADX, event calendar,
+        liquidity, wing-credit, expiry resolution) -- this delta-accuracy
+        check was the next thing in line. Restore 0.08 after reviewing
+        case-by-case losses.
         """
         from src.market_data.option_chain import bs_delta
         T = max(dte, 1) / 365.0

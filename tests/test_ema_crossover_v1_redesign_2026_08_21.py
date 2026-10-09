@@ -306,13 +306,14 @@ def test_main_py_wires_up_ema_crossover_v1_round2_params():
     from src.api import main as main_module
     src = inspect.getsource(main_module)
     idx = src.index('StrategyRegistry.load_strategy("EMA_CROSSOVER"')
-    block = src[idx:idx + 2400]
+    block = src[idx:idx + 3200]
     # Fixed 2026-08-27 (trade review): adx_entry_threshold raised 18->22,
     # underlying_stop_atr_mult raised 1.0->1.4 -- see ema_crossover.py's
     # matching comments for why.
     # EXPERIMENT (2026-10-08, explicit user instruction): adx_entry_threshold
-    # further lowered 22->8. Restore 22 after reviewing case-by-case losses.
-    assert '"adx_entry_threshold": 8' in block
+    # further lowered 22->8, then partially raised to 16 on 2026-10-09
+    # (reduce ema_crossover_v1 trade volume). Restore 22 after review.
+    assert '"adx_entry_threshold": 16' in block
     assert '"rvol_hard_gate": False' in block
     assert '"mtf_strict": False' in block
     assert '"ema_reversal_exit": True' in block

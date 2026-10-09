@@ -259,11 +259,17 @@ async def lifespan(app: FastAPI):
         # already-strong trend" intent (still well below the old flat-25
         # gate this strategy had before the 2026-08-21 redesign) while
         # screening out the weakest setups.
-        # EXPERIMENT (2026-10-08, explicit user instruction): lowered 22 -> 8
-        # to stop screening out marginal crossovers on entry ADX, to see
-        # trades across all strategies and review losses case-by-case.
+        # EXPERIMENT (2026-10-08, explicit user instruction): lowered 22 -> 8,
+        # then partially raised back to 16 on 2026-10-09 ("we can reduce
+        # the trades for ema_crossover... iron_condor & credit_spread are
+        # my main strategies") -- ema_crossover_v1's real (corrected, see
+        # a33431e) performance over the first 2 days was a 33% win rate and
+        # a large net loss, and its high trade volume was claiming
+        # underlyings via the cross-strategy collision guard, crowding out
+        # credit_spread_v1/iron_condor_v1 candidates. Not reverted fully to
+        # 22 -- still deliberately looser than original, just not maximal.
         # Restore 22 after review.
-        "adx_entry_threshold": 8,
+        "adx_entry_threshold": 16,
         # adx_checked_internally is hardcoded True in ema_crossover.py's
         # initialize() (not parameter-driven, unlike everything else here)
         # -- listing it would silently be a no-op, so it's intentionally
@@ -286,10 +292,12 @@ async def lifespan(app: FastAPI):
         # sample -- the gap itself was never checked. Same 0.1% floor as the
         # exit side's ema_reversal_min_gap_pct, checked once at fire time.
         # EXPERIMENT (2026-10-08, explicit user instruction): lowered
-        # 0.001 -> 0.0001 (entry side only; exit-side ema_reversal_min_gap_pct
-        # above is untouched so exits still reflect realistic behavior).
-        # Restore 0.001 after review.
-        "entry_min_gap_pct": 0.0001,
+        # 0.001 -> 0.0001, then partially raised back to 0.0005 on
+        # 2026-10-09 -- see matching comment on adx_entry_threshold above
+        # (reduce ema_crossover_v1 trade volume). Entry side only; exit-side
+        # ema_reversal_min_gap_pct above is untouched so exits still
+        # reflect realistic behavior. Restore 0.001 after review.
+        "entry_min_gap_pct": 0.0005,
         "entry_option_delta": None,
     })
     StrategyRegistry.load_strategy("CREDIT_SPREAD", "credit_spread_v1", {

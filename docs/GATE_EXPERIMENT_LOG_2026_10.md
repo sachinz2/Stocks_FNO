@@ -205,6 +205,75 @@ bug fix, not a loosened gate. Keep it regardless of what else gets reverted.
 
 ---
 
+**⚠️ Priority shift, 2026-10-09 (end of day 2):** after seeing the *corrected*
+P&L for the first 2 days (see "Historical pnl correction" section below —
+the dashboard had been showing fake profits), the user clarified: *"we can
+reduce the trades for ema_crossover, but we need trades in iron_condor,
+iron_condor & credit_spread are my main strategies."* `ema_crossover_v1`'s
+real performance was a 33% win rate and a large net loss over 29 trades
+across the two days, and its high volume was claiming underlyings via the
+cross-strategy collision guard (item 16), crowding out
+`credit_spread_v1`/`iron_condor_v1` candidates. Items 14-16 below implement
+this: one gate loosened further for `credit_spread_v1`/`iron_condor_v1`
+specifically, two gates partially (not fully) tightened back for
+`ema_crossover_v1` only (`momentum_v1` untouched — the user named
+`ema_crossover_v1` specifically).
+
+## 14. Resolved-strike delta-accuracy tolerance (credit_spread_v1 + iron_condor_v1)
+
+| | |
+|---|---|
+| **File** | `src/live_trading/live_trading_engine.py` — `_resolved_strike_delta_ok()`'s `delta_tol` default |
+| **Original** | `0.08` |
+| **Loosened to** | `0.15` |
+| **What it does**: after `_resolve_contract()` snaps a computed strike to the nearest actually-listed one, this re-verifies the FINAL strike's real Black-Scholes delta hasn't drifted too far from the original target (e.g. -0.20 for a put short). Shared by both `credit_spread_v1` (1 call site) and `iron_condor_v1` (2 call sites, one per short leg) — neither passes `delta_tol` explicitly, so both use this default. |
+| **Found live, same day:** this was the very next gate `iron_condor_v1` hit (GAIL) immediately after clearing every other gate in its chain (pool, ADX, event calendar, liquidity, wing-credit, expiry resolution) for the first time. |
+| **Tests touched:** none needed updating — the two existing delta-tolerance tests (`test_second_opinion_review_2026_08_21.py`) use strikes far enough outside tolerance that widening 0.08→0.15 doesn't flip either result. |
+
+## 15. ema_crossover_v1 ADX entry threshold — partially re-tightened
+
+| | |
+|---|---|
+| **File** | `src/api/main.py`, `EMA_CROSSOVER` config dict |
+| **Original** | `22` → loosened to `8` (`be759a7`, item 8) → **partially re-tightened to `16`** |
+| **Why not back to 22:** the user asked to *reduce*, not eliminate, `ema_crossover_v1` activity — still deliberately looser than the pre-experiment baseline. |
+| **Tests touched:** `test_ema_crossover_v1_redesign_2026_08_21.py`, `test_trade_review_fixes_2026_08_27.py` (2 tests) — literal value and one window-size bump. |
+
+## 16. ema_crossover_v1 entry min-gap — partially re-tightened
+
+| | |
+|---|---|
+| **File** | `src/api/main.py`, `EMA_CROSSOVER` config dict |
+| **Original** | `0.001` → loosened to `0.0001` (`be759a7`, item 8) → **partially re-tightened to `0.0005`** |
+| **Scope reminder:** entry side only — `ema_reversal_min_gap_pct` (exit side) was never touched by item 8 or this change, so exits still reflect realistic behavior. |
+| **Tests touched:** `test_trade_review_fixes_2026_08_27.py` (1 test) — literal value and window-size bump. |
+
+---
+
+## Historical pnl correction (2026-10-09) — unrelated bug, not a loosened gate
+
+Separately from this experiment: the user noticed several `ema_crossover_v1`
+"EOD square-off" trades showed large profits despite exit price being
+*lower* than entry price. Root cause: `PaperBroker.get_positions()` returns
+LIVE references into its internal position dicts, and the closing order
+zeroes out a fully-closed position's `avg_price`/`quantity` the instant it
+fills. `_square_off_all()`/`_exit_all_options_for()` were both re-reading
+those fields from the position dict *after* placing the closing order,
+silently picking up the post-close zero instead of the real pre-close
+value. Fixed in `a33431e` (see that commit for the full writeup) — this is
+a correctness bug, unrelated to any gate, and stays fixed regardless of
+what else in this log gets reverted.
+
+6 historical `trade_journal` rows (ids 204, 224, 225, 229, 231, 235) had
+already been written with the wrong `pnl` before the fix landed — all 6
+were corrected via direct `UPDATE` to their real `(exit-entry)*qty` value
+on 2026-10-09, on the user's explicit request. The real 2-day P&L is **far
+worse** than what was shown live: Oct 8 -₹11,524.50, Oct 9 -₹51,590.00
+(both strategies, both days net negative) — not the roughly-breakeven
+picture the corrupted data suggested at the time.
+
+---
+
 ## What was deliberately NOT loosened (and why — don't touch these without a fresh decision)
 
 | Gate | File | Why it's different from everything above |

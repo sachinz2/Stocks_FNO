@@ -260,12 +260,13 @@ def test_thin_gap_holds_pending_state_for_a_later_bar_once_it_widens():
 
 def test_main_py_wires_entry_min_gap_pct():
     # EXPERIMENT (2026-10-08, explicit user instruction): lowered
-    # 0.001 -> 0.0001. Restore 0.001 after reviewing case-by-case losses.
+    # 0.001 -> 0.0001, then partially raised to 0.0005 on 2026-10-09
+    # (reduce ema_crossover_v1 trade volume). Restore 0.001 after review.
     from src.api import main as main_module
     src = inspect.getsource(main_module)
     idx = src.index('StrategyRegistry.load_strategy("EMA_CROSSOVER"')
-    block = src[idx:idx + 3500]
-    assert '"entry_min_gap_pct": 0.0001' in block
+    block = src[idx:idx + 4000]
+    assert '"entry_min_gap_pct": 0.0005' in block
 
 
 # ── momentum_v1: extension/VWAP filters widened, zero trades Aug 24-26 ──────
@@ -475,13 +476,14 @@ def test_pullback_expiry_via_repeated_rvol_rejected_breakouts_is_logged_and_rese
 def test_main_py_wires_all_four_fixes_for_ema_crossover():
     # EXPERIMENT (2026-10-08, explicit user instruction): adx_entry_threshold
     # further lowered 22->8 (entry-side only -- the other three, all
-    # exit-side, are untouched). Window widened 2400->3000 for the added
-    # comment block. Restore 22 after reviewing case-by-case losses.
+    # exit-side, are untouched), then partially raised to 16 on 2026-10-09
+    # (reduce ema_crossover_v1 trade volume). Window widened 2400->3500 for
+    # the added comment blocks. Restore 22 after reviewing case-by-case losses.
     from src.api import main as main_module
     src = inspect.getsource(main_module)
     idx = src.index('StrategyRegistry.load_strategy("EMA_CROSSOVER"')
-    block = src[idx:idx + 3000]
-    assert '"adx_entry_threshold": 8' in block
+    block = src[idx:idx + 3500]
+    assert '"adx_entry_threshold": 16' in block
     assert '"underlying_stop_atr_mult": 1.4' in block
     assert '"ema_reversal_min_gap_pct": 0.001' in block
     assert '"ema_reversal_confirm_bars": 2' in block
