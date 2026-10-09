@@ -302,6 +302,53 @@ async def get_real_contract(
         expiry_iso = expiry.strftime("%Y-%m-%d") if hasattr(expiry, "strftime") else str(expiry)
         strikes_for_expiry = data.get(expiry_iso)
         if not strikes_for_expiry:
+            # Fixed 2026-10-09 (live incident): _last_expiry_weekday()'s
+            # hand-rolled "last Tuesday of the month" formula computed
+            # 2026-11-24 for November's roll-forward expiry, but NSE's
+            # actual listed expiry that month is 2026-11-23 -- one day
+            # earlier (our hardcoded NSE holiday fallback list is almost
+            # certainly missing a holiday on the 24th; exchange_calendars
+            # isn't installed so there's no live cross-check). This made
+            # EVERY credit_spread_v1/iron_condor_v1 roll-forward entry fail
+            # closed on "no verified real contract" for every single
+            # candidate -- our own date arithmetic drifted from what's
+            # actually listed, the exact "root-cause shape" this whole
+            # real-contract cache exists to catch (see this function's own
+            # docstring). Already snapping an unlisted STRIKE to the
+            # nearest real one below; apply the identical snap-to-nearest-
+            # real-value fallback to the EXPIRY itself, within a small
+            # tolerance, before giving up. A 1-2 day DTE drift from this is
+            # immaterial to this system's premium/greeks math; the
+            # tradingsymbol itself doesn't even encode the exact day
+            # (e.g. "ONGC26NOV212.5CE"), only month -- so this cannot
+            # produce a wrong contract, only recover a wrong dict lookup.
+            try:
+                target_date = date.fromisoformat(expiry_iso)
+            except ValueError:
+                target_date = None
+            if target_date is not None:
+                _EXPIRY_SNAP_TOLERANCE_DAYS = 5
+                nearest_expiry_iso = None
+                nearest_distance = None
+                for cached_expiry_iso in data.keys():
+                    try:
+                        cached_date = date.fromisoformat(cached_expiry_iso)
+                    except ValueError:
+                        continue
+                    distance = abs((cached_date - target_date).days)
+                    if distance <= _EXPIRY_SNAP_TOLERANCE_DAYS and (
+                        nearest_distance is None or distance < nearest_distance
+                    ):
+                        nearest_distance = distance
+                        nearest_expiry_iso = cached_expiry_iso
+                if nearest_expiry_iso is not None:
+                    logger.warning(
+                        f"get_real_contract: {symbol} expiry {expiry_iso} not listed "
+                        f"(computed date doesn't match NSE's actual calendar) -- "
+                        f"snapped to nearest real listed expiry {nearest_expiry_iso}"
+                    )
+                    strikes_for_expiry = data.get(nearest_expiry_iso)
+        if not strikes_for_expiry:
             return None
 
         def _key(k: float) -> str:

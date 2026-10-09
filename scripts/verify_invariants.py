@@ -1097,6 +1097,29 @@ def check_strategy_health_reads_the_real_pause_reason(repo: Path) -> Result:
     return PASS, name, "get_report() reads the real paused_reason/paused_by from the strategy instance, not a stale internal dict."
 
 
+def check_real_contract_snaps_an_unlisted_expiry_too(repo: Path) -> Result:
+    name = "get_real_contract() snaps an unlisted EXPIRY to the nearest real one, not just an unlisted strike"
+    src = _read(repo, "src/market_data/option_chain.py")
+    idx = src.find("async def get_real_contract(")
+    if idx == -1:
+        return FAIL, name, "get_real_contract() missing."
+    body = src[idx: idx + 4500]
+    if "strikes_for_expiry = data.get(expiry_iso)" not in body:
+        return FAIL, name, "Could not locate the expiry lookup -- function body may have changed shape."
+    if "_EXPIRY_SNAP_TOLERANCE_DAYS" not in body:
+        return FAIL, name, (
+            "get_real_contract() no longer snaps an unlisted expiry to the nearest real listed "
+            "one -- confirmed live 2026-10-09: _last_expiry_weekday()'s hand-rolled 'last Tuesday "
+            "of the month' formula computed 2026-11-24 for November's roll-forward expiry, but "
+            "NSE's actual listed expiry that month was 2026-11-23 (one day earlier, almost "
+            "certainly a holiday missing from the hardcoded fallback list). Every credit_spread_v1/"
+            "iron_condor_v1 roll-forward entry failed closed on 'no verified real contract' for "
+            "every single candidate that day -- the exact 'our own date arithmetic has no live "
+            "cross-check' root cause this cache exists to catch, just for expiry instead of strike."
+        )
+    return PASS, name, "An unlisted expiry snaps to the nearest real listed one (within tolerance), the same fail-closed-but-smart pattern already used for an unlisted strike."
+
+
 STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_exit_classification_by_pnl,
     check_capital_allocation_keys,
@@ -1134,6 +1157,7 @@ STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_exit_all_options_for_preserves_multileg_tracking,
     check_low_vol_regime_has_no_structurally_impossible_strategy,
     check_strategy_health_reads_the_real_pause_reason,
+    check_real_contract_snaps_an_unlisted_expiry_too,
     check_gate_bottleneck_alerting_is_wired,
     check_shadow_observation_never_reaches_real_order_placement,
     check_signal_staleness_watches_paused_strategies_too,

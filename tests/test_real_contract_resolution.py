@@ -100,8 +100,52 @@ async def test_expiry_not_in_cached_window_returns_none():
     redis = _FakeRedis({f"{REDIS_CONTRACT_PREFIX}BAJFINANCE": json.dumps(_cache_payload())})
 
     # Cache only has 2026-08-25 and 2026-09-29 -- a far-month expiry outside
-    # the cached 3-nearest window must fail closed to None, not guess.
+    # the cached 3-nearest window (and outside the expiry-snap tolerance)
+    # must fail closed to None, not guess.
     result = await get_real_contract("BAJFINANCE", date(2026, 12, 29), 1160, "CE", redis)
+
+    assert result is None
+
+
+# ── Expiry snapping (2026-10-09 live incident) ──────────────────────────────
+#
+# _last_expiry_weekday()'s hand-rolled "last Tuesday of the month" formula
+# computed 2026-11-24 for November's roll-forward expiry, but NSE's actual
+# listed expiry that month was 2026-11-23 (one day earlier -- almost
+# certainly a holiday missing from the hardcoded fallback list). Every
+# credit_spread_v1/iron_condor_v1 roll-forward entry failed closed on "no
+# verified real contract" for every single candidate that day. Just like an
+# unlisted STRIKE already snaps to the nearest real one, an unlisted EXPIRY
+# must now snap to the nearest real listed expiry within a small tolerance.
+
+@pytest.mark.asyncio
+async def test_expiry_one_day_off_snaps_to_nearest_real_expiry():
+    redis = _FakeRedis({f"{REDIS_CONTRACT_PREFIX}BAJFINANCE": json.dumps(_cache_payload())})
+
+    # Computed 2026-09-30, real listed expiry is 2026-09-29 (1 day off).
+    result = await get_real_contract("BAJFINANCE", date(2026, 9, 30), 1160, "CE", redis)
+
+    assert result == ("BAJFINANCE26SEP1160CE", 1160)
+
+
+@pytest.mark.asyncio
+async def test_expiry_snap_picks_the_closer_of_two_candidates():
+    redis = _FakeRedis({f"{REDIS_CONTRACT_PREFIX}BAJFINANCE": json.dumps(_cache_payload())})
+
+    # 2026-09-27 is 2 days from 2026-09-29 and 33 days from 2026-08-25 --
+    # must snap to the nearer one (Sep), not the first/farther one (Aug).
+    result = await get_real_contract("BAJFINANCE", date(2026, 9, 27), 1160, "CE", redis)
+
+    assert result == ("BAJFINANCE26SEP1160CE", 1160)
+
+
+@pytest.mark.asyncio
+async def test_expiry_snap_respects_tolerance_and_fails_closed_beyond_it():
+    redis = _FakeRedis({f"{REDIS_CONTRACT_PREFIX}BAJFINANCE": json.dumps(_cache_payload())})
+
+    # 10 days from the nearest cached expiry (2026-09-29) -- beyond the
+    # snap tolerance, must fail closed rather than guess a wildly wrong month.
+    result = await get_real_contract("BAJFINANCE", date(2026, 10, 9), 1160, "CE", redis)
 
     assert result is None
 
