@@ -405,15 +405,15 @@ _AGREEING_TICK15 = json.dumps({"ema20": 105.0, "ema50": 100.0})  # bullish, agre
 
 @pytest.mark.asyncio
 async def test_option_quality_gate_rejects_a_wide_spread(monkeypatch):
-    # EXPERIMENT (2026-10-08, explicit user instruction): _OPTION_MAX_SPREAD_PCT
-    # raised 8.0 -> 40.0, so the fixture's spread_pct must exceed 40.0 to
-    # still exercise the block. Restore 13.33 (and the 8.0 threshold) after
-    # reviewing case-by-case losses.
+    # EXPERIMENT (2026-10-08/09, explicit user instruction): _OPTION_MAX_SPREAD_PCT
+    # raised 8.0 -> 40.0 -> 150.0, so the fixture's spread_pct must exceed
+    # 150.0 to still exercise the block. Restore 13.33 (and the 8.0
+    # threshold) after reviewing case-by-case losses.
     async def _fake_quote(contract, kite, redis):
         return 45.0
 
     async def _fake_quality(contract, kite):
-        return {"bid": 30.0, "ask": 60.0, "spread_pct": 66.67, "oi": 1000, "volume": 500}
+        return {"bid": 10.0, "ask": 35.0, "spread_pct": 200.0, "oi": 1000, "volume": 500}
 
     monkeypatch.setattr("src.market_data.option_chain.get_option_quote", _fake_quote)
     monkeypatch.setattr("src.market_data.option_chain.get_option_quality_metrics", _fake_quality)
@@ -426,7 +426,7 @@ async def test_option_quality_gate_rejects_a_wide_spread(monkeypatch):
     rej = fake._last_gate_rejection
     assert rej["gate"] == "option_quality_passed"
     assert rej["reason"] == "OPTION_SPREAD_TOO_WIDE"
-    assert rej["value"] == 66.67
+    assert rej["value"] == 200.0
     assert fake.order_manager.place_order.await_count == 0
 
 

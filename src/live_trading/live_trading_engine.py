@@ -7277,8 +7277,20 @@ class LiveTradingEngine:
     # in _resolve_lot_and_contract() etc. (fail closed when NO quote exists
     # at all) is UNCHANGED -- that's data integrity, not a risk-tolerance
     # threshold, and loosening it would fabricate prices instead of just
-    # tolerating worse real ones. Restore 8.0 after reviewing losses.
-    _OPTION_MAX_SPREAD_PCT = 40.0
+    # tolerating worse real ones.
+    #
+    # EXPERIMENT (2026-10-09, explicit user instruction): raised further,
+    # 40.0 -> 150.0. After cefdf9a's expiry-snap fix unblocked contract
+    # resolution, every single credit_spread_v1/iron_condor_v1 candidate
+    # that cycle was a next-month (far-dated) contract with genuinely thin
+    # liquidity -- observed spreads 44.6%-113.5% (ONGC, HDFCBANK,
+    # BHARTIARTL, ICICIBANK, GRASIM, AXISBANK, COALINDIA), all above the
+    # 40.0 ceiling. Raised with margin above the worst observed case so
+    # today's actual candidates aren't still screened out by this gate.
+    # Restore 8.0 (both raises) after reviewing case-by-case losses --
+    # expect this specifically to reproduce illiquid-fill losses, that's
+    # the known tradeoff of loosening it this far.
+    _OPTION_MAX_SPREAD_PCT = 150.0
 
     async def _get_market_data(self, symbol: str) -> Optional[Dict[str, Any]]:
         redis = getattr(self, "_redis", None)
