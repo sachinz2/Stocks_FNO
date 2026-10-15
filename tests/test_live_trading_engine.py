@@ -467,10 +467,18 @@ async def test_rvol_valid_gate_exempts_strategies_with_rvol_checked_internally()
 
 
 @pytest.mark.asyncio
-async def test_rvol_valid_gate_still_blocks_strategies_without_internal_check():
+async def test_rvol_valid_gate_still_blocks_strategies_without_internal_check(monkeypatch):
     """Guard against over-fixing: ema_crossover_v1 (rvol_checked_internally
     unset/False) has no internal RVOL validation of its own -- it must
     still be blocked by this gate exactly as before."""
+    # Pinned to a safe hour (2026-10-15, data-driven hour=13 exclusion added
+    # to _process_signal): this test's strategy.name happens to be
+    # "ema_crossover_v1", so without pinning the clock it would spuriously
+    # short-circuit (or not) depending on the real wall-clock hour the
+    # suite runs at -- not what this test is about.
+    import datetime as _dt
+    import src.live_trading.live_trading_engine as lte_module
+    monkeypatch.setattr(lte_module, "now_ist", lambda: _dt.datetime(2026, 10, 15, 10, 0, 0))
     fake = _FakeRvolGateEngine()
     strategy = SimpleNamespace(
         name="ema_crossover_v1", is_active=True, min_dte=0, max_dte=999,
@@ -485,7 +493,7 @@ async def test_rvol_valid_gate_still_blocks_strategies_without_internal_check():
 
 
 @pytest.mark.asyncio
-async def test_rvol_valid_gate_respects_rvol_hard_gate_false():
+async def test_rvol_valid_gate_respects_rvol_hard_gate_false(monkeypatch):
     """Fixed 2026-09-15 (user-reported live incident): PAYTM and BANDHANBNK
     both fired real, confirmed ema_crossover_v1 crossovers on 2026-09-15
     and were both discarded with 'RVOL not yet computable' -- even though
@@ -497,6 +505,10 @@ async def test_rvol_valid_gate_respects_rvol_hard_gate_false():
     than for "RVOL confirmed low", backwards. Now consistent: a strategy
     that opted out of the hard gate gets treated the same way whether RVOL
     is measurably low OR simply not yet measurable."""
+    # Pinned to a safe hour -- see matching comment on the preceding test.
+    import datetime as _dt
+    import src.live_trading.live_trading_engine as lte_module
+    monkeypatch.setattr(lte_module, "now_ist", lambda: _dt.datetime(2026, 10, 15, 10, 0, 0))
     fake = _FakeRvolGateEngine()
     strategy = SimpleNamespace(
         name="ema_crossover_v1", is_active=True, min_dte=0, max_dte=999,

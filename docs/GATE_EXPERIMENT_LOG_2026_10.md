@@ -230,14 +230,14 @@ specifically, two gates partially (not fully) tightened back for
 | **Found live, same day:** this was the very next gate `iron_condor_v1` hit (GAIL) immediately after clearing every other gate in its chain (pool, ADX, event calendar, liquidity, wing-credit, expiry resolution) for the first time. |
 | **Tests touched:** none needed updating — the two existing delta-tolerance tests (`test_second_opinion_review_2026_08_21.py`) use strikes far enough outside tolerance that widening 0.08→0.15 doesn't flip either result. |
 
-## 15. ema_crossover_v1 ADX entry threshold — partially re-tightened
+## 15. ema_crossover_v1 ADX entry threshold — partially re-tightened, twice
 
 | | |
 |---|---|
 | **File** | `src/api/main.py`, `EMA_CROSSOVER` config dict |
-| **Original** | `22` → loosened to `8` (`be759a7`, item 8) → **partially re-tightened to `16`** |
-| **Why not back to 22:** the user asked to *reduce*, not eliminate, `ema_crossover_v1` activity — still deliberately looser than the pre-experiment baseline. |
-| **Tests touched:** `test_ema_crossover_v1_redesign_2026_08_21.py`, `test_trade_review_fixes_2026_08_27.py` (2 tests) — literal value and one window-size bump. |
+| **Original** | `22` → loosened to `8` (`be759a7`, item 8) → re-tightened to `16` (2026-10-09, "reduce ema_crossover_v1 trades") → **nudged to `20`** (2026-10-15, data-driven) |
+| **Why not back to 22:** the 2026-10-15 trade review (104 trades) found ADX≥22 wasn't clearly better than the 16-22 band (36.8% vs 39.3% win rate) -- a full revert isn't supported by the data. The <16 trades (already excluded by the 10-09 change) were clearly the worst (21.1% win rate), so nudging closer to 22 trims more of that tail without the unsupported full jump. |
+| **Tests touched:** `test_ema_crossover_v1_redesign_2026_08_21.py`, `test_trade_review_fixes_2026_08_27.py` (2 tests) — literal value bumps, window-size increases. |
 
 ## 16. ema_crossover_v1 entry min-gap — partially re-tightened
 
@@ -247,6 +247,17 @@ specifically, two gates partially (not fully) tightened back for
 | **Original** | `0.001` → loosened to `0.0001` (`be759a7`, item 8) → **partially re-tightened to `0.0005`** |
 | **Scope reminder:** entry side only — `ema_reversal_min_gap_pct` (exit side) was never touched by item 8 or this change, so exits still reflect realistic behavior. |
 | **Tests touched:** `test_trade_review_fixes_2026_08_27.py` (1 test) — literal value and window-size bump. |
+
+## 17. ema_crossover_v1 — new hour=13 (1-2pm IST) entry exclusion
+
+| | |
+|---|---|
+| **File** | `src/live_trading/live_trading_engine.py`, `_process_signal()` -- new check, right after the VOLATILE-regime BUY-skip, before the daily-order-limit check |
+| **What it does** | Blocks new `ema_crossover_v1` entries specifically during IST hour 13 (1:00-2:00pm). `momentum_v1` and all other strategies are unaffected -- scoped by `strategy.name == "ema_crossover_v1"`. |
+| **Evidence (2026-10-15, 104-trade review, Oct 8-15)** | Hour=13 entries accounted for ₹47,208 of the total ₹112,140 loss (42%) at a 15% win rate vs 39-42% every other hour -- survives removing the single biggest outlier trade (IDEA, -₹20,013). **Caveat on record**: concentrated in 2 of 5 sampled days (Oct 9, Oct 14 = 88% of the hour-13 damage; Oct 13 was fine) rather than uniformly bad every day, and the entire 104-trade sample is RANGE_BOUND-regime-only -- re-validate if/when a TRENDING/VOLATILE stretch provides fresh data. |
+| **This is a new rule, not a loosened-then-retightened experiment value** -- there's no "original" to revert to. If it turns out not to hold up, remove the `if` block entirely (kept as a single, clearly-delimited block for easy removal). |
+| **Tests touched** | 6 existing tests that drive the real `_process_signal()` with `strategy.name="ema_crossover_v1"` started failing/would-have-failed depending on the real wall-clock hour at test-run time (confirmed live: the full suite ran at 13:xx IST and exactly these 6 failed). Fixed by pinning `now_ist()` to a safe hour via `monkeypatch` in each (`test_live_trading_engine.py` x2, `test_rich_gate_rejection_detail_2026_09_16.py` x5 via a new autouse fixture). **This is a real, pre-existing class of risk** -- any test that drives `_process_signal()` with an unmocked clock and `strategy.name="ema_crossover_v1"` is now time-dependent; 15 test files reference that name but only these were confirmed to actually reach this code path. |
+| **`verify_invariants.py`** | `check_ema_crossover_hour13_exclusion_is_scoped_correctly` added -- confirms the exclusion exists, actually blocks (not just logs), and main.py's `adx_entry_threshold` matches the 2026-10-15 value. |
 
 ---
 

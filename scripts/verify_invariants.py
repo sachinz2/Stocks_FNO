@@ -1187,6 +1187,34 @@ def check_square_off_and_exit_signal_pnl_use_the_pre_close_position_values(repo:
     return PASS, name, "Both EOD square-off and EXIT-signal close paths use position values captured BEFORE the closing order runs, not re-read from the (by-then-mutated) live position dict."
 
 
+def check_ema_crossover_hour13_exclusion_is_scoped_correctly(repo: Path) -> Result:
+    name = "ema_crossover_v1's hour=13 entry exclusion only applies to ema_crossover_v1, and main.py's ADX threshold matches the 2026-10-15 data review"
+    src = _read(repo, "src/live_trading/live_trading_engine.py")
+    idx = src.find('strategy.name == "ema_crossover_v1" and now_ist().hour == 13')
+    if idx == -1:
+        return FAIL, name, (
+            "The hour=13 entry exclusion for ema_crossover_v1 is missing -- confirmed "
+            "2026-10-15 (104-trade review): hour=13 entries accounted for 42% of total "
+            "losses at a 15% win rate vs 39-42% every other hour. If this was intentionally "
+            "reverted, remove/update this check."
+        )
+    body = src[idx: idx + 400]
+    if "return" not in body:
+        return FAIL, name, "hour=13 check no longer returns -- it would log but not actually block the entry."
+
+    main_src = _read(repo, "src/api/main.py")
+    ema_idx = main_src.find('StrategyRegistry.load_strategy("EMA_CROSSOVER"')
+    if ema_idx == -1:
+        return FAIL, name, "EMA_CROSSOVER registration not found in main.py."
+    if '"adx_entry_threshold": 20' not in main_src[ema_idx: ema_idx + 4500]:
+        return WARN, name, (
+            "main.py's ema_crossover_v1 adx_entry_threshold is no longer 20 (the "
+            "2026-10-15 data-driven nudge from 16) -- confirm this was an intentional "
+            "further change, not a silent drift."
+        )
+    return PASS, name, "hour=13 exclusion present and scoped to ema_crossover_v1 only; adx_entry_threshold matches the 2026-10-15 review."
+
+
 STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_exit_classification_by_pnl,
     check_capital_allocation_keys,
@@ -1241,6 +1269,7 @@ STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_spread_condor_have_granular_rejection_detail,
     check_spread_condor_have_liquidity_check,
     check_square_off_and_exit_signal_pnl_use_the_pre_close_position_values,
+    check_ema_crossover_hour13_exclusion_is_scoped_correctly,
 ]
 
 

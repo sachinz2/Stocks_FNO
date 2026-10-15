@@ -3110,6 +3110,26 @@ class LiveTradingEngine:
             )
             return
 
+        # EXPERIMENT (2026-10-15, explicit user instruction, data-driven):
+        # block ema_crossover_v1 entries during hour 13 (1:00-2:00pm IST).
+        # Confirmed on 104 trades since the gate-loosening experiment began
+        # (be759a7 onward, all in RANGE_BOUND regime): hour=13 entries
+        # accounted for Rs47,208 of the total Rs112,140 loss (42%) at a 15%
+        # win rate, vs 39-42% for every other hour -- the single worst hour
+        # by a wide margin. Survives removing the single biggest outlier
+        # trade (IDEA, -Rs20,013). Caveat on record: concentrated in 2 of 5
+        # sampled days rather than uniformly bad every day, and the entire
+        # sample is RANGE_BOUND-only -- revisit if/when a TRENDING/VOLATILE
+        # stretch provides fresh data. Scoped to ema_crossover_v1 only --
+        # momentum_v1 wasn't part of this analysis and is untouched.
+        if strategy.name == "ema_crossover_v1" and now_ist().hour == 13:
+            logger.info(
+                f"[{strategy.name}] {symbol} {signal_str} skipped — hour=13 "
+                "(1-2pm IST) entry window excluded (data-driven, 2026-10-15 "
+                "trade review: worst-performing hour, 15% win rate)."
+            )
+            return
+
         if self._max_daily_orders > 0 and self._today_order_count >= self._max_daily_orders:
             logger.warning(f"Daily order limit ({self._max_daily_orders}) reached.")
             return

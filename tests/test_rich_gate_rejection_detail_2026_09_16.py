@@ -15,6 +15,7 @@ the real numbers right actually matters, so it's tested against the real
 code path, not just _record_signal_trace() in isolation (see
 test_signal_decision_trace_2026_09_15.py for that).
 """
+import datetime as _dt
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -22,6 +23,19 @@ import pytest
 
 from src.live_trading.live_trading_engine import LiveTradingEngine
 from src.core.enums import SignalType
+
+
+@pytest.fixture(autouse=True)
+def _pin_clock_outside_the_hour13_exclusion(monkeypatch):
+    # EXPERIMENT (2026-10-15, data-driven): _process_signal() now blocks
+    # ema_crossover_v1 entries during hour=13 IST. Every test in this file
+    # drives the REAL _process_signal() with strategy.name="ema_crossover_v1"
+    # -- without pinning the clock, these would spuriously pass/fail
+    # depending on the real wall-clock hour the suite happens to run at,
+    # which has nothing to do with what this file actually tests (gate
+    # rejection detail, not time-of-day filtering).
+    import src.live_trading.live_trading_engine as lte_module
+    monkeypatch.setattr(lte_module, "now_ist", lambda: _dt.datetime(2026, 10, 15, 10, 0, 0))
 
 
 class _FakeEngine:

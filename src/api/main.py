@@ -266,10 +266,16 @@ async def lifespan(app: FastAPI):
         # a33431e) performance over the first 2 days was a 33% win rate and
         # a large net loss, and its high trade volume was claiming
         # underlyings via the cross-strategy collision guard, crowding out
-        # credit_spread_v1/iron_condor_v1 candidates. Not reverted fully to
-        # 22 -- still deliberately looser than original, just not maximal.
-        # Restore 22 after review.
-        "adx_entry_threshold": 16,
+        # credit_spread_v1/iron_condor_v1 candidates.
+        # Nudged 16 -> 20 on 2026-10-15 (data-driven, same trade review that
+        # added the hour=13 exclusion above _process_signal): across 104
+        # trades, ADX>=22 wasn't clearly better than the 16-22 band (36.8%
+        # vs 39.3% win rate), so a full revert to 22 wasn't justified by the
+        # data -- but the <16 trades (now long excluded) were clearly the
+        # worst (21.1% win rate), so nudging closer to 22 trims more of that
+        # weak tail without the full-revert jump. Still deliberately looser
+        # than the original 22. Restore 22 after a fuller review.
+        "adx_entry_threshold": 20,
         # adx_checked_internally is hardcoded True in ema_crossover.py's
         # initialize() (not parameter-driven, unlike everything else here)
         # -- listing it would silently be a no-op, so it's intentionally
