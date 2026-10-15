@@ -283,6 +283,29 @@ worse** than what was shown live: Oct 8 -₹11,524.50, Oct 9 -₹51,590.00
 (both strategies, both days net negative) — not the roughly-breakeven
 picture the corrupted data suggested at the time.
 
+## Reversal-exit MFE/MAE logging bug (2026-10-15) — unrelated bug, not a loosened gate
+
+Found during the same multi-pass `ema_crossover_v1` trade review that produced
+items 15 and 17 above: all 15 reversal-exit trades in the Oct 8-15 sample
+showed exactly `0.0` for `underlying_mfe_pct`/`mae_pct`/`option_mfe_pct`/
+`mae_pct`, regardless of real hold time (9-305 minutes) or symbol --
+impossible for real market data, confirming a logging bug rather than a real
+pattern. Root cause: `_close_option_positions()` (the "Reversal exit" closer)
+never read these 4 fields off the single-leg journal dict and passed them to
+`_log_trade_close()`, unlike every *other* exit path
+(`_execute_single_leg_exit`, EOD square-off, EXIT-signal close), which all do.
+`_log_trade_close()` leaves its entry-time-seeded `0.0` default untouched
+when the caller passes `None` -- so this silently produced fake-zero data for
+that entire 15-trade/0%-win bucket. Fixed (same commit as items 15/17's
+deployment) by reading `jrnl.get("mfe_underlying_pct")` etc., identical to
+the other 3 exit paths. 1 new regression test, verified to fail without the
+fix and pass with it. This is a correctness/observability bug, unrelated to
+any gate, and stays fixed regardless of what else in this log gets reverted.
+No historical row correction was done for this one (unlike the pnl bug
+above) -- the 15 affected rows just keep their 0.0 MFE/MAE values as a
+known gap in that historical data; only trades closed by this path *after*
+the fix will have real values.
+
 ---
 
 ## What was deliberately NOT loosened (and why — don't touch these without a fresh decision)

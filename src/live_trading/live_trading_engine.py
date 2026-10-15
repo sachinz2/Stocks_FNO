@@ -3859,12 +3859,30 @@ class LiveTradingEngine:
             jrnl = self._single_leg_journals.pop(contract, None)
             if jrnl:
                 pnl = (_rev_fill_p - entry_p) * abs(qty)
+                # Fixed 2026-10-15 (user-flagged, found during the
+                # ema_crossover_v1 trade review): this was the one exit path
+                # that never passed underlying_mfe_pct/mae_pct/option_mfe_pct/
+                # mae_pct through to _log_trade_close() -- every OTHER exit
+                # path (_execute_single_leg_exit, EOD square-off, EXIT-signal
+                # close) reads these same 4 fields off `jrnl`
+                # (mfe_underlying_pct/mae_underlying_pct/mfe_option_pct/
+                # mae_option_pct, tracked continuously per-cycle) and passes
+                # them through -- this one silently left every reversal-exit
+                # row at its entry-time-seeded 0.0 default. Confirmed live:
+                # all 15 reversal-exit trades in the Oct 8-15 sample showed
+                # exactly 0.0 for all 4 fields regardless of real hold time
+                # (9-305 minutes) or symbol, making that whole 15-trade/
+                # 0%-win bucket unanalyzable until now.
                 await self._log_trade_close(
                     journal_id=jrnl.get("journal_id"),
                     exit_price=_rev_fill_p,
                     pnl=pnl,
                     exit_reason=f"Reversal exit ({opposite_type} signal)",
                     market_data=market_data,
+                    underlying_mfe_pct=jrnl.get("mfe_underlying_pct"),
+                    underlying_mae_pct=jrnl.get("mae_underlying_pct"),
+                    option_mfe_pct=jrnl.get("mfe_option_pct"),
+                    option_mae_pct=jrnl.get("mae_option_pct"),
                 )
                 self.risk_manager.release_deployed_capital(
                     jrnl.get("strategy_name", "ema_crossover_v1"), entry_p * abs(qty),

@@ -1215,6 +1215,31 @@ def check_ema_crossover_hour13_exclusion_is_scoped_correctly(repo: Path) -> Resu
     return PASS, name, "hour=13 exclusion present and scoped to ema_crossover_v1 only; adx_entry_threshold matches the 2026-10-15 review."
 
 
+def check_reversal_exit_passes_mfe_mae_through(repo: Path) -> Result:
+    name = "Reversal exit passes real tracked MFE/MAE through to _log_trade_close(), same as every other exit path"
+    src = _read(repo, "src/live_trading/live_trading_engine.py")
+    idx = src.find("async def _close_option_positions(")
+    if idx == -1:
+        return FAIL, name, "_close_option_positions() (the reversal-exit closer) missing."
+    body = src[idx: idx + 8000]
+    call_idx = body.find('exit_reason=f"Reversal exit (')
+    if call_idx == -1:
+        return FAIL, name, "Could not locate the reversal-exit's _log_trade_close() call."
+    window = body[call_idx: call_idx + 400]
+    if "jrnl.get(\"mfe_underlying_pct\")" not in window:
+        return FAIL, name, (
+            "_close_option_positions() no longer passes underlying_mfe_pct/mae_pct/"
+            "option_mfe_pct/mae_pct through to _log_trade_close() -- confirmed live "
+            "2026-10-15: every reversal-exit trade_journal row showed exactly 0.0 for "
+            "all 4 fields regardless of real hold time, because _log_trade_close() "
+            "leaves its entry-time-seeded 0.0 default untouched when the caller passes "
+            "None. This was the one exit path missing this passthrough -- "
+            "_execute_single_leg_exit, EOD square-off, and EXIT-signal close all "
+            "already read these same 4 fields off the single-leg journal dict."
+        )
+    return PASS, name, "Reversal exit reads mfe_underlying_pct/mae_underlying_pct/mfe_option_pct/mae_option_pct off the journal and passes them through."
+
+
 STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_exit_classification_by_pnl,
     check_capital_allocation_keys,
@@ -1270,6 +1295,7 @@ STATIC_CHECKS: List[Callable[[Path], Result]] = [
     check_spread_condor_have_liquidity_check,
     check_square_off_and_exit_signal_pnl_use_the_pre_close_position_values,
     check_ema_crossover_hour13_exclusion_is_scoped_correctly,
+    check_reversal_exit_passes_mfe_mae_through,
 ]
 
 
