@@ -324,9 +324,14 @@ class RiskManager:
             # ceiling is unchanged: the paper broker's own cash balance and
             # _check_available_margin() still cap what can physically be
             # deployed -- this only removes an additional, now-undersized
-            # soft cap on top of that. Restore `self.initial_capital *
-            # alloc_pct` after reviewing case-by-case losses.
-            budget = 1_000_000.0
+            # soft cap on top of that.
+            # RESET (2026-10-15, explicit user instruction: "reset the
+            # available funds... there should be 1 lakh to trade each
+            # strategy"): flat budget brought down from Rs10,00,000 to
+            # Rs1,00,000 per strategy. Still flat across strategies, not the
+            # original initial_capital * alloc_pct formula -- restore that
+            # formula instead if/when the % model is wanted back.
+            budget = 100_000.0
             deployed = self._strategy_deployed.get(strategy_name, 0.0)
             if capital_at_risk is not None:
                 # Explicit max-loss figure from the caller (credit spreads/condors —

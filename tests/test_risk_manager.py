@@ -153,12 +153,13 @@ from src.core.constants import STRATEGY_CAPITAL_ALLOCATION
 
 
 def test_capital_at_risk_blocks_sell_entry_over_strategy_budget():
-    # EXPERIMENT (2026-10-08, explicit user instruction): per-strategy budget
-    # is now a flat Rs10,00,000 (validate_trade()'s "5. Per-strategy capital
-    # allocation" section), not initial_capital * STRATEGY_CAPITAL_ALLOCATION.
-    # Restore the percentage formula below after reviewing case-by-case losses.
+    # RESET (2026-10-15, explicit user instruction: "1 lakh to trade each
+    # strategy"): per-strategy budget is a flat Rs1,00,000 (validate_trade()'s
+    # "5. Per-strategy capital allocation" section), not initial_capital *
+    # STRATEGY_CAPITAL_ALLOCATION. Restore the percentage formula below after
+    # reviewing case-by-case losses.
     rm = RiskManager(initial_capital=300_000.0)
-    budget = 1_000_000.0
+    budget = 100_000.0
     rm._strategy_deployed["credit_spread_v1"] = budget - 1000.0  # simulate prior trades
 
     ok = rm.validate_trade(
@@ -170,8 +171,10 @@ def test_capital_at_risk_blocks_sell_entry_over_strategy_budget():
 
 
 def test_capital_at_risk_allows_sell_entry_within_budget():
+    # RESET (2026-10-15): flat Rs1,00,000 budget, not initial_capital *
+    # STRATEGY_CAPITAL_ALLOCATION -- see test_capital_at_risk_blocks_sell_entry_over_strategy_budget.
     rm = RiskManager(initial_capital=300_000.0)
-    budget = 300_000.0 * STRATEGY_CAPITAL_ALLOCATION["credit_spread_v1"]
+    budget = 100_000.0
     rm._strategy_deployed["credit_spread_v1"] = budget - 1000.0
 
     ok = rm.validate_trade(
@@ -199,11 +202,12 @@ def test_sell_without_capital_at_risk_keeps_old_fail_open_default():
 def test_buy_path_unaffected_by_capital_at_risk_gate():
     # ema_crossover_v1 / momentum_v1 BUY entries still gate on quantity*price
     # as before -- capital_at_risk is specific to SELL-anchored spread/condor legs.
-    # EXPERIMENT (2026-10-08, explicit user instruction): per-strategy budget
-    # is now a flat Rs10,00,000, not initial_capital * STRATEGY_CAPITAL_ALLOCATION.
-    # Restore the percentage formula after reviewing case-by-case losses.
+    # RESET (2026-10-15, explicit user instruction: "1 lakh to trade each
+    # strategy"): per-strategy budget is a flat Rs1,00,000, not initial_capital
+    # * STRATEGY_CAPITAL_ALLOCATION. Restore the percentage formula after
+    # reviewing case-by-case losses.
     rm = RiskManager(initial_capital=300_000.0)
-    ema_budget = 1_000_000.0
+    ema_budget = 100_000.0
     rm._strategy_deployed["ema_crossover_v1"] = ema_budget - 100.0
 
     ok = rm.validate_trade("TESTPE", "BUY", 25, 50.0, strategy_name="ema_crossover_v1")  # 25*50=1250 > 100 headroom
