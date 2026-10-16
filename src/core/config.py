@@ -55,9 +55,23 @@ class Settings(BaseSettings):
     # actually available. _reconcile_paper_broker_balance() recomputes
     # broker.balance as INITIAL_CAPITAL + total_realized_pnl - deployed_cash
     # on every restart, so this top-up takes effect on the next restart
-    # without wiping any trade history. Restore 300,000 (or reconsider
+    # without wiping any trade history.
+    #
+    # Topped up AGAIN 600,000 -> 1,500,000 (same day, ~2hrs later): the
+    # 600K top-up fixed _check_available_margin() (the entry gate) but
+    # iron_condor_v1 candidates then started clearing every gate and still
+    # failing at actual order placement -- PaperBroker.place_order() has
+    # its OWN, much stricter, independent margin model for SELL-to-open
+    # legs (see SHORT_MARGIN_MULTIPLE_OF_PREMIUM in paper_broker.py: 10x
+    # the premium per short lot, not wing-width-based). The 3 existing
+    # credit_spread_v1 short legs (HDFCBANK, POWERGRID, WIPRO) alone
+    # already lock ~Rs2,98,930 under that model, leaving only ~Rs16-28K
+    # free -- nowhere near the Rs55k-233k iron_condor_v1 candidates needed.
+    # User chose "top up again" over loosening SHORT_MARGIN_MULTIPLE_OF_PREMIUM
+    # itself (which would reduce modeled short-selling risk for ALL short
+    # legs, not just unblock capital). Restore 300,000 (or reconsider
     # entirely) after reviewing case-by-case losses.
-    INITIAL_CAPITAL: float = 600000.0
+    INITIAL_CAPITAL: float = 1500000.0
     MAX_OPEN_POSITIONS: int = 5
     # Reverted back to 0.05 (2026-10-09): the earlier same-day 0.05->0.20
     # resize (a6be7e7) is superseded by a full, date-bounded bypass of the
