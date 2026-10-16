@@ -43,7 +43,21 @@ class Settings(BaseSettings):
     EMAIL_RECIPIENT: str = ""
 
     # Trading
-    INITIAL_CAPITAL: float = 300000.0
+    # Topped up 300,000 -> 600,000 (2026-10-16, explicit user instruction:
+    # "we want trades in iron_condor... what more can we do?"). Real blocker
+    # found live: PaperBroker.balance had shrunk to ~Rs1,07,515 from
+    # cumulative realized paper losses across the gate-loosening experiment,
+    # and _check_available_margin() (paper mode) checks THIS balance minus
+    # capital locked in active spreads/condors -- not the per-strategy soft
+    # budget in risk_manager.py. Most iron_condor_v1 candidates this morning
+    # (COALINDIA, PIDILITIND, SBIN, TITAN, LT, INDUSINDBK, DMART) were
+    # rejected "insufficient margin" needing Rs27k-60k each against ~Rs40k
+    # actually available. _reconcile_paper_broker_balance() recomputes
+    # broker.balance as INITIAL_CAPITAL + total_realized_pnl - deployed_cash
+    # on every restart, so this top-up takes effect on the next restart
+    # without wiping any trade history. Restore 300,000 (or reconsider
+    # entirely) after reviewing case-by-case losses.
+    INITIAL_CAPITAL: float = 600000.0
     MAX_OPEN_POSITIONS: int = 5
     # Reverted back to 0.05 (2026-10-09): the earlier same-day 0.05->0.20
     # resize (a6be7e7) is superseded by a full, date-bounded bypass of the

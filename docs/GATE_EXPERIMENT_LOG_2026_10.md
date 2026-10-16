@@ -263,6 +263,23 @@ specifically, two gates partially (not fully) tightened back for
 
 ---
 
+## 18. iron_condor_v1 push — three further changes, 2026-10-16
+
+User: *"we want trades in iron_condor... what more can we do?"* Diagnosed
+live from ~1hr of rejection logs (09:54-10:53 IST, 2026-10-16): every
+candidate was failing at one of four points. Three were acted on; one was
+investigated and found NOT to be a bug.
+
+| | |
+|---|---|
+| **a) PaperBroker capital top-up** | **File:** `src/core/config.py`, `INITIAL_CAPITAL` `300,000 -> 600,000`. **Why:** the dominant rejection reason this morning was "insufficient margin" (COALINDIA ~Rs40,500, PIDILITIND ~Rs40-60K, SBIN ~Rs45-60K, TITAN/LT ~Rs52,500, INDUSINDBK ~Rs56,000) — this is `_check_available_margin()`'s paper-mode check against `broker.balance` (a SHARED pool across all 4 strategies), not the per-strategy soft budget touched in item 11/the 2026-10-15 reset. `broker.balance` had shrunk to ~Rs1,07,515 from cumulative realized paper losses. `_reconcile_paper_broker_balance()` recomputes it as `INITIAL_CAPITAL + total_realized - deployed_cash` on every restart, so this takes effect on next restart without wiping any trade history. |
+| **b) iron_condor_v1 wing-credit floor** | **File:** `src/live_trading/live_trading_engine.py`, `_process_iron_condor()`. `MIN_WING_CREDIT_PCT` `0.10 -> 0.07`, **iron_condor_v1 only** — `credit_spread_v1`'s matching `MIN_CREDIT_PCT_OF_WING` left at `0.10` (31.9 rolling PF, already working, no case to loosen its own risk/reward floor). ONGC/TITAN/DRREDDY were repeatedly missing the 0.10 floor by small amounts as the market ticked (e.g. Rs0.21-0.30 vs Rs0.50 needed on ONGC). |
+| **c) Option bid-ask spread cap** | **File:** `src/live_trading/live_trading_engine.py`, `_OPTION_MAX_SPREAD_PCT` `150.0 -> 200.0`. Clears LICI (observed 193.22%) and PIDILITIND (152-159%), both repeat-rejected. **Side effect flagged:** this constant is shared across ALL 4 strategies (single-leg entries too) — `ema_crossover_v1`/`momentum_v1`'s own liquidity gate loosens by the same amount, even though neither was asked for and both are currently the worse-performing strategies. |
+| **d) Delta-tolerance-after-cache-resolution — investigated, not changed** | IDFCFIRSTB/BEL were failing `_resolved_strike_delta_ok()` (0.15 tolerance). Dug into `_resolve_contract()`/`_resolved_strike_delta_ok()`: this is NOT a stale-cache bug — `bs_delta()` is recomputed fresh from the current `underlying_price`/`dte`/`sigma` each call. The "after contract-cache resolution" wording refers to `get_real_contract()` snapping the candidate strike to a different, actually-listed strike (by design); what's being checked is whether *that* real strike's real delta is still within tolerance of the original target. Working as designed, already widened once (0.08->0.15 on 2026-10-09). Left untouched — widening further changes the condor's actual risk/reward profile, not just signal volume; flagged back to user rather than auto-changed. |
+| **Tests touched:** `test_multi_leg_liquidity_check_2026_10_01.py` (2 tests), `test_trade_quality_layer_2026_09_16.py` (1 test) — literal `spread_pct` fixtures bumped above 200.0. |
+
+---
+
 ## Historical pnl correction (2026-10-09) — unrelated bug, not a loosened gate
 
 Separately from this experiment: the user noticed several `ema_crossover_v1`

@@ -47,12 +47,12 @@ async def test_passes_when_every_leg_is_within_spread_tolerance(monkeypatch):
 @pytest.mark.asyncio
 async def test_fails_closed_on_the_first_too_wide_leg(monkeypatch):
     # EXPERIMENT (2026-10-08, explicit user instruction): _OPTION_MAX_SPREAD_PCT
-    # raised 8.0 -> 40.0 -> 150.0, so the "wide" fixture value must exceed
-    # 150.0 to still exercise the block. Restore 15.0 (and the 8.0 threshold)
-    # after reviewing case-by-case losses.
+    # raised 8.0 -> 40.0 -> 150.0 -> 200.0 (2026-10-16), so the "wide" fixture
+    # value must exceed 200.0 to still exercise the block. Restore 15.0 (and
+    # the 8.0 threshold) after reviewing case-by-case losses.
     async def _fake_quality(contract, kite):
         if "LONG" in contract:
-            return {"spread_pct": 180.0, "oi": 10, "volume": 2}  # wide -- illiquid
+            return {"spread_pct": 230.0, "oi": 10, "volume": 2}  # wide -- illiquid
         return {"spread_pct": 2.0, "oi": 1000, "volume": 500}
 
     monkeypatch.setattr(
@@ -65,7 +65,7 @@ async def test_fails_closed_on_the_first_too_wide_leg(monkeypatch):
 
     assert ok is False
     assert fake._last_gate_rejection["reason"] == "OPTION_SPREAD_TOO_WIDE"
-    assert fake._last_gate_rejection["value"] == 180.0
+    assert fake._last_gate_rejection["value"] == 230.0
     assert fake._last_gate_rejection["threshold"] == LiveTradingEngine._OPTION_MAX_SPREAD_PCT
 
 
@@ -74,12 +74,12 @@ async def test_checks_all_four_iron_condor_legs_not_just_the_first_two(monkeypat
     checked = []
 
     # EXPERIMENT (2026-10-08/09, explicit user instruction): fixture value
-    # raised above the current 150.0 threshold (was 20.0 under the original
-    # 8.0 threshold, then 50.0 under 40.0).
+    # raised above the current 200.0 threshold (was 20.0 under the original
+    # 8.0 threshold, then 50.0 under 40.0, then 180.0 under 150.0).
     async def _fake_quality(contract, kite):
         checked.append(contract)
         if contract == "CALL_LONG":
-            return {"spread_pct": 180.0, "oi": 5, "volume": 1}
+            return {"spread_pct": 230.0, "oi": 5, "volume": 1}
         return {"spread_pct": 1.5, "oi": 1000, "volume": 500}
 
     monkeypatch.setattr(

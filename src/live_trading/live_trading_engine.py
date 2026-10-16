@@ -5490,13 +5490,21 @@ class LiveTradingEngine:
         #
         # EXPERIMENT (2026-10-09, explicit user instruction: "loosen it a
         # little bit"): see matching comment in _process_credit_spread()
-        # above -- same deliberately modest 0.20 -> 0.10 cut. Restore 0.20
-        # after reviewing case-by-case losses.
+        # above -- same deliberately modest 0.20 -> 0.10 cut.
+        # EXPERIMENT (2026-10-16, explicit user instruction: "we want trades
+        # in iron_condor... what more can we do?"): nudged 0.10 -> 0.07,
+        # iron_condor_v1 only (credit_spread_v1's matching
+        # MIN_CREDIT_PCT_OF_WING left at 0.10 -- it's already profitable,
+        # 31.9 rolling PF, no case for loosening its own risk/reward floor).
+        # ONGC/TITAN/DRREDDY were repeatedly missing the 0.10 floor by small
+        # amounts (e.g. Rs0.21-0.30 vs Rs0.50 needed on ONGC; Rs14.52-14.95
+        # vs Rs15.00 on TITAN) as the market ticked, cycle after cycle.
+        # Restore 0.20 after reviewing case-by-case losses.
         put_wing_width  = abs(put_short_strike  - put_long_strike)
         call_wing_width = abs(call_short_strike - call_long_strike)
         put_wing_credit  = put_short_p  - put_long_p
         call_wing_credit = call_short_p - call_long_p
-        MIN_WING_CREDIT_PCT = 0.10
+        MIN_WING_CREDIT_PCT = 0.07
         if put_wing_credit < put_wing_width * MIN_WING_CREDIT_PCT:
             logger.info(
                 f"[IronCondor] {symbol} skipped — put wing credit ₹{put_wing_credit:.2f} < "
@@ -7379,10 +7387,18 @@ class LiveTradingEngine:
     # BHARTIARTL, ICICIBANK, GRASIM, AXISBANK, COALINDIA), all above the
     # 40.0 ceiling. Raised with margin above the worst observed case so
     # today's actual candidates aren't still screened out by this gate.
-    # Restore 8.0 (both raises) after reviewing case-by-case losses --
+    # EXPERIMENT (2026-10-16, explicit user instruction: "we want trades in
+    # iron_condor... what more can we do?"): raised 150.0 -> 200.0 to clear
+    # LICI (observed 193.22%) and PIDILITIND (152.11%-158.97%), both
+    # repeat-rejected iron_condor_v1 candidates. NOTE: this constant is
+    # shared across ALL 4 strategies (single-leg entries at this file's
+    # ~3670, multi-leg at ~6928) -- ema_crossover_v1/momentum_v1's own
+    # option-liquidity gate loosens by the same amount, even though neither
+    # was asked for and both are currently the worse-performing strategies.
+    # Restore 8.0 (all three raises) after reviewing case-by-case losses --
     # expect this specifically to reproduce illiquid-fill losses, that's
     # the known tradeoff of loosening it this far.
-    _OPTION_MAX_SPREAD_PCT = 150.0
+    _OPTION_MAX_SPREAD_PCT = 200.0
 
     async def _get_market_data(self, symbol: str) -> Optional[Dict[str, Any]]:
         redis = getattr(self, "_redis", None)
