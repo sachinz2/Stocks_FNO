@@ -272,6 +272,15 @@ specifically, two gates partially (not fully) tightened back for
 | **Expected effect:** cuts `ema_crossover_v1` volume hard -- only ~32 of the last 148 trades would have cleared `20<=ADX<25`. Consistent with the user's standing instruction that this strategy's volume can shrink (`"we can reduce the trades for ema_crossover... iron_condor & credit_spread are my main strategies"`, item 14). |
 | **Tests touched:** `tests/test_trade_review_fixes_2026_08_27.py` (2 existing tests bumped `adx14` fixture 25.0->22.0 to stay below the new ceiling since they test gap logic, not ADX; 5 new tests added for the ceiling itself + its main.py wiring), `tests/test_third_review_2026_08_21.py` (1 window-size bump, 3000->3500). |
 
+## 20. momentum_v1 — hour=13 entry exclusion extended from ema_crossover_v1
+
+| | |
+|---|---|
+| **File** | `src/live_trading/live_trading_engine.py`, `_process_signal()` -- the existing 2026-10-15 ema_crossover_v1 hour=13 check's condition widened from `strategy.name == "ema_crossover_v1"` to `strategy.name in ("ema_crossover_v1", "momentum_v1")`. |
+| **Evidence (2026-10-19, 34-trade review, Oct 8-19)** | Independent analysis found the identical pattern already fixed for ema_crossover_v1: 11/34 momentum_v1 trades (a third of all volume) fall in hour=13, at a 9.1% win rate, accounting for ₹24,078 of the strategy's total ₹46,353 loss (52%). Spans 5 different days (Oct 8, 9, 15, 16, 19) and 8 different symbols; removing the single worst trade still leaves -₹15,870 at 10% win rate -- not an outlier artifact. Same RANGE_BOUND-only caveat as the ema_crossover_v1 version applies (100% of the sample is RANGE_BOUND). |
+| **Also observed, not acted on:** 33 of 34 momentum_v1 trades have RVOL<0.5 at entry, and that bucket is clearly the worst-performing; the single trade with RVOL 0.5-1.0 was the best trade in the sample (+₹1,648, 41% MFE). Suggestive but n=1 for the "good" bucket -- nowhere near enough to set a threshold on. Revisit once more data accumulates. |
+| **Tests touched:** `verify_invariants.py`'s `check_ema_crossover_hour13_exclusion_is_scoped_correctly` updated to check for both strategy names. `test_rich_gate_rejection_detail_2026_09_16.py`: 3 new tests (hour=13 blocks each strategy independently; hour=10 blocks neither). |
+
 ---
 
 ## 18. iron_condor_v1 push — three further changes, 2026-10-16
