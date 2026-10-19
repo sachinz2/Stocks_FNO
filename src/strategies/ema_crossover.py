@@ -114,6 +114,23 @@ class EMACrossoverStrategy(StrategyBase):
         # rising" diagram box. adx_checked_internally=True tells the engine
         # to skip its own now-redundant flat gate for this strategy.
         self.adx_entry_threshold = self.parameters.get("adx_entry_threshold", 22)
+        # EXPERIMENT (2026-10-19, data-driven, explicit user instruction:
+        # "tighten the gates separately for each strategy... ema_crossover"):
+        # added a CEILING, turning the floor into a band. 148-trade review
+        # (Oct 8-19) found the ADX/entry relationship is NOT monotonic --
+        # 20-25 is the single best-performing bucket (43.8% win), 25-35 is a
+        # robust loss concentration (21-29% win, ~2x the MAE of the 20-25
+        # band) driven by entries into an already-extended move that's prone
+        # to a sharp reversal, and 35+ shows tentative recovery on too thin a
+        # sample (n=10) to act on. Separately, 8 of the 9 worst-ever
+        # reversal-exit losses since the MFE/MAE fix all had entry ADX>=25 --
+        # this ceiling would have blocked them at entry. Applied BEFORE the
+        # "OR rising" escape valve below, unconditionally: a still-rising
+        # ADX that's already >= the ceiling is the worst case in the data
+        # (already extended AND still accelerating), not a safer one -- the
+        # escape valve is for a genuinely early, still-low-but-rising setup,
+        # which by definition isn't anywhere near this ceiling.
+        self.adx_entry_ceiling = self.parameters.get("adx_entry_ceiling", 25)
         self.adx_checked_internally = True
         self._HISTORY_LEN = 3
 
@@ -254,7 +271,7 @@ class EMACrossoverStrategy(StrategyBase):
 
         logger.info(
             f"Initialized EMA Crossover '{self.name}' ({self.fast_period}/{self.slow_period}) | "
-            f"ADX entry>={self.adx_entry_threshold} (OR rising) | "
+            f"ADX entry>={self.adx_entry_threshold} (OR rising), <{self.adx_entry_ceiling} always | "
             f"RVOL hard_gate={self.rvol_hard_gate} | require_RS={self.require_rs} | "
             f"MTF strict={self.mtf_strict} strong_opposition>={self.mtf_strong_opposition_pct}% | "
             f"delta_target={self.entry_option_delta or 'ATM'} | "
@@ -436,8 +453,14 @@ class EMACrossoverStrategy(StrategyBase):
             # data-availability gate downstream of this signal.
             adx_ok = adx is None
             if adx is not None:
-                hist_adx = self._adx_history.get(symbol, [])
-                adx_ok = adx >= self.adx_entry_threshold or (len(hist_adx) >= 2 and adx > hist_adx[-2])
+                if adx >= self.adx_entry_ceiling:
+                    # Too extended -- see adx_entry_ceiling's docstring in
+                    # initialize(). Unconditional: a rising ADX already past
+                    # the ceiling is the worst case in the data, not exempt.
+                    adx_ok = False
+                else:
+                    hist_adx = self._adx_history.get(symbol, [])
+                    adx_ok = adx >= self.adx_entry_threshold or (len(hist_adx) >= 2 and adx > hist_adx[-2])
 
             # Fixed 2026-08-27 (trade review, entry-side follow-up): require
             # the EMA20/50 gap to have actually separated by a meaningful

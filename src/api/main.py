@@ -276,6 +276,12 @@ async def lifespan(app: FastAPI):
         # weak tail without the full-revert jump. Still deliberately looser
         # than the original 22. Restore 22 after a fuller review.
         "adx_entry_threshold": 20,
+        # EXPERIMENT (2026-10-19, data-driven): new ceiling, turning the
+        # floor into a band -- see adx_entry_ceiling's docstring in
+        # ema_crossover.py's initialize() for the full 148-trade rationale
+        # (20-25 is the best-performing ADX bucket; 25-35 is a robust loss
+        # concentration; 8/9 worst-ever reversal-exit losses had ADX>=25).
+        "adx_entry_ceiling": 25,
         # adx_checked_internally is hardcoded True in ema_crossover.py's
         # initialize() (not parameter-driven, unlike everything else here)
         # -- listing it would silently be a no-op, so it's intentionally

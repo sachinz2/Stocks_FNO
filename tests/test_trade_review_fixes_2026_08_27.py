@@ -209,6 +209,66 @@ def test_crossover_at_adx_20_no_longer_fires_without_rising():
     assert signal == "HOLD"
 
 
+# ── Fix 5 (2026-10-19): ADX entry gate gets a ceiling, not just a floor ─────
+#
+# 148-trade review (Oct 8-19) found the ADX/entry relationship is NOT
+# monotonic: 20-25 is the single best-performing bucket (43.8% win), 25-35
+# is a robust loss concentration (21-29% win, ~2x the MAE of the 20-25
+# band), and 8 of the 9 worst reversal-exit losses since the MFE/MAE fix had
+# entry ADX>=25. adx_entry_ceiling=25 blocks that whole zone, unconditionally
+# -- even a still-rising ADX already at/above the ceiling is blocked, since
+# an already-extended-and-still-accelerating entry is the worst case in the
+# data, not a safer one.
+
+def test_adx_entry_ceiling_default_is_25():
+    strat = _ema()
+    assert strat.adx_entry_ceiling == 25
+
+
+def test_crossover_at_adx_25_does_not_fire_even_though_it_clears_the_floor():
+    """ADX=25 clears the 22 floor comfortably, but must be blocked by the
+    new ceiling (>= 25 always blocks, regardless of the floor/rising check)."""
+    strat = _ema(signal_confirm_bars=1)
+    strat.generate_signal({"symbol": "X", "ema20": 99.0, "ema50": 100.0, "adx14": 25.0, "ohlc_bar_key": "live:t0"})
+    signal = strat.generate_signal({"symbol": "X", "ema20": 101.0, "ema50": 100.0, "adx14": 25.0, "ohlc_bar_key": "live:t1"})
+    assert signal == "HOLD"
+
+
+def test_crossover_at_adx_30_rising_still_does_not_fire():
+    """The ceiling is unconditional -- a rising ADX already past it is the
+    worst case in the data (already extended AND still accelerating), not
+    exempt the way a sub-floor rising ADX is."""
+    strat = _ema(signal_confirm_bars=1)
+    strat.generate_signal({"symbol": "X", "ema20": 99.0, "ema50": 100.0, "adx14": 28.0, "ohlc_bar_key": "live:t0"})
+    signal = strat.generate_signal({"symbol": "X", "ema20": 101.0, "ema50": 100.0, "adx14": 30.0, "ohlc_bar_key": "live:t1"})
+    assert signal == "HOLD"
+
+
+def test_crossover_just_under_the_ceiling_still_fires():
+    """ADX=24.9 clears the floor and sits just under the new ceiling --
+    must still fire normally."""
+    strat = _ema(signal_confirm_bars=1)
+    strat.generate_signal({"symbol": "X", "ema20": 99.0, "ema50": 100.0, "adx14": 24.9, "ohlc_bar_key": "live:t0"})
+    signal = strat.generate_signal({"symbol": "X", "ema20": 101.0, "ema50": 100.0, "adx14": 24.9, "ohlc_bar_key": "live:t1"})
+    assert signal == "BUY"
+
+
+def test_adx_entry_ceiling_is_configurable():
+    strat = _ema(signal_confirm_bars=1, adx_entry_ceiling=40)
+    strat.generate_signal({"symbol": "X", "ema20": 99.0, "ema50": 100.0, "adx14": 30.0, "ohlc_bar_key": "live:t0"})
+    # ADX=30 would hit the default 25 ceiling, but this instance's ceiling is 40.
+    signal = strat.generate_signal({"symbol": "X", "ema20": 101.0, "ema50": 100.0, "adx14": 30.0, "ohlc_bar_key": "live:t1"})
+    assert signal == "BUY"
+
+
+def test_main_py_wires_adx_entry_ceiling():
+    from src.api import main as main_module
+    src = inspect.getsource(main_module)
+    idx = src.index('StrategyRegistry.load_strategy("EMA_CROSSOVER"')
+    block = src[idx:idx + 5000]
+    assert '"adx_entry_ceiling": 25' in block
+
+
 # ── Entry-side follow-up: minimum EMA gap required to fire at all ──────────
 # (2026-08-27, after user feedback that the exit-side fix alone doesn't
 # address why entries themselves were frequently poor -- ADX/RVOL at entry
@@ -231,10 +291,12 @@ def test_crossover_with_tiny_gap_does_not_fire_even_with_adx_and_bars_confirmed(
 
 
 def test_crossover_with_gap_past_the_floor_fires():
+    # adx14=22.0, not 25.0 -- 2026-10-19 added an adx_entry_ceiling=25 (see
+    # ema_crossover.py), and this test is about the gap floor, not ADX.
     strat = _ema(signal_confirm_bars=1)
-    strat.generate_signal({"symbol": "X", "ema20": 99.0, "ema50": 100.0, "adx14": 25.0, "ohlc_bar_key": "live:t0"})
+    strat.generate_signal({"symbol": "X", "ema20": 99.0, "ema50": 100.0, "adx14": 22.0, "ohlc_bar_key": "live:t0"})
     # 0.5% gap, well past the 0.1% default floor.
-    signal = strat.generate_signal({"symbol": "X", "ema20": 100.5, "ema50": 100.0, "adx14": 25.0, "ohlc_bar_key": "live:t1"})
+    signal = strat.generate_signal({"symbol": "X", "ema20": 100.5, "ema50": 100.0, "adx14": 22.0, "ohlc_bar_key": "live:t1"})
     assert signal == "BUY"
 
 
@@ -250,11 +312,13 @@ def test_thin_gap_holds_pending_state_for_a_later_bar_once_it_widens():
     """A crossover that starts thin but widens on the very next confirming
     bar must still fire without needing a brand-new crossover to restart --
     same "hold, don't clear" behavior already established for adx_ok."""
+    # adx14=22.0, not 25.0 -- 2026-10-19 added an adx_entry_ceiling=25 (see
+    # ema_crossover.py), and this test is about gap state, not ADX.
     strat = _ema(signal_confirm_bars=1)
-    strat.generate_signal({"symbol": "X", "ema20": 99.0, "ema50": 100.0, "adx14": 25.0, "ohlc_bar_key": "live:t0"})
-    r1 = strat.generate_signal({"symbol": "X", "ema20": 100.05, "ema50": 100.0, "adx14": 25.0, "ohlc_bar_key": "live:t1"})
+    strat.generate_signal({"symbol": "X", "ema20": 99.0, "ema50": 100.0, "adx14": 22.0, "ohlc_bar_key": "live:t0"})
+    r1 = strat.generate_signal({"symbol": "X", "ema20": 100.05, "ema50": 100.0, "adx14": 22.0, "ohlc_bar_key": "live:t1"})
     assert r1 == "HOLD"
-    r2 = strat.generate_signal({"symbol": "X", "ema20": 100.5, "ema50": 100.0, "adx14": 25.0, "ohlc_bar_key": "live:t2"})
+    r2 = strat.generate_signal({"symbol": "X", "ema20": 100.5, "ema50": 100.0, "adx14": 22.0, "ohlc_bar_key": "live:t2"})
     assert r2 == "BUY"
 
 
@@ -265,7 +329,9 @@ def test_main_py_wires_entry_min_gap_pct():
     from src.api import main as main_module
     src = inspect.getsource(main_module)
     idx = src.index('StrategyRegistry.load_strategy("EMA_CROSSOVER"')
-    block = src[idx:idx + 4500]
+    # Window widened 4500 -> 5000 (2026-10-19): the new adx_entry_ceiling
+    # comment pushed this literal further into the block.
+    block = src[idx:idx + 5000]
     assert '"entry_min_gap_pct": 0.0005' in block
 
 

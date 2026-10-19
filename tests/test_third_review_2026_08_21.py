@@ -69,7 +69,9 @@ def test_main_py_wires_require_rs_false_for_ema_crossover():
     from src.api import main as main_module
     src = inspect.getsource(main_module)
     idx = src.index('StrategyRegistry.load_strategy("EMA_CROSSOVER"')
-    block = src[idx:idx + 3000]
+    # Window widened 3000 -> 3500 (2026-10-19): the new adx_entry_ceiling
+    # comment pushed this literal further into the block.
+    block = src[idx:idx + 3500]
     assert '"require_rs": False' in block
 
 
