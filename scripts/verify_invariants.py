@@ -1188,15 +1188,17 @@ def check_square_off_and_exit_signal_pnl_use_the_pre_close_position_values(repo:
 
 
 def check_ema_crossover_hour13_exclusion_is_scoped_correctly(repo: Path) -> Result:
-    name = "ema_crossover_v1's hour=13 entry exclusion only applies to ema_crossover_v1, and main.py's ADX threshold matches the 2026-10-15 data review"
+    name = "ema_crossover_v1/momentum_v1's hour=13 entry exclusion applies to exactly those two strategies, and main.py's ADX threshold matches the 2026-10-15 data review"
     src = _read(repo, "src/live_trading/live_trading_engine.py")
-    idx = src.find('strategy.name == "ema_crossover_v1" and now_ist().hour == 13')
+    idx = src.find('strategy.name in ("ema_crossover_v1", "momentum_v1") and now_ist().hour == 13')
     if idx == -1:
         return FAIL, name, (
-            "The hour=13 entry exclusion for ema_crossover_v1 is missing -- confirmed "
-            "2026-10-15 (104-trade review): hour=13 entries accounted for 42% of total "
-            "losses at a 15% win rate vs 39-42% every other hour. If this was intentionally "
-            "reverted, remove/update this check."
+            "The hour=13 entry exclusion for ema_crossover_v1/momentum_v1 is missing or "
+            "no longer covers both strategies -- confirmed independently for each: "
+            "ema_crossover_v1 (2026-10-15, 104-trade review, 42% of losses at 15% win "
+            "rate) and momentum_v1 (2026-10-19, 34-trade review, 52% of losses at 9.1% "
+            "win rate). If this was intentionally reverted for either strategy, "
+            "remove/update this check."
         )
     body = src[idx: idx + 400]
     if "return" not in body:
@@ -1212,7 +1214,7 @@ def check_ema_crossover_hour13_exclusion_is_scoped_correctly(repo: Path) -> Resu
             "2026-10-15 data-driven nudge from 16) -- confirm this was an intentional "
             "further change, not a silent drift."
         )
-    return PASS, name, "hour=13 exclusion present and scoped to ema_crossover_v1 only; adx_entry_threshold matches the 2026-10-15 review."
+    return PASS, name, "hour=13 exclusion present and scoped to exactly ema_crossover_v1 and momentum_v1; adx_entry_threshold matches the 2026-10-15 review."
 
 
 def check_reversal_exit_passes_mfe_mae_through(repo: Path) -> Result:

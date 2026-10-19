@@ -105,6 +105,81 @@ async def test_adx_rejection_captures_real_value_and_threshold():
     assert rej["reason"] == "ADX_BELOW_THRESHOLD"
 
 
+# ── hour=13 entry exclusion (ema_crossover_v1 2026-10-15, momentum_v1 ───────
+# 2026-10-19) -- both data-driven, confirmed independently for each strategy
+# via its own trade review (see matching comment in _process_signal()).
+
+@pytest.mark.asyncio
+async def test_hour13_blocks_ema_crossover_v1_entries(monkeypatch):
+    import datetime as _dt
+    import src.live_trading.live_trading_engine as lte_module
+    monkeypatch.setattr(lte_module, "now_ist", lambda: _dt.datetime(2026, 10, 19, 13, 30, 0))
+    fake = _FakeEngine({
+        "close": 1200.0, "ltp_source": "live_tick",
+        "rvol": 2.0, "rvol_valid": True,
+        "adx14": 30.0, "adx_valid": True,
+    })
+    strategy = SimpleNamespace(
+        name="ema_crossover_v1", is_active=True, min_dte=0, max_dte=999,
+        generate_signal=lambda market_data: SignalType.BUY,
+    )
+
+    await LiveTradingEngine._process_signal(fake, strategy, "SBIN", vix=15.0, regime="TRENDING")
+
+    # Blocked before the ADX gate even runs -- only signal_generated is audited.
+    assert fake._signal_gate_stats.get("ema_crossover_v1") == {"signal_generated": 1}
+    assert fake._last_gate_rejection is None
+
+
+@pytest.mark.asyncio
+async def test_hour13_blocks_momentum_v1_entries(monkeypatch):
+    import datetime as _dt
+    import src.live_trading.live_trading_engine as lte_module
+    monkeypatch.setattr(lte_module, "now_ist", lambda: _dt.datetime(2026, 10, 19, 13, 45, 0))
+    fake = _FakeEngine({
+        "close": 1200.0, "ltp_source": "live_tick",
+        "rvol": 2.0, "rvol_valid": True,
+        "adx14": 30.0, "adx_valid": True,
+    })
+    strategy = SimpleNamespace(
+        name="momentum_v1", is_active=True, min_dte=0, max_dte=999,
+        generate_signal=lambda market_data: SignalType.SELL,
+    )
+
+    await LiveTradingEngine._process_signal(fake, strategy, "SBIN", vix=15.0, regime="TRENDING")
+
+    assert fake._signal_gate_stats.get("momentum_v1") == {"signal_generated": 1}
+    assert fake._last_gate_rejection is None
+
+
+@pytest.mark.asyncio
+async def test_hour10_does_not_block_ema_crossover_v1_or_momentum_v1(monkeypatch):
+    """Confirms the exclusion is hour-specific, not a blanket block on either
+    strategy -- both must still reach the ADX gate normally outside hour=13."""
+    import datetime as _dt
+    import src.live_trading.live_trading_engine as lte_module
+    monkeypatch.setattr(lte_module, "now_ist", lambda: _dt.datetime(2026, 10, 19, 10, 0, 0))
+
+    for name in ("ema_crossover_v1", "momentum_v1"):
+        fake = _FakeEngine({
+            "close": 1200.0, "ltp_source": "live_tick",
+            "rvol": 2.0, "rvol_valid": True,
+            "adx14": 18.5, "adx_valid": True,   # below the flat 25 threshold -> rejected there
+        })
+        strategy = SimpleNamespace(
+            name=name, is_active=True, min_dte=0, max_dte=999,
+            rvol_checked_internally=True,
+            generate_signal=lambda market_data: SignalType.BUY,
+        )
+
+        await LiveTradingEngine._process_signal(fake, strategy, "SBIN", vix=15.0, regime="TRENDING")
+
+        rej = fake._last_gate_rejection
+        assert rej is not None, f"{name} was unexpectedly blocked before reaching the ADX gate"
+        assert rej["gate"] == "adx_passed"
+        assert rej["reason"] == "ADX_BELOW_THRESHOLD"
+
+
 class _FakeRedisMtf:
     def __init__(self, tick15_value):
         self._value = tick15_value

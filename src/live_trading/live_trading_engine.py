@@ -3120,13 +3120,21 @@ class LiveTradingEngine:
         # trade (IDEA, -Rs20,013). Caveat on record: concentrated in 2 of 5
         # sampled days rather than uniformly bad every day, and the entire
         # sample is RANGE_BOUND-only -- revisit if/when a TRENDING/VOLATILE
-        # stretch provides fresh data. Scoped to ema_crossover_v1 only --
-        # momentum_v1 wasn't part of this analysis and is untouched.
-        if strategy.name == "ema_crossover_v1" and now_ist().hour == 13:
+        # stretch provides fresh data.
+        #
+        # EXTENDED to momentum_v1 (2026-10-19, data-driven, same user
+        # instruction to review each strategy separately): independent
+        # 34-trade sample found the identical pattern -- 11/34 trades (a
+        # third of all volume) fall in hour=13, at a 9.1% win rate,
+        # accounting for Rs24,078 of the strategy's total Rs46,353 loss
+        # (52%). Spans 5 different days and 8 different symbols; removing
+        # the single worst trade still leaves -Rs15,870 at 10% win rate --
+        # not an outlier artifact. Same RANGE_BOUND-only caveat applies.
+        if strategy.name in ("ema_crossover_v1", "momentum_v1") and now_ist().hour == 13:
             logger.info(
                 f"[{strategy.name}] {symbol} {signal_str} skipped — hour=13 "
-                "(1-2pm IST) entry window excluded (data-driven, 2026-10-15 "
-                "trade review: worst-performing hour, 15% win rate)."
+                "(1-2pm IST) entry window excluded (data-driven trade review: "
+                "worst-performing hour for this strategy)."
             )
             return
 
