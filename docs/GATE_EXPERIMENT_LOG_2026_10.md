@@ -261,6 +261,17 @@ specifically, two gates partially (not fully) tightened back for
 | **Tests touched** | 6 existing tests that drive the real `_process_signal()` with `strategy.name="ema_crossover_v1"` started failing/would-have-failed depending on the real wall-clock hour at test-run time (confirmed live: the full suite ran at 13:xx IST and exactly these 6 failed). Fixed by pinning `now_ist()` to a safe hour via `monkeypatch` in each (`test_live_trading_engine.py` x2, `test_rich_gate_rejection_detail_2026_09_16.py` x5 via a new autouse fixture). **This is a real, pre-existing class of risk** -- any test that drives `_process_signal()` with an unmocked clock and `strategy.name="ema_crossover_v1"` is now time-dependent; 15 test files reference that name but only these were confirmed to actually reach this code path. |
 | **`verify_invariants.py`** | `check_ema_crossover_hour13_exclusion_is_scoped_correctly` added -- confirms the exclusion exists, actually blocks (not just logs), and main.py's `adx_entry_threshold` matches the 2026-10-15 value. |
 
+## 19. ema_crossover_v1 — ADX entry gate gets a ceiling (floor -> band)
+
+| | |
+|---|---|
+| **File** | `src/strategies/ema_crossover.py` (`initialize()` + `generate_signal()`), `src/api/main.py` (`EMA_CROSSOVER` config dict: `"adx_entry_ceiling": 25`) |
+| **What it does** | `adx_entry_ceiling=25`, checked BEFORE the existing floor/rising logic: `adx >= 25` always blocks (`adx_ok = False`), unconditionally -- even if ADX is rising. Only `adx < 25` reaches the existing `adx >= adx_entry_threshold (20) OR ADX rising` check. Net effect: entries now require `20 <= ADX < 25`, or a still-rising ADX below 25. |
+| **Evidence (2026-10-19, 148-trade review, Oct 8-19)** | ADX/entry relationship is non-monotonic, not a simple "higher is better": `<16`=30.8% win, `16-20`=39.1%, **`20-25`=43.8% (best)**, `25-30`=28.9%, `30-35`=21.1% (worst), `35+`=40.0% (n=10, too thin to act on). The 25-35 "valley" has ~2x the avg MAE of the 20-25 band (-14.49%/-11.52% vs -9.26%) and less upside (avg MFE 6.07%/3.98% vs 8.18%) -- buying into an already-extended move prone to a sharp reversal, not catching a fresh one. Cross-checked against a separate dig into "fresh opposite signal" reversal-exit losses (9 trades since the Oct-15 MFE/MAE fix, 0% win, -₹4,374 avg -- the single worst bucket found this session): **8 of 9 already had entry ADX>=25** -- this ceiling would have blocked them before the reversal-exit mechanism ever got involved. |
+| **Deliberately NOT done:** no attempt to also exempt the 35+ recovery -- only 10 trades, too thin to build a non-contiguous band around yet. Revisit once more data accumulates. |
+| **Expected effect:** cuts `ema_crossover_v1` volume hard -- only ~32 of the last 148 trades would have cleared `20<=ADX<25`. Consistent with the user's standing instruction that this strategy's volume can shrink (`"we can reduce the trades for ema_crossover... iron_condor & credit_spread are my main strategies"`, item 14). |
+| **Tests touched:** `tests/test_trade_review_fixes_2026_08_27.py` (2 existing tests bumped `adx14` fixture 25.0->22.0 to stay below the new ceiling since they test gap logic, not ADX; 5 new tests added for the ceiling itself + its main.py wiring), `tests/test_third_review_2026_08_21.py` (1 window-size bump, 3000->3500). |
+
 ---
 
 ## 18. iron_condor_v1 push — three further changes, 2026-10-16
