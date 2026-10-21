@@ -919,6 +919,31 @@ elif page == "System Health":
 
 
 elif page == "Admin":
+    # Re-added 2026-10-21 (explicit user instruction): the dashboard-wide
+    # login gate was removed the same day (port 8501 is open to the
+    # internet, ufw: 8501/tcp ALLOW Anywhere), but this page specifically
+    # holds live-trading-state mutations (kill switch, email alerts, and
+    # further down: restart/reset) -- scoped here instead of the whole app,
+    # same DASHBOARD_PASSWORD env var/fallback as the old app-wide gate.
+    _ADMIN_DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "admin123")
+
+    def _admin_password_entered():
+        if st.session_state.get("admin_password_input") == _ADMIN_DASHBOARD_PASSWORD:
+            st.session_state["admin_password_correct"] = True
+            del st.session_state["admin_password_input"]
+        else:
+            st.session_state["admin_password_correct"] = False
+
+    if not st.session_state.get("admin_password_correct", False):
+        st.title("Admin Controls")
+        st.text_input(
+            "Admin Password", type="password",
+            on_change=_admin_password_entered, key="admin_password_input",
+        )
+        if st.session_state.get("admin_password_correct") is False:
+            st.error("Password incorrect")
+        st.stop()
+
     st.title("Admin Controls")
     st.warning("These controls affect live trading state. Use with care.")
 
