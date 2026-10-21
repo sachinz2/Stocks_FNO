@@ -12,7 +12,6 @@ from src.core.constants import FNO_SYMBOLS
 st.set_page_config(page_title="Falcon Quant Platform", layout="wide", page_icon="🦅")
 
 API_BASE_URL = os.environ.get("API_BASE_URL", "http://api:8000/api/v1")
-_DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "admin123")
 INITIAL_CAPITAL = float(os.environ.get("INITIAL_CAPITAL", "300000"))
 # Fixed 2026-08-21 (deep review): was a hardcoded 0.05 literal, disconnected
 # from settings.MAX_DAILY_LOSS_PCT (.env) which RiskManager actually reads --
@@ -35,27 +34,6 @@ _ADMIN_AUTH_HEADERS = {"X-Admin-Token": _ADMIN_API_TOKEN}
 # Read-only /logs/recent token — same var the API's logs_router reads.
 _LOGS_API_TOKEN = os.environ.get("LOGS_API_TOKEN", "")
 
-
-def check_password():
-    def password_entered():
-        if st.session_state["password"] == _DASHBOARD_PASSWORD:
-            st.session_state["password_correct"] = True
-            del st.session_state["password"]
-        else:
-            st.session_state["password_correct"] = False
-
-    if "password_correct" not in st.session_state:
-        st.text_input("Password", type="password", on_change=password_entered, key="password")
-        return False
-    elif not st.session_state["password_correct"]:
-        st.text_input("Password", type="password", on_change=password_entered, key="password")
-        st.error("Password incorrect")
-        return False
-    return True
-
-
-if not check_password():
-    st.stop()
 
 # --- Navigation ---
 st.sidebar.title("Falcon Quant")
