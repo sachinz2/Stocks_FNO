@@ -208,6 +208,25 @@ class MomentumStrategy(StrategyBase):
         # entry threshold), this tighter stop applies instead of waiting for
         # the full hard-stop drawdown.
         self.weakening_stop_loss_pct = self.parameters.get("weakening_stop_loss_pct", 0.25)
+        # EXPERIMENT (2026-10-21, data-driven, explicit user instruction:
+        # "can you fix" momentum_v1): 43-trade review (Oct 8-21) found a
+        # near-perfect split invisible to any entry-time feature (ADX/RVOL/
+        # VIX/hour were all nearly identical between the two groups) --
+        # positions whose premium NEVER traded above entry (option_mfe_pct
+        # stayed exactly 0.0) were 0% win rate, -Rs2,810 avg (20 trades,
+        # -Rs56,207 total); positions that showed ANY favorable move, even
+        # briefly, were roughly breakeven (30.4% win, +Rs62 avg, 23 trades).
+        # Removing the zero-MFE group would make this strategy net positive
+        # over the window. Checked these aren't instant/same-cycle exits
+        # (held 15-80 min, plenty of monitoring cycles) -- these positions
+        # genuinely never saw a single moment of favorable price action.
+        # stall_exit_minutes picked as a reasonable starting point (shorter
+        # than nearly every zero-MFE loss's actual hold time, so it should
+        # cut most of them meaningfully earlier), NOT derived from precise
+        # time-to-first-favorable-move data (trade_journal only has final
+        # MFE/MAE, not a time series) -- revisit based on observed results,
+        # same as every other data-driven change this session.
+        self.stall_exit_minutes = self.parameters.get("stall_exit_minutes", 15)
         # Once a position has been up at least this much from entry, it must
         # never be allowed to close as a realized loss -- see manage_position()'s
         # breakeven-stop check for why trailing_stop_pct alone doesn't guarantee this.
@@ -409,7 +428,8 @@ class MomentumStrategy(StrategyBase):
             f"BreakdownContinuation={self.enable_breakdown_continuation} "
             f"(min_bars={self.breakdown_min_established_bars}, RVOL>={self.breakdown_rvol_min}) | "
             f"ProfitBooking: giveback {self.profit_booking_giveback_pct:.0%} of peak "
-            f"once profit crosses engine activation floor"
+            f"once profit crosses engine activation floor | "
+            f"StallExit={self.stall_exit_minutes}min (never-traded-above-entry)"
         )
 
     def generate_signal(self, data: Dict[str, Any]) -> Optional[str]:
@@ -997,6 +1017,10 @@ class MomentumStrategy(StrategyBase):
                               (default Rs700) has been crossed at least once,
                               and the check is skipped (not fail-closed) if
                               either is missing.
+          - minutes_since_entry, mfe_option_pct : added 2026-10-21, feed the
+                              stall exit below; skipped (not fail-closed) if
+                              either is missing (e.g. a position restored
+                              from before this field existed).
 
         Exit conditions (in priority order):
           0. Rs-profit-booking giveback (added 2026-09-10, user request) —
@@ -1010,6 +1034,14 @@ class MomentumStrategy(StrategyBase):
                                   the directional/structural checks below —
                                   ADDITIONAL to (not a replacement for) the
                                   pct-based trailing stop (#6)/breakeven (#7).
+          0.5. Stall exit (added 2026-10-21, data-driven) — premium has
+                                  never traded above entry (mfe_option_pct
+                                  <= 0) for at least stall_exit_minutes.
+                                  Checked ahead of every other check below,
+                                  including the underlying-based stop — the
+                                  point is to cut a position showing zero
+                                  favorable movement before it reaches a
+                                  worse, later stop level.
           1. Underlying-based stop/target (added 2026-08-21, round 2) — the
                                   PRIMARY exit driver per the external
                                   review: underlying's close has moved
@@ -1091,6 +1123,32 @@ class MomentumStrategy(StrategyBase):
                     f"peak Rs{_pb_peak_rs:.0f}) -- exiting."
                 )
                 return "EXIT"
+
+        # EXPERIMENT (2026-10-21, data-driven): stall exit -- see
+        # stall_exit_minutes' docstring in initialize() for the full
+        # 43-trade rationale. minutes_since_entry/mfe_option_pct are
+        # engine-tracked (the same running MFE already written to
+        # trade_journal at exit); skipped gracefully (not fail-closed) if
+        # either is missing (e.g. a position restored from before this
+        # field existed). Checked before every other exit condition below,
+        # including the underlying-based stop -- the whole point is to cut
+        # a position that's shown zero favorable movement BEFORE it
+        # reaches a worse, later stop level.
+        _minutes_since_entry = current_position.get("minutes_since_entry")
+        _mfe_option_pct      = current_position.get("mfe_option_pct")
+        if (
+            self.stall_exit_minutes > 0
+            and _minutes_since_entry is not None
+            and _mfe_option_pct is not None
+            and _minutes_since_entry >= self.stall_exit_minutes
+            and _mfe_option_pct <= 0.0
+        ):
+            logger.info(
+                f"[{self.name}] Stall exit: {_minutes_since_entry:.0f} min since "
+                f"entry, premium has never traded above entry (mfe={_mfe_option_pct:.2f}%) "
+                f"-- exiting before this becomes a larger loss."
+            )
+            return "EXIT"
 
         # Fixed 2026-08-21 (external review, round 2 -- sections 20-21):
         # underlying-based stop/target, the PRIMARY exit driver per the

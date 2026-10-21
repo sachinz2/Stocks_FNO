@@ -406,6 +406,87 @@ def test_underlying_based_stop_checked_before_premium_hard_stop():
     assert strat.manage_position(pos, 16.0) == "EXIT"
 
 
+# ── Stall exit (2026-10-21, data-driven) ─────────────────────────────────────
+# 43-trade review: positions whose premium never traded above entry
+# (mfe_option_pct <= 0) were 0% win rate; positions with any favorable move,
+# even briefly, were roughly breakeven. See stall_exit_minutes' docstring in
+# momentum.py's initialize() for the full rationale.
+
+def test_stall_exit_fires_after_threshold_with_zero_mfe():
+    strat = _mom()
+    pos = {
+        "avg_price": 40.0, "peak_premium": 40.0, "current_adx": 30.0,
+        "minutes_since_entry": 15.0, "mfe_option_pct": 0.0,
+    }
+    assert strat.manage_position(pos, 39.5) == "EXIT"
+
+
+def test_stall_exit_does_not_fire_before_threshold():
+    strat = _mom()
+    pos = {
+        "avg_price": 40.0, "peak_premium": 40.0, "current_adx": 30.0,
+        "minutes_since_entry": 14.9, "mfe_option_pct": 0.0,
+    }
+    assert strat.manage_position(pos, 39.5) == "HOLD"
+
+
+def test_stall_exit_does_not_fire_if_premium_ever_traded_above_entry():
+    """mfe_option_pct > 0 means the premium was favorable at some point,
+    even if it has since fallen back -- not a stall."""
+    strat = _mom()
+    pos = {
+        "avg_price": 40.0, "peak_premium": 42.0, "current_adx": 30.0,
+        "minutes_since_entry": 30.0, "mfe_option_pct": 5.0,
+    }
+    assert strat.manage_position(pos, 39.5) == "HOLD"
+
+
+def test_stall_exit_skips_gracefully_when_fields_missing():
+    """A position restored from before this field existed must not be
+    force-closed just because minutes_since_entry/mfe_option_pct are absent."""
+    strat = _mom()
+    pos = {"avg_price": 40.0, "peak_premium": 40.0, "current_adx": 30.0}
+    assert strat.manage_position(pos, 39.9) == "HOLD"
+
+
+def test_stall_exit_checked_before_underlying_based_stop():
+    """Both would fire here -- confirm the stall exit is checked first (same
+    EXIT outcome either way, but this pins the priority rather than leaving
+    it untested)."""
+    strat = _mom()
+    pos = {
+        "avg_price": 40.0, "peak_premium": 40.0, "current_adx": 30.0,
+        "minutes_since_entry": 15.0, "mfe_option_pct": 0.0,
+        "is_call": True, "entry_underlying_price": 100.0, "entry_atr": 2.0,
+        "current_close": 97.9,  # underlying stop would also breach
+    }
+    assert strat.manage_position(pos, 39.5) == "EXIT"
+
+
+def test_stall_exit_is_configurable():
+    strat = _mom(stall_exit_minutes=60)
+    pos = {
+        "avg_price": 40.0, "peak_premium": 40.0, "current_adx": 30.0,
+        "minutes_since_entry": 15.0, "mfe_option_pct": 0.0,
+    }
+    # 15 min would trip the default 15-minute threshold, but this instance's is 60.
+    assert strat.manage_position(pos, 39.5) == "HOLD"
+
+
+def test_stall_exit_can_be_disabled():
+    strat = _mom(stall_exit_minutes=0)
+    pos = {
+        "avg_price": 40.0, "peak_premium": 40.0, "current_adx": 30.0,
+        "minutes_since_entry": 999.0, "mfe_option_pct": 0.0,
+    }
+    assert strat.manage_position(pos, 39.5) == "HOLD"
+
+
+def test_stall_exit_minutes_default_is_15():
+    strat = _mom()
+    assert strat.stall_exit_minutes == 15
+
+
 # ── Engine: entry-context capture + threading ────────────────────────────────
 
 def test_engine_captures_entry_underlying_price_and_atr_at_entry():
@@ -429,6 +510,17 @@ def test_engine_threads_entry_context_into_manage_position_call():
     src = inspect.getsource(LiveTradingEngine._check_open_option_exits)
     assert '"entry_underlying_price": owner_info.get("entry_underlying_price")' in src
     assert '"entry_atr":              owner_info.get("entry_atr")' in src
+
+
+def test_engine_captures_entry_timestamp_and_threads_stall_exit_fields():
+    import inspect
+    from src.live_trading.live_trading_engine import LiveTradingEngine as _LTE
+    entry_src = inspect.getsource(_LTE._process_signal)
+    assert '"entry_timestamp": now_ist().isoformat(),' in entry_src
+
+    exits_src = inspect.getsource(_LTE._check_open_option_exits)
+    assert '"minutes_since_entry": _minutes_since_entry' in exits_src
+    assert '"mfe_option_pct":      owner_info.get("mfe_option_pct")' in exits_src
 
 
 # ── Production wiring must carry the round-2 params too ─────────────────────

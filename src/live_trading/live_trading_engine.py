@@ -2128,11 +2128,30 @@ class LiveTradingEngine:
                 owner_info["mfe_option_pct"] = max(owner_info.get("mfe_option_pct", 0.0) or 0.0, _opt_move_pct)
                 owner_info["mae_option_pct"] = min(owner_info.get("mae_option_pct", 0.0) or 0.0, _opt_move_pct)
 
+                # Added 2026-10-21: feeds MomentumStrategy's stall exit.
+                # None (not 0) when entry_timestamp is missing -- e.g. a
+                # position restored from before this field existed -- so
+                # the check skips gracefully rather than firing on a
+                # fabricated "0 minutes since entry."
+                _minutes_since_entry = None
+                _entry_ts_raw = owner_info.get("entry_timestamp")
+                if _entry_ts_raw:
+                    try:
+                        _entry_dt = datetime.fromisoformat(_entry_ts_raw)
+                        _minutes_since_entry = (now_ist() - _entry_dt).total_seconds() / 60.0
+                    except (ValueError, TypeError):
+                        _minutes_since_entry = None
+
                 if exit_reason is None and owner_strategy is not None:
                     result = owner_strategy.manage_position(
                         {
                             "avg_price": entry_p,
                             "peak_premium": peak,
+                            # Added 2026-10-21 -- feed MomentumStrategy's
+                            # stall exit; unused (no-op) by strategies that
+                            # don't check them.
+                            "minutes_since_entry": _minutes_since_entry,
+                            "mfe_option_pct":      owner_info.get("mfe_option_pct"),
                             # Fixed 2026-09-10 (user request): feeds the
                             # additional Rs-profit-booking exit (see the
                             # engine-side tracking above and this dict's
@@ -3727,6 +3746,11 @@ class LiveTradingEngine:
                     "underlying":    symbol,
                     "strategy_name": strategy.name,
                     "date":          now_ist().date().isoformat(),
+                    # Added 2026-10-21: feeds MomentumStrategy's stall exit
+                    # (manage_position()) -- minutes_since_entry is computed
+                    # from this at the call site each cycle. A no-op for
+                    # strategies that don't check minutes_since_entry.
+                    "entry_timestamp": now_ist().isoformat(),
                     # Regime at entry (not current regime at exit time) — the
                     # VOLATILE-specific tightened exit logic in manage_position()
                     # keys off this, so a crash-catching entry keeps its faster
