@@ -281,6 +281,17 @@ specifically, two gates partially (not fully) tightened back for
 | **Also observed, not acted on:** 33 of 34 momentum_v1 trades have RVOL<0.5 at entry, and that bucket is clearly the worst-performing; the single trade with RVOL 0.5-1.0 was the best trade in the sample (+₹1,648, 41% MFE). Suggestive but n=1 for the "good" bucket -- nowhere near enough to set a threshold on. Revisit once more data accumulates. |
 | **Tests touched:** `verify_invariants.py`'s `check_ema_crossover_hour13_exclusion_is_scoped_correctly` updated to check for both strategy names. `test_rich_gate_rejection_detail_2026_09_16.py`: 3 new tests (hour=13 blocks each strategy independently; hour=10 blocks neither). |
 
+## 21. momentum_v1 — new "stall exit" (not a gate, a new exit mechanism)
+
+| | |
+|---|---|
+| **File** | `src/strategies/momentum.py` (`initialize()` + `manage_position()`, new `stall_exit_minutes` param, default 15), `src/live_trading/live_trading_engine.py` (`_process_signal()` captures `entry_timestamp` at journal creation; `_check_open_option_exits()` computes `minutes_since_entry` and threads it + the already-tracked `mfe_option_pct` into `manage_position()`). |
+| **What it does** | Exits a position early if its premium has never traded above entry (`mfe_option_pct <= 0`) for at least `stall_exit_minutes`. Checked ahead of every other exit condition, including the underlying-based stop -- the point is to cut a position showing zero favorable movement before it reaches a worse, later stop level. |
+| **Evidence (2026-10-21, 43-trade review, Oct 8-21)** | Split by whether `option_mfe_pct` was exactly 0.0 at exit: zero-MFE trades were **0% win rate, -₹2,810 avg (20 trades, -₹56,207 total)**; nonzero-MFE trades (showed *any* favorable move, however brief) were roughly breakeven (**30.4% win, +₹62 avg, 23 trades, +₹1,417 total**). Removing the zero-MFE group alone would make the strategy net positive over the window. Confirmed this isn't an instant/same-cycle-exit artifact -- zero-MFE trades held 15-80 minutes, plenty of monitoring cycles to register a favorable tick if one ever came. Checked ADX/RVOL/VIX/hour-of-day as potential entry-time predictors of which group a trade falls into -- all nearly identical between the two groups (RVOL was actually *higher*, backwards from expectation), so **this cannot be fixed with a better entry gate**; it's genuinely only visible after entry. |
+| **This is a different kind of change than everything else in this log** -- not a threshold tightened/loosened on an existing gate, but a brand-new, timed exit condition. `stall_exit_minutes=15` is a reasonable starting point (shorter than nearly every zero-MFE loss's actual hold time), **not derived from precise time-to-first-favorable-move data** -- `trade_journal` only has the final MFE/MAE at exit, not a time series, so there was no way to find the "optimal" cutoff precisely. Revisit based on observed results. |
+| **Scope:** `momentum_v1` only -- `ema_crossover_v1`'s zero-MFE pattern was never analyzed; do not assume this generalizes without checking separately. |
+| **Tests touched:** `test_momentum_v1_redesign_round2_2026_08_21.py` (8 new tests: fires at/after threshold, not before, not if ever favorable, skips gracefully when fields missing, checked before the underlying-based stop, configurable, disableable, default value), `test_trade_review_fixes_2026_08_27.py` (1 window-size bump, 4200->4600). |
+
 ---
 
 ## 18. iron_condor_v1 push — three further changes, 2026-10-16
