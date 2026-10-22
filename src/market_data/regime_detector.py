@@ -129,9 +129,22 @@ STRATEGY_MOMENTUM  = "momentum_v1"
 # }
 REGIME_STRATEGY_MAP: Dict[str, list] = {
     "TRENDING":    [STRATEGY_EMA, STRATEGY_SPREAD, STRATEGY_MOMENTUM, STRATEGY_CONDOR],
-    "RANGE_BOUND": [STRATEGY_CONDOR, STRATEGY_SPREAD, STRATEGY_EMA, STRATEGY_MOMENTUM],
-    "VOLATILE":    [STRATEGY_SPREAD, STRATEGY_EMA, STRATEGY_MOMENTUM, STRATEGY_CONDOR],
-    "LOW_VOL":     [STRATEGY_EMA, STRATEGY_MOMENTUM, STRATEGY_SPREAD, STRATEGY_CONDOR],
+    # EXPERIMENT (2026-10-22, data-driven, explicit user instruction,
+    # momentum_v1 only -- ema_crossover_v1/credit_spread_v1/iron_condor_v1's
+    # own entries here are untouched): STRATEGY_MOMENTUM removed from
+    # RANGE_BOUND/VOLATILE/LOW_VOL, restoring its original TRENDING-only
+    # scope. 54-trade review (Oct 8-22) found 85% of momentum_v1's volume
+    # (46/54 trades) was entering during RANGE_BOUND -- a regime this
+    # trend-continuation strategy was never originally eligible for --
+    # accounting for the bulk of its loss (-Rs67,802 of -Rs79,925 total).
+    # TRENDING-only entries (8 trades) were ALSO unprofitable (12.5% win,
+    # -Rs12,123) -- this doesn't fix momentum_v1 outright, but removes 85%
+    # of volume/loss that was never supposed to be eligible in the first
+    # place. See _DISABLED_ORIGINAL_MAP_FOR_REFERENCE_ONLY below -- this
+    # restores exactly momentum_v1's original single-regime entry.
+    "RANGE_BOUND": [STRATEGY_CONDOR, STRATEGY_SPREAD, STRATEGY_EMA],
+    "VOLATILE":    [STRATEGY_SPREAD, STRATEGY_EMA, STRATEGY_CONDOR],
+    "LOW_VOL":     [STRATEGY_EMA, STRATEGY_SPREAD, STRATEGY_CONDOR],
 }
 _DISABLED_ORIGINAL_MAP_FOR_REFERENCE_ONLY = {
     "TRENDING":    [STRATEGY_EMA, STRATEGY_SPREAD, STRATEGY_MOMENTUM],  # spread aligned with trend = low breach risk

@@ -92,6 +92,39 @@ def test_range_bound_is_the_only_regime_iron_condor_can_actually_trade_in():
         )
 
 
+# ── momentum_v1 restored to TRENDING-only (2026-10-22, data-driven) ─────────
+# 54-trade review found 85% of momentum_v1's volume (46/54) was entering
+# during RANGE_BOUND -- a regime this trend-continuation strategy was never
+# originally eligible for, accounting for the bulk of its loss. Unlike the
+# still-loosened condor/spread/EMA mapping above (deliberately left alone),
+# this one change was approved and applied -- not skipped.
+
+def test_momentum_is_trending_only_again():
+    assert STRATEGY_MOMENTUM in REGIME_STRATEGY_MAP["TRENDING"]
+    for regime, strategies in REGIME_STRATEGY_MAP.items():
+        if regime == "TRENDING":
+            continue
+        assert STRATEGY_MOMENTUM not in strategies, (
+            f"momentum_v1 should not be regime-eligible in {regime} -- "
+            "a trend-continuation thesis needs an actual trend"
+        )
+
+
+def test_momentum_removal_does_not_disturb_the_other_strategies_still_loosened_map():
+    # The other 3 strategies' own (still-experimental) regime eligibility
+    # must be exactly what it was before this change -- only momentum_v1's
+    # entries were touched.
+    assert STRATEGY_EMA in REGIME_STRATEGY_MAP["RANGE_BOUND"]
+    assert STRATEGY_EMA in REGIME_STRATEGY_MAP["VOLATILE"]
+    assert STRATEGY_EMA in REGIME_STRATEGY_MAP["LOW_VOL"]
+    assert STRATEGY_SPREAD in REGIME_STRATEGY_MAP["RANGE_BOUND"]
+    assert STRATEGY_SPREAD in REGIME_STRATEGY_MAP["VOLATILE"]
+    assert STRATEGY_SPREAD in REGIME_STRATEGY_MAP["LOW_VOL"]
+    assert STRATEGY_CONDOR in REGIME_STRATEGY_MAP["RANGE_BOUND"]
+    assert STRATEGY_CONDOR in REGIME_STRATEGY_MAP["VOLATILE"]
+    assert STRATEGY_CONDOR in REGIME_STRATEGY_MAP["LOW_VOL"]
+
+
 def test_hysteresis_low_vix_alone_does_not_exit_trending():
     # ATR% between the exit (lower) and enter (higher) thresholds, already
     # TRENDING: a VIX dip alone must NOT kick it back out while ATR% is still
