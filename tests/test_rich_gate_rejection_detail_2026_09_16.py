@@ -180,6 +180,57 @@ async def test_hour10_does_not_block_ema_crossover_v1_or_momentum_v1(monkeypatch
         assert rej["reason"] == "ADX_BELOW_THRESHOLD"
 
 
+# ── Same-day re-entry block (2026-10-22, data-driven) ───────────────────────
+# _exited_today already existed ("adverse exits today -- blocks same-day
+# re-entry") and was already checked by _process_credit_spread()/
+# _process_iron_condor(), but was never wired up for the single-leg
+# strategies sharing _process_signal(). Quick same-symbol re-entries were
+# found to perform meaningfully worse than each strategy's own baseline
+# (momentum_v1: 0% win rate on 6 instances; ema_crossover_v1: 25.0% win
+# rate on 20, vs 34.3% overall).
+
+@pytest.mark.asyncio
+async def test_single_leg_entry_blocked_when_symbol_already_exited_today():
+    fake = _FakeEngine({
+        "close": 1200.0, "ltp_source": "live_tick",
+        "rvol": 2.0, "rvol_valid": True,
+        "adx14": 30.0, "adx_valid": True,
+    })
+    fake._exited_today = {"SBIN"}
+    strategy = SimpleNamespace(
+        name="momentum_v1", is_active=True, min_dte=0, max_dte=999,
+        generate_signal=lambda market_data: SignalType.BUY,
+    )
+
+    await LiveTradingEngine._process_signal(fake, strategy, "SBIN", vix=15.0, regime="TRENDING")
+
+    # Blocked before even the cross-strategy collision-guard's next step
+    # (_close_option_positions) runs.
+    fake._close_option_positions.assert_not_awaited()
+    assert fake._signal_gate_stats.get("momentum_v1") == {"signal_generated": 1}
+
+
+@pytest.mark.asyncio
+async def test_single_leg_entry_not_blocked_for_a_different_symbol():
+    fake = _FakeEngine({
+        "close": 1200.0, "ltp_source": "live_tick",
+        "rvol": 2.0, "rvol_valid": True,
+        "adx14": 18.5, "adx_valid": True,   # below the flat 25 threshold -> rejected there, proving we got past the re-entry check
+    })
+    fake._exited_today = {"TCS"}
+    strategy = SimpleNamespace(
+        name="momentum_v1", is_active=True, min_dte=0, max_dte=999,
+        rvol_checked_internally=True,
+        generate_signal=lambda market_data: SignalType.BUY,
+    )
+
+    await LiveTradingEngine._process_signal(fake, strategy, "SBIN", vix=15.0, regime="TRENDING")
+
+    rej = fake._last_gate_rejection
+    assert rej is not None, "SBIN was unexpectedly blocked by TCS's re-entry entry"
+    assert rej["gate"] == "adx_passed"
+
+
 class _FakeRedisMtf:
     def __init__(self, tick15_value):
         self._value = tick15_value

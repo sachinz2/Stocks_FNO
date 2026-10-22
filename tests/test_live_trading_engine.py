@@ -226,6 +226,7 @@ class _FakeEngine:
         self._closed_journals = []
         self._kite = None
         self._redis = None
+        self._exited_today = set()
 
     async def _get_market_data(self, symbol):
         return {"atr14": 8.8737}
@@ -759,6 +760,48 @@ async def test_single_leg_exit_pnl_falls_back_to_quote_when_fill_unavailable():
     journal_id, exit_price, pnl, exit_reason = fake._closed_journals[0]
     expected_fallback_pnl = (5.05 - 5.29) * 1900
     assert abs(pnl - expected_fallback_pnl) < 0.01
+
+
+# ── Same-day re-entry block (2026-10-22, data-driven) ───────────────────────
+# See matching entry-side tests in test_rich_gate_rejection_detail_2026_09_16.py.
+# _exited_today routes by realized pnl sign, same convention as
+# _process_credit_spread()/_process_iron_condor()'s own adverse/profit
+# bucket routing -- not by scanning exit_reason text.
+
+@pytest.mark.asyncio
+async def test_adverse_single_leg_exit_adds_underlying_to_exited_today():
+    fake = _FakeEngine(fill_price=4.90)  # entry 5.29 -> fill 4.90 = a loss
+    fake._single_leg_journals["POWERGRID26AUG270PE"] = {
+        "journal_id": 155, "underlying": "POWERGRID", "strategy_name": "momentum_v1",
+    }
+
+    async def _get_market_data(symbol):
+        return {}
+    fake._get_market_data = _get_market_data
+
+    await LiveTradingEngine._execute_single_leg_exit(
+        fake, "POWERGRID26AUG270PE", 1900, 5.29, 5.05, "stop loss",
+    )
+
+    assert "POWERGRID" in fake._exited_today
+
+
+@pytest.mark.asyncio
+async def test_profitable_single_leg_exit_does_not_add_underlying_to_exited_today():
+    fake = _FakeEngine(fill_price=5.60)  # entry 5.29 -> fill 5.60 = a win
+    fake._single_leg_journals["POWERGRID26AUG270PE"] = {
+        "journal_id": 155, "underlying": "POWERGRID", "strategy_name": "momentum_v1",
+    }
+
+    async def _get_market_data(symbol):
+        return {}
+    fake._get_market_data = _get_market_data
+
+    await LiveTradingEngine._execute_single_leg_exit(
+        fake, "POWERGRID26AUG270PE", 1900, 5.29, 5.60, "target hit",
+    )
+
+    assert "POWERGRID" not in fake._exited_today
 
 
 # ── fill_price Decimal/float TypeError crashed the whole signal cycle (2026-08-12) ──

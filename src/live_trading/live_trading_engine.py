@@ -2312,6 +2312,14 @@ class LiveTradingEngine:
             self.risk_manager.release_deployed_capital(
                 info.get("strategy_name", "ema_crossover_v1"), entry_p * abs(qty),
             )
+            # EXPERIMENT (2026-10-22, data-driven): routes into the same
+            # _exited_today same-day re-entry block _process_credit_spread()/
+            # _process_iron_condor() already use -- by realized pnl sign,
+            # same convention as their own "adverse vs profit bucket" routing
+            # (see matching comment in _check_spread_exits), not by scanning
+            # exit_reason text.
+            if pnl < 0:
+                self._exited_today.add(info["underlying"])
             await self._persist_state()
 
         await self._notify(
@@ -3176,6 +3184,27 @@ class LiveTradingEngine:
                 f"[{strategy.name}] {symbol} skipped — already has an active "
                 "credit_spread/iron_condor structure open (cross-strategy "
                 "contract-collision guard)."
+            )
+            return
+
+        # EXPERIMENT (2026-10-22, data-driven, explicit user instruction):
+        # same-day re-entry block -- _exited_today already existed and is
+        # checked by _process_credit_spread()/_process_iron_condor() before
+        # a new entry, but was never wired up for the single-leg strategies
+        # (ema_crossover_v1/momentum_v1) that share this function, despite
+        # the exact same adverse-exit-blocks-same-day-re-entry comment on
+        # its own declaration. Quick same-symbol re-entries (<=2hrs after
+        # that symbol's own prior exit) were found to perform meaningfully
+        # worse than each strategy's own baseline: momentum_v1 0% win rate
+        # on 6 instances (-Rs12,050 combined, strategy's overall win rate
+        # 14.8%), ema_crossover_v1 25.0% win rate on 20 instances
+        # (-Rs26,843 combined, overall 34.3%) -- not a threshold tuned from
+        # a statistical pattern, a documented existing guard that simply
+        # never got connected to half the strategies that could use it.
+        if symbol in self._exited_today:
+            logger.info(
+                f"[{strategy.name}] {symbol} skipped — already exited today, "
+                "no re-entry (same-day re-entry block)."
             )
             return
 
