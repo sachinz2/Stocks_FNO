@@ -22,7 +22,8 @@ def _fake_trade_journal_row(**overrides):
         regime_atr_pct=1.2, iv_rank=0.4, vix_at_entry=13.5, day_of_week=4, hour_of_day=10,
         atr_at_exit=1.3, vix_at_exit=13.8, regime_label="TRENDING",
         total_slippage_pts=0.5, slippage=0.5,
-        underlying_price_at_entry=2500.0, rvol_at_entry=1.6, adx_at_entry=30.0,
+        underlying_price_at_entry=2500.0, rvol_at_entry=1.6,
+        rvol_closed_bar_at_entry=1.4, adx_at_entry=30.0,
         dte_at_entry=25, delta_at_entry=0.6,
         underlying_mfe_pct=2.1, underlying_mae_pct=-0.5,
         option_mfe_pct=15.0, option_mae_pct=-8.0,
@@ -39,8 +40,8 @@ def test_trade_to_dict_includes_the_entry_context_and_mfe_mae_fields():
     row = _fake_trade_journal_row()
     d = _trade_to_dict(row)
     for field in (
-        "underlying_price_at_entry", "rvol_at_entry", "adx_at_entry",
-        "dte_at_entry", "delta_at_entry",
+        "underlying_price_at_entry", "rvol_at_entry", "rvol_closed_bar_at_entry",
+        "adx_at_entry", "dte_at_entry", "delta_at_entry",
         "underlying_mfe_pct", "underlying_mae_pct", "option_mfe_pct", "option_mae_pct",
     ):
         assert field in d, f"missing field: {field}"
@@ -62,7 +63,8 @@ def test_trade_to_dict_handles_null_new_fields_for_older_rows():
     """Rows written before these columns existed (or by structure types that
     don't populate them) must not crash -- all new fields are nullable."""
     row = _fake_trade_journal_row(
-        underlying_price_at_entry=None, rvol_at_entry=None, adx_at_entry=None,
+        underlying_price_at_entry=None, rvol_at_entry=None,
+        rvol_closed_bar_at_entry=None, adx_at_entry=None,
         dte_at_entry=None, delta_at_entry=None,
         underlying_mfe_pct=None, underlying_mae_pct=None,
         option_mfe_pct=None, option_mae_pct=None,

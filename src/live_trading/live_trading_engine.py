@@ -6844,6 +6844,15 @@ class LiveTradingEngine:
             # Only populated when the underlying data was actually present
             # in market_data (single-leg entries) -- None for anything else.
             _rvol_e = market_data.get("rvol")
+            # Added 2026-10-22: the LAST FINALIZED bar's RVOL -- the variable
+            # momentum_v1's pullback+breakout entry logic actually gates on
+            # (rvol_checked_internally=True strategies), distinct from
+            # _rvol_e above (the still-forming current bar, what the
+            # engine's OWN shared gate uses for everything else). See
+            # rvol_closed_bar_at_entry's docstring on the model for the full
+            # story -- a 54-trade RVOL analysis was built on rvol_at_entry
+            # before this was found to be the wrong field for momentum_v1.
+            _rvol_closed_e = market_data.get("rvol_closed_bar")
             _adx_e  = market_data.get("adx14")
             _close_e = market_data.get("close")
             row = await repo.create({
@@ -6869,6 +6878,7 @@ class LiveTradingEngine:
                 "hour_of_day":    entry_ts.hour,        # IST hour
                 "underlying_price_at_entry": float(_close_e) if _close_e else None,
                 "rvol_at_entry":  float(_rvol_e) if _rvol_e is not None else None,
+                "rvol_closed_bar_at_entry": float(_rvol_closed_e) if _rvol_closed_e is not None else None,
                 "adx_at_entry":   float(_adx_e) if _adx_e is not None else None,
                 "dte_at_entry":   dte,
                 "delta_at_entry": entry_option_delta,

@@ -58,6 +58,10 @@ def _trade_to_dict(t: TradeJournal) -> Dict[str, Any]:
         # this endpoint.
         "underlying_price_at_entry": t.underlying_price_at_entry,
         "rvol_at_entry":             t.rvol_at_entry,
+        # Added 2026-10-22: see rvol_closed_bar_at_entry's docstring on the
+        # model -- NOT the same variable as rvol_at_entry above for
+        # momentum_v1's pullback+breakout entries.
+        "rvol_closed_bar_at_entry":  t.rvol_closed_bar_at_entry,
         "adx_at_entry":              t.adx_at_entry,
         "dte_at_entry":              t.dte_at_entry,
         "delta_at_entry":            t.delta_at_entry,

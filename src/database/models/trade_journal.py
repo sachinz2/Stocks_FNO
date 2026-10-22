@@ -57,6 +57,19 @@ class TradeJournal(Base):
     # populate these; NULL, not 0, means "not tracked for this trade."
     underlying_price_at_entry = Column(Float, nullable=True)
     rvol_at_entry             = Column(Float, nullable=True)
+    # Added 2026-10-22: rvol_at_entry above is market_data["rvol"] -- the
+    # still-forming CURRENT bar's volume-so-far. momentum_v1's own
+    # pullback+breakout entry logic (rvol_checked_internally=True) doesn't
+    # gate on that field at all -- it gates on market_data["rvol_closed_bar"]
+    # (ltp_poller.py), the last FINALIZED bar's volume, a different number.
+    # Found live: a 54-trade RVOL-bucket analysis built on rvol_at_entry
+    # looked actionable, but rvol_at_entry turned out not to be the variable
+    # that actually gated the entry for momentum_v1 -- this column exists so
+    # that mistake isn't repeatable. NULL for ema_crossover_v1 (doesn't set
+    # rvol_checked_internally, so the engine's shared gate -- which DOES use
+    # plain "rvol", matching rvol_at_entry correctly -- is what actually
+    # gates its entries; no mismatch there, no need for this column).
+    rvol_closed_bar_at_entry  = Column(Float, nullable=True)
     adx_at_entry              = Column(Float, nullable=True)
     dte_at_entry              = Column(Integer, nullable=True)
     delta_at_entry            = Column(Float, nullable=True)   # target delta used for strike selection, if any (else ATM)
