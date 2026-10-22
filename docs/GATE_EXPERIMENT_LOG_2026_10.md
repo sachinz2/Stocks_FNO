@@ -410,3 +410,83 @@ As of this writing: `ema_crossover_v1`, `momentum_v1`, and `credit_spread_v1`
 have all placed at least one trade since the experiment began. `iron_condor_v1`
 has not yet — not blocked by any specific gate at last check, just hasn't had
 its own candidate come up yet in the pool rotation.
+
+---
+
+## 22. iron_condor_v1 — observations only, 2026-10-22 (NO code changed, explicit user instruction)
+
+User: *"which gate(s) we can tighten in iron_condor? please analyze."* Full
+history is only **5 trades ever** (ITC, COALINDIA, TORNTPHARM, SUNPHARMA,
+ASIANPAINT) — far too thin for the 148/43-trade statistical approach used
+for `ema_crossover_v1`/`momentum_v1`. Logged as observations, deliberately
+**not acted on** per explicit instruction ("don't change anything yet").
+
+### What it's NOT — checked every loosened entry gate against all 5 trades, none explain the losses
+
+| Trade | ADX | VIX | IV Rank | Credit/max-loss | P&L |
+|---|---|---|---|---|---|
+| ITC | 16.4 | 14.64 | 0.513 | 26.3% | -₹690 |
+| COALINDIA | 11.4 | 14.48 | 0.715 | 36.1% | -₹1,647 |
+| TORNTPHARM | 22.7 | 14.70 | 0.683 | 29.5% | +₹3,953 |
+| SUNPHARMA | 39.3 | 14.99 | 0.703 | 25.3% | -₹1,078 |
+| ASIANPAINT | 17.7 | 15.17 | 0.915 | 24.2% | -₹1,530 |
+
+VIX (14.5-15.2) and IV rank (0.51-0.92) comfortably clear even the
+**original, pre-experiment** floors (12.0 and 0.30) on every single trade —
+tightening either back up would not have blocked any of these 5. Same for
+the wing-credit floor (credit/max-loss 24-36%, nowhere near even the
+original 20%, let alone the current 7%). ADX is the one soft exception —
+only SUNPHARMA (39.3) is notably high relative to a tighter ceiling, and
+it's a single data point.
+
+### What it IS (1): the REGIME_STRATEGY_MAP loosening directly caused one loss
+
+**ITC entered while `regime_label` was already `TRENDING`** — confirmed
+directly in its trade record. `regime_detector.py`'s current
+`REGIME_STRATEGY_MAP["TRENDING"]` includes `STRATEGY_CONDOR` (loosened
+2026-10-08, part of the original all-at-once loosening, item 1). The
+preserved original map (`_DISABLED_ORIGINAL_MAP_FOR_REFERENCE_ONLY`) lists
+`iron_condor_v1` under `RANGE_BOUND` *only* — a market-neutral,
+range-betting structure was never supposed to be eligible to enter during a
+classified TRENDING regime in the first place. This is the single most
+concrete, directly-verifiable finding of this entire dig: not a statistical
+pattern inferred from a small sample, but one specific trade whose entry
+regime is on record as contradicting the strategy's fundamental thesis,
+traceable to one specific, already-identified loosened setting.
+
+### What it IS (2): the "close whole condor on first wing's 75% profit" exit, and next-day regime-shift exits, both point the same direction
+
+3 of 5 trades (ITC, COALINDIA, TORNTPHARM) closed via: *"if one wing's
+short premium decays to 25% of entry (75%+ profit), close the entire
+condor — holding exposes the now-more-threatened OTHER wing to breach"*
+(`_check_condor_exits()`, around line 5867). Mechanically sound risk logic
+(the stock moved toward the triggering wing's strike means it moved *away*
+from the other wing, so the untriggered wing's own exposure is credibly
+larger now) -- but 2 of 3 times (ITC, COALINDIA) it still closed at a net
+loss, meaning the threatened wing's cost outpaced the safe wing's gain.
+Couldn't compute a reliable counterfactual ("would holding longer have been
+worse") without intraday tick data this analysis didn't pull — flagged, not
+concluded to be wrong.
+
+The other 2 trades (SUNPHARMA, ASIANPAINT) entered during `RANGE_BOUND` but
+were force-exited the very next session by `_check_condor_exits()`'s
+regime-shift check (`regime_detector` had already reclassified to
+`TRENDING` by the next day). 2 of 5 (40%) hitting this in such a short
+window, on top of ITC's direct TRENDING-entry case above, is a consistent
+story: **across this entire 5-trade sample, the underlying market has
+behaved more directionally/trending than range-bound**, and a pure
+range-betting strategy has been fighting that the whole stretch. This may
+be as much "the current market character is wrong for this strategy right
+now" as "a specific gate is wrong" — can't distinguish the two with this
+little data.
+
+### Candidate for reconsideration (not applied)
+
+Restoring `iron_condor_v1` to `RANGE_BOUND`-only in `REGIME_STRATEGY_MAP`
+(reverting just this one strategy's entry in the loosened map, independent
+of `credit_spread_v1`/`ema_crossover_v1`/`momentum_v1`'s own entries there)
+is the most concretely-justified single change surfaced by this dig — it
+would have blocked exactly the one trade with directly-verifiable evidence
+against it (ITC), without touching VIX/IV-rank/wing-credit/ADX, none of
+which were shown to be the actual constraint. **Not applied** — logged for
+the next tightening pass.
