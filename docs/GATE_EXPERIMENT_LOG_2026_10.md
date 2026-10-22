@@ -490,3 +490,13 @@ would have blocked exactly the one trade with directly-verifiable evidence
 against it (ITC), without touching VIX/IV-rank/wing-credit/ADX, none of
 which were shown to be the actual constraint. **Not applied** — logged for
 the next tightening pass.
+
+## 23. ema_crossover_v1 / momentum_v1 — same-day re-entry block wired up
+
+| | |
+|---|---|
+| **File** | `src/live_trading/live_trading_engine.py`: `_process_signal()` checks `_exited_today` right after the existing cross-strategy collision guard (entry side); `_execute_single_leg_exit()` adds the underlying to `_exited_today` on an adverse close, `pnl < 0` (exit side). |
+| **What it does** | `_exited_today` is not new -- it already existed ("adverse exits today -- blocks same-day re-entry") and was already checked by `_process_credit_spread()`/`_process_iron_condor()` before a new entry, but had never been wired up for the single-leg strategies (`ema_crossover_v1`/`momentum_v1`) that share `_process_signal()`. This connects the two existing halves of a mechanism that already worked for 2 of 4 strategies. |
+| **Evidence (2026-10-22, user: "i believe we can look into momentum strategy...")** | Quick same-symbol re-entries (<=2hrs after that symbol's own prior exit) perform meaningfully worse than each strategy's own baseline: `momentum_v1` **0% win rate on 6 instances** (-₹12,050 combined; strategy's overall win rate 14.8%), `ema_crossover_v1` **25.0% win rate on 20 instances** (-₹26,843 combined; overall 34.3%). `KALYANKJIL` alone was entered and stopped out 3 times in one hour on 2026-10-22 (10:55, 11:20, 11:55), each a fresh loss right after the last. Not a threshold tuned from a statistical pattern -- a documented, working guard that was simply never connected to half the strategies that could use it. |
+| **Routing convention** | By realized `pnl` sign, matching `_check_spread_exits()`/`_check_condor_exits()`'s own "route to profit or adverse bucket... by realized P&L, not by scanning exit_reason text" comment -- not a string match on `exit_reason`. |
+| **Tests touched:** `test_rich_gate_rejection_detail_2026_09_16.py`'s `_FakeEngine` (2 new tests: blocked when the symbol is in `_exited_today`, not blocked for a different symbol), `test_live_trading_engine.py`'s `_FakeEngine` (added missing `_exited_today` attribute; 2 new tests: adverse exit adds the underlying, profitable exit does not). |
