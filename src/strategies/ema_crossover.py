@@ -230,6 +230,24 @@ class EMACrossoverStrategy(StrategyBase):
         # peak-tracking side. Same mechanism as momentum_v1's.
         self.profit_booking_giveback_pct = self.parameters.get("profit_booking_giveback_pct", 0.35)
 
+        # EXPERIMENT (2026-10-23, data-driven): stall exit, ported from
+        # momentum_v1's 2026-10-21 fix after confirming the same pattern
+        # here. 182-trade sample: 51 trades (28%) where the option never
+        # once traded above entry (mfe_option_pct <= 0) were a flat 0% win
+        # rate, avg -Rs3,485, totaling -Rs177,716 -- ~75% of this strategy's
+        # entire lifetime loss, concentrated in a bucket with zero winners.
+        # Average hold before these finally closed (via stop-loss/reversal/
+        # EOD) was ~99 minutes; only 16/51 resolved within 30 minutes on
+        # their own. 30 min picked as a starting point that's clearly
+        # shorter than the group's average hold (catching most of the long
+        # tail meaningfully earlier, including the single worst same-day
+        # loss, TECHM, which ran 114 min with zero favorable movement
+        # throughout) while still giving a genuine setup time to show any
+        # favorable tick at all -- NOT derived from time-to-first-favorable
+        # data (trade_journal only has final MFE/MAE, not a time series),
+        # same caveat as momentum_v1's. Revisit based on observed results.
+        self.stall_exit_minutes = self.parameters.get("stall_exit_minutes", 30)
+
         # Fixed 2026-08-21 (external review, section 14): expose the same
         # delta-based strike selection mechanism built for momentum_v1 --
         # None/0 keeps the existing ATM behavior (this strategy's own
@@ -287,7 +305,8 @@ class EMACrossoverStrategy(StrategyBase):
             f"(min_gap={self.ema_reversal_min_gap_pct:.2%}, confirm_bars={self.ema_reversal_confirm_bars}) | "
             f"EntryMinGap={self.entry_min_gap_pct:.2%} | "
             f"ProfitBooking: giveback {self.profit_booking_giveback_pct:.0%} of peak "
-            f"once profit crosses engine activation floor"
+            f"once profit crosses engine activation floor | "
+            f"StallExit={self.stall_exit_minutes}min (never-traded-above-entry)"
         )
 
     def generate_signal(self, data: Dict[str, Any]) -> Optional[str]:
@@ -559,6 +578,14 @@ class EMACrossoverStrategy(StrategyBase):
                                 higher-priority concern than the checks below
                                 — ADDITIONAL to (not a replacement for) the
                                 pct-based trailing stop (#5)/breakeven (#6).
+          0.5. Stall exit (added 2026-10-23, data-driven, ported from
+                                momentum_v1) — premium has never traded
+                                above entry (mfe_option_pct <= 0) for at
+                                least stall_exit_minutes. Checked ahead of
+                                every other check below, including the
+                                underlying-based stop — the point is to cut
+                                a position showing zero favorable movement
+                                before it reaches a worse, later stop level.
           1. Underlying-based stop/target (added 2026-08-21) — mirrors
                                 momentum_v1's round-2 addition, and checked
                                 first for the same reason momentum_v1's own
@@ -626,6 +653,34 @@ class EMACrossoverStrategy(StrategyBase):
                 if contract_id is not None:
                     self._clear_reversal_state(contract_id)
                 return "EXIT"
+
+        # 0.5. EXPERIMENT (2026-10-23, data-driven): stall exit, ported from
+        # momentum_v1 -- see stall_exit_minutes' docstring in initialize()
+        # for the full 51-trade rationale. minutes_since_entry/mfe_option_pct
+        # are engine-tracked (the same running MFE already written to
+        # trade_journal at exit); skipped gracefully (not fail-closed) if
+        # either is missing (e.g. a position restored from before this
+        # field existed). Checked before every other exit condition below,
+        # including the underlying-based stop -- the whole point is to cut
+        # a position that's shown zero favorable movement BEFORE it
+        # reaches a worse, later stop level.
+        _minutes_since_entry = current_position.get("minutes_since_entry")
+        _mfe_option_pct      = current_position.get("mfe_option_pct")
+        if (
+            self.stall_exit_minutes > 0
+            and _minutes_since_entry is not None
+            and _mfe_option_pct is not None
+            and _minutes_since_entry >= self.stall_exit_minutes
+            and _mfe_option_pct <= 0.0
+        ):
+            logger.info(
+                f"[{self.name}] Stall exit: {_minutes_since_entry:.0f} min since "
+                f"entry, premium has never traded above entry (mfe={_mfe_option_pct:.2f}%) "
+                f"-- exiting before this becomes a larger loss."
+            )
+            if contract_id is not None:
+                self._clear_reversal_state(contract_id)
+            return "EXIT"
 
         # 1. Underlying-based stop/target (added 2026-08-21) -- see
         # docstring and momentum.py's identical pattern for the rationale.

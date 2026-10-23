@@ -588,3 +588,67 @@ def test_iron_condor_entry_cutoff_is_logged_at_info_not_debug():
     block = src[max(0, idx - 120):idx]
     assert "logger.info(" in block
     assert "logger.debug(" not in block
+
+
+# ── Stall exit (2026-10-23, data-driven, ported from momentum_v1) ──────────
+# 182-trade sample: 51 trades (28%) where the option never once traded above
+# entry (mfe_option_pct <= 0) were a flat 0% win rate, totaling -Rs177,716 --
+# ~75% of this strategy's entire lifetime loss. See stall_exit_minutes'
+# docstring in ema_crossover.py's initialize() for the full rationale.
+
+def test_stall_exit_fires_after_threshold_with_zero_mfe():
+    strat = _ema()
+    pos = _pos(40.0, 39.0, minutes_since_entry=30.0, mfe_option_pct=0.0)
+    assert strat.manage_position(pos, 39.5) == "EXIT"
+
+
+def test_stall_exit_does_not_fire_before_threshold():
+    strat = _ema()
+    pos = _pos(40.0, 39.0, minutes_since_entry=29.9, mfe_option_pct=0.0)
+    assert strat.manage_position(pos, 39.5) == "HOLD"
+
+
+def test_stall_exit_does_not_fire_if_premium_ever_traded_above_entry():
+    """mfe_option_pct > 0 means the premium was favorable at some point,
+    even if it has since fallen back -- not a stall."""
+    strat = _ema()
+    pos = _pos(40.0, 39.0, peak_premium=42.0, minutes_since_entry=45.0, mfe_option_pct=5.0)
+    assert strat.manage_position(pos, 39.5) == "HOLD"
+
+
+def test_stall_exit_skips_gracefully_when_fields_missing():
+    """A position restored from before this field existed must not be
+    force-closed just because minutes_since_entry/mfe_option_pct are absent."""
+    strat = _ema()
+    pos = _pos(40.0, 39.0)
+    assert strat.manage_position(pos, 39.9) == "HOLD"
+
+
+def test_stall_exit_checked_before_underlying_based_stop():
+    """Both would fire here -- confirm the stall exit is checked first (same
+    EXIT outcome either way, but this pins the priority rather than leaving
+    it untested)."""
+    strat = _ema()
+    pos = _pos(
+        40.0, 39.0, minutes_since_entry=30.0, mfe_option_pct=0.0,
+        entry_underlying_price=100.0, entry_atr=2.0, current_close=97.0,
+    )
+    assert strat.manage_position(pos, 39.5) == "EXIT"
+
+
+def test_stall_exit_is_configurable():
+    strat = _ema(stall_exit_minutes=60)
+    pos = _pos(40.0, 39.0, minutes_since_entry=30.0, mfe_option_pct=0.0)
+    # 30 min would trip the default 30-minute threshold, but this instance's is 60.
+    assert strat.manage_position(pos, 39.5) == "HOLD"
+
+
+def test_stall_exit_can_be_disabled():
+    strat = _ema(stall_exit_minutes=0)
+    pos = _pos(40.0, 39.0, minutes_since_entry=999.0, mfe_option_pct=0.0)
+    assert strat.manage_position(pos, 39.5) == "HOLD"
+
+
+def test_stall_exit_minutes_default_is_30():
+    strat = _ema()
+    assert strat.stall_exit_minutes == 30
