@@ -1132,11 +1132,13 @@ def check_daily_loss_bypass_has_an_expiry_and_does_not_touch_the_manual_kill_swi
             "check it didn't become a silent permanent disable)."
         )
     body = src[max(0, idx - 200): idx + 400]
-    if "date(2026, 10, 23)" not in body:
+    if "date(2026, 11, 6)" not in body:
         return FAIL, name, (
             "The daily-loss bypass's hard-coded expiry date changed or was removed -- this check "
             "exists specifically so a 2-week experiment can't silently become permanent. Confirm "
-            "the new date is intentional before updating this check to match."
+            "the new date is intentional before updating this check to match. (Was re-extended "
+            "2026-10-23 -> 2026-11-06 after the first bypass expired and immediately tripped the "
+            "same day; if it's been extended again, update this check's expected date to match.)"
         )
     # Layer 1 (the manual kill-switch flag + activate/deactivate API) must be
     # completely unaffected -- this bypass is scoped to layer 2 only.
@@ -1146,7 +1148,7 @@ def check_daily_loss_bypass_has_an_expiry_and_does_not_touch_the_manual_kill_swi
     layer1_body = src[layer1_idx: idx]
     if '"kill_switch_active"' not in layer1_body or '"circuit_breaker_active"' not in layer1_body:
         return FAIL, name, "Manual kill-switch/circuit-breaker flag check appears to have been altered alongside the daily-loss bypass -- these must stay independent."
-    return PASS, name, "Daily-loss auto-trip bypass has a hard-coded 2026-10-23 expiry and the manual kill-switch flag/API are untouched."
+    return PASS, name, "Daily-loss auto-trip bypass has a hard-coded 2026-11-06 expiry and the manual kill-switch flag/API are untouched."
 
 
 def check_square_off_and_exit_signal_pnl_use_the_pre_close_position_values(repo: Path) -> Result:

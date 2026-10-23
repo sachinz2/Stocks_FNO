@@ -227,8 +227,18 @@ class RiskManager:
         # kill switch FLAG and its manual activate/deactivate API (layer 1
         # above) are UNCHANGED -- a manual override is still possible.
         # Self-reactivates on the date below without needing a manual revert.
+        #
+        # RE-EXTENDED (2026-10-23, explicit user instruction): the first
+        # bypass expired exactly today and immediately tripped -- PnL
+        # -Rs13,858.50 against an -Rs11,170.34 limit (5% of initial_capital,
+        # which has compounded down to ~Rs223,407 from cumulative realized
+        # losses across this whole experiment, so the absolute threshold is
+        # now tight). Same stated reason as the original bypass: "still
+        # doing paper trading and need to do as many trades as possible."
+        # Pushed another 2 weeks, same self-expiring mechanism, same layer-1
+        # manual override still available.
         from datetime import date as _date
-        _DAILY_LOSS_AUTO_TRIP_DISABLED_UNTIL = _date(2026, 10, 23)
+        _DAILY_LOSS_AUTO_TRIP_DISABLED_UNTIL = _date(2026, 11, 6)
         if now_ist().date() >= _DAILY_LOSS_AUTO_TRIP_DISABLED_UNTIL:
             total_daily_pnl = self.daily_realized_pnl + self.daily_unrealized_pnl
             max_allowed_loss = -(self.initial_capital * self.rules["max_daily_loss_pct"])

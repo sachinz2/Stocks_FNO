@@ -243,13 +243,14 @@ async def test_kill_switch_trips_mid_sequence_blocks_entries_not_exits(monkeypat
     from src.risk.risk_manager import RiskManager
 
     # EXPERIMENT (2026-10-09, explicit user instruction): the daily-loss
-    # auto-trip is bypassed through 2026-10-23 ("deactivate the kill switch
-    # for 2 weeks") -- monkeypatch past that date so this test still
-    # exercises the real trip logic. Remove once the bypass itself is
-    # removed from risk_manager.py.
+    # auto-trip was bypassed through 2026-10-23 ("deactivate the kill switch
+    # for 2 weeks"), then RE-EXTENDED to 2026-11-06 the day the first bypass
+    # expired and immediately tripped -- monkeypatch past that date so this
+    # test still exercises the real trip logic. Remove once the bypass
+    # itself is removed from risk_manager.py.
     import datetime as _dt
     import src.risk.risk_manager as rm_module
-    monkeypatch.setattr(rm_module, "now_ist", lambda: _dt.datetime(2026, 11, 1))
+    monkeypatch.setattr(rm_module, "now_ist", lambda: _dt.datetime(2026, 11, 10))
 
     class _Row:
         _next_id = 1
