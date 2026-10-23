@@ -73,11 +73,6 @@ def test_low_vol_is_empty_no_strategy_can_pass_its_own_vix_gate_there():
     assert REGIME_STRATEGY_MAP["LOW_VOL"] == []
 
 
-@pytest.mark.skip(
-    reason="EXPERIMENT (2026-10-08, explicit user instruction): "
-    "REGIME_STRATEGY_MAP now lists every strategy under every regime. "
-    "Un-skip after reverting the map."
-)
 def test_range_bound_is_the_only_regime_iron_condor_can_actually_trade_in():
     # RANGE_BOUND (vix >= 12, ATR% low) is the one regime where both the
     # regime gate and iron_condor_v1's own vix_allows_selling() gate can
@@ -96,8 +91,10 @@ def test_range_bound_is_the_only_regime_iron_condor_can_actually_trade_in():
 # 54-trade review found 85% of momentum_v1's volume (46/54) was entering
 # during RANGE_BOUND -- a regime this trend-continuation strategy was never
 # originally eligible for, accounting for the bulk of its loss. Unlike the
-# still-loosened condor/spread/EMA mapping above (deliberately left alone),
-# this one change was approved and applied -- not skipped.
+# still-loosened spread/EMA mapping (deliberately left alone), this one
+# change was approved and applied -- not skipped. (iron_condor_v1's own
+# matching restriction followed the next day -- see the TRENDING-only
+# block below.)
 
 def test_momentum_is_trending_only_again():
     assert STRATEGY_MOMENTUM in REGIME_STRATEGY_MAP["TRENDING"]
@@ -110,19 +107,33 @@ def test_momentum_is_trending_only_again():
         )
 
 
-def test_momentum_removal_does_not_disturb_the_other_strategies_still_loosened_map():
-    # The other 3 strategies' own (still-experimental) regime eligibility
-    # must be exactly what it was before this change -- only momentum_v1's
-    # entries were touched.
+def test_momentum_and_condor_removal_do_not_disturb_ema_and_spreads_still_loosened_map():
+    # ema_crossover_v1/credit_spread_v1's own (still-experimental) regime
+    # eligibility must be exactly what it was before either restriction --
+    # only momentum_v1's and iron_condor_v1's entries were touched.
     assert STRATEGY_EMA in REGIME_STRATEGY_MAP["RANGE_BOUND"]
     assert STRATEGY_EMA in REGIME_STRATEGY_MAP["VOLATILE"]
     assert STRATEGY_EMA in REGIME_STRATEGY_MAP["LOW_VOL"]
     assert STRATEGY_SPREAD in REGIME_STRATEGY_MAP["RANGE_BOUND"]
     assert STRATEGY_SPREAD in REGIME_STRATEGY_MAP["VOLATILE"]
     assert STRATEGY_SPREAD in REGIME_STRATEGY_MAP["LOW_VOL"]
+
+
+# ── iron_condor_v1 restored to RANGE_BOUND-only (2026-10-23, data-driven) ───
+# Full-week review: 5 of 8 closes exited via "Regime shift: TRENDING
+# post-entry" -- all losses, -Rs16,607 combined, swamping the only
+# profitable exit type all week (+Rs1,616 net). Same fix as momentum_v1's,
+# one day later -- approved and applied, not skipped.
+
+def test_condor_is_range_bound_only_again():
     assert STRATEGY_CONDOR in REGIME_STRATEGY_MAP["RANGE_BOUND"]
-    assert STRATEGY_CONDOR in REGIME_STRATEGY_MAP["VOLATILE"]
-    assert STRATEGY_CONDOR in REGIME_STRATEGY_MAP["LOW_VOL"]
+    for regime, strategies in REGIME_STRATEGY_MAP.items():
+        if regime == "RANGE_BOUND":
+            continue
+        assert STRATEGY_CONDOR not in strategies, (
+            f"iron_condor_v1 should not be regime-eligible in {regime} -- "
+            "a market-neutral, range-betting structure needs an actual range"
+        )
 
 
 def test_hysteresis_low_vix_alone_does_not_exit_trending():
@@ -137,11 +148,6 @@ def test_hysteresis_low_vix_alone_does_not_exit_trending():
     assert MRD._classify(vix=11.5, atr_pct=mid_atr, ema_spread_pct=0.3, prev_regime=None) == "LOW_VOL"
 
 
-@pytest.mark.skip(
-    reason="EXPERIMENT (2026-10-08, explicit user instruction): "
-    "REGIME_STRATEGY_MAP now lists every strategy under every regime. "
-    "Un-skip after reverting the map."
-)
 def test_volatile_regime_includes_ema_crash_catching_excludes_momentum():
     assert STRATEGY_EMA in REGIME_STRATEGY_MAP["VOLATILE"]
     assert STRATEGY_SPREAD in REGIME_STRATEGY_MAP["VOLATILE"]

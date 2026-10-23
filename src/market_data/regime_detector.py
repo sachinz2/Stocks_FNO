@@ -128,7 +128,23 @@ STRATEGY_MOMENTUM  = "momentum_v1"
 #     "LOW_VOL":     [],
 # }
 REGIME_STRATEGY_MAP: Dict[str, list] = {
-    "TRENDING":    [STRATEGY_EMA, STRATEGY_SPREAD, STRATEGY_MOMENTUM, STRATEGY_CONDOR],
+    # EXPERIMENT (2026-10-23, data-driven, explicit user instruction,
+    # iron_condor_v1 only -- ema_crossover_v1/credit_spread_v1's own entries
+    # here are untouched): STRATEGY_CONDOR removed from TRENDING/VOLATILE/
+    # LOW_VOL, restoring its original RANGE_BOUND-only scope -- same fix
+    # already applied to momentum_v1 on 2026-10-22 (see that comment on
+    # RANGE_BOUND below). Full-week review (Oct 19-23): 5 of iron_condor_v1's
+    # 8 closes exited via "Regime shift: TRENDING post-entry -- condor range
+    # assumption broken" -- ALL 5 losses, -Rs16,607 combined. Every
+    # profitable exit all week (+Rs1,616 net) came from a different
+    # mechanism entirely (a wing hitting its own profit target), completely
+    # swamped by the regime-shift losses. A market-neutral, range-betting
+    # structure should never have been eligible to enter during a
+    # classified TRENDING regime in the first place -- the Oct 8 loosening
+    # opened it to all 4 regimes. See _DISABLED_ORIGINAL_MAP_FOR_REFERENCE_ONLY
+    # below -- this restores exactly iron_condor_v1's original single-regime
+    # entry.
+    "TRENDING":    [STRATEGY_EMA, STRATEGY_SPREAD, STRATEGY_MOMENTUM],
     # EXPERIMENT (2026-10-22, data-driven, explicit user instruction,
     # momentum_v1 only -- ema_crossover_v1/credit_spread_v1/iron_condor_v1's
     # own entries here are untouched): STRATEGY_MOMENTUM removed from
@@ -143,8 +159,8 @@ REGIME_STRATEGY_MAP: Dict[str, list] = {
     # place. See _DISABLED_ORIGINAL_MAP_FOR_REFERENCE_ONLY below -- this
     # restores exactly momentum_v1's original single-regime entry.
     "RANGE_BOUND": [STRATEGY_CONDOR, STRATEGY_SPREAD, STRATEGY_EMA],
-    "VOLATILE":    [STRATEGY_SPREAD, STRATEGY_EMA, STRATEGY_CONDOR],
-    "LOW_VOL":     [STRATEGY_EMA, STRATEGY_SPREAD, STRATEGY_CONDOR],
+    "VOLATILE":    [STRATEGY_SPREAD, STRATEGY_EMA],
+    "LOW_VOL":     [STRATEGY_EMA, STRATEGY_SPREAD],
 }
 _DISABLED_ORIGINAL_MAP_FOR_REFERENCE_ONLY = {
     "TRENDING":    [STRATEGY_EMA, STRATEGY_SPREAD, STRATEGY_MOMENTUM],  # spread aligned with trend = low breach risk
