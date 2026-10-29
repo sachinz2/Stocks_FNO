@@ -132,6 +132,21 @@ class EMACrossoverStrategy(StrategyBase):
         # which by definition isn't anywhere near this ceiling.
         self.adx_entry_ceiling = self.parameters.get("adx_entry_ceiling", 25)
         self.adx_checked_internally = True
+
+        # EXPERIMENT (2026-10-29, data-driven, explicit user instruction:
+        # "even if just 2-3 trades per day, they should result in net
+        # profit"): new entry ceiling on the underlying's own price level.
+        # 191-trade review found ADX/RVOL/IV-rank/hour/day-of-week don't
+        # discriminate winners from losers in the current window (rolling-
+        # 30 profit factor had collapsed 1.21 -> 0.073), but underlying
+        # price does: stocks priced >=Rs3,000 at entry were 21.6% win,
+        # -Rs1,433 avg (51 trades, 27% of volume, 39% of all losses) vs
+        # 25-42.5% win, -Rs694 to -Rs897 avg for every cheaper band. Not
+        # proven WHY (plausibly wider relative bid-ask/strike spacing on
+        # costlier names, or just a smaller, noisier remaining sample once
+        # split 4 ways) -- but it's the one clean, sizeable split found,
+        # so screening it out at entry.
+        self.underlying_price_ceiling = self.parameters.get("underlying_price_ceiling", 3000.0)
         self._HISTORY_LEN = 3
 
         # Fixed 2026-08-21 (external review): RVOL demoted from a hard
@@ -306,7 +321,8 @@ class EMACrossoverStrategy(StrategyBase):
             f"EntryMinGap={self.entry_min_gap_pct:.2%} | "
             f"ProfitBooking: giveback {self.profit_booking_giveback_pct:.0%} of peak "
             f"once profit crosses engine activation floor | "
-            f"StallExit={self.stall_exit_minutes}min (never-traded-above-entry)"
+            f"StallExit={self.stall_exit_minutes}min (never-traded-above-entry) | "
+            f"PriceCeiling=Rs{self.underlying_price_ceiling:,.0f}"
         )
 
     def generate_signal(self, data: Dict[str, Any]) -> Optional[str]:
@@ -316,6 +332,7 @@ class EMACrossoverStrategy(StrategyBase):
           strategy's per-symbol crossover state straight across its rotating pool.
         - ema20 (or dynamic fast_period key)
         - ema50 (or dynamic slow_period key)
+        - close: underlying's current price — gates underlying_price_ceiling.
         - ohlc_bar_key (optional): changes once per 5-min bar; used so that
           signal_confirm_bars counts distinct completed candles, not engine cycles.
         """
@@ -325,6 +342,7 @@ class EMACrossoverStrategy(StrategyBase):
         bar_key   = data.get("ohlc_bar_key")  # None in test/backtest contexts
         adx       = data.get("adx14")
         adx_valid = data.get("adx_valid")
+        close     = data.get("close")
 
         if fast_ema is None or slow_ema is None:
             logger.warning(f"Strategy {self.name}: Missing EMA data.")
@@ -489,7 +507,15 @@ class EMACrossoverStrategy(StrategyBase):
             gap_pct = abs(fast_ema - slow_ema) / abs(slow_ema) if slow_ema else 0.0
             gap_ok = gap_pct >= self.entry_min_gap_pct
 
-            if adx_ok and gap_ok:
+            # EXPERIMENT (2026-10-29, data-driven): see underlying_price_
+            # ceiling's docstring in initialize() for the full rationale.
+            # Fails OPEN (not closed) on a missing/zero close -- this is a
+            # refinement filter layered on an already-qualifying crossover,
+            # not a core data-availability gate; a missing price here would
+            # already have been caught by far earlier checks if it mattered.
+            price_ok = close is None or close <= 0 or close < self.underlying_price_ceiling
+
+            if adx_ok and gap_ok and price_ok:
                 logger.info(
                     f"[{self.name}] {symbol} {current_dir} confirmed after "
                     f"{self._pending_count[symbol]} bars (ADX={adx}, gap={gap_pct:.3%}) — firing."
@@ -500,15 +526,21 @@ class EMACrossoverStrategy(StrategyBase):
                 self._pending_bar_key.pop(symbol, None)
             else:
                 # Crossover confirmed but ADX hasn't caught up yet and/or the
-                # EMA gap is still too thin -- leave the pending state intact
-                # (don't clear it) so a later bar can still fire without
-                # needing a brand new crossover to restart the confirmation
-                # count. A genuine trend's gap should widen across the next
-                # bar or two; one that doesn't never fires at all.
+                # EMA gap is still too thin and/or the underlying is too
+                # pricey -- leave the pending state intact (don't clear it)
+                # so a later bar can still fire without needing a brand new
+                # crossover to restart the confirmation count. A genuine
+                # trend's gap should widen across the next bar or two; one
+                # that doesn't never fires at all. price_ok, unlike the
+                # other two, can never flip from False to True on a later
+                # bar (the underlying's price level doesn't change enough
+                # intraday to cross a Rs3,000 ceiling) -- this setup simply
+                # never fires, same as a gap that never widens.
                 logger.debug(
                     f"[{self.name}] {symbol} {current_dir} confirmed but "
                     f"ADX_ok={adx_ok} (ADX={adx}) gap_ok={gap_ok} (gap={gap_pct:.3%} "
-                    f"< {self.entry_min_gap_pct:.3%}) — holding, not firing yet."
+                    f"< {self.entry_min_gap_pct:.3%}) price_ok={price_ok} "
+                    f"(close={close}) — holding, not firing yet."
                 )
         elif current_dir is not None and symbol in self._pending_signal:
             logger.debug(

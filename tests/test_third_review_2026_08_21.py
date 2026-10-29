@@ -65,14 +65,20 @@ def test_engine_rs_gate_respects_require_rs_override():
     assert 'getattr(strategy, "require_rs", True)' in rs_block
 
 
-def test_main_py_wires_require_rs_false_for_ema_crossover():
+def test_main_py_wires_require_rs_true_for_ema_crossover():
+    # EXPERIMENT (2026-10-29, explicit user instruction): flipped back to
+    # True -- see require_rs/mtf_strict's matching comment in main.py's
+    # EMA_CROSSOVER config dict for the full rationale (191-trade review,
+    # rolling-30 profit factor collapsed to 0.073, neither ADX nor RVOL
+    # discriminating winners from losers anymore).
     from src.api import main as main_module
     src = inspect.getsource(main_module)
     idx = src.index('StrategyRegistry.load_strategy("EMA_CROSSOVER"')
-    # Window widened 3000 -> 3500 (2026-10-19): the new adx_entry_ceiling
-    # comment pushed this literal further into the block.
-    block = src[idx:idx + 3500]
-    assert '"require_rs": False' in block
+    # Window widened 3500 -> 5500 (2026-10-29): the new underlying_price_
+    # ceiling/mtf_strict/require_rs comment blocks pushed this literal
+    # further into the dict.
+    block = src[idx:idx + 5500]
+    assert '"require_rs": True' in block
 
 
 # ── GTT / active-structure publication race ──────────────────────────────────

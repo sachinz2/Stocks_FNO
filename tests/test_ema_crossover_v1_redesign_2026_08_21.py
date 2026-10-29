@@ -306,7 +306,10 @@ def test_main_py_wires_up_ema_crossover_v1_round2_params():
     from src.api import main as main_module
     src = inspect.getsource(main_module)
     idx = src.index('StrategyRegistry.load_strategy("EMA_CROSSOVER"')
-    block = src[idx:idx + 3800]
+    # Window widened 3800 -> 5800 (2026-10-29): the new underlying_price_
+    # ceiling/mtf_strict/require_rs comment blocks pushed these literals
+    # further into the dict.
+    block = src[idx:idx + 5800]
     # Fixed 2026-08-27 (trade review): adx_entry_threshold raised 18->22,
     # underlying_stop_atr_mult raised 1.0->1.4 -- see ema_crossover.py's
     # matching comments for why.
@@ -315,6 +318,9 @@ def test_main_py_wires_up_ema_crossover_v1_round2_params():
     # nudged to 20 on 2026-10-15 (data-driven). Restore 22 after review.
     assert '"adx_entry_threshold": 20' in block
     assert '"rvol_hard_gate": False' in block
-    assert '"mtf_strict": False' in block
+    # EXPERIMENT (2026-10-29, explicit user instruction): flipped back to
+    # True -- see mtf_strict's matching comment in main.py's EMA_CROSSOVER
+    # config dict for the full rationale.
+    assert '"mtf_strict": True' in block
     assert '"ema_reversal_exit": True' in block
     assert '"underlying_stop_atr_mult": 1.4' in block

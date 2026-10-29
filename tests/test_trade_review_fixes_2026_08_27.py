@@ -269,6 +269,60 @@ def test_main_py_wires_adx_entry_ceiling():
     assert '"adx_entry_ceiling": 25' in block
 
 
+# ── Underlying-price entry ceiling (2026-10-29, data-driven) ───────────────
+# 191-trade review: stocks priced >=Rs3,000 at entry were 21.6% win,
+# -Rs1,433 avg (51 trades, 39% of all losses) vs 25-42.5% win, -Rs694 to
+# -Rs897 avg for every cheaper band -- neither ADX nor RVOL discriminated
+# winners from losers in the same review (rolling-30 profit factor had
+# collapsed 1.21 -> 0.073). See underlying_price_ceiling's docstring in
+# ema_crossover.py's initialize() for the full rationale.
+
+def test_underlying_price_ceiling_default_is_3000():
+    strat = _ema()
+    assert strat.underlying_price_ceiling == 3000.0
+
+
+def test_crossover_above_the_price_ceiling_does_not_fire():
+    strat = _ema(signal_confirm_bars=1)
+    strat.generate_signal({"symbol": "X", "ema20": 99.0, "ema50": 100.0, "adx14": 22.0, "close": 3500.0, "ohlc_bar_key": "live:t0"})
+    signal = strat.generate_signal({"symbol": "X", "ema20": 101.0, "ema50": 100.0, "adx14": 22.0, "close": 3500.0, "ohlc_bar_key": "live:t1"})
+    assert signal == "HOLD"
+
+
+def test_crossover_just_under_the_price_ceiling_still_fires():
+    strat = _ema(signal_confirm_bars=1)
+    strat.generate_signal({"symbol": "X", "ema20": 99.0, "ema50": 100.0, "adx14": 22.0, "close": 2999.0, "ohlc_bar_key": "live:t0"})
+    signal = strat.generate_signal({"symbol": "X", "ema20": 101.0, "ema50": 100.0, "adx14": 22.0, "close": 2999.0, "ohlc_bar_key": "live:t1"})
+    assert signal == "BUY"
+
+
+def test_price_ceiling_fails_open_when_close_is_missing():
+    """A position/test context that never passes close must not be
+    silently blocked by a brand-new, 2026-10-29 refinement filter --
+    matches every other ADX/gap entry-quality check's fail-open convention
+    for missing data."""
+    strat = _ema(signal_confirm_bars=1)
+    strat.generate_signal({"symbol": "X", "ema20": 99.0, "ema50": 100.0, "adx14": 22.0, "ohlc_bar_key": "live:t0"})
+    signal = strat.generate_signal({"symbol": "X", "ema20": 101.0, "ema50": 100.0, "adx14": 22.0, "ohlc_bar_key": "live:t1"})
+    assert signal == "BUY"
+
+
+def test_underlying_price_ceiling_is_configurable():
+    strat = _ema(signal_confirm_bars=1, underlying_price_ceiling=5000.0)
+    strat.generate_signal({"symbol": "X", "ema20": 99.0, "ema50": 100.0, "adx14": 22.0, "close": 3500.0, "ohlc_bar_key": "live:t0"})
+    # close=3500 would hit the default Rs3,000 ceiling, but this instance's is 5000.
+    signal = strat.generate_signal({"symbol": "X", "ema20": 101.0, "ema50": 100.0, "adx14": 22.0, "close": 3500.0, "ohlc_bar_key": "live:t1"})
+    assert signal == "BUY"
+
+
+def test_main_py_wires_underlying_price_ceiling():
+    from src.api import main as main_module
+    src = inspect.getsource(main_module)
+    idx = src.index('StrategyRegistry.load_strategy("EMA_CROSSOVER"')
+    block = src[idx:idx + 7000]
+    assert '"underlying_price_ceiling": 3000.0' in block
+
+
 # ── Entry-side follow-up: minimum EMA gap required to fire at all ──────────
 # (2026-08-27, after user feedback that the exit-side fix alone doesn't
 # address why entries themselves were frequently poor -- ADX/RVOL at entry
@@ -329,9 +383,10 @@ def test_main_py_wires_entry_min_gap_pct():
     from src.api import main as main_module
     src = inspect.getsource(main_module)
     idx = src.index('StrategyRegistry.load_strategy("EMA_CROSSOVER"')
-    # Window widened 4500 -> 5000 (2026-10-19): the new adx_entry_ceiling
-    # comment pushed this literal further into the block.
-    block = src[idx:idx + 5000]
+    # Window widened 5000 -> 7000 (2026-10-29): the new underlying_price_
+    # ceiling/mtf_strict/require_rs comment blocks pushed this literal
+    # further into the dict.
+    block = src[idx:idx + 7000]
     assert '"entry_min_gap_pct": 0.0005' in block
 
 
@@ -548,7 +603,10 @@ def test_main_py_wires_all_four_fixes_for_ema_crossover():
     from src.api import main as main_module
     src = inspect.getsource(main_module)
     idx = src.index('StrategyRegistry.load_strategy("EMA_CROSSOVER"')
-    block = src[idx:idx + 4000]
+    # Window widened 4000 -> 6500 (2026-10-29): the new underlying_price_
+    # ceiling/mtf_strict/require_rs comment blocks pushed these literals
+    # further into the dict.
+    block = src[idx:idx + 6500]
     assert '"adx_entry_threshold": 20' in block
     assert '"underlying_stop_atr_mult": 1.4' in block
     assert '"ema_reversal_min_gap_pct": 0.001' in block

@@ -282,13 +282,35 @@ async def lifespan(app: FastAPI):
         # (20-25 is the best-performing ADX bucket; 25-35 is a robust loss
         # concentration; 8/9 worst-ever reversal-exit losses had ADX>=25).
         "adx_entry_ceiling": 25,
+        # EXPERIMENT (2026-10-29, data-driven): new entry ceiling -- see
+        # underlying_price_ceiling's docstring in ema_crossover.py's
+        # initialize() for the full 191-trade rationale (stocks priced
+        # >=Rs3,000 were 21.6% win / -Rs1,433 avg vs 25-42.5% win / -Rs694
+        # to -Rs897 avg for every cheaper band, 39% of all losses from 27%
+        # of trades).
+        "underlying_price_ceiling": 3000.0,
         # adx_checked_internally is hardcoded True in ema_crossover.py's
         # initialize() (not parameter-driven, unlike everything else here)
         # -- listing it would silently be a no-op, so it's intentionally
         # left out of this dict.
         "rvol_hard_gate": False,
-        "mtf_strict": False, "mtf_strong_opposition_pct": 0.3,
-        "require_rs": False,
+        # EXPERIMENT (2026-10-29, explicit user instruction: "even if just
+        # 2-3 trades per day, they should result in net profit"): both
+        # flipped back to True, reverting the 2026-08-21 external-review
+        # loosening. Neither ADX nor RVOL discriminated winners from losers
+        # in a 191-trade review that prompted this (rolling-30 profit
+        # factor had collapsed 1.21 -> 0.073) -- RS/MTF are the two existing,
+        # already-built filters that could plausibly cut volume toward the
+        # 2-3/day target while biasing toward stronger setups, by requiring
+        # the stock to already be a confirmed RS leader/laggard and the
+        # 15-min trend to actually agree, instead of merely "not strongly
+        # opposing." Explicitly NOT retroactively provable the way the
+        # underlying_price_ceiling below is (no rs_rank history stored per
+        # trade) -- a forward-looking experiment, not a proven fix. Revert
+        # to False if volume collapses to ~0/day or the loss rate doesn't
+        # improve after a real sample.
+        "mtf_strict": True, "mtf_strong_opposition_pct": 0.3,
+        "require_rs": True,
         "ema_reversal_exit": True,
         # Fixed 2026-08-27 (trade review): 44% of all exits over Aug 24-26
         # were EMA-reversal exits, ALL losses, many firing on an EMA20/50
