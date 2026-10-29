@@ -195,3 +195,140 @@ async def test_concurrent_rollover_calls_create_only_one_active_period(monkeypat
     assert len(active_periods) == 1, \
         f"expected exactly one active period, got {len(active_periods)} -- concurrent calls raced past the guard"
     assert results[0] is results[1] is active_periods[0]
+
+
+# ── Non-positive capital floor (2026-10-29 live incident) ───────────────────
+#
+# Compounding had no floor: a period that loses more than its own
+# starting_capital carried a NEGATIVE ending_capital forward unconditionally
+# as the next period's starting_capital. Confirmed live: Sep30-Oct27 lost
+# -Rs345,079 against a Rs223,407 base, ending at -Rs121,672, which poisoned
+# every %-based risk check downstream (the BUY exposure check's own limit,
+# initial_capital * 30%, went negative too -- rejecting every single BUY all
+# day). Two floors added: one in the rollover loop (future periods), one
+# that self-heals an already-active period created before the floor existed.
+
+class _FakeMergeSession:
+    """Minimal async-context-manager session stand-in for the self-heal
+    path's `async with session_factory() as session: session.merge/commit/
+    refresh`. Not simulating real SQLAlchemy merge semantics (identity
+    merge is enough) -- this test file's own stated philosophy is isolating
+    orchestration logic from the SQL layer, same as _create_period/
+    _close_period being monkeypatched outright elsewhere in this file."""
+
+    def __init__(self, store):
+        self._store = store
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def merge(self, obj):
+        self._store["merged"] = obj
+        return obj
+
+    async def commit(self):
+        self._store["committed"] = True
+
+    async def refresh(self, obj):
+        self._store["refreshed"] = obj
+
+
+@pytest.mark.asyncio
+async def test_rollover_floors_a_negative_ending_capital_to_the_default(monkeypatch):
+    old_period = _period(date(2026, 9, 30), date(2026, 10, 27), 223_406.75)
+    closed_period = _period(
+        date(2026, 9, 30), date(2026, 10, 27), 223_406.75,
+        closed=True, ending_capital=-121_671.87,
+    )
+    create_mock = AsyncMock(return_value=_period(date(2026, 10, 28), date(2026, 11, 24), 300_000.0))
+    sf = object()
+
+    monkeypatch.setattr(capital_periods, "get_active_period", AsyncMock(return_value=old_period))
+    monkeypatch.setattr(capital_periods, "_close_period", AsyncMock(return_value=closed_period))
+    monkeypatch.setattr(capital_periods, "_create_period", create_mock)
+
+    rm = _FakeRiskManager()
+    await capital_periods.rollover_if_needed(
+        session_factory=sf, default_capital=300_000.0, risk_manager=rm,
+        today=date(2026, 10, 29),
+    )
+
+    # The new period must be created with the FLOORED default, not the
+    # negative ending_capital it actually closed at.
+    create_mock.assert_awaited_once_with(sf, date(2026, 10, 28), date(2026, 11, 24), 300_000.0)
+    assert rm.set_capital_calls == [300_000.0]
+
+
+@pytest.mark.asyncio
+async def test_rollover_does_not_floor_a_positive_ending_capital(monkeypatch):
+    """Regression guard: ordinary profitable/losing-but-still-positive
+    compounding must be completely unaffected by the new floor."""
+    old_period = _period(date(2026, 7, 29), date(2026, 8, 25), 300_000.0)
+    closed_period = _period(
+        date(2026, 7, 29), date(2026, 8, 25), 300_000.0,
+        closed=True, ending_capital=340_000.0,
+    )
+    create_mock = AsyncMock(return_value=_period(date(2026, 8, 26), date(2026, 9, 29), 340_000.0))
+    sf = object()
+
+    monkeypatch.setattr(capital_periods, "get_active_period", AsyncMock(return_value=old_period))
+    monkeypatch.setattr(capital_periods, "_close_period", AsyncMock(return_value=closed_period))
+    monkeypatch.setattr(capital_periods, "_create_period", create_mock)
+
+    rm = _FakeRiskManager()
+    await capital_periods.rollover_if_needed(
+        session_factory=sf, default_capital=300_000.0, risk_manager=rm,
+        today=date(2026, 8, 27),
+    )
+
+    create_mock.assert_awaited_once_with(sf, date(2026, 8, 26), date(2026, 9, 29), 340_000.0)
+    assert rm.set_capital_calls == [340_000.0]
+
+
+@pytest.mark.asyncio
+async def test_self_heals_an_already_active_period_with_non_positive_starting_capital(monkeypatch):
+    """The exact live incident: a PRIOR run (before this floor existed)
+    already created the active period with a negative starting_capital.
+    No rollover is due today (period_end >= today), so only the self-heal
+    path can fix it -- must run on every call, not just at a rollover."""
+    bad_active = _period(date(2026, 10, 28), date(2026, 11, 24), -121_671.87)
+    store = {}
+
+    monkeypatch.setattr(capital_periods, "get_active_period", AsyncMock(return_value=bad_active))
+    monkeypatch.setattr(capital_periods, "_create_period", AsyncMock())
+    monkeypatch.setattr(capital_periods, "_close_period", AsyncMock())
+
+    rm = _FakeRiskManager()
+    result = await capital_periods.rollover_if_needed(
+        session_factory=lambda: _FakeMergeSession(store),
+        default_capital=1_500_000.0, risk_manager=rm,
+        today=date(2026, 10, 29),
+    )
+
+    assert store.get("committed") is True
+    assert result.starting_capital == 1_500_000.0
+    assert rm.set_capital_calls == [1_500_000.0]
+
+
+@pytest.mark.asyncio
+async def test_self_heal_does_not_touch_a_positive_active_period(monkeypatch):
+    good_active = _period(date(2026, 7, 29), date(2026, 8, 25), 321_556.0)
+    store = {}
+
+    monkeypatch.setattr(capital_periods, "get_active_period", AsyncMock(return_value=good_active))
+    monkeypatch.setattr(capital_periods, "_create_period", AsyncMock())
+    monkeypatch.setattr(capital_periods, "_close_period", AsyncMock())
+
+    rm = _FakeRiskManager()
+    result = await capital_periods.rollover_if_needed(
+        session_factory=lambda: _FakeMergeSession(store),
+        default_capital=300_000.0, risk_manager=rm,
+        today=date(2026, 8, 13),
+    )
+
+    assert "committed" not in store, "a healthy positive period must never hit the self-heal DB write"
+    assert result.starting_capital == 321_556.0
+    assert rm.set_capital_calls == [321_556.0]

@@ -137,8 +137,53 @@ async def rollover_if_needed(session_factory, default_capital: float, risk_manag
             closed = await _close_period(session_factory, active)
             next_start = closed.period_end + timedelta(days=1)
             _, next_end = get_capital_period_bounds(next_start)
-            active = await _create_period(session_factory, next_start, next_end, float(closed.ending_capital))
+            # FLOORED 2026-10-29 (live incident): compounding had no floor --
+            # a period that loses more than its own starting_capital carried
+            # a NEGATIVE ending_capital forward unconditionally as the next
+            # period's starting_capital. Confirmed live: Sep30-Oct27 lost
+            # -Rs345,079 against a Rs223,407 base, ending at -Rs121,672,
+            # which poisoned every %-based risk check downstream (the BUY
+            # exposure check's own limit, initial_capital * 30%, went
+            # negative too -- rejecting every single BUY all day, the exact
+            # "REJECTED_BY_RISK" incident this fixes). Reset to the
+            # configured baseline instead of carrying a non-positive figure
+            # forward -- explicit user instruction ("floor at a fresh
+            # baseline") over the alternative of clamping to exactly 0,
+            # which would still break every %-based check (0% of anything
+            # is 0).
+            _next_starting_capital = float(closed.ending_capital)
+            if _next_starting_capital <= 0:
+                logger.error(
+                    f"[CapitalPeriod] {closed.period_start} -> {closed.period_end} "
+                    f"ended at Rs{_next_starting_capital:,.2f} (lost more than it "
+                    f"started with) -- flooring the next period's starting_capital "
+                    f"to the configured baseline (Rs{default_capital:,.2f}) instead "
+                    "of carrying a non-positive figure forward."
+                )
+                _next_starting_capital = default_capital
+            active = await _create_period(session_factory, next_start, next_end, _next_starting_capital)
             rolled = True
+
+        # Self-heal (2026-10-29 live incident): the ALREADY-active period may
+        # have been created with a non-positive starting_capital by a PRIOR
+        # run of this same function, before the floor above existed --
+        # exactly what happened live. Every subsequent call must still
+        # correct it (not just the one rollover that created it), since this
+        # function runs on every startup/scheduled tick, not only at a
+        # rollover boundary.
+        if float(active.starting_capital) <= 0:
+            logger.error(
+                f"[CapitalPeriod] Active period {active.period_start} -> "
+                f"{active.period_end} has a non-positive starting_capital "
+                f"(Rs{float(active.starting_capital):,.2f}) -- flooring to the "
+                f"configured baseline (Rs{default_capital:,.2f})."
+            )
+            async with session_factory() as session:
+                merged = await session.merge(active)
+                merged.starting_capital = default_capital
+                await session.commit()
+                await session.refresh(merged)
+                active = merged
 
     if risk_manager is not None:
         risk_manager.set_capital(float(active.starting_capital))
