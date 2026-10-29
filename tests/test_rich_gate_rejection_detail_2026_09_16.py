@@ -41,6 +41,7 @@ def _pin_clock_outside_the_hour13_exclusion(monkeypatch):
 class _FakeEngine:
     _audit_gate = LiveTradingEngine._audit_gate
     _has_active_multi_leg_structure = LiveTradingEngine._has_active_multi_leg_structure
+    _ELEVATED_VIX_ENTRY_CEILING = LiveTradingEngine._ELEVATED_VIX_ENTRY_CEILING
 
     def __init__(self, market_data, redis=None, rs_ranker=None):
         self._active_spreads = {}
@@ -178,6 +179,98 @@ async def test_hour10_does_not_block_ema_crossover_v1_or_momentum_v1(monkeypatch
         assert rej is not None, f"{name} was unexpectedly blocked before reaching the ADX gate"
         assert rej["gate"] == "adx_passed"
         assert rej["reason"] == "ADX_BELOW_THRESHOLD"
+
+
+# ── Elevated-VIX entry ceiling (2026-10-29, data-driven) ────────────────────
+# 15-day review (Oct 13-28) found the same break point independently in
+# ema_crossover_v1 and iron_condor_v1: both strategies deteriorated sharply
+# once VIX crossed ~16, concentrating nearly all of that window's losses.
+# Scoped to ema_crossover_v1 only here (momentum_v1 showed 0% win in EVERY
+# VIX bucket that same window, so a ceiling wouldn't have helped it).
+
+@pytest.mark.asyncio
+async def test_vix_ceiling_blocks_ema_crossover_v1_entries():
+    fake = _FakeEngine({
+        "close": 1200.0, "ltp_source": "live_tick",
+        "rvol": 2.0, "rvol_valid": True,
+        "adx14": 30.0, "adx_valid": True,
+    })
+    strategy = SimpleNamespace(
+        name="ema_crossover_v1", is_active=True, min_dte=0, max_dte=999,
+        generate_signal=lambda market_data: SignalType.BUY,
+    )
+
+    await LiveTradingEngine._process_signal(fake, strategy, "SBIN", vix=16.0, regime="TRENDING")
+
+    # Blocked before the ADX gate even runs -- only signal_generated is audited.
+    assert fake._signal_gate_stats.get("ema_crossover_v1") == {"signal_generated": 1}
+    assert fake._last_gate_rejection is None
+
+
+@pytest.mark.asyncio
+async def test_vix_just_under_the_ceiling_does_not_block_ema_crossover_v1():
+    fake = _FakeEngine({
+        "close": 1200.0, "ltp_source": "live_tick",
+        "rvol": 2.0, "rvol_valid": True,
+        "adx14": 18.5, "adx_valid": True,   # below the flat 25 threshold -> rejected there
+    })
+    strategy = SimpleNamespace(
+        name="ema_crossover_v1", is_active=True, min_dte=0, max_dte=999,
+        rvol_checked_internally=True,
+        generate_signal=lambda market_data: SignalType.BUY,
+    )
+
+    await LiveTradingEngine._process_signal(fake, strategy, "SBIN", vix=15.9, regime="TRENDING")
+
+    rej = fake._last_gate_rejection
+    assert rej is not None, "unexpectedly blocked by the VIX ceiling just under its threshold"
+    assert rej["gate"] == "adx_passed"
+
+
+@pytest.mark.asyncio
+async def test_vix_ceiling_does_not_block_momentum_v1():
+    """Confirms the ceiling is ema_crossover_v1-specific -- momentum_v1
+    showed 0% win at every VIX bucket in the same window, so there's no
+    data to justify blocking it here too."""
+    fake = _FakeEngine({
+        "close": 1200.0, "ltp_source": "live_tick",
+        "rvol": 2.0, "rvol_valid": True,
+        "adx14": 18.5, "adx_valid": True,
+    })
+    strategy = SimpleNamespace(
+        name="momentum_v1", is_active=True, min_dte=0, max_dte=999,
+        rvol_checked_internally=True,
+        generate_signal=lambda market_data: SignalType.BUY,
+    )
+
+    await LiveTradingEngine._process_signal(fake, strategy, "SBIN", vix=20.0, regime="TRENDING")
+
+    rej = fake._last_gate_rejection
+    assert rej is not None, "momentum_v1 should not be affected by the ema_crossover_v1-only VIX ceiling"
+    assert rej["gate"] == "adx_passed"
+
+
+@pytest.mark.asyncio
+async def test_vix_ceiling_fails_open_on_missing_vix():
+    """A VIX-fetch outage must not silently halt every ema_crossover_v1
+    entry -- unlike credit_spread_v1/iron_condor_v1's premium-selling
+    thesis, this strategy has no fundamental dependency on VIX."""
+    fake = _FakeEngine({
+        "close": 1200.0, "ltp_source": "live_tick",
+        "rvol": 2.0, "rvol_valid": True,
+        "adx14": 18.5, "adx_valid": True,
+    })
+    strategy = SimpleNamespace(
+        name="ema_crossover_v1", is_active=True, min_dte=0, max_dte=999,
+        rvol_checked_internally=True,
+        generate_signal=lambda market_data: SignalType.BUY,
+    )
+
+    await LiveTradingEngine._process_signal(fake, strategy, "SBIN", vix=None, regime="TRENDING")
+
+    rej = fake._last_gate_rejection
+    assert rej is not None, "vix=None should fail open, not block the entry"
+    assert rej["gate"] == "adx_passed"
 
 
 # ── Same-day re-entry block (2026-10-22, data-driven) ───────────────────────

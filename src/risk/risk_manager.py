@@ -278,7 +278,9 @@ class RiskManager:
             # duplicates of option_chain.py's iv_rank_allows_selling()/
             # vix_allows_selling(), loosened the same way and for the same
             # reason there. The None-fail-closed checks above/below are
-            # UNCHANGED. Restore 0.30/12.0 after reviewing case-by-case losses.
+            # UNCHANGED.
+            # iv_rank: still loosened -- no data reviewed for this one.
+            # Restore 0.30 after reviewing case-by-case losses.
             if iv_rank < 0.0:
                 logger.warning(
                     f"Risk: IV rank {iv_rank:.2f} < 0.0 for {symbol} "
@@ -291,9 +293,13 @@ class RiskManager:
                     "— cannot verify market-wide premium level, skipping."
                 )
                 return False
-            if vix < 0.0:
+            # RESTORED 2026-10-29 (user-prompted review, matches option_chain.py's
+            # vix_allows_selling() restoration): the 27+ day zero-trade crisis
+            # that justified loosening this to 0.0 is long resolved. See that
+            # function's docstring for the full reasoning.
+            if vix < 12.0:
                 logger.warning(
-                    f"Risk: India VIX {vix:.1f} < 0 — market unusually quiet, "
+                    f"Risk: India VIX {vix:.1f} < 12 — market unusually quiet, "
                     f"premiums too cheap market-wide, skipping [{strategy_name}]."
                 )
                 return False

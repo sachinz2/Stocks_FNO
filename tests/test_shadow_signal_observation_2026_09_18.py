@@ -187,6 +187,7 @@ class _FakeProcessSignalEngine:
     _record_rejected_outcome = LiveTradingEngine._record_rejected_outcome
     _compute_trade_quality_score = LiveTradingEngine._compute_trade_quality_score
     _PAUSED_SIGNAL_OUTCOME_STRATEGIES = LiveTradingEngine._PAUSED_SIGNAL_OUTCOME_STRATEGIES
+    _ELEVATED_VIX_ENTRY_CEILING = LiveTradingEngine._ELEVATED_VIX_ENTRY_CEILING
 
     def __init__(self, streaks):
         self._active_spreads = {}

@@ -160,7 +160,16 @@ REGIME_STRATEGY_MAP: Dict[str, list] = {
     # restores exactly momentum_v1's original single-regime entry.
     "RANGE_BOUND": [STRATEGY_CONDOR, STRATEGY_SPREAD, STRATEGY_EMA],
     "VOLATILE":    [STRATEGY_SPREAD, STRATEGY_EMA],
-    "LOW_VOL":     [STRATEGY_EMA, STRATEGY_SPREAD],
+    # RESTORED 2026-10-29 (user-prompted review, direct consequence of
+    # restoring vix_allows_selling()'s floor to 12.0 the same day -- see
+    # that function's docstring): STRATEGY_SPREAD removed again.
+    # credit_spread_v1's own entry gate structurally can never pass while
+    # LOW_VOL (VIX < 12 by definition, gate requires VIX >= 12) -- listing
+    # it here was the exact 2026-09-18 live incident this test class
+    # exists to prevent, reintroduced the moment the floor came back
+    # without this. STRATEGY_EMA stays -- ema_crossover_v1 has no VIX-floor
+    # dependency at all, loosened or not, so there's nothing to revert here.
+    "LOW_VOL":     [STRATEGY_EMA],
 }
 _DISABLED_ORIGINAL_MAP_FOR_REFERENCE_ONLY = {
     "TRENDING":    [STRATEGY_EMA, STRATEGY_SPREAD, STRATEGY_MOMENTUM],  # spread aligned with trend = low breach risk

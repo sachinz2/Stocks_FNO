@@ -417,6 +417,7 @@ class _FakeRvolGateEngine:
     behavioral harness for a specific, isolated gate like this one."""
     _audit_gate = LiveTradingEngine._audit_gate
     _has_active_multi_leg_structure = LiveTradingEngine._has_active_multi_leg_structure
+    _ELEVATED_VIX_ENTRY_CEILING = LiveTradingEngine._ELEVATED_VIX_ENTRY_CEILING
 
     def __init__(self):
         self._active_spreads = {}
@@ -1758,6 +1759,7 @@ class _FakeCollisionEngine:
     _record_rejected_outcome            = LiveTradingEngine._record_rejected_outcome
     _compute_trade_quality_score        = LiveTradingEngine._compute_trade_quality_score
     _PAUSED_SIGNAL_OUTCOME_STRATEGIES   = LiveTradingEngine._PAUSED_SIGNAL_OUTCOME_STRATEGIES
+    _ELEVATED_VIX_ENTRY_CEILING         = LiveTradingEngine._ELEVATED_VIX_ENTRY_CEILING
 
     def __init__(self, active_spreads=None, active_condors=None, single_leg_journals=None):
         self._active_spreads = active_spreads or {}

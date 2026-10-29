@@ -798,6 +798,26 @@ class LiveTradingEngine:
     # not. Operator-tunable like DEFAULT_EXPECTED_DRAWDOWN in strategy_monitor.py.
     _SIGNAL_STALENESS_DAYS = 3
 
+    # EXPERIMENT (2026-10-29, data-driven): new entry ceiling for
+    # ema_crossover_v1/iron_condor_v1 -- see _process_signal()'s and
+    # _process_iron_condor()'s own comments for the per-strategy evidence.
+    # 15-day review (Oct 13-28) found the same break point independently in
+    # both strategies: ema_crossover_v1 was +Rs14,265 (28.6% win) at
+    # VIX<15 vs -Rs69,562 combined at VIX>=16; iron_condor_v1 lost
+    # -Rs43,084 of its -Rs44,076 total from VIX>=16.19 entries, with the
+    # VIX<15.2 trades roughly flat (-Rs992.5 net). Neither strategy has ever
+    # had a VIX-based entry gate before -- credit_spread_v1/iron_condor_v1's
+    # existing vix_allows_selling() is a FLOOR (VIX>=12, "is premium rich
+    # enough"), unrelated and unchanged. Caveat: both samples are drawn from
+    # one continuous VIX run-up (Oct 20-28), not multiple independent
+    # episodes -- treat as a first instance to validate through a second
+    # one, not a fully proven threshold. momentum_v1 explicitly excluded:
+    # same-window check found 0% win rate in EVERY VIX bucket including
+    # <15, so a VIX ceiling wouldn't have changed anything for it.
+    # credit_spread_v1 excluded too -- only 3 trades in the whole window,
+    # too thin to confirm or refute.
+    _ELEVATED_VIX_ENTRY_CEILING = 16.0
+
     async def _check_signal_staleness(self) -> None:
         """
         Alerts once per trading day (called from send_daily_report) if a
@@ -3165,6 +3185,28 @@ class LiveTradingEngine:
             )
             return
 
+        # EXPERIMENT (2026-10-29, data-driven): see _ELEVATED_VIX_ENTRY_
+        # CEILING's class-level docstring for the full evidence. Scoped to
+        # ema_crossover_v1 only -- momentum_v1 showed 0% win at every VIX
+        # bucket this same window (a ceiling wouldn't have helped it).
+        # Fails OPEN (not closed) on vix=None: unlike credit_spread_v1/
+        # iron_condor_v1's premium-selling thesis, this strategy has no
+        # fundamental dependency on VIX -- a VIX-fetch outage should not
+        # silently halt every ema_crossover_v1 entry over a brand-new,
+        # single-episode protective check.
+        if (
+            strategy.name == "ema_crossover_v1"
+            and vix is not None
+            and vix >= self._ELEVATED_VIX_ENTRY_CEILING
+        ):
+            logger.info(
+                f"[{strategy.name}] {symbol} {signal_str} skipped — VIX "
+                f"{vix:.1f} >= {self._ELEVATED_VIX_ENTRY_CEILING:.1f} "
+                "(data-driven: elevated-VIX entries concentrated this "
+                "strategy's recent losses)."
+            )
+            return
+
         if self._max_daily_orders > 0 and self._today_order_count >= self._max_daily_orders:
             logger.warning(f"Daily order limit ({self._max_daily_orders}) reached.")
             return
@@ -5281,6 +5323,26 @@ class LiveTradingEngine:
                 }
             return
         self._audit_gate(strategy.name, "vix_passed")
+
+        # EXPERIMENT (2026-10-29, data-driven): new ceiling, on top of (not
+        # a replacement for) the vix_allows_selling() floor just above --
+        # see _ELEVATED_VIX_ENTRY_CEILING's class-level docstring for the
+        # full evidence. vix is guaranteed non-None here (the floor check
+        # above already returned on None), so no fail-open/closed choice
+        # needed.
+        if vix >= self._ELEVATED_VIX_ENTRY_CEILING:
+            logger.info(
+                f"[IronCondor] {symbol} skipped — VIX={vix:.1f} >= "
+                f"{self._ELEVATED_VIX_ENTRY_CEILING:.1f} (data-driven: elevated-VIX "
+                "entries accounted for nearly all of this strategy's recent "
+                "regime-shift losses)."
+            )
+            self._last_gate_rejection = {
+                "gate": "vix_passed", "value": round(vix, 2),
+                "threshold": self._ELEVATED_VIX_ENTRY_CEILING, "reason": "VIX_TOO_HIGH",
+            }
+            return
+
         if not iv_rank_allows_selling(iv_rank):
             if iv_rank is None:
                 logger.info(f"[IronCondor] {symbol} skipped — IV Rank unavailable (fail-closed, can't confirm premium is worth selling).")

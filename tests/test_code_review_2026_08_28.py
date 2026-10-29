@@ -202,11 +202,39 @@ def test_vix_allows_selling_fails_closed_on_none():
 
 
 def test_vix_allows_selling_still_correct_for_real_values():
-    # EXPERIMENT (2026-10-08, explicit user instruction): threshold dropped
-    # 12.0 -> 0.0 in option_chain.py. Restore 12.0 and this test's original
-    # 11.9/False assertion after reviewing case-by-case losses.
-    assert vix_allows_selling(0.0) is True
+    # RESTORED 2026-10-29 (user-prompted review): threshold dropped 12.0 ->
+    # 0.0 on 2026-10-08, now restored -- see vix_allows_selling()'s own
+    # docstring for the full reasoning.
+    assert vix_allows_selling(11.9) is False
+    assert vix_allows_selling(12.0) is True
     assert vix_allows_selling(15.0) is True
+
+
+# ── Elevated-VIX entry ceiling for iron_condor_v1 (2026-10-29, data-driven) ──
+# 15-day review: -Rs43,084 of iron_condor_v1's -Rs44,076 total loss in that
+# window came from entries at VIX>=16.19 (regime-shift exits); the VIX<15.2
+# trades were roughly flat. See _ELEVATED_VIX_ENTRY_CEILING's class-level
+# docstring in live_trading_engine.py for the full evidence, including the
+# matching ema_crossover_v1 finding and the momentum_v1/credit_spread_v1
+# exclusions. This is a NEW ceiling, additional to (not a replacement for)
+# vix_allows_selling()'s floor just above -- source-inspected rather than
+# executed end-to-end, matching this file's existing convention for deep
+# engine wiring (e.g. _process_iron_condor()'s contract-resolution/margin
+# pipeline has no lightweight fake harness to drive).
+
+def test_iron_condor_has_a_vix_ceiling_on_top_of_the_floor():
+    src = inspect.getsource(LiveTradingEngine._process_iron_condor)
+    assert "vix_allows_selling(vix)" in src
+    floor_idx = src.index("if not vix_allows_selling(vix):")
+    ceiling_idx = src.index("self._ELEVATED_VIX_ENTRY_CEILING")
+    assert ceiling_idx > floor_idx, "the ceiling check must run after the floor check, not replace it"
+    block = src[ceiling_idx - 50:ceiling_idx + 200]
+    assert "vix >= self._ELEVATED_VIX_ENTRY_CEILING" in block
+    assert "VIX_TOO_HIGH" in src
+
+
+def test_elevated_vix_entry_ceiling_is_16():
+    assert LiveTradingEngine._ELEVATED_VIX_ENTRY_CEILING == 16.0
 
 
 def test_iv_rank_allows_selling_fails_closed_on_none():

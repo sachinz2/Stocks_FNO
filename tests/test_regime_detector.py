@@ -45,12 +45,13 @@ def test_high_vix_always_volatile_regardless_of_atr():
 
 @pytest.mark.skip(
     reason="EXPERIMENT (2026-10-08, explicit user instruction): "
-    "REGIME_STRATEGY_MAP now lists every strategy under every regime so "
-    "trades can be seen across all strategies and losses reviewed case-by-"
-    "case. This test's underlying reasoning (LOW_VOL mutually excludes any "
-    "currently-registered strategy's own VIX gate) is still correct -- the "
-    "VIX gate itself was ALSO loosened (0.0) as part of the same "
-    "experiment, which breaks the premise. Un-skip after reverting both."
+    "REGIME_STRATEGY_MAP still lists ema_crossover_v1/credit_spread_v1 "
+    "under LOW_VOL (not reverted). UPDATED 2026-10-29: vix_allows_selling() "
+    "itself was restored to 12.0 that day (user-prompted review), but that "
+    "alone doesn't rescue this test -- ema_crossover_v1 was never VIX-gated "
+    "to begin with (it has no vix_allows_selling() dependency, loosened or "
+    "not), so it can still 'pass' and sit in LOW_VOL regardless. Un-skip "
+    "once REGIME_STRATEGY_MAP['LOW_VOL'] itself is reverted."
 )
 def test_low_vol_is_empty_no_strategy_can_pass_its_own_vix_gate_there():
     # Fixed 2026-09-03 (live incident): LOW_VOL is defined as vix < 12.0, but
@@ -111,12 +112,26 @@ def test_momentum_and_condor_removal_do_not_disturb_ema_and_spreads_still_loosen
     # ema_crossover_v1/credit_spread_v1's own (still-experimental) regime
     # eligibility must be exactly what it was before either restriction --
     # only momentum_v1's and iron_condor_v1's entries were touched.
+    # credit_spread_v1/LOW_VOL is the one exception, covered separately
+    # below (removed 2026-10-29 for an unrelated reason -- the restored
+    # vix_allows_selling() floor, not a disturbance from this fix).
     assert STRATEGY_EMA in REGIME_STRATEGY_MAP["RANGE_BOUND"]
     assert STRATEGY_EMA in REGIME_STRATEGY_MAP["VOLATILE"]
     assert STRATEGY_EMA in REGIME_STRATEGY_MAP["LOW_VOL"]
     assert STRATEGY_SPREAD in REGIME_STRATEGY_MAP["RANGE_BOUND"]
     assert STRATEGY_SPREAD in REGIME_STRATEGY_MAP["VOLATILE"]
-    assert STRATEGY_SPREAD in REGIME_STRATEGY_MAP["LOW_VOL"]
+
+
+def test_credit_spread_removed_from_low_vol_again_after_vix_floor_restored():
+    # RESTORED 2026-10-29 (user-prompted review): direct consequence of
+    # restoring vix_allows_selling()'s floor to 12.0 the same day --
+    # credit_spread_v1's own entry gate structurally can never pass while
+    # LOW_VOL (VIX < 12 by definition), so listing it eligible here would
+    # reintroduce the exact 2026-09-18 live incident this test class exists
+    # to prevent. ema_crossover_v1 stays -- it has no VIX-floor dependency,
+    # loosened or not.
+    assert STRATEGY_SPREAD not in REGIME_STRATEGY_MAP["LOW_VOL"]
+    assert STRATEGY_EMA in REGIME_STRATEGY_MAP["LOW_VOL"]
 
 
 # ── iron_condor_v1 restored to RANGE_BOUND-only (2026-10-23, data-driven) ───

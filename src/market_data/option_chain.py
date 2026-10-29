@@ -241,12 +241,17 @@ def vix_allows_selling(vix: Optional[float]) -> bool:
     """
     if vix is None:
         return False
-    # EXPERIMENT (2026-10-08, explicit user instruction): threshold dropped
-    # 12.0 -> 0.0 so VIX level stops blocking credit_spread_v1/iron_condor_v1
-    # entries, to see trades across all strategies and review losses case-by-
-    # case. The None-fail-closed check above is UNCHANGED -- that's a data-
-    # outage guard, not a risk-tolerance threshold. Restore 12.0 after review.
-    return vix >= 0.0
+    # RESTORED 2026-10-29 (user-prompted review): was dropped 12.0 -> 0.0 on
+    # 2026-10-08 (explicit user instruction) as one of many gates loosened
+    # together after 27+ days of zero trades across every strategy -- that
+    # crisis is long resolved (all 4 strategies trading plenty since), and
+    # this floor was never revisited. Restoring it changes nothing in the
+    # conditions seen in the 15-day review that prompted this check (VIX sat
+    # at 14.5-17.8 throughout, already above 12) -- this is closing a stale
+    # 3-week-old experiment, not a response to new data. iv_rank_allows_
+    # selling() below is a SEPARATE threshold from the same 2026-10-08
+    # experiment and is NOT restored here -- no data reviewed for it.
+    return vix >= 12.0
 
 
 def iv_rank_allows_selling(iv_rank: Optional[float]) -> bool:
