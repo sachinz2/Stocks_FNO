@@ -49,6 +49,7 @@ def _reversal_engine(order_status):
         _single_leg_journals={"RELIANCE26AUG2900CE": {"journal_id": 1, "strategy_name": "ema_crossover_v1"}},
         _kite=None, _redis=None,
         _real_fill=LiveTradingEngine._real_fill,
+        _leg_round_trip_fees=LiveTradingEngine._leg_round_trip_fees,
         _log_trade_close=AsyncMock(),
         _persist_state=AsyncMock(),
     )
@@ -108,6 +109,7 @@ async def test_square_off_does_not_journal_close_when_broker_rejects(monkeypatch
         _active_spreads={}, _active_condors={},
         _kite=None, _redis=None,
         _real_fill=LiveTradingEngine._real_fill,
+        _leg_round_trip_fees=LiveTradingEngine._leg_round_trip_fees,
         _get_underlying_from_contract=lambda self, c: "TCS",
         _get_market_data=AsyncMock(return_value=None),
         _log_trade_close=AsyncMock(),
@@ -143,6 +145,7 @@ async def test_exit_all_options_for_does_not_journal_close_when_broker_rejects(m
         _active_spreads={}, _active_condors={}, _exited_today=set(),
         _kite=None, _redis=None,
         _real_fill=LiveTradingEngine._real_fill,
+        _leg_round_trip_fees=LiveTradingEngine._leg_round_trip_fees,
         _get_market_data=AsyncMock(return_value=None),
         _log_trade_close=AsyncMock(),
         _persist_state=AsyncMock(),
@@ -316,6 +319,8 @@ async def test_spread_exit_retry_does_not_resend_order_for_already_closed_leg(mo
     }
     fake = SimpleNamespace(
         _real_fill=LiveTradingEngine._real_fill,
+        _leg_round_trip_fees=LiveTradingEngine._leg_round_trip_fees,
+        _stale_data_since={}, _stale_data_alerted=set(), _STALE_DATA_ALERT_SECONDS=120,
         order_manager=SimpleNamespace(place_order=_fake_place_order),
         risk_manager=_FakeRiskMgr(),
         _active_spreads={"TITAN": spread}, _active_condors={},

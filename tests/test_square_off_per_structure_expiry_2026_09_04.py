@@ -49,6 +49,7 @@ def _condor(expiry_date: str, prefix: str) -> dict:
 def _fake_engine(active_condors, active_spreads=None):
     return SimpleNamespace(
         _real_fill=LiveTradingEngine._real_fill,
+        _leg_round_trip_fees=LiveTradingEngine._leg_round_trip_fees,
         order_manager=SimpleNamespace(
             place_order=AsyncMock(return_value=SimpleNamespace(order_status="OPEN", fill_price=5.0))
         ),

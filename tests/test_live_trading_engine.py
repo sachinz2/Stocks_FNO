@@ -210,6 +210,7 @@ class _FakeEngine:
     """Duck-typed stand-in -- only the attributes/methods the target methods
     actually touch."""
     _real_fill = staticmethod(LiveTradingEngine._real_fill)
+    _leg_round_trip_fees = staticmethod(LiveTradingEngine._leg_round_trip_fees)
 
     def __init__(self, fill_price=None):
         self.order_manager = _FakeOrderManager(fill_price)
@@ -242,6 +243,39 @@ class _FakeEngine:
 
     async def _notify(self, msg):
         self._notifications.append(msg)
+
+
+# ── _leg_round_trip_fees() (2026-11-05, external review finding) ───────────
+# trade_journal.pnl was always gross of the real brokerage/STT/exchange/GST/
+# SEBI/stamp fees PaperBroker deducts from its own balance on every order.
+
+def test_leg_round_trip_fees_long_leg_is_buy_then_sell():
+    from src.paper_trading.paper_broker import PaperBroker
+    fees = LiveTradingEngine._leg_round_trip_fees(100, 50.0, 55.0, is_short=False)
+    expected = (
+        PaperBroker._transaction_fees("BUY", 100, 50.0)
+        + PaperBroker._transaction_fees("SELL", 100, 55.0)
+    )
+    assert fees == pytest.approx(expected)
+
+
+def test_leg_round_trip_fees_short_leg_is_sell_then_buy():
+    from src.paper_trading.paper_broker import PaperBroker
+    fees = LiveTradingEngine._leg_round_trip_fees(100, 50.0, 45.0, is_short=True)
+    expected = (
+        PaperBroker._transaction_fees("SELL", 100, 50.0)
+        + PaperBroker._transaction_fees("BUY", 100, 45.0)
+    )
+    assert fees == pytest.approx(expected)
+
+
+def test_leg_round_trip_fees_takes_absolute_quantity():
+    """A negative (short-position-style) qty must not flip the fee sign --
+    fees are always a cost, never a rebate."""
+    fees_pos = LiveTradingEngine._leg_round_trip_fees(100, 50.0, 55.0)
+    fees_neg = LiveTradingEngine._leg_round_trip_fees(-100, 50.0, 55.0)
+    assert fees_pos == fees_neg
+    assert fees_pos > 0
 
 
 # ── Manual close position (2026-08-06) ───────────────────────────────────────
@@ -284,7 +318,7 @@ async def test_close_single_leg_position_writes_journal_and_releases_capital():
     assert len(fake._closed_journals) == 1
     journal_id, exit_price, pnl, exit_reason = fake._closed_journals[0]
     assert journal_id == 154
-    expected_pnl = (exit_price - 46.59) * 175
+    expected_pnl = (exit_price - 46.59) * 175 - LiveTradingEngine._leg_round_trip_fees(175, 46.59, exit_price)
     assert abs(pnl - expected_pnl) < 0.01
 
     assert fake.risk_manager.released == [("momentum_v1", 46.59 * 175)]
@@ -736,7 +770,9 @@ async def test_single_leg_exit_pnl_uses_real_fill_price_not_quote():
     journal_id, exit_price, pnl, exit_reason = fake._closed_journals[0]
 
     wrong_pnl_if_quote_based = (quoted_exit_price - entry_fill) * qty
-    correct_pnl = (real_exit_fill - entry_fill) * qty
+    correct_pnl = (real_exit_fill - entry_fill) * qty - LiveTradingEngine._leg_round_trip_fees(
+        qty, entry_fill, real_exit_fill,
+    )
 
     assert abs(pnl - correct_pnl) < 0.01
     assert abs(pnl - wrong_pnl_if_quote_based) > 100, "pnl must not match the old quote-based calculation"
@@ -759,7 +795,7 @@ async def test_single_leg_exit_pnl_falls_back_to_quote_when_fill_unavailable():
     )
 
     journal_id, exit_price, pnl, exit_reason = fake._closed_journals[0]
-    expected_fallback_pnl = (5.05 - 5.29) * 1900
+    expected_fallback_pnl = (5.05 - 5.29) * 1900 - LiveTradingEngine._leg_round_trip_fees(1900, 5.29, 5.05)
     assert abs(pnl - expected_fallback_pnl) < 0.01
 
 
@@ -839,7 +875,7 @@ async def test_single_leg_exit_handles_decimal_fill_price_without_crashing():
     assert closed is True, "a Decimal fill_price must not crash the exit"
     assert len(fake._closed_journals) == 1, "trade_journal close must still run after the crash site"
     _, exit_price, pnl, _ = fake._closed_journals[0]
-    assert abs(pnl - (4.90 - 5.29) * 1900) < 0.01
+    assert abs(pnl - ((4.90 - 5.29) * 1900 - LiveTradingEngine._leg_round_trip_fees(1900, 5.29, 4.90))) < 0.01
     assert exit_price == 4.90
 
 
@@ -869,6 +905,7 @@ class _FakeSquareOffOrderManager:
 
 class _FakeSquareOffEngine:
     _real_fill = staticmethod(LiveTradingEngine._real_fill)
+    _leg_round_trip_fees = staticmethod(LiveTradingEngine._leg_round_trip_fees)
 
     def __init__(self, fill_price):
         self.order_manager = _FakeSquareOffOrderManager(fill_price)
@@ -917,7 +954,7 @@ async def test_square_off_uses_real_fill_price_not_quote_estimate():
 
     entry_p = 46.59
     qty = 175
-    correct_pnl = (real_exit_fill - entry_p) * qty
+    correct_pnl = (real_exit_fill - entry_p) * qty - LiveTradingEngine._leg_round_trip_fees(qty, entry_p, real_exit_fill)
 
     assert exit_price == real_exit_fill
     assert abs(pnl - correct_pnl) < 0.01
@@ -949,7 +986,7 @@ async def test_square_off_handles_decimal_fill_price_without_crashing():
 
     entry_p = 46.59
     qty = 175
-    correct_pnl = (44.10 - entry_p) * qty
+    correct_pnl = (44.10 - entry_p) * qty - LiveTradingEngine._leg_round_trip_fees(qty, entry_p, 44.10)
 
     assert exit_price == 44.10
     assert abs(pnl - correct_pnl) < 0.01
@@ -978,6 +1015,7 @@ class _FakeMultiSquareOffOrderManager:
 
 class _FakeMultiSquareOffEngine:
     _real_fill = staticmethod(LiveTradingEngine._real_fill)
+    _leg_round_trip_fees = staticmethod(LiveTradingEngine._leg_round_trip_fees)
 
     def __init__(self):
         self.order_manager = _FakeMultiSquareOffOrderManager(
@@ -1063,6 +1101,7 @@ class _FakeExpiryJournalFailOrderManager:
 
 class _FakeExpiryJournalFailEngine:
     _real_fill = staticmethod(LiveTradingEngine._real_fill)
+    _leg_round_trip_fees = staticmethod(LiveTradingEngine._leg_round_trip_fees)
 
     def __init__(self):
         self.order_manager = _FakeExpiryJournalFailOrderManager(fill_price=5.0)
@@ -1185,6 +1224,7 @@ class _FakeExitAllOrderManager:
 
 class _FakeExitAllEngine:
     _real_fill = staticmethod(LiveTradingEngine._real_fill)
+    _leg_round_trip_fees = staticmethod(LiveTradingEngine._leg_round_trip_fees)
 
     def __init__(self, fill_price):
         self.order_manager = _FakeExitAllOrderManager(fill_price)
@@ -1227,7 +1267,7 @@ async def test_exit_all_options_for_writes_trade_journal_with_real_fill():
     journal_id, exit_price, pnl, exit_reason = fake._closed_journals[0]
     entry_p, qty = 22.00, 650
     assert exit_price == real_exit_fill
-    assert abs(pnl - (real_exit_fill - entry_p) * qty) < 0.01
+    assert abs(pnl - ((real_exit_fill - entry_p) * qty - LiveTradingEngine._leg_round_trip_fees(qty, entry_p, real_exit_fill))) < 0.01
     assert "CIPLA" in fake._exited_today
 
 
@@ -1427,6 +1467,7 @@ class _FakeSpreadExitEngine:
     37.44 / 10.67 after slippage."""
 
     _real_fill = staticmethod(LiveTradingEngine._real_fill)
+    _leg_round_trip_fees = staticmethod(LiveTradingEngine._leg_round_trip_fees)
 
     def __init__(self):
         self.order_manager = _FakeSpreadOrderManager({
@@ -1434,6 +1475,9 @@ class _FakeSpreadExitEngine:
             "TITAN26SEP4400PE": 10.67,   # long leg real fill (SELL to close)
         })
         self.risk_manager = _FakeSpreadRiskManager()
+        self._stale_data_since = {}
+        self._stale_data_alerted = set()
+        self._STALE_DATA_ALERT_SECONDS = 120
         self._active_spreads = {
             "TITAN": {
                 "short_contract": "TITAN26SEP4650PE", "long_contract": "TITAN26SEP4400PE",
@@ -1485,6 +1529,49 @@ class _FakeSpreadExitEngine:
         ]
 
 
+# ── Multi-leg exits must not skip the whole position on a missing
+# underlying feed (2026-11-05, external review finding #3) ────────────────
+
+class _FakeStaleDataSpreadEngine(_FakeSpreadExitEngine):
+    """Same TITAN spread as _FakeSpreadExitEngine, but _get_market_data()
+    returns None (simulating an underlying-feed outage) -- the DTE-tiered
+    profit check must still fire off each leg's own option quote."""
+
+    async def _get_market_data(self, symbol):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_spread_exit_still_evaluates_premium_checks_when_underlying_data_is_missing():
+    from datetime import timedelta
+    from src.core.utils import now_ist
+
+    fake = _FakeStaleDataSpreadEngine()
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(
+            "src.live_trading.live_trading_engine.get_near_month_expiry",
+            lambda: now_ist().replace(tzinfo=None) + timedelta(days=11),
+        )
+
+        async def _fake_get_option_quote(contract, kite, redis):
+            return {"TITAN26SEP4650PE": 36.35, "TITAN26SEP4400PE": 11.00}[contract]
+        mp.setattr("src.market_data.option_chain.get_option_quote", _fake_get_option_quote)
+
+        await LiveTradingEngine._check_spread_exits(fake, active_strategies={})
+
+    # Must still close via the DTE-tiered profit check, driven entirely by
+    # each leg's own option quote -- NOT silently skipped because the
+    # underlying feed itself returned nothing this cycle.
+    assert len(fake._closed_journals) == 1, (
+        "a missing underlying feed must not block premium-based exits that "
+        "don't actually need the underlying's own price"
+    )
+    _, _, _, exit_reason = fake._closed_journals[0]
+    assert "DTE-tiered profit" in exit_reason
+    assert "TITAN" not in fake._active_spreads
+
+
 @pytest.mark.asyncio
 async def test_spread_exit_pnl_uses_real_fill_not_quote():
     from datetime import timedelta
@@ -1511,14 +1598,98 @@ async def test_spread_exit_pnl_uses_real_fill_not_quote():
     journal_id, exit_price, pnl, exit_reason = fake._closed_journals[0]
 
     # Real fill-based numbers, NOT the quote-based ones (short 36.35/long
-    # 11.00 would give exit_price=25.35, pnl=7638.75 -- the bug).
+    # 11.00 would give exit_price=25.35, pnl=7638.75 -- the bug). 7390.25 is
+    # the fill-based price delta before fees; net of both legs' real
+    # entry+exit fees (2026-11-05 fix) it is 7260.73.
     assert exit_price == 26.77
-    assert abs(pnl - 7390.25) < 0.01
+    assert abs(pnl - 7260.73) < 0.01
     assert "DTE-tiered profit" in exit_reason
 
     # TITAN must be fully closed out and routed to the profit bucket.
     assert "TITAN" not in fake._active_spreads
     assert "TITAN" in fake._profit_closed_today
+
+
+# ── Credit spread profit-target requires the combined net P&L, not just
+# the short leg's own decay (2026-11-05, external review finding #6) ───────
+
+class _FakeNetLossSpreadEngine(_FakeSpreadExitEngine):
+    """Short leg decays well past its DTE-tiered profit target (10 -> 4,
+    60% captured, past the 45% dte<=14 tier), but the long leg lost more
+    value than the short leg gained (8 -> 0.5) -- net spread pnl =
+    (10-4)-(8-0.5) = -1.5, a real loss despite the short leg's own number
+    looking like a clean win."""
+
+    def __init__(self):
+        self.order_manager = _FakeSpreadOrderManager({
+            "NETLOSS26SEP100PE": 4.0,
+            "NETLOSS26SEP90PE":  0.5,
+        })
+        self.risk_manager = _FakeSpreadRiskManager()
+        self._stale_data_since = {}
+        self._stale_data_alerted = set()
+        self._STALE_DATA_ALERT_SECONDS = 120
+        self._active_spreads = {
+            "NETLOSS": {
+                "short_contract": "NETLOSS26SEP100PE", "long_contract": "NETLOSS26SEP90PE",
+                "short_premium": 10.0, "long_premium": 8.0, "net_credit": 2.0,
+                "short_strike": 100, "long_strike": 90, "option_type": "PE",
+                "spread_type": "BULL_PUT_SPREAD", "lot_size": 175,
+                "entry_vix": 0.0, "gtt_id": None, "strategy_name": "credit_spread_v1",
+            },
+        }
+        self._active_condors = {}
+        self._exited_today = set()
+        self._profit_closed_today = set()
+        self._close_on_first_cycle = set()
+        self._closed_journals = []
+        self._notifications = []
+        self._ltp_poller = None
+        self._kite = None
+        self._redis = None
+
+    async def _get_market_data(self, symbol):
+        # current_price above the short put strike (100) -- no breach. A
+        # BULL_PUT_SPREAD profits while the underlying stays above the
+        # short strike; the long strike (90) below it is just the
+        # protective wing, not a second breach boundary.
+        return {"close": 105.0, "atr14": 2.0}
+
+    async def _safe_get_positions(self):
+        return [
+            {"symbol": "NETLOSS26SEP100PE", "quantity": -175, "avg_price": 10.0},
+            {"symbol": "NETLOSS26SEP90PE",  "quantity": 175,  "avg_price": 8.0},
+        ]
+
+
+@pytest.mark.asyncio
+async def test_spread_profit_target_does_not_fire_on_a_net_loss():
+    from datetime import timedelta
+    from src.core.utils import now_ist
+
+    fake = _FakeNetLossSpreadEngine()
+
+    with pytest.MonkeyPatch.context() as mp:
+        # DTE=10 -> the dte<=14 tier (45% target): short at 4.0 is well
+        # past 10.0*0.45=4.5, so the short-leg-only check WOULD fire here.
+        mp.setattr(
+            "src.live_trading.live_trading_engine.get_near_month_expiry",
+            lambda: now_ist().replace(tzinfo=None) + timedelta(days=10),
+        )
+
+        async def _fake_get_option_quote(contract, kite, redis):
+            return {"NETLOSS26SEP100PE": 4.0, "NETLOSS26SEP90PE": 0.5}[contract]
+        mp.setattr("src.market_data.option_chain.get_option_quote", _fake_get_option_quote)
+
+        await LiveTradingEngine._check_spread_exits(fake, active_strategies={})
+
+    # Must NOT have closed on the DTE-tiered profit check -- the combined
+    # structure is a real loss, not a win.
+    assert len(fake._closed_journals) == 0, (
+        "the short leg hitting its own 45% decay target must not close the "
+        "spread when the long leg's loss outweighs it (net spread pnl = -1.5)"
+    )
+    assert "NETLOSS" in fake._active_spreads, "position must stay open, not get force-closed on a false profit signal"
 
 
 class _FakeCondorOrder:
@@ -1541,6 +1712,7 @@ class _FakeCondorExitEngine:
     """Same fill-vs-quote fix, on the 4-leg iron condor exit path."""
 
     _real_fill = staticmethod(LiveTradingEngine._real_fill)
+    _leg_round_trip_fees = staticmethod(LiveTradingEngine._leg_round_trip_fees)
 
     def __init__(self):
         # Quote-side prices (what the exit DECISION and old buggy pnl used):
@@ -1554,6 +1726,9 @@ class _FakeCondorExitEngine:
             "SBIN26SEP5000CE": 5.9,
         })
         self.risk_manager = _FakeSpreadRiskManager()
+        self._stale_data_since = {}
+        self._stale_data_alerted = set()
+        self._STALE_DATA_ALERT_SECONDS = 120
         self._active_spreads = {}
         self._active_condors = {
             "SBIN": {
@@ -1608,6 +1783,45 @@ class _FakeCondorExitEngine:
         ]
 
 
+class _FakeStaleDataCondorEngine(_FakeCondorExitEngine):
+    """Same SBIN condor as _FakeCondorExitEngine, but _get_market_data()
+    returns None -- the profit-target check must still fire off each
+    leg's own option quote (2026-11-05, external review finding #3)."""
+
+    async def _get_market_data(self, symbol):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_condor_exit_still_evaluates_premium_checks_when_underlying_data_is_missing():
+    from datetime import timedelta
+    from src.core.utils import now_ist
+
+    fake = _FakeStaleDataCondorEngine()
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(
+            "src.live_trading.live_trading_engine.get_near_month_expiry",
+            lambda: now_ist().replace(tzinfo=None) + timedelta(days=25),
+        )
+
+        _quotes = {
+            "SBIN26SEP4400PE": 4.8, "SBIN26SEP4300PE": 1.9,
+            "SBIN26SEP4900CE": 15.2, "SBIN26SEP5000CE": 5.9,
+        }
+        async def _fake_get_option_quote(contract, kite, redis):
+            return _quotes[contract]
+        mp.setattr("src.market_data.option_chain.get_option_quote", _fake_get_option_quote)
+
+        await LiveTradingEngine._check_condor_exits(fake, active_strategies={})
+
+    assert len(fake._closed_journals) == 1, (
+        "a missing underlying feed must not block the condor's premium-"
+        "based profit-target check"
+    )
+    assert "SBIN" not in fake._active_condors
+
+
 @pytest.mark.asyncio
 async def test_condor_exit_pnl_uses_real_fill_not_quote():
     from datetime import timedelta
@@ -1638,11 +1852,102 @@ async def test_condor_exit_pnl_uses_real_fill_not_quote():
     # Fill-based: (20-4.8)+(18-15.2)-(8-1.9)-(7-5.9) = 10.8 * 175 = 1890.0
     # exit_price = 4.8+15.2-1.9-5.9 = 12.2
     # Quote-based (the bug) would instead give exit_price=11.5, pnl=2012.5.
+    # 1890.0 is the price delta before fees; net of all 4 legs' real
+    # entry+exit fees (2026-11-05 fix) it is 1683.05.
     assert exit_price == 12.2
-    assert abs(pnl - 1890.0) < 0.01
+    assert abs(pnl - 1683.05) < 0.01
 
     assert "SBIN" not in fake._active_condors
     assert "SBIN" in fake._profit_closed_today
+
+
+# ── Condor profit-target requires the combined 4-leg net P&L, not just one
+# wing's decay (2026-11-05, external review finding #6, confirmed against
+# live evidence the same day -- COALINDIA/ITC on 2026-10-20 both closed via
+# this exact check with exit_reason "75%+ profit" at a NET LOSS) ───────────
+
+class _FakeNetLossCondorEngine(_FakeCondorExitEngine):
+    """Put wing decays past its 75% profit target (20 -> 3), but the call
+    wing moved hard against the condor (18 -> 35, a real threat just short
+    of the 2x stop-loss) and its long leg only partially offset that (7 ->
+    10). Net condor pnl = (20-3)+(18-35)-(8-1)-(7-10) = 17-17-7+3 = -4, a
+    real loss despite the put wing's own number looking like a clean win."""
+
+    def __init__(self):
+        self.order_manager = _FakeCondorOrderManager({
+            "NETLOSS26SEP4400PE": 3.0,
+            "NETLOSS26SEP4300PE": 1.0,
+            "NETLOSS26SEP4900CE": 35.0,
+            "NETLOSS26SEP5000CE": 10.0,
+        })
+        self.risk_manager = _FakeSpreadRiskManager()
+        self._stale_data_since = {}
+        self._stale_data_alerted = set()
+        self._STALE_DATA_ALERT_SECONDS = 120
+        self._active_spreads = {}
+        self._active_condors = {
+            "NETLOSS": {
+                "put_short_contract": "NETLOSS26SEP4400PE", "put_long_contract": "NETLOSS26SEP4300PE",
+                "call_short_contract": "NETLOSS26SEP4900CE", "call_long_contract": "NETLOSS26SEP5000CE",
+                "put_short_premium": 20.0, "put_long_premium": 8.0,
+                "call_short_premium": 18.0, "call_long_premium": 7.0,
+                "put_short_strike": 4400, "put_long_strike": 4300,
+                "call_short_strike": 4900, "call_long_strike": 5000,
+                "net_credit": 23.0, "lot_size": 175,
+                "entry_vix": 0.0, "strategy_name": "iron_condor_v1",
+            },
+        }
+        self._exited_today = set()
+        self._profit_closed_today = set()
+        self._close_on_first_cycle = set()
+        self._closed_journals = []
+        self._notifications = []
+        self._ltp_poller = None
+        self._kite = None
+        self._redis = None
+
+    async def _get_market_data(self, symbol):
+        return {"close": 4650.0, "atr14": 20.0}
+
+    async def _safe_get_positions(self):
+        return [
+            {"symbol": "NETLOSS26SEP4400PE", "quantity": -175, "avg_price": 20.0},
+            {"symbol": "NETLOSS26SEP4300PE", "quantity": 175,  "avg_price": 8.0},
+            {"symbol": "NETLOSS26SEP4900CE", "quantity": -175, "avg_price": 18.0},
+            {"symbol": "NETLOSS26SEP5000CE", "quantity": 175,  "avg_price": 7.0},
+        ]
+
+
+@pytest.mark.asyncio
+async def test_condor_profit_target_does_not_fire_on_a_net_loss():
+    from datetime import timedelta
+    from src.core.utils import now_ist
+
+    fake = _FakeNetLossCondorEngine()
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(
+            "src.live_trading.live_trading_engine.get_near_month_expiry",
+            lambda: now_ist().replace(tzinfo=None) + timedelta(days=25),
+        )
+
+        _quotes = {
+            "NETLOSS26SEP4400PE": 3.0, "NETLOSS26SEP4300PE": 1.0,
+            "NETLOSS26SEP4900CE": 35.0, "NETLOSS26SEP5000CE": 10.0,
+        }
+        async def _fake_get_option_quote(contract, kite, redis):
+            return _quotes[contract]
+        mp.setattr("src.market_data.option_chain.get_option_quote", _fake_get_option_quote)
+
+        await LiveTradingEngine._check_condor_exits(fake, active_strategies={})
+
+    # Must NOT have closed on the put wing's own 75%+ profit signal -- the
+    # combined 4-leg structure is a real loss, not a win.
+    assert len(fake._closed_journals) == 0, (
+        "the put wing hitting its own 75% decay target must not close the "
+        "condor when the call wing's loss outweighs it (net condor pnl = -4)"
+    )
+    assert "NETLOSS" in fake._active_condors, "position must stay open, not get force-closed on a false profit signal"
 
 
 # ── Entry-side counterpart of the same fill-vs-quote bug (2026-08-13) ────────
@@ -2035,3 +2340,48 @@ def test_iron_condor_entry_has_gate_audit_checkpoints():
     ]
     positions = [src.index(f'"{gate}"') for gate in expected_gates]
     assert positions == sorted(positions), "gate checkpoints must appear in the order they're actually checked"
+
+
+# ── Restart balance reconciliation is net of fees (2026-11-05) ─────────────
+# External review finding #1: trade_journal.pnl used to be gross of fees,
+# so this reconciliation's SUM(trade_journal.pnl) silently excluded every
+# fee ever paid. Fixed at the source (pnl itself is now net of fees, see
+# _leg_round_trip_fees) -- this just confirms the reconciliation correctly
+# picks up whatever total_realized the DB actually sums to, fees included.
+
+class _FakeScalarResult:
+    def __init__(self, value):
+        self._value = value
+
+    def scalar(self):
+        return self._value
+
+
+class _FakeReconcileSession:
+    def __init__(self, total_realized):
+        self._total_realized = total_realized
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def execute(self, stmt):
+        return _FakeScalarResult(self._total_realized)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_paper_broker_balance_uses_the_net_of_fees_sum(monkeypatch):
+    """total_realized here (-1621.20) is already net of fees -- the fix
+    is that SUM(trade_journal.pnl) itself now includes fees at the source,
+    not a second deduction applied here. The reconciliation formula just
+    needs to use whatever that sum is, unchanged."""
+    import src.database.connection as conn_mod
+    from src.core.config import settings
+    monkeypatch.setattr(conn_mod, "AsyncSessionLocal", lambda: _FakeReconcileSession(-1621.20))
+
+    fake = SimpleNamespace(broker=SimpleNamespace(balance=0.0, _positions={}))
+    await LiveTradingEngine._reconcile_paper_broker_balance(fake)
+
+    assert fake.broker.balance == pytest.approx(settings.INITIAL_CAPITAL - 1621.20, abs=0.01)

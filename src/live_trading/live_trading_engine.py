@@ -1383,6 +1383,22 @@ class LiveTradingEngine:
                     (quantity * avg_price: negative qty means a short/credit
                     position, so this naturally adds back the premium already
                     received for it rather than treating it as spent).
+
+        Fixed 2026-11-05 (external review finding #1): this formula was
+        always structurally correct -- the actual gap was that
+        trade_journal.pnl itself (the thing SUM() reads) used to be gross
+        of fees, so "total_realized_pnl" silently excluded every fee ever
+        paid, and this reconciliation inherited that gap with no separate
+        bug of its own. Now that pnl is net of fees at the source (see
+        _leg_round_trip_fees()), this formula is correct going forward with
+        no change needed here. Residual gap: every trade closed BEFORE this
+        fix is still recorded gross of fees in the DB -- this reconciliation
+        (and every historical win-rate/profit-factor figure) will carry a
+        small, fixed, one-time discrepancy for those rows until/unless they
+        are backfilled. Not attempted here -- a backfill would need to
+        decide which fee schedule applied on which historical date (Zerodha's
+        STT changed 2026-04-01) and is a separate, deliberately out-of-scope
+        decision from this fix.
         """
         if not hasattr(self.broker, "balance"):
             return
@@ -1753,7 +1769,13 @@ class LiveTradingEngine:
             if journal is None:
                 return
             entry_price = float(journal.entry_price or 0)
-            pnl = round((fill_price - entry_price) * qty, 2)
+            # Fixed 2026-11-05 (external review finding): see
+            # _leg_round_trip_fees()'s docstring.
+            pnl = round(
+                (fill_price - entry_price) * qty
+                - self._leg_round_trip_fees(qty, entry_price, fill_price, is_short=(qty < 0)),
+                2,
+            )
             await self._log_trade_close(
                 journal_id=journal.id,
                 exit_price=fill_price,
@@ -2311,7 +2333,12 @@ class LiveTradingEngine:
         # never ran, even though the SELL order itself had already filled.
         _fill_p = self._real_fill(db_order, current_p)
         _slip   = abs(_fill_p - current_p)
-        pnl = (_fill_p - entry_p) * abs(qty)
+        # Fixed 2026-11-05 (external review finding): pnl used to be pure
+        # price delta, gross of the real brokerage/STT/exchange/GST/SEBI/
+        # stamp fees PaperBroker already deducts from its own balance on
+        # both the entry and this exit order -- see _leg_round_trip_fees()'s
+        # docstring for the full history.
+        pnl = (_fill_p - entry_p) * abs(qty) - self._leg_round_trip_fees(qty, entry_p, _fill_p)
 
         # Write exit to trade_journal so PnL appears in analytics + dashboard
         info = self._single_leg_journals.pop(contract, None)
@@ -2430,6 +2457,40 @@ class LiveTradingEngine:
         right one by default instead of by copy-paste).
         """
         return float(getattr(order, "fill_price", None) or fallback)
+
+    @staticmethod
+    def _leg_round_trip_fees(
+        qty: int, entry_price: float, exit_price: float, is_short: bool = False,
+    ) -> float:
+        """
+        Fixed 2026-11-05 (external review finding): trade_journal.pnl has
+        always been computed as (exit_fill - entry_fill) * qty -- real
+        slippage-adjusted fills on both sides, but never the brokerage/
+        STT/exchange/GST/SEBI/stamp fees PaperBroker separately deducts
+        from its own balance on every order (confirmed: self.balance does
+        subtract them; the persisted journal pnl never did). Every win
+        rate / profit factor / rolling-PF figure surfaced by this codebase
+        has therefore been gross of fees, not net.
+
+        Recomputed analytically here rather than persisted at entry time --
+        _transaction_fees(side, qty, price) is a pure function of inputs
+        already on hand at every pnl call site (entry_price/exit_price/
+        qty), so there's nothing to look up or migrate. is_short=True for
+        a SELL-to-open/BUY-to-close leg (credit_spread/iron_condor short
+        legs); False (default) for the ordinary BUY-to-open/SELL-to-close
+        single-leg case. Only correct for PAPER mode's own fee model --
+        LIVE mode would need the broker's actual confirmed fee, a separate
+        concern for whenever this system actually starts placing real
+        orders (still paper-only as of this fix).
+        """
+        from src.paper_trading.paper_broker import PaperBroker
+        entry_side = "SELL" if is_short else "BUY"
+        exit_side  = "BUY" if is_short else "SELL"
+        qty = abs(qty)
+        return (
+            PaperBroker._transaction_fees(entry_side, qty, entry_price)
+            + PaperBroker._transaction_fees(exit_side, qty, exit_price)
+        )
 
     @staticmethod
     def _find_non_crowded_strike_within_delta_tolerance(
@@ -3961,7 +4022,10 @@ class LiveTradingEngine:
             logger.info(f"REVERSAL EXIT: SELL {contract} @ Rs{_rev_fill_p:.2f}")
             jrnl = self._single_leg_journals.pop(contract, None)
             if jrnl:
-                pnl = (_rev_fill_p - entry_p) * abs(qty)
+                # Fixed 2026-11-05 (external review finding): see
+                # _leg_round_trip_fees()'s docstring -- pnl was gross of
+                # both orders' real fees.
+                pnl = (_rev_fill_p - entry_p) * abs(qty) - self._leg_round_trip_fees(qty, entry_p, _rev_fill_p)
                 # Fixed 2026-10-15 (user-flagged, found during the
                 # ema_crossover_v1 trade review): this was the one exit path
                 # that never passed underlying_mfe_pct/mae_pct/option_mfe_pct/
@@ -4807,9 +4871,48 @@ class LiveTradingEngine:
 
         for underlying, spread in self._active_spreads.items():
             try:
-                market_data = await self._get_market_data(underlying)
-                if not market_data:
-                    continue
+                # Fixed 2026-11-05 (external review finding #3): this used to
+                # skip the ENTIRE position on missing underlying data, before
+                # ever attempting each leg's own option quote -- a transient
+                # underlying-feed gap could block premium-based stop/target
+                # checks that don't actually need the underlying at all, even
+                # though the option contracts themselves were still quotable.
+                # The single-leg path (_check_open_option_exits()) was
+                # already fixed this way on 2026-09-xx; mirrors that exact
+                # pattern (same _stale_data_since/_stale_data_alerted
+                # trackers, keyed by underlying -- general-purpose, not
+                # single-leg-specific) instead of re-inventing one. Every
+                # downstream read of market_data below already goes through
+                # .get() with a safe default, and the one check that
+                # genuinely needs the underlying (strike breach) already
+                # guards on `current_price > 0` -- substituting {} here was
+                # enough to let everything else degrade gracefully instead
+                # of bailing out wholesale.
+                _raw_market_data = await self._get_market_data(underlying)
+                _now_naive = now_ist().replace(tzinfo=None)
+                if _raw_market_data is None:
+                    _since = self._stale_data_since.setdefault(underlying, _now_naive)
+                    _stale_secs = (_now_naive - _since).total_seconds()
+                    if (
+                        _stale_secs >= self._STALE_DATA_ALERT_SECONDS
+                        and underlying not in self._stale_data_alerted
+                    ):
+                        self._stale_data_alerted.add(underlying)
+                        logger.critical(
+                            f"Market data for {underlying} has been stale for "
+                            f"{_stale_secs:.0f}s while a credit_spread_v1 position is open."
+                        )
+                        await self._notify(
+                            f"DATA STALENESS ALERT\n{underlying}: market data stale for "
+                            f"{_stale_secs:.0f}s+ while a credit_spread_v1 position is open.\n"
+                            "Premium-based stop/target exits are still running off each "
+                            "leg's own option quote where available; underlying-based "
+                            "breach checks are paused until fresh data returns."
+                        )
+                else:
+                    self._stale_data_since.pop(underlying, None)
+                    self._stale_data_alerted.discard(underlying)
+                market_data = _raw_market_data or {}
 
                 # Fixed 2026-08-20 (deep review): dte used to be the module-level
                 # near-month expiry's DTE for every spread, but a spread rolled to
@@ -4872,6 +4975,21 @@ class LiveTradingEngine:
                 # E: VIX spike → tighten thresholds before normal manage_position check.
                 # If VIX has risen 50%+ from entry, IV expansion works against short options —
                 # take 60% profit early and use 1.5× SL instead of waiting for full 2× SL.
+                # Fixed 2026-11-05 (external review finding #6): both profit-
+                # target checks below (VIX-spike profit, DTE-tiered profit)
+                # used to fire purely off the SHORT leg's own premium decay --
+                # the short leg hitting 40%/its DTE-tiered target doesn't mean
+                # the SPREAD is profitable, since the long leg could have lost
+                # more than the short leg gained in the meantime. Confirmed
+                # this is a real, not just theoretical, gap: the matching
+                # iron_condor check (same pattern, fixed the same day) had
+                # already been observed live closing at a net LOSS while its
+                # own exit_reason said "75%+ profit" (COALINDIA/ITC, 2026-10-20).
+                # Stop-loss/breach/DTE-expiry exits above are deliberately
+                # UNCHANGED -- those are risk exits, correctly triggered by a
+                # single leg's own threat regardless of the other leg.
+                _net_spread_pnl = (spread["short_premium"] - cur_short) - (spread["long_premium"] - cur_long)
+
                 if exit_reason is None:
                     _entry_vix = spread.get("entry_vix", 0.0)
                     if _entry_vix > 0:
@@ -4882,11 +5000,11 @@ class LiveTradingEngine:
                                     f"VIX spike SL (entry {_entry_vix:.1f}→now {_cur_vix:.1f}): "
                                     f"short ₹{cur_short:.2f} ≥ 1.5× — exiting early"
                                 )
-                            elif cur_short <= spread["short_premium"] * 0.40:
+                            elif cur_short <= spread["short_premium"] * 0.40 and _net_spread_pnl > 0:
                                 pnl_pct = (spread["short_premium"] - cur_short) / spread["short_premium"] * 100
                                 exit_reason = (
                                     f"VIX spike profit (entry {_entry_vix:.1f}→now {_cur_vix:.1f}): "
-                                    f"60% captured ({pnl_pct:.1f}%) — exiting early"
+                                    f"60% captured ({pnl_pct:.1f}%), net spread Rs{_net_spread_pnl:.2f} — exiting early"
                                 )
 
                 # DTE-tiered profit target — accept less profit as gamma risk rises near expiry.
@@ -4900,11 +5018,11 @@ class LiveTradingEngine:
                         _dte_profit_pct = max(_dte_profit_pct, 0.45)
                     elif dte <= 21:
                         _dte_profit_pct = max(_dte_profit_pct, 0.35)
-                    if cur_short <= spread["short_premium"] * _dte_profit_pct:
+                    if cur_short <= spread["short_premium"] * _dte_profit_pct and _net_spread_pnl > 0:
                         _captured = round((1 - cur_short / spread["short_premium"]) * 100, 1)
                         exit_reason = (
                             f"DTE-tiered profit (DTE={dte}): "
-                            f"{_captured}% captured — target {100 - int(_dte_profit_pct * 100)}%"
+                            f"{_captured}% captured, net spread Rs{_net_spread_pnl:.2f} — target {100 - int(_dte_profit_pct * 100)}%"
                         )
 
                 if exit_reason is None and cs_strategy:
@@ -5065,10 +5183,19 @@ class LiveTradingEngine:
                 # fill) -- not the quote.
                 _slippage = abs(_short_fill - cur_short) + abs(_long_fill - cur_long)
 
+                # Fixed 2026-11-05 (external review finding): see
+                # _leg_round_trip_fees()'s docstring -- net_pnl was gross of
+                # both legs' real entry+exit fees. Short leg is SELL-to-
+                # open/BUY-to-close; long leg is the ordinary BUY-to-open/
+                # SELL-to-close direction.
+                _spread_fees = (
+                    self._leg_round_trip_fees(lot, spread["short_premium"], _short_fill, is_short=True)
+                    + self._leg_round_trip_fees(lot, spread["long_premium"], _long_fill, is_short=False)
+                )
                 net_pnl = (
                     (spread["short_premium"] - _short_fill)
                     - (spread["long_premium"]  - _long_fill)
-                ) * lot
+                ) * lot - _spread_fees
 
                 # Must match the max-loss figure add_deployed_capital() used at entry
                 # (see _process_credit_spread) — not just the long leg's premium.
@@ -5876,9 +6003,36 @@ class LiveTradingEngine:
 
         for underlying, c in self._active_condors.items():
             try:
-                market_data = await self._get_market_data(underlying)
-                if not market_data:
-                    continue
+                # Fixed 2026-11-05 (external review finding #3): same fix as
+                # _check_spread_exits() -- see that method's comment for the
+                # full rationale. Mirrors the single-leg path's existing
+                # staleness-tracking pattern instead of bailing out on the
+                # whole position when only the underlying feed has a gap.
+                _raw_market_data = await self._get_market_data(underlying)
+                _now_naive = now_ist().replace(tzinfo=None)
+                if _raw_market_data is None:
+                    _since = self._stale_data_since.setdefault(underlying, _now_naive)
+                    _stale_secs = (_now_naive - _since).total_seconds()
+                    if (
+                        _stale_secs >= self._STALE_DATA_ALERT_SECONDS
+                        and underlying not in self._stale_data_alerted
+                    ):
+                        self._stale_data_alerted.add(underlying)
+                        logger.critical(
+                            f"Market data for {underlying} has been stale for "
+                            f"{_stale_secs:.0f}s while an iron_condor_v1 position is open."
+                        )
+                        await self._notify(
+                            f"DATA STALENESS ALERT\n{underlying}: market data stale for "
+                            f"{_stale_secs:.0f}s+ while an iron_condor_v1 position is open.\n"
+                            "Premium-based stop/target exits are still running off each "
+                            "leg's own option quote where available; underlying-based "
+                            "breach checks are paused until fresh data returns."
+                        )
+                else:
+                    self._stale_data_since.pop(underlying, None)
+                    self._stale_data_alerted.discard(underlying)
+                market_data = _raw_market_data or {}
 
                 try:
                     condor_expiry = datetime.fromisoformat(c["expiry_date"])
@@ -5958,12 +6112,35 @@ class LiveTradingEngine:
                     _put_hit  = cur_ps <= c["put_short_premium"]  * profit_pct
                     _call_hit = cur_cs <= c["call_short_premium"] * profit_pct
                     if _put_hit or _call_hit:
-                        # Close entire condor when EITHER short decays to target.
-                        # If one wing is at 75% profit the stock has moved toward that wing's
-                        # short strike — keeping the trade open exposes the OTHER wing to breach.
-                        _which = "put" if _put_hit else "call"
-                        profit_label = "75%+" if profit_pct <= 0.25 else "60%+ (VIX spike early exit)"
-                        exit_reason = f"{_which.capitalize()} wing at {profit_label} profit — closing condor"
+                        # Fixed 2026-11-05 (external review finding #6,
+                        # confirmed against live evidence the same day --
+                        # COALINDIA/ITC on 2026-10-20 both closed via this
+                        # exact check with exit_reason "75%+ profit" at a
+                        # NET LOSS): one short leg decaying to target doesn't
+                        # mean the condor is profitable -- the threatened
+                        # wing's long leg, or the other side entirely, can
+                        # have lost more than this wing gained. Require the
+                        # combined 4-leg net P&L to actually be positive
+                        # before closing for profit. Breach/SL/DTE-expiry
+                        # exits above are deliberately UNCHANGED -- those are
+                        # risk exits, correctly triggered by a single wing's
+                        # own threat regardless of the net structure value.
+                        _net_condor_pnl = (
+                            (c["put_short_premium"]  - cur_ps)
+                            + (c["call_short_premium"] - cur_cs)
+                            - (c["put_long_premium"]   - cur_pl)
+                            - (c["call_long_premium"]  - cur_cl)
+                        )
+                        if _net_condor_pnl > 0:
+                            # Close entire condor when EITHER short decays to target.
+                            # If one wing is at 75% profit the stock has moved toward that wing's
+                            # short strike — keeping the trade open exposes the OTHER wing to breach.
+                            _which = "put" if _put_hit else "call"
+                            profit_label = "75%+" if profit_pct <= 0.25 else "60%+ (VIX spike early exit)"
+                            exit_reason = (
+                                f"{_which.capitalize()} wing at {profit_label} profit, "
+                                f"net condor Rs{_net_condor_pnl:.2f} — closing condor"
+                            )
 
                 # G: Regime shift post-entry — iron condors need RANGE_BOUND/LOW_VOL.
                 # If regime has shifted to TRENDING or VOLATILE after entry, the neutrality
@@ -6149,12 +6326,21 @@ class LiveTradingEngine:
                 _slippage = (abs(_ps_fill - cur_ps) + abs(_pl_fill - cur_pl)
                              + abs(_cs_fill - cur_cs) + abs(_cl_fill - cur_cl))
 
+                # Fixed 2026-11-05 (external review finding): see
+                # _leg_round_trip_fees()'s docstring -- net_pnl was gross
+                # of all 4 legs' real entry+exit fees.
+                _condor_fees = (
+                    self._leg_round_trip_fees(lot, c["put_short_premium"],  _ps_fill, is_short=True)
+                    + self._leg_round_trip_fees(lot, c["call_short_premium"], _cs_fill, is_short=True)
+                    + self._leg_round_trip_fees(lot, c["put_long_premium"],   _pl_fill, is_short=False)
+                    + self._leg_round_trip_fees(lot, c["call_long_premium"],  _cl_fill, is_short=False)
+                )
                 net_pnl = (
                     (c["put_short_premium"]  - _ps_fill)
                     + (c["call_short_premium"] - _cs_fill)
                     - (c["put_long_premium"]   - _pl_fill)
                     - (c["call_long_premium"]  - _cl_fill)
-                ) * lot
+                ) * lot - _condor_fees
 
                 # Must match the max-loss figure add_deployed_capital() used at entry
                 # (see _process_iron_condor) — not just the long legs' premium.
@@ -6363,7 +6549,9 @@ class LiveTradingEngine:
 
             _jrnl_info = self._single_leg_journals.pop(contract, None)
             if _jrnl_info:
-                _pnl = round((_ex_fill_p - entry_p) * _qty, 2)
+                # Fixed 2026-11-05 (external review finding): see
+                # _leg_round_trip_fees()'s docstring.
+                _pnl = round((_ex_fill_p - entry_p) * _qty - self._leg_round_trip_fees(_qty, entry_p, _ex_fill_p), 2)
                 await self._log_trade_close(
                     journal_id=_jrnl_info.get("journal_id"),
                     exit_price=_ex_fill_p,
@@ -6614,7 +6802,12 @@ class LiveTradingEngine:
                     # correct value.
                     _entry_p = entry_p
                     _signed  = 1 if qty > 0 else -1
-                    _pnl     = round((_sq_fill_p - _entry_p) * abs(qty) * _signed, 2)
+                    # Fixed 2026-11-05 (external review finding): see
+                    # _leg_round_trip_fees()'s docstring -- qty<0 is a
+                    # short single-leg position (SELL-to-open), so the fee
+                    # side convention flips (SELL entry, BUY exit).
+                    _fees    = self._leg_round_trip_fees(qty, _entry_p, _sq_fill_p, is_short=(qty < 0))
+                    _pnl     = round((_sq_fill_p - _entry_p) * abs(qty) * _signed - _fees, 2)
                     # Per-CONTRACT classification (falls back to the global
                     # near-month is_expiry for single-leg EMA/momentum
                     # contracts, which is accurate for them -- see fix note above).
@@ -6733,7 +6926,13 @@ class LiveTradingEngine:
                 _short_x = _exit_prices.get(_s.get("short_contract", ""), _s.get("short_premium", 0))
                 _long_x  = _exit_prices.get(_s.get("long_contract", ""),  _s.get("long_premium", 0))
                 _lot     = _s.get("lot_size", 0)
-                _net     = ((_s.get("short_premium", 0) - _short_x) - (_s.get("long_premium", 0) - _long_x)) * _lot
+                # Fixed 2026-11-05 (external review finding): see
+                # _leg_round_trip_fees()'s docstring.
+                _exp_fees = (
+                    self._leg_round_trip_fees(_lot, _s.get("short_premium", 0), _short_x, is_short=True)
+                    + self._leg_round_trip_fees(_lot, _s.get("long_premium", 0), _long_x, is_short=False)
+                )
+                _net     = ((_s.get("short_premium", 0) - _short_x) - (_s.get("long_premium", 0) - _long_x)) * _lot - _exp_fees
                 _width   = abs(_s.get("short_strike", 0) - _s.get("long_strike", 0))
                 # Fixed 2026-08-21 (deep review): real-fill basis
                 # (matching entry reservation / normal exit release),
@@ -6787,12 +6986,20 @@ class LiveTradingEngine:
                 _cs_x = _exit_prices.get(_c.get("call_short_contract", ""), _c.get("call_short_premium", 0))
                 _cl_x = _exit_prices.get(_c.get("call_long_contract", ""),  _c.get("call_long_premium", 0))
                 _lot_c = _c.get("lot_size", 0)
+                # Fixed 2026-11-05 (external review finding): see
+                # _leg_round_trip_fees()'s docstring.
+                _exp_fees_c = (
+                    self._leg_round_trip_fees(_lot_c, _c.get("put_short_premium", 0),  _ps_x, is_short=True)
+                    + self._leg_round_trip_fees(_lot_c, _c.get("call_short_premium", 0), _cs_x, is_short=True)
+                    + self._leg_round_trip_fees(_lot_c, _c.get("put_long_premium", 0),   _pl_x, is_short=False)
+                    + self._leg_round_trip_fees(_lot_c, _c.get("call_long_premium", 0),  _cl_x, is_short=False)
+                )
                 _net_c = (
                     (_c.get("put_short_premium", 0)  - _ps_x)
                     + (_c.get("call_short_premium", 0) - _cs_x)
                     - (_c.get("put_long_premium", 0)   - _pl_x)
                     - (_c.get("call_long_premium", 0)  - _cl_x)
-                ) * _lot_c
+                ) * _lot_c - _exp_fees_c
                 _put_wing_x  = abs(_c.get("put_short_strike", 0)  - _c.get("put_long_strike", 0))
                 _call_wing_x = abs(_c.get("call_short_strike", 0) - _c.get("call_long_strike", 0))
                 # Fixed 2026-08-21 (deep review): real-fill basis

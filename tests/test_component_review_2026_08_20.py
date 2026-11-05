@@ -200,6 +200,7 @@ async def test_expiry_day_partial_leg_failure_does_not_clear_gtt_journal_or_capi
     }
     fake = SimpleNamespace(
         _real_fill=LiveTradingEngine._real_fill,
+        _leg_round_trip_fees=LiveTradingEngine._leg_round_trip_fees,
         order_manager=SimpleNamespace(place_order=_fake_place_order),
         risk_manager=_FakeRiskMgr(),
         _peak_premiums={}, _peak_profits={}, _single_leg_journals={},
@@ -288,6 +289,7 @@ async def test_expiry_day_full_leg_success_still_clears_normally(monkeypatch):
 
     fake = SimpleNamespace(
         _real_fill=LiveTradingEngine._real_fill,
+        _leg_round_trip_fees=LiveTradingEngine._leg_round_trip_fees,
         order_manager=SimpleNamespace(place_order=_fake_place_order),
         risk_manager=_FakeRiskMgr(),
         _peak_premiums={}, _peak_profits={}, _single_leg_journals={},

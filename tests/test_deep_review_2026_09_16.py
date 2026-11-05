@@ -328,6 +328,7 @@ class _FakeExitAllTrackingOrderManager:
 
 class _FakeExitAllTrackingEngine:
     _real_fill = staticmethod(LiveTradingEngine._real_fill)
+    _leg_round_trip_fees = staticmethod(LiveTradingEngine._leg_round_trip_fees)
 
     def __init__(self, active_spreads=None, active_condors=None):
         self.order_manager = _FakeExitAllTrackingOrderManager(fill_price=25.0)

@@ -901,9 +901,17 @@ class LTPPoller:
         # day. Fixed: use ONLY today's own bars (`live_rows`, already built
         # above for session_vwap) as the RVOL baseline -- correctly NaN/
         # unavailable until 20 of today's own bars genuinely exist.
-        if has_live_data and len(live_rows) >= 20:
+        # Fixed 2026-11-05 (external review finding): rolling(20).mean() at
+        # the last position is inclusive of that same last row -- the
+        # numerator bar was quietly part of its own baseline average,
+        # biasing every RVOL reading toward 1.0 (most on unusually
+        # high-volume bars, the exact bars this metric exists to detect).
+        # .shift(1) moves the rolling window back by one bar so the
+        # baseline is the 20 bars STRICTLY BEFORE the current one -- needs
+        # 21 rows total (20 baseline + the current bar), not 20.
+        if has_live_data and len(live_rows) >= 21:
             _today_vol = pd.Series([r["volume"] for r in live_rows])
-            _vol_avg20 = _today_vol.rolling(20).mean().iloc[-1]
+            _vol_avg20 = _today_vol.rolling(20).mean().shift(1).iloc[-1]
             _rvol_valid = bool(_vol_avg20 and _vol_avg20 > 0 and not pd.isna(_vol_avg20))
             rvol = round(float(_today_vol.iloc[-1] / _vol_avg20), 2) if _rvol_valid else 0.0
         else:
@@ -928,9 +936,14 @@ class LTPPoller:
         # that entire window as a result. This uses ONLY `bars_today`
         # (finalized bars with real, full-bar volume) so both the numerator
         # and the rolling-average population are on equal footing.
-        if live_range and len(live_range.get("bars_today") or []) >= 20:
+        # Fixed 2026-11-05 (external review finding, same bias as `rvol`
+        # above): needs 21 completed bars (20 baseline + the one being
+        # measured), not 20 -- see that fix's comment for the full
+        # rationale. .shift(1) excludes the measured bar from its own
+        # rolling-average baseline.
+        if live_range and len(live_range.get("bars_today") or []) >= 21:
             _closed_vol = pd.Series([b.get("volume", 0) for b in live_range["bars_today"]])
-            _closed_avg20 = _closed_vol.rolling(20).mean().iloc[-1]
+            _closed_avg20 = _closed_vol.rolling(20).mean().shift(1).iloc[-1]
             _rvol_closed_valid = bool(_closed_avg20 and _closed_avg20 > 0 and not pd.isna(_closed_avg20))
             rvol_closed_bar = round(float(_closed_vol.iloc[-1] / _closed_avg20), 2) if _rvol_closed_valid else 0.0
         else:

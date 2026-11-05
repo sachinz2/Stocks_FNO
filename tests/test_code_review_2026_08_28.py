@@ -420,8 +420,13 @@ def test_estimate_option_premium_bs_branch_unaffected_by_fallback_fix():
 def test_ltp_poller_rvol_uses_todays_bars_not_multiday_series():
     src = inspect.getsource(LTPPoller._enrich)
     idx = src.index("RVOL — current bar volume")
-    block = src[idx:idx + 2000]
-    assert "if has_live_data and len(live_rows) >= 20:" in block
+    # Window widened 2000 -> 2500 (2026-11-05): the new off-by-one-fix
+    # comment block pushed this literal further in.
+    block = src[idx:idx + 2500]
+    # Threshold raised 20 -> 21 on 2026-11-05 (external review finding):
+    # the rolling baseline now excludes the measured bar itself via
+    # .shift(1), which needs one extra row to stay valid.
+    assert "if has_live_data and len(live_rows) >= 21:" in block
     assert "_today_vol = pd.Series([r[" in block
 
 

@@ -24,10 +24,10 @@ async def test_paper_broker_place_buy_order(paper_broker):
     assert order_id is not None
     # Real fill (BUY -> ask = price + 3% half-spread @ >Rs5 tier):
     #   fill = 2500 + 2500*0.03 = 2575.00; cost = 25750.00
-    #   fees = brokerage(7.725, capped 20) + exchange(13.6475) + gst(3.8471)
-    #        + sebi(0.02575) + stamp(0.7725) = 26.02
-    #   balance = 100000 - 25750.00 - 26.02 = 74223.98
-    assert paper_broker.balance == pytest.approx(74223.98, abs=0.01)
+    #   fees (2026-11-05 rate card) = brokerage(20) + exchange(9.149)
+    #        + gst(5.251) + sebi(0.026) + stamp(0.773) = 35.20
+    #   balance = 100000 - 25750.00 - 35.20 = 74214.80
+    assert paper_broker.balance == pytest.approx(74214.80, abs=0.01)
 
     orders = await paper_broker.get_orders()
     assert len(orders) == 1
@@ -49,13 +49,13 @@ async def test_paper_broker_insufficient_funds(paper_broker):
 
 @pytest.mark.asyncio
 async def test_paper_broker_buy_and_sell(paper_broker):
-    # Buy 10 @ 100 -> fill 103.00 (100 + 100*0.03), fees 1.04
+    # Buy 10 @ 100 -> fill 103.00 (100 + 100*0.03), fees 24.06 (2026-11-05 rate card)
     await paper_broker.place_order("TCS", "BUY", 10, 100.0)
-    assert paper_broker.balance == pytest.approx(98968.96, abs=0.01)
+    assert paper_broker.balance == pytest.approx(98945.94, abs=0.01)
 
-    # Sell 5 @ 110 -> fill 106.70 (110 - 110*0.03), fees 1.06
+    # Sell 5 @ 110 -> fill 106.70 (110 - 110*0.03), fees 24.62 (2026-11-05 rate card)
     await paper_broker.place_order("TCS", "SELL", 5, 110.0)
-    assert paper_broker.balance == pytest.approx(99501.40, abs=0.01)
+    assert paper_broker.balance == pytest.approx(99454.82, abs=0.01)
 
     positions = await paper_broker.get_positions()
     assert len(positions) == 1
@@ -74,11 +74,12 @@ async def test_paper_broker_buy_and_sell(paper_broker):
 @pytest.mark.asyncio
 async def test_paper_broker_sell_to_open_naked_short(paper_broker):
     # Sell 10 @ 100 (fresh symbol, no prior position) -> fill 97.00
-    # (100 - 100*0.03), fees 1.92, margin blocked 10*97.00*10.0=9700.00.
+    # (100 - 100*0.03), fees 25.46 (2026-11-05 rate card), margin blocked
+    # 10*97.00*10.0=9700.00.
     order_id = await paper_broker.place_order("NIFTY24000CE", "SELL", 10, 100.0)
 
     assert order_id is not None
-    assert paper_broker.balance == pytest.approx(100968.08, abs=0.01)
+    assert paper_broker.balance == pytest.approx(100944.54, abs=0.01)
 
     positions = await paper_broker.get_positions()
     assert len(positions) == 1

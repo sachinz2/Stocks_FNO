@@ -301,6 +301,8 @@ async def test_spread_exit_cancels_short_leg_gtt_immediately_on_partial_failure(
     }
     fake = SimpleNamespace(
         _real_fill=LiveTradingEngine._real_fill,
+        _leg_round_trip_fees=LiveTradingEngine._leg_round_trip_fees,
+        _stale_data_since={}, _stale_data_alerted=set(), _STALE_DATA_ALERT_SECONDS=120,
         order_manager=SimpleNamespace(place_order=_fake_place_order),
         risk_manager=_FakeRiskMgr(),
         _active_spreads={"TITAN": spread}, _active_condors={},
@@ -364,6 +366,8 @@ async def test_condor_exit_cancels_each_short_legs_gtt_independently_on_partial_
     }
     fake = SimpleNamespace(
         _real_fill=LiveTradingEngine._real_fill,
+        _leg_round_trip_fees=LiveTradingEngine._leg_round_trip_fees,
+        _stale_data_since={}, _stale_data_alerted=set(), _STALE_DATA_ALERT_SECONDS=120,
         order_manager=SimpleNamespace(place_order=_fake_place_order),
         risk_manager=_FakeRiskMgr(),
         _active_spreads={}, _active_condors={"TITAN": condor},

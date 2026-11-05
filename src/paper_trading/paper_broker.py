@@ -45,20 +45,30 @@ class PaperBroker(AbstractBroker):
         Estimate Zerodha F&O fees per order (options).
         Brokerage dominates at ₹20 flat — the rest are small for low-premium trades.
 
-        Zerodha F&O fee structure:
-          Brokerage        : ₹20 flat per order (or 0.03% turnover, whichever lower)
-          STT              : 0.1% of premium turnover on SELL side only
-          Exchange charges : 0.053% of premium turnover (NSE)
-          GST              : 18% on (brokerage + exchange charges)
-          SEBI charges     : ₹10 per crore of turnover
-          Stamp duty       : 0.003% of turnover on BUY side only
+        Fixed 2026-11-05 (external review finding, confirmed against
+        zerodha.com/charges/ and the official STT bulletin before changing
+        this): the formula was stale against Zerodha's current rate card.
+          Brokerage        : ₹20 flat per executed order -- NOT "or 0.03%
+                              turnover, whichever lower" (that alternative
+                              doesn't exist on Zerodha's real schedule and
+                              was silently UNDER-charging small-turnover
+                              trades).
+          STT              : 0.15% of premium turnover on SELL side only
+                              (was 0.10% -- changed 2026-04-01).
+          Exchange charges : 0.03553% of premium turnover (NSE) (was
+                              0.053%, ~1.5x too high).
+          GST              : 18% on (brokerage + exchange charges + SEBI
+                              charges) -- was excluding SEBI from the GST
+                              base.
+          SEBI charges     : ₹10 per crore of turnover (unchanged, already correct).
+          Stamp duty       : 0.003% of turnover on BUY side only (unchanged, already correct).
         """
         turnover = quantity * price
-        brokerage = min(20.0, turnover * 0.0003)
-        stt = turnover * 0.001 if side == "SELL" else 0.0
-        exchange = turnover * 0.00053
-        gst = (brokerage + exchange) * 0.18
+        brokerage = 20.0
+        stt = turnover * 0.0015 if side == "SELL" else 0.0
+        exchange = turnover * 0.0003553
         sebi = turnover * 0.000001  # ₹10 per crore = ₹10 / 1,00,00,000
+        gst = (brokerage + exchange + sebi) * 0.18
         stamp = turnover * 0.00003 if side == "BUY" else 0.0
         return round(brokerage + stt + exchange + gst + sebi + stamp, 2)
 

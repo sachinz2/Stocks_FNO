@@ -67,6 +67,7 @@ async def test_square_off_pnl_uses_the_pre_close_entry_price_not_the_post_close_
 
     fake = SimpleNamespace(
         _real_fill=LiveTradingEngine._real_fill,
+        _leg_round_trip_fees=LiveTradingEngine._leg_round_trip_fees,
         order_manager=SimpleNamespace(place_order=_mutating_place_order(position)),
         risk_manager=_FakeRiskMgr(),
         _peak_premiums={}, _peak_profits={},
@@ -97,9 +98,12 @@ async def test_square_off_pnl_uses_the_pre_close_entry_price_not_the_post_close_
 
     assert fake._log_trade_close.await_count == 1
     kwargs = fake._log_trade_close.call_args.kwargs
-    assert kwargs["pnl"] == pytest.approx(-1525.50, abs=0.01), (
-        "pnl must be (exit - entry) * qty = (14.94 - 16.07) * 1350 = "
-        f"-1525.50 -- got {kwargs['pnl']} (exit_price * qty = 20169.0 is "
+    # (14.94 - 16.07) * 1350 = -1525.50 before fees; net of the real
+    # entry+exit fees on this long single-leg position (2026-11-05 fix)
+    # it is -1621.20.
+    assert kwargs["pnl"] == pytest.approx(-1621.20, abs=0.01), (
+        "pnl must be (exit - entry) * qty, net of fees = -1621.20 -- "
+        f"got {kwargs['pnl']} (exit_price * qty = 20169.0 is "
         "the exact shape of the live bug: entry price silently read as "
         "the post-close zeroed-out avg_price instead of the real 16.07)"
     )
@@ -118,6 +122,7 @@ async def test_exit_all_options_for_pnl_and_capital_release_use_the_pre_close_qu
         order_manager=SimpleNamespace(place_order=_mutating_place_order(position)),
         risk_manager=_FakeRiskMgr(),
         _real_fill=LiveTradingEngine._real_fill,
+        _leg_round_trip_fees=LiveTradingEngine._leg_round_trip_fees,
         _peak_premiums={}, _peak_profits={},
         _single_leg_journals={"RELIANCE26OCT1400CE": {
             "journal_id": 7, "strategy_name": "momentum_v1", "underlying": "RELIANCE",

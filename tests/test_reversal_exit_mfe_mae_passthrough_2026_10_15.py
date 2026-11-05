@@ -37,6 +37,7 @@ async def test_reversal_exit_passes_real_tracked_mfe_mae_through():
 
     fake = SimpleNamespace(
         _real_fill=LiveTradingEngine._real_fill,
+        _leg_round_trip_fees=LiveTradingEngine._leg_round_trip_fees,
         order_manager=SimpleNamespace(
             place_order=AsyncMock(return_value=SimpleNamespace(order_status="COMPLETE", fill_price=12.32)),
         ),

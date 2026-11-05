@@ -225,7 +225,10 @@ def test_enrich_rvol_closed_bar_ignores_the_barely_formed_current_bar():
 
     bars_today = []
     base_time = IST.localize(dt.datetime(2026, 7, 30, 9, 15, 0))
-    for i in range(19):
+    # 20 prior bars (the baseline), not 19 -- see the 2026-11-05 fix on
+    # rvol_closed_bar's own computation: the rolling baseline now excludes
+    # the measured bar itself, needing 21 total bars (20 baseline + 1).
+    for i in range(20):
         bars_today.append({
             "date": (base_time + dt.timedelta(minutes=5 * i)).isoformat(),
             "open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0,
@@ -233,7 +236,7 @@ def test_enrich_rvol_closed_bar_ignores_the_barely_formed_current_bar():
         })
     # The just-completed bar: a real, elevated-volume breakout bar.
     bars_today.append({
-        "date": (base_time + dt.timedelta(minutes=5 * 19)).isoformat(),
+        "date": (base_time + dt.timedelta(minutes=5 * 20)).isoformat(),
         "open": 100.0, "high": 101.5, "low": 100.0, "close": 101.5,
         "volume": 8000,
     })
@@ -270,6 +273,114 @@ def test_enrich_rvol_closed_bar_invalid_with_fewer_than_20_completed_bars():
     tick = LTPPoller._enrich("TESTSTOCK", hist.copy(), 100.2, live_range=live_range)
     assert tick["rvol_closed_bar_valid"] is False
     assert tick["rvol_closed_bar"] == 0.0
+
+
+# ── RVOL off-by-one bias (2026-11-05, external review finding) ─────────────
+# rolling(20).mean() at the last row is inclusive of that same row -- the
+# bar being measured was quietly part of its own baseline average, biasing
+# every reading toward 1.0, most on exactly the unusually high-volume bars
+# this metric exists to detect. Fixed for both `rvol` (still-forming
+# current bar vs today's live rows) and `rvol_closed_bar` (last completed
+# bar vs other completed bars).
+
+def test_rvol_closed_bar_excludes_the_measured_bar_from_its_own_baseline():
+    """20 baseline bars @ 1000, one measured bar @ 2000 -- the correct
+    ratio is exactly 2.0 (2000 / a clean 1000 baseline), not something
+    dragged toward 1.0 by including the 2000 bar in its own denominator."""
+    hist = _make_hist_baseline("2026-07-29", n=2, price=100.0, volume=1000)
+    bars_today = []
+    base_time = IST.localize(dt.datetime(2026, 7, 30, 9, 15, 0))
+    for i in range(20):
+        bars_today.append({
+            "date": (base_time + dt.timedelta(minutes=5 * i)).isoformat(),
+            "open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0,
+            "volume": 1000,
+        })
+    bars_today.append({
+        "date": (base_time + dt.timedelta(minutes=5 * 20)).isoformat(),
+        "open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0,
+        "volume": 2000,
+    })
+    live_range = {
+        "bars_today": bars_today,
+        "cur_bar_open": 100.0, "cur_bar_high": 100.5, "cur_bar_low": 99.5,
+        "cur_bar_volume": 100,
+        "day_open": 100.0, "day_high": 100.5, "day_low": 99.5,
+    }
+    tick = LTPPoller._enrich("TESTSTOCK", hist.copy(), 100.2, live_range=live_range)
+    assert tick["rvol_closed_bar_valid"] is True
+    assert tick["rvol_closed_bar"] == 2.0
+
+
+def test_rvol_closed_bar_invalid_with_exactly_20_completed_bars():
+    """20 completed bars is no longer enough -- a valid reading now needs
+    21 (20 genuinely prior bars to form the baseline, plus the one being
+    measured), since the baseline must exclude the measured bar itself."""
+    hist = _make_hist_baseline("2026-07-29", n=2, price=100.0, volume=1000)
+    bars_today = []
+    base_time = IST.localize(dt.datetime(2026, 7, 30, 9, 15, 0))
+    for i in range(20):
+        bars_today.append({
+            "date": (base_time + dt.timedelta(minutes=5 * i)).isoformat(),
+            "open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0,
+            "volume": 1000,
+        })
+    live_range = {
+        "bars_today": bars_today,
+        "cur_bar_open": 100.0, "cur_bar_high": 100.5, "cur_bar_low": 99.5,
+        "cur_bar_volume": 100,
+        "day_open": 100.0, "day_high": 100.5, "day_low": 99.5,
+    }
+    tick = LTPPoller._enrich("TESTSTOCK", hist.copy(), 100.2, live_range=live_range)
+    assert tick["rvol_closed_bar_valid"] is False
+    assert tick["rvol_closed_bar"] == 0.0
+
+
+def test_rvol_excludes_the_current_forming_bar_from_its_own_baseline():
+    """Same bias, same fix, for plain `rvol` (the still-forming current
+    bar vs today's live rows, which include that current bar as the last
+    row of live_rows)."""
+    hist = _make_hist_baseline("2026-07-29", n=2, price=100.0, volume=1000)
+    bars_today = []
+    base_time = IST.localize(dt.datetime(2026, 7, 30, 9, 15, 0))
+    for i in range(20):
+        bars_today.append({
+            "date": (base_time + dt.timedelta(minutes=5 * i)).isoformat(),
+            "open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0,
+            "volume": 1000,
+        })
+    live_range = {
+        "bars_today": bars_today,
+        "cur_bar_open": 100.0, "cur_bar_high": 100.5, "cur_bar_low": 99.5,
+        "cur_bar_volume": 3000,
+        "day_open": 100.0, "day_high": 100.5, "day_low": 99.5,
+    }
+    tick = LTPPoller._enrich("TESTSTOCK", hist.copy(), 100.2, live_range=live_range)
+    assert tick["rvol_valid"] is True
+    assert tick["rvol"] == 3.0
+
+
+def test_rvol_invalid_with_exactly_20_live_rows():
+    """20 live_rows (19 completed bars + the current forming one) is no
+    longer enough -- same 21-row requirement as rvol_closed_bar."""
+    hist = _make_hist_baseline("2026-07-29", n=2, price=100.0, volume=1000)
+    bars_today = []
+    base_time = IST.localize(dt.datetime(2026, 7, 30, 9, 15, 0))
+    for i in range(19):
+        bars_today.append({
+            "date": (base_time + dt.timedelta(minutes=5 * i)).isoformat(),
+            "open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0,
+            "volume": 1000,
+        })
+    live_range = {
+        "bars_today": bars_today,
+        "cur_bar_open": 100.0, "cur_bar_high": 100.5, "cur_bar_low": 99.5,
+        "cur_bar_volume": 3000,
+        "day_open": 100.0, "day_high": 100.5, "day_low": 99.5,
+    }
+    tick = LTPPoller._enrich("TESTSTOCK", hist.copy(), 100.2, live_range=live_range)
+    assert tick["rvol_valid"] is False
+    assert tick["rvol"] == 0.0
 
 
 def test_enrich_day_prev_close_is_prior_trading_day_not_bar_to_bar():
