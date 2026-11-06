@@ -3266,6 +3266,21 @@ class LiveTradingEngine:
                 "(data-driven: elevated-VIX entries concentrated this "
                 "strategy's recent losses)."
             )
+            self._last_gate_rejection = {
+                "gate": "vix_passed", "value": round(vix, 2),
+                "threshold": self._ELEVATED_VIX_ENTRY_CEILING, "reason": "VIX_TOO_HIGH",
+            }
+            # Fixed 2026-11-06 (user question: "why no CE trades today"):
+            # _record_rejected_outcome() (called unconditionally for every
+            # REJECTED candidate by _record_signal_trace() right after this
+            # method returns) silently no-ops without signal/close in
+            # _last_signal_metrics -- this ceiling returns before line
+            # ~3278 would otherwise set them, so every VIX-ceiling rejection
+            # was invisible to /analytics/rejected-outcomes, with no way to
+            # retrospectively check whether a blocked BUY (CE) or SELL (PE)
+            # would actually have worked out that day.
+            self._last_signal_metrics["signal"] = signal_str
+            self._last_signal_metrics["close"] = float(market_data.get("close", 0))
             return
 
         if self._max_daily_orders > 0 and self._today_order_count >= self._max_daily_orders:
@@ -4354,6 +4369,8 @@ class LiveTradingEngine:
             self._last_gate_rejection = {
                 "gate": "adx_passed", "value": round(_adx_cs, 2), "threshold": 70, "reason": "ADX_TOO_HIGH_BLOWTHROUGH_RISK",
             }
+            self._last_signal_metrics["signal"] = "BULL_PUT" if "PUT" in spread_type else "BEAR_CALL"
+            self._last_signal_metrics["close"] = underlying_price
             return
         self._audit_gate(strategy.name, "adx_passed")
 
@@ -4547,6 +4564,11 @@ class LiveTradingEngine:
                 "gate": "min_credit", "value": round(total_credit, 2),
                 "threshold": MIN_SPREAD_NET_CREDIT, "reason": "NET_CREDIT_BELOW_FEE_FLOOR",
             }
+            # Fixed 2026-11-06 (same fix as this function's ADX>70 gate above).
+            self._last_signal_metrics["signal"] = (
+                "BULL_PUT" if "PUT" in spread_type else "BEAR_CALL"
+            )
+            self._last_signal_metrics["close"] = underlying_price
             return
 
         # Risk/reward check: net credit must be ≥ MIN_CREDIT_PCT_OF_WING of wing width.
@@ -4572,6 +4594,11 @@ class LiveTradingEngine:
                 "gate": "min_credit", "value": round(net_credit, 2),
                 "threshold": round(spread_width_pts * MIN_CREDIT_PCT_OF_WING, 2), "reason": "RISK_REWARD_TOO_POOR",
             }
+            # Fixed 2026-11-06 (same fix as this function's ADX>70 gate above).
+            self._last_signal_metrics["signal"] = (
+                "BULL_PUT" if "PUT" in spread_type else "BEAR_CALL"
+            )
+            self._last_signal_metrics["close"] = underlying_price
             return
 
         # Margin check — in live mode verify we have enough balance before placing.
@@ -5468,6 +5495,9 @@ class LiveTradingEngine:
                 "gate": "vix_passed", "value": round(vix, 2),
                 "threshold": self._ELEVATED_VIX_ENTRY_CEILING, "reason": "VIX_TOO_HIGH",
             }
+            # 2026-11-06: outcome-tracking fields -- see ema_crossover_v1's VIX-ceiling site for the rationale.
+            self._last_signal_metrics["signal"] = "CONDOR"
+            self._last_signal_metrics["close"] = underlying_price
             return
 
         if not iv_rank_allows_selling(iv_rank):

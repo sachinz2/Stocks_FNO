@@ -75,7 +75,11 @@ def test_credit_spread_adx_still_blocks():
     # 15-30 -> 5-45 -> 0-70. Restore 15/30 after reviewing case-by-case losses.
     src = inspect.getsource(LiveTradingEngine._process_credit_spread)
     assert _block(src, "ADX={_adx_cs:.1f} < 0"), "ADX range gate must remain blocking"
-    assert _block(src, "ADX={_adx_cs:.1f} > 70"), "ADX range gate must remain blocking"
+    # window widened 400->500 (2026-11-06): this site now also populates
+    # _last_signal_metrics for /analytics/rejected-outcomes, pushing the
+    # `return` further from the anchor -- see live_trading_engine.py's
+    # matching comment there.
+    assert _block(src, "ADX={_adx_cs:.1f} > 70", window=500), "ADX range gate must remain blocking"
 
 
 def test_iron_condor_pcr_still_blocks():

@@ -204,7 +204,39 @@ async def test_vix_ceiling_blocks_ema_crossover_v1_entries():
 
     # Blocked before the ADX gate even runs -- only signal_generated is audited.
     assert fake._signal_gate_stats.get("ema_crossover_v1") == {"signal_generated": 1}
-    assert fake._last_gate_rejection is None
+    # Fixed 2026-11-06 (user question: "why no CE trades today" surfaced
+    # that this rejection was invisible to /analytics/rejected-outcomes --
+    # _last_gate_rejection was never set here, unlike every other gate in
+    # this file): the VIX ceiling now records its own rejection detail too.
+    rej = fake._last_gate_rejection
+    assert rej is not None
+    assert rej["gate"] == "vix_passed"
+    assert rej["value"] == 16.0
+    assert rej["threshold"] == 16.0
+    assert rej["reason"] == "VIX_TOO_HIGH"
+
+
+@pytest.mark.asyncio
+async def test_vix_ceiling_rejection_is_visible_to_rejected_outcome_tracking():
+    """_record_rejected_outcome() (called by _record_signal_trace() for
+    every REJECTED candidate) silently no-ops without signal/close in
+    _last_signal_metrics -- confirms the VIX-ceiling rejection now populates
+    both, so a day entirely blocked by this gate is no longer a blind spot
+    for /analytics/rejected-outcomes."""
+    fake = _FakeEngine({
+        "close": 1234.5, "ltp_source": "live_tick",
+        "rvol": 2.0, "rvol_valid": True,
+        "adx14": 30.0, "adx_valid": True,
+    })
+    strategy = SimpleNamespace(
+        name="ema_crossover_v1", is_active=True, min_dte=0, max_dte=999,
+        generate_signal=lambda market_data: SignalType.BUY,
+    )
+
+    await LiveTradingEngine._process_signal(fake, strategy, "SBIN", vix=17.3, regime="TRENDING")
+
+    assert fake._last_signal_metrics.get("signal") == "BUY"
+    assert fake._last_signal_metrics.get("close") == 1234.5
 
 
 @pytest.mark.asyncio

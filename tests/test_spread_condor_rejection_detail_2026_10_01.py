@@ -100,3 +100,41 @@ def test_every_rejection_site_is_followed_by_a_return_within_a_few_lines():
             )
             idx = close_idx
         assert count >= 11, f"{method.__name__}: expected at least 11 rejection sites, found {count}"
+
+
+# ── _last_signal_metrics population for the Elevated-VIX-ceiling / ADX>70 /
+# min-credit gates (2026-11-06, user question: "why no CE trades today")
+# ─────────────────────────────────────────────────────────────────────────
+# _record_rejected_outcome() -- called unconditionally by _record_signal_trace()
+# for every REJECTED candidate -- silently no-ops unless _last_signal_metrics
+# already has "signal" and "close" set. Those two keys were never populated
+# anywhere in _process_credit_spread()/_process_iron_condor(), so EVERY
+# rejection in either method (not just these 3 gates) was invisible to
+# /analytics/rejected-outcomes despite _last_gate_rejection already carrying
+# a specific reason. This only fixes the 3 gates a live incident actually
+# asked about (elevated-VIX ceiling, ADX>70, net-credit-vs-wing-width) --
+# see live_trading_engine.py's "Fixed 2026-11-06" comments at each site.
+
+def test_iron_condor_vix_ceiling_populates_signal_metrics_for_outcome_tracking():
+    src = inspect.getsource(LiveTradingEngine._process_iron_condor)
+    idx = src.index('"reason": "VIX_TOO_HIGH"')
+    window = src[idx: idx + 400]
+    assert 'self._last_signal_metrics["signal"] = "CONDOR"' in window
+    assert 'self._last_signal_metrics["close"] = underlying_price' in window
+
+
+def test_credit_spread_adx_ceiling_populates_signal_metrics_for_outcome_tracking():
+    src = inspect.getsource(LiveTradingEngine._process_credit_spread)
+    idx = src.index('"reason": "ADX_TOO_HIGH_BLOWTHROUGH_RISK"')
+    window = src[idx: idx + 400]
+    assert 'self._last_signal_metrics["signal"] = "BULL_PUT" if "PUT" in spread_type else "BEAR_CALL"' in window
+    assert 'self._last_signal_metrics["close"] = underlying_price' in window
+
+
+def test_credit_spread_min_credit_gates_populate_signal_metrics_for_outcome_tracking():
+    src = inspect.getsource(LiveTradingEngine._process_credit_spread)
+    for reason in ("NET_CREDIT_BELOW_FEE_FLOOR", "RISK_REWARD_TOO_POOR"):
+        idx = src.index(f'"reason": "{reason}"')
+        window = src[idx: idx + 400]
+        assert 'self._last_signal_metrics["signal"]' in window, f"missing for {reason}"
+        assert 'self._last_signal_metrics["close"] = underlying_price' in window, f"missing for {reason}"
