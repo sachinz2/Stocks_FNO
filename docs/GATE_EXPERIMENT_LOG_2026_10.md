@@ -589,4 +589,24 @@ User question (2026-11-06): "why no CE trades today?" turned up that `ema_crosso
 Zero change to any trading decision — purely unblocks data that was always meant to be collected. Scope deliberately limited to the 4 gates this question was actually about; the same `_last_signal_metrics` gap likely exists at other `_process_credit_spread`/`_process_iron_condor` rejection sites (DTE, IV rank, VWAP, PCR, event calendar, margin) and can be closed the same way later if needed.
 
 **Tests touched**: `test_rich_gate_rejection_detail_2026_09_16.py` (fixed `test_vix_ceiling_blocks_ema_crossover_v1_entries`'s now-stale `_last_gate_rejection is None` assertion; added `test_vix_ceiling_rejection_is_visible_to_rejected_outcome_tracking`), `test_spread_condor_rejection_detail_2026_10_01.py` (3 new static source-inspection tests, matching this file's established "too deep a precondition chain to drive end-to-end" convention), `test_gate_consolidation.py` (widened one `_block()` call's window 400→500 — the ADX>70 site's `return` moved further from its anchor). Full suite: 1131 passed, 2 skipped, 0 failed. `verify_invariants.py`: 57 passed, 3 warnings, 0 skipped, 0 failed (one WARN about regime classification matching fallback defaults exactly — pre-existing, unrelated to this change, flagged by the script itself as "possibly coincidence").
+
+## 31. credit_spread_v1 ADX ceiling restored 70 → 45 (deliberate midpoint, data-informed, not a full revert)
+
+Flagged twice earlier this session as a loose end from the 2026-10-08 crisis loosening (15-30 → 5-45 → 0-70) that was never reverted — item 27/28's "Restore after reviewing case-by-case losses" note, still outstanding. User explicitly asked to land somewhere **in between** 70 and the original 30, not jump straight back to 30.
+
+**Data used to pick 45** (`src/live_trading/live_trading_engine.py`, `_process_credit_spread` ADX gate, ~line 4364): of this strategy's 13 real trades to date with a valid ADX reading, bucketed by entry ADX —
+
+| ADX band | n | Win rate | Net P&L |
+|---|---|---|---|
+| [0,15) | 1 | 100% | +₹114 |
+| [15,30) | 2 | 100% | +₹2,181 |
+| **[30,45)** | **7** | **43%** | **-₹24,732** |
+| [45,60) | 2 | 50% | +₹6,900 |
+| [60,70) | 1 | 0% | -₹1,020 |
+
+The [30,45) band concentrated nearly the entire loss (AXISBANK, ONGC, FORCEMOT, RELIANCE all lost there), while [45,60) was net positive (PATANJALI, COALINDIA) and the lone >60 trade was close to flat. **Sample is small — 13 trades total, 7 in the worst bucket** — so 45 is a reasoned compromise this data points toward, not a precisely-fitted optimum. Revisit once more trades accumulate past the new ceiling.
+
+Only the ceiling changed (70 → 45); the floor (`ADX < 0` → condor territory) and iron_condor_v1's separate ADX gate (still loosened to ≥70, not part of this review) are untouched.
+
+**Tests touched**: `test_gate_consolidation.py::test_credit_spread_adx_still_blocks` (updated anchor string `> 70` → `> 45`). Full suite: 1131 passed, 2 skipped, 0 failed. `verify_invariants.py`: 57 passed, 2 warnings, 1 skipped (outside market hours), 0 failed.
 | **Tests touched:** `test_trade_review_fixes_2026_08_27.py` — 6 new for the price ceiling (default is 3000, blocks above it, fires just under it, fails open on missing close, configurable, main.py wiring). `test_third_review_2026_08_21.py` — renamed/updated the stale `require_rs: False` wiring assertion to `True`. `test_ema_crossover_v1_redesign_2026_08_21.py` — updated the stale `mtf_strict: False` wiring assertion to `True`. 3 window-size widenings elsewhere in `test_trade_review_fixes_2026_08_27.py`/`test_ema_crossover_v1_redesign_2026_08_21.py` for the new comment blocks. |

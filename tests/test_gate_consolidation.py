@@ -72,14 +72,16 @@ def test_credit_spread_vwap_still_blocks():
 
 def test_credit_spread_adx_still_blocks():
     # EXPERIMENT (2026-10-08, explicit user instruction): band widened
-    # 15-30 -> 5-45 -> 0-70. Restore 15/30 after reviewing case-by-case losses.
+    # 15-30 -> 5-45 -> 0-70. Reviewed 2026-11-06: restored to 0-45 (a
+    # deliberate midpoint, not a full revert to 15-30) -- see
+    # live_trading_engine.py's matching comment for the case-by-case data.
     src = inspect.getsource(LiveTradingEngine._process_credit_spread)
     assert _block(src, "ADX={_adx_cs:.1f} < 0"), "ADX range gate must remain blocking"
     # window widened 400->500 (2026-11-06): this site now also populates
     # _last_signal_metrics for /analytics/rejected-outcomes, pushing the
     # `return` further from the anchor -- see live_trading_engine.py's
     # matching comment there.
-    assert _block(src, "ADX={_adx_cs:.1f} > 70", window=500), "ADX range gate must remain blocking"
+    assert _block(src, "ADX={_adx_cs:.1f} > 45", window=500), "ADX range gate must remain blocking"
 
 
 def test_iron_condor_pcr_still_blocks():

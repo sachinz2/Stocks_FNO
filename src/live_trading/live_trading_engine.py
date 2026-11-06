@@ -4350,8 +4350,18 @@ class LiveTradingEngine:
         # EXPERIMENT (2026-10-08, explicit user instruction): band widened
         # 15-30 -> 5-45, then further to 0-70 after ASIANPAINT (ADX=47) was
         # the first clean credit_spread_v1 candidate of the day and still
-        # got blocked just over the 45 ceiling. Restore 15/30 after
-        # reviewing case-by-case losses.
+        # got blocked just over the 45 ceiling.
+        #
+        # Reviewed 2026-11-06 (case-by-case loss review, as flagged above):
+        # ceiling restored 70 -> 45, a deliberate midpoint, not a return to
+        # the original 30. Of this strategy's 13 real trades to date, the
+        # ADX[30,45) band concentrated the damage -- 7 trades, 43% win,
+        # -Rs24,732 net (AXISBANK/ONGC/FORCEMOT/RELIANCE all lost there) --
+        # while ADX[45,60) was net positive (+Rs6,900, 2 trades: PATANJALI/
+        # COALINDIA) and the one ADX>60 trade (WIPRO, 62.7) was close to
+        # flat. Sample is small (13 trades, 7 in the worst bucket) -- this
+        # is a reasoned compromise informed by that data, not a precisely
+        # fitted threshold. Revisit once more trades accumulate past 45.
         if _adx_cs < 0:
             logger.info(
                 f"[CreditSpread] {symbol} skipped — ADX={_adx_cs:.1f} < 0 "
@@ -4361,13 +4371,13 @@ class LiveTradingEngine:
                 "gate": "adx_passed", "value": round(_adx_cs, 2), "threshold": 0, "reason": "ADX_TOO_LOW_CONDOR_TERRITORY",
             }
             return
-        if _adx_cs > 70:
+        if _adx_cs > 45:
             logger.info(
-                f"[CreditSpread] {symbol} skipped — ADX={_adx_cs:.1f} > 70 "
+                f"[CreditSpread] {symbol} skipped — ADX={_adx_cs:.1f} > 45 "
                 "(trend too strong; blowthrough risk)"
             )
             self._last_gate_rejection = {
-                "gate": "adx_passed", "value": round(_adx_cs, 2), "threshold": 70, "reason": "ADX_TOO_HIGH_BLOWTHROUGH_RISK",
+                "gate": "adx_passed", "value": round(_adx_cs, 2), "threshold": 45, "reason": "ADX_TOO_HIGH_BLOWTHROUGH_RISK",
             }
             self._last_signal_metrics["signal"] = "BULL_PUT" if "PUT" in spread_type else "BEAR_CALL"
             self._last_signal_metrics["close"] = underlying_price
