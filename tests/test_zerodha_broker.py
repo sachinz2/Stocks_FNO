@@ -68,6 +68,37 @@ async def test_place_order_exit_uses_market_order_no_price(broker):
     assert "price" not in kwargs, "MARKET orders must not pass a price -- they execute at best available"
 
 
+@pytest.mark.asyncio
+async def test_place_order_exit_sets_market_protection(broker):
+    # Fixed 2026-11-09 (live incident, caught manually before any real
+    # automated order hit it): Kite's live API rejects a bare MARKET order
+    # on an illiquid stock option outright unless market_protection is
+    # explicitly set -- the SDK defaults it to None, which looks optional
+    # but isn't at the real API (zerodha/pykiteconnect#225, #242). Every
+    # exit order is MARKET, so without this every live stop-loss/profit-
+    # target/EOD-square-off/reversal exit on a stock option would have been
+    # rejected at the broker the moment live mode was flipped on -- paper
+    # trading never exercises this path at all.
+    broker.kite.place_order.return_value = "order789"
+
+    await broker.place_order("SBIN", "SELL", 100, 500.0, is_exit_order=True)
+
+    _, kwargs = broker.kite.place_order.call_args
+    assert kwargs["market_protection"] == -1
+
+
+@pytest.mark.asyncio
+async def test_place_order_entry_does_not_set_market_protection(broker):
+    # market_protection only applies to MARKET/SL-M order types -- entries
+    # stay LIMIT and must not carry a parameter that doesn't apply to them.
+    broker.kite.place_order.return_value = "order123"
+
+    await broker.place_order("SBIN", "BUY", 100, 500.0, is_exit_order=False)
+
+    _, kwargs = broker.kite.place_order.call_args
+    assert "market_protection" not in kwargs
+
+
 def test_product_for_defaults_to_nrml(broker):
     # credit_spread_v1/iron_condor_v1 (and unknown/None strategy names) are
     # positional -- held for days/weeks to collect theta decay -- so must

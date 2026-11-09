@@ -203,6 +203,23 @@ class ZerodhaBroker(AbstractBroker):
         )
         if not is_exit_order:
             kwargs["price"] = price  # MARKET orders execute at best available price, no price param
+        else:
+            # Fixed 2026-11-09 (live incident, caught manually before any
+            # real automated order hit it): Kite's live API REJECTS a bare
+            # MARKET order on an illiquid stock option outright ("MARKET
+            # orders are blocked for stock options due to illiquidity")
+            # unless market_protection is explicitly set -- the SDK's
+            # place_order() defaults it to None, which reads as "optional"
+            # but is actually "caller forgot to set it" at the real API
+            # (confirmed via Kite Connect docs + zerodha/pykiteconnect#225,
+            # #242). Every exit order is MARKET (see comment above), so
+            # without this, every live exit on a stock option -- stop-loss,
+            # profit-target, EOD square-off, reversal -- would have been
+            # rejected at the broker the moment live mode was ever flipped
+            # on, with paper trading never exercising this path at all. -1
+            # = automatic protection per exchange guidelines, the value
+            # Kite's own docs recommend over a hardcoded percentage.
+            kwargs["market_protection"] = -1
 
         # Fixed 2026-08-20 (deep review): this used to be a bare @retry on the
         # whole method with no idempotency key -- if kite.place_order() itself
