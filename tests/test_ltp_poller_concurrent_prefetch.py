@@ -109,6 +109,100 @@ async def test_one_symbol_failing_does_not_block_others():
     assert "BAD" in poller._history_loaded_at
 
 
+# ── HISTORY_RETRY_SECONDS short-circuit for symbols with no real data yet ──
+# Fixed 2026-11-09 (live incident, recurring): kite.historical_data() can
+# come back empty WITHOUT raising (plausible for a throttled response right
+# after a rate-limit burst), and both call sites stamp *_loaded_at=now
+# regardless -- a symbol with zero real data cached then had to wait the
+# FULL refresh_seconds (300s/900s) before the next attempt, repeating
+# indefinitely if later attempts also came back empty. Confirmed live twice
+# in one day on force-tracked open-position underlyings (TORNTPHARM/ITC/
+# JIOFIN), both times right after a container restart's cold-start burst.
+
+@pytest.mark.asyncio
+async def test_symbol_with_no_data_yet_retries_sooner_than_the_full_refresh_window():
+    from src.market_data.ltp_poller import HISTORY_RETRY_SECONDS
+    poller = LTPPoller(redis_client=None, symbols=["NODATA"], kite=object(),
+                        instrument_tokens={"NODATA": 1})
+    # Simulate a prior failed/empty attempt: loaded_at stamped, no real data cached.
+    poller._history_loaded_at["NODATA"] = dt.datetime.now() - dt.timedelta(seconds=HISTORY_RETRY_SECONDS + 1)
+
+    fetched = []
+
+    def _fake_fetch(symbol):
+        fetched.append(symbol)
+        return _df()
+
+    loop = asyncio.get_running_loop()
+    await poller._prefetch_stale_histories(
+        poller.symbols, loop, _fake_fetch, poller._history_loaded_at, poller._history, 300,
+    )
+
+    assert fetched == ["NODATA"], (
+        "a symbol with no real data yet must retry after HISTORY_RETRY_SECONDS, "
+        "not wait the full 300s refresh_seconds"
+    )
+
+
+@pytest.mark.asyncio
+async def test_symbol_with_real_data_waits_the_full_refresh_window_not_the_short_retry():
+    from src.market_data.ltp_poller import HISTORY_RETRY_SECONDS
+    poller = LTPPoller(redis_client=None, symbols=["HASDATA"], kite=object(),
+                        instrument_tokens={"HASDATA": 1})
+    poller._history["HASDATA"] = _df()
+    # Past the short retry window but well within the full 300s refresh window.
+    poller._history_loaded_at["HASDATA"] = dt.datetime.now() - dt.timedelta(seconds=HISTORY_RETRY_SECONDS + 1)
+
+    fetched = []
+
+    def _fake_fetch(symbol):
+        fetched.append(symbol)
+        return _df()
+
+    loop = asyncio.get_running_loop()
+    await poller._prefetch_stale_histories(
+        poller.symbols, loop, _fake_fetch, poller._history_loaded_at, poller._history, 300,
+    )
+
+    assert fetched == [], (
+        "a symbol that already has real cached data must wait the full "
+        "300s refresh_seconds, not the short HISTORY_RETRY_SECONDS"
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_history_retries_sooner_when_no_data_cached_yet():
+    """Same fix, direct call site: _get_history() (not the concurrent
+    prefetch helper) is what poll()'s main per-symbol loop actually calls."""
+    from src.market_data.ltp_poller import HISTORY_RETRY_SECONDS
+    poller = LTPPoller(redis_client=None, symbols=["NODATA"], kite=object(),
+                        instrument_tokens={"NODATA": 1})
+    poller._history_loaded_at["NODATA"] = dt.datetime.now() - dt.timedelta(seconds=HISTORY_RETRY_SECONDS + 1)
+    poller._fetch_kite_ohlc = lambda symbol: _df()
+
+    loop = asyncio.get_running_loop()
+    result = await poller._get_history("NODATA", loop)
+
+    assert result is not None and not result.empty
+
+
+@pytest.mark.asyncio
+async def test_get_history_does_not_retry_early_once_real_data_is_cached():
+    from src.market_data.ltp_poller import HISTORY_RETRY_SECONDS
+    poller = LTPPoller(redis_client=None, symbols=["HASDATA"], kite=object(),
+                        instrument_tokens={"HASDATA": 1})
+    poller._history["HASDATA"] = _df()
+    poller._history_loaded_at["HASDATA"] = dt.datetime.now() - dt.timedelta(seconds=HISTORY_RETRY_SECONDS + 1)
+
+    calls = []
+    poller._fetch_kite_ohlc = lambda symbol: calls.append(symbol) or _df()
+
+    loop = asyncio.get_running_loop()
+    await poller._get_history("HASDATA", loop)
+
+    assert calls == [], "must not re-fetch within the full 300s window once real data is cached"
+
+
 @pytest.mark.asyncio
 async def test_skips_symbols_without_kite_or_token():
     poller = LTPPoller(redis_client=None, symbols=["HASTOKEN", "NOTOKEN"], kite=object(),
@@ -160,3 +254,30 @@ def test_poll_calls_prefetch_for_both_5min_and_15min_before_main_loop():
     first_prefetch_idx = src.index("await self._prefetch_stale_histories(")
     main_loop_idx = src.index("for symbol in self.symbols:")
     assert first_prefetch_idx < main_loop_idx, "prefetch must run before the main per-symbol loop"
+
+
+# ── _fetch_kite_ohlc()/_fetch_kite_ohlc_15m() now log an empty (non-raising)
+# Kite response instead of failing completely silently (2026-11-09, same
+# live incident as above) ─────────────────────────────────────────────────
+
+class _FakeEmptyKite:
+    def historical_data(self, *a, **kw):
+        return []  # Zerodha returned a well-formed but empty response, no exception
+
+
+def test_fetch_kite_ohlc_logs_on_empty_response(caplog):
+    poller = LTPPoller(redis_client=None, symbols=["SYM"], kite=_FakeEmptyKite(),
+                        instrument_tokens={"SYM": 1})
+    with caplog.at_level("WARNING"):
+        result = poller._fetch_kite_ohlc("SYM")
+    assert result is None
+    assert any("returned empty for SYM" in r.message for r in caplog.records)
+
+
+def test_fetch_kite_ohlc_15m_logs_on_empty_response(caplog):
+    poller = LTPPoller(redis_client=None, symbols=["SYM"], kite=_FakeEmptyKite(),
+                        instrument_tokens={"SYM": 1})
+    with caplog.at_level("WARNING"):
+        result = poller._fetch_kite_ohlc_15m("SYM")
+    assert result is None
+    assert any("returned empty for SYM" in r.message for r in caplog.records)

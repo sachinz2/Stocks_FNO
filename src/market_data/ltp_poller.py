@@ -92,6 +92,20 @@ _POOL_STATUS_TTL_SEC = 150  # generous vs the 60s poll cadence
 
 HISTORY_REFRESH_SECONDS      = 300  # reload 5-min OHLC baseline every 5 min
 _HISTORY_15M_REFRESH_SECONDS = 900  # reload 15-min OHLC baseline every 15 min
+# Fixed 2026-11-09 (live incident, recurring): kite.historical_data() can
+# come back as an empty/falsy response WITHOUT raising -- plausible for a
+# throttled/degraded response right after a rate-limit burst (e.g. every
+# container restart's cold-start prefetch) -- and both _get_history() and
+# _prefetch_stale_histories() stamp *_loaded_at[symbol]=now unconditionally
+# even when that happened, so a symbol with zero real data cached yet still
+# had to wait the full 5/15-min window before the next attempt, repeating
+# indefinitely if later attempts also came back empty. A symbol stuck here
+# shows as permanently stale to every downstream consumer (confirmed live:
+# force-tracked open-position underlyings TORNTPHARM/ITC/JIOFIN, twice in
+# one day, both times right after a restart). This shorter window applies
+# ONLY while a symbol has no real cached data at all -- once it has a
+# genuine fetch, the normal 5/15-min cadence above applies unchanged.
+HISTORY_RETRY_SECONDS = 30
 
 # ATR% thresholds that must match strategy parameters
 # EXPERIMENT (2026-10-08, explicit user instruction): raised 1.2 -> 5.0 and
@@ -660,12 +674,20 @@ class LTPPoller:
         the top of poll(), before the main per-symbol loop -- by the time
         that loop calls _get_history()/_get_history_15m(), the caches it
         needs are already warm and those calls return instantly.
+
+        Fixed 2026-11-09: a symbol with no real data cached yet (first
+        attempt never succeeded, e.g. an empty-but-no-exception Kite
+        response during a rate-limit burst) uses the much shorter
+        HISTORY_RETRY_SECONDS instead of the full refresh_seconds -- same
+        fix, same reason, as _get_history()/_get_history_15m().
         """
         now = datetime.now()
         stale = [
             s for s in symbols
             if self._kite and s in self._tokens
-            and (loaded_at.get(s) is None or (now - loaded_at[s]).total_seconds() > refresh_seconds)
+            and (loaded_at.get(s) is None or (now - loaded_at[s]).total_seconds() > (
+                refresh_seconds if (s in history and not history[s].empty) else HISTORY_RETRY_SECONDS
+            ))
         ]
         if not stale:
             return
@@ -686,12 +708,16 @@ class LTPPoller:
         await asyncio.gather(*(_fetch_one(s) for s in stale))
 
     async def _get_history(self, symbol: str, loop) -> Optional[pd.DataFrame]:
-        """Return Zerodha 5-min OHLC, refreshing cache every 5 minutes.
-        On fetch failure the timestamp is still updated so the symbol is not
-        retried every 60 s — it waits the full HISTORY_REFRESH_SECONDS before retry."""
+        """Return Zerodha 5-min OHLC, refreshing cache every 5 minutes once it
+        has real data. On fetch failure the timestamp is still updated so the
+        symbol is not retried every 60 s -- but while there's no real data
+        cached at all yet, it retries on the much shorter HISTORY_RETRY_SECONDS
+        instead of waiting the full 5 minutes (see that constant's docstring)."""
         now = datetime.now()
         last = self._history_loaded_at.get(symbol)
-        stale = last is None or (now - last).total_seconds() > HISTORY_REFRESH_SECONDS
+        _has_data = symbol in self._history and not self._history[symbol].empty
+        _window = HISTORY_REFRESH_SECONDS if _has_data else HISTORY_RETRY_SECONDS
+        stale = last is None or (now - last).total_seconds() > _window
 
         if stale:
             if self._kite and symbol in self._tokens:
@@ -718,6 +744,10 @@ class LTPPoller:
                 token, from_date, to_date, "5minute", continuous=False, oi=False
             )
             if not records:
+                logger.warning(
+                    f"kite.historical_data returned empty for {symbol} "
+                    "(no exception raised) -- will retry per HISTORY_RETRY_SECONDS."
+                )
                 return None
             df = pd.DataFrame(records)
             # Keep "date" so _enrich can produce ohlc_bar_key for true-bar confirmation
@@ -1104,10 +1134,14 @@ class LTPPoller:
     # ── 15-min multi-timeframe helpers ────────────────────────────────────────
 
     async def _get_history_15m(self, symbol: str, loop) -> Optional[pd.DataFrame]:
-        """Return Zerodha 15-min OHLC, refreshing cache every 15 minutes."""
+        """Return Zerodha 15-min OHLC, refreshing cache every 15 minutes once
+        it has real data -- same HISTORY_RETRY_SECONDS short-circuit as
+        _get_history() while there's no real data cached yet."""
         now  = datetime.now()
         last = self._history_15m_loaded_at.get(symbol)
-        stale = last is None or (now - last).total_seconds() > _HISTORY_15M_REFRESH_SECONDS
+        _has_data = symbol in self._history_15m and not self._history_15m[symbol].empty
+        _window = _HISTORY_15M_REFRESH_SECONDS if _has_data else HISTORY_RETRY_SECONDS
+        stale = last is None or (now - last).total_seconds() > _window
 
         if stale:
             if self._kite and symbol in self._tokens:
@@ -1131,6 +1165,10 @@ class LTPPoller:
                 token, from_date, to_date, "15minute", continuous=False, oi=False
             )
             if not records:
+                logger.warning(
+                    f"kite.historical_data(15m) returned empty for {symbol} "
+                    "(no exception raised) -- will retry per HISTORY_RETRY_SECONDS."
+                )
                 return None
             df = pd.DataFrame(records)
             # Keep "date" so _enrich_15m can drop any of today's bars before
