@@ -51,7 +51,7 @@ def test_credit_spread_sets_rejection_detail_at_every_gate():
         "IV_RANK_UNAVAILABLE", "IV_RANK_TOO_LOW",
         "BULL_PUT_BELOW_VWAP", "BEAR_CALL_ABOVE_VWAP",
         "ADX_UNAVAILABLE", "ADX_TOO_LOW_CONDOR_TERRITORY", "ADX_TOO_HIGH_BLOWTHROUGH_RISK",
-        "EVENT_WITHIN_5_DAYS",
+        "EVENT_WITHIN_3_DAYS",
         "NET_CREDIT_BELOW_FEE_FLOOR", "RISK_REWARD_TOO_POOR",
         "INSUFFICIENT_MARGIN",
     }

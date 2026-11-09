@@ -477,7 +477,7 @@ class _FakeRvolGateEngine:
 
 
 @pytest.mark.asyncio
-async def test_rvol_valid_gate_exempts_strategies_with_rvol_checked_internally():
+async def test_rvol_valid_gate_exempts_strategies_with_rvol_checked_internally(monkeypatch):
     """Fixed 2026-09-15 (live incident review): momentum_v1's pullback+
     breakout model already validates its own breakout via rvol_closed_bar
     inside generate_signal() -- by the time it returns BUY/SELL here, that
@@ -485,6 +485,12 @@ async def test_rvol_valid_gate_exempts_strategies_with_rvol_checked_internally()
     been consumed. This separate, unrelated plain-rvol validity gate must
     not re-litigate and discard that already-confirmed signal just because
     the STILL-FORMING current bar's RVOL isn't measurable yet."""
+    # Pinned to a safe hour (2026-10-15, data-driven hour=13 exclusion added
+    # for ema_crossover_v1/momentum_v1) -- same fix as the other pinned
+    # tests in this file, needed here too since this one wasn't pinned.
+    import datetime as _dt
+    import src.live_trading.live_trading_engine as lte_module
+    monkeypatch.setattr(lte_module, "now_ist", lambda: _dt.datetime(2026, 10, 15, 10, 0, 0))
     fake = _FakeRvolGateEngine()
     strategy = SimpleNamespace(
         name="momentum_v1", is_active=True, min_dte=0, max_dte=999,
@@ -608,7 +614,11 @@ async def test_sell_rs_gate_blocks_a_strong_stock_not_in_the_bottom_10():
 
 
 @pytest.mark.asyncio
-async def test_sell_rs_gate_passes_a_weak_stock_in_the_bottom_10():
+async def test_sell_rs_gate_passes_a_weak_stock_in_the_bottom_10(monkeypatch):
+    # Pinned to a safe hour -- same fix as the other pinned tests in this file.
+    import datetime as _dt
+    import src.live_trading.live_trading_engine as lte_module
+    monkeypatch.setattr(lte_module, "now_ist", lambda: _dt.datetime(2026, 10, 15, 10, 0, 0))
     fake = _FakeRsGateEngine(_rs_ranks_fixture())
     strategy = SimpleNamespace(
         name="momentum_v1", is_active=True, min_dte=0, max_dte=999,
@@ -715,7 +725,11 @@ async def test_mtf_gate_fails_closed_on_zero_ema_values_present_but_not_yet_vali
 
 
 @pytest.mark.asyncio
-async def test_mtf_gate_passes_with_genuinely_valid_agreeing_data():
+async def test_mtf_gate_passes_with_genuinely_valid_agreeing_data(monkeypatch):
+    # Pinned to a safe hour -- same fix as the other pinned tests in this file.
+    import datetime as _dt
+    import src.live_trading.live_trading_engine as lte_module
+    monkeypatch.setattr(lte_module, "now_ist", lambda: _dt.datetime(2026, 10, 15, 10, 0, 0))
     tick15 = json.dumps({"ema20": 105.0, "ema50": 100.0})  # bullish, agrees with BUY
     fake = _FakeMtfGateEngine(_FakeMtfRedis(tick15_value=tick15))
     strategy = _mtf_strategy()

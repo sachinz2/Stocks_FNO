@@ -409,6 +409,11 @@ async def test_option_quality_gate_rejects_a_wide_spread(monkeypatch):
     # raised 8.0 -> 40.0 -> 150.0 -> 200.0 (2026-10-16), so the fixture's
     # spread_pct must exceed 200.0 to still exercise the block. Restore
     # 13.33 (and the 8.0 threshold) after reviewing case-by-case losses.
+    # Pinned to a safe hour (momentum_v1 is excluded during hour=13 IST).
+    import datetime as _dt
+    import src.live_trading.live_trading_engine as lte_module
+    monkeypatch.setattr(lte_module, "now_ist", lambda: _dt.datetime(2026, 10, 15, 10, 0, 0))
+
     async def _fake_quote(contract, kite, redis):
         return 45.0
 
@@ -432,6 +437,11 @@ async def test_option_quality_gate_rejects_a_wide_spread(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_option_quality_gate_passes_a_tight_spread(monkeypatch):
+    # Pinned to a safe hour (momentum_v1 is excluded during hour=13 IST).
+    import datetime as _dt
+    import src.live_trading.live_trading_engine as lte_module
+    monkeypatch.setattr(lte_module, "now_ist", lambda: _dt.datetime(2026, 10, 15, 10, 0, 0))
+
     async def _fake_quote(contract, kite, redis):
         return 45.0
 
@@ -453,6 +463,11 @@ async def test_option_quality_gate_passes_a_tight_spread(monkeypatch):
 async def test_option_quality_gate_fails_open_when_spread_is_not_computable(monkeypatch):
     # A thin, one-sided, or empty order book -- no spread_pct means nothing
     # to reject on; this v1 doesn't hard-block on missing depth alone.
+    # Pinned to a safe hour (momentum_v1 is excluded during hour=13 IST).
+    import datetime as _dt
+    import src.live_trading.live_trading_engine as lte_module
+    monkeypatch.setattr(lte_module, "now_ist", lambda: _dt.datetime(2026, 10, 15, 10, 0, 0))
+
     async def _fake_quote(contract, kite, redis):
         return 45.0
 
@@ -472,6 +487,10 @@ async def test_option_quality_gate_fails_open_when_spread_is_not_computable(monk
 
 @pytest.mark.asyncio
 async def test_option_quality_gate_is_skippable_per_strategy(monkeypatch):
+    # Pinned to a safe hour (momentum_v1 is excluded during hour=13 IST).
+    import datetime as _dt
+    import src.live_trading.live_trading_engine as lte_module
+    monkeypatch.setattr(lte_module, "now_ist", lambda: _dt.datetime(2026, 10, 15, 10, 0, 0))
     quality_calls = []
 
     async def _fake_quote(contract, kite, redis):

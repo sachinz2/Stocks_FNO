@@ -4384,22 +4384,29 @@ class LiveTradingEngine:
             return
         self._audit_gate(strategy.name, "adx_passed")
 
-        # Event/earnings calendar filter — block entries within 5 trading days.
+        # Event/earnings calendar filter — block entries within 3 trading days.
         # Earnings and RBI events cause IV crush and gap risk that destroys spread edge.
         from src.market_data.event_calendar import has_event_within_days as _has_event
         # EXPERIMENT (2026-10-08, explicit user instruction): window shrunk
         # 5 -> 1 -> 0 trading days (this week's dense Q2 earnings calendar was
-        # catching nearly every candidate at 1 day). days=0 still blocks
-        # trading directly into a literal same-day earnings/RBI print --
-        # has_event_within_days()'s cutoff = today + 0 trading days = today,
-        # so today <= event_date <= today only matches today itself. Restore
-        # 5 after reviewing case-by-case losses.
-        if await _has_event(symbol, getattr(self, "_redis", None), days=0):
+        # catching nearly every candidate at 1 day).
+        #
+        # Reviewed 2026-11-09 (then-vs-now gate review, explicit user
+        # instruction: "0 -> 3", a deliberate midpoint, not a full restore
+        # to 5): this gate's impact couldn't be verified retroactively the
+        # way the ADX ceiling and min-credit floor were -- the event
+        # calendar is a live-scraped Redis cache of upcoming events only,
+        # with no historical record of what it showed on any past date, so
+        # there's no way to check whether any of era 2's losing trades had
+        # an earnings/RBI print inside the original 5-day window. 3 is a
+        # precautionary compromise given that uncertainty, not a
+        # data-backed number like the other two gates restored the same day.
+        if await _has_event(symbol, getattr(self, "_redis", None), days=3):
             logger.info(
-                f"[CreditSpread] {symbol} skipped — earnings or NSE event within 5 days"
+                f"[CreditSpread] {symbol} skipped — earnings or NSE event within 3 days"
             )
             self._last_gate_rejection = {
-                "gate": "event_calendar_passed", "value": True, "threshold": False, "reason": "EVENT_WITHIN_5_DAYS",
+                "gate": "event_calendar_passed", "value": True, "threshold": False, "reason": "EVENT_WITHIN_3_DAYS",
             }
             return
         self._audit_gate(strategy.name, "event_calendar_passed")
@@ -4590,9 +4597,21 @@ class LiveTradingEngine:
         # the aggressive multi-x jumps used for the other gates this
         # session) -- this is a risk/reward floor, not a liquidity or
         # contract-resolution check, so a smaller nudge was asked for.
-        # Restore 0.20 after reviewing case-by-case losses.
+        #
+        # Reviewed 2026-11-09 (then-vs-now gate review, explicit user
+        # instruction: "0.10 -> 0.15", a deliberate midpoint, not a full
+        # restore to 0.20): of era 2's 13 real trades since this floor
+        # loosened, 12 (92%) only existed because of this exact cut -- their
+        # true credit/wing_width ratio sat in the 10-20% band the original
+        # 20% floor would have blocked. That bucket alone was net -Rs29,694
+        # (every big loss: FORCEMOT, RELIANCE, AXISBANK, ONGC, COALINDIA,
+        # WIPRO). The one trade that would have cleared the ORIGINAL 20%
+        # floor anyway (PATANJALI, ratio=30.4%) was also the single biggest
+        # winner in this strategy's history, +Rs13,136. 0.15 keeps slightly
+        # more volume than a full revert while cutting the thinnest
+        # (10-15%) end of the loosened band entirely.
         spread_width_pts = abs(short_strike - long_strike)
-        MIN_CREDIT_PCT_OF_WING = 0.10
+        MIN_CREDIT_PCT_OF_WING = 0.15
         if net_credit < spread_width_pts * MIN_CREDIT_PCT_OF_WING:
             logger.info(
                 f"[CreditSpread] {symbol} skipped — net credit ₹{net_credit:.2f} < "
