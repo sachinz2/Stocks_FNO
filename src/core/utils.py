@@ -46,12 +46,24 @@ _NSE_HOLIDAYS_FALLBACK: frozenset = frozenset({
     date(2026, 6, 7),    # Eid ul-Adha / Bakri Eid (approx)
     date(2026, 6, 26),   # Muharram (Ashura)
     date(2026, 8, 15),   # Independence Day
-    date(2026, 8, 27),   # Janmashtami
+    # date(2026, 8, 27) deliberately NOT listed as "Janmashtami" -- confirmed
+    # wrong twice now: the 2026-08-27 incident (this function's own
+    # docstring) found XBSE's real calendar treated it as a trading day, and
+    # a fresh WebSearch (2026-11-10) against NSE's actual published 2026
+    # holiday list confirms August 2026 has no weekday NSE trading holiday
+    # at all. Kept out even though _check() below now unions this list with
+    # exchange_calendars -- re-adding it would resurrect the exact bug that
+    # incident already fixed.
     date(2026, 10, 2),   # Gandhi Jayanti
     date(2026, 10, 20),  # Dussehra / Vijaya Dashami (approx)
-    date(2026, 11, 14),  # Diwali Laxmi Pujan (approx)
-    date(2026, 11, 15),  # Diwali Balipratipada (approx)
-    date(2026, 11, 25),  # Guru Nanak Jayanti (approx)
+    # Fixed 2026-11-10 (live incident): the previous Nov 14/15/25 "(approx)"
+    # guesses were wrong -- verified via WebSearch against NSE's actual
+    # published 2026 holiday list. Diwali Laxmi Pujan falls on Sun Nov 8
+    # (Muhurat trading is a special evening session, not a regular weekday
+    # closure, so it's deliberately NOT added here -- Sunday is already
+    # excluded by the weekday>=5 check). Real dates:
+    date(2026, 11, 10),  # Diwali Balipratipada
+    date(2026, 11, 24),  # Guru Nanak Jayanti / Prakash Gurpurb Sri Guru Nanak Dev
     date(2026, 12, 25),  # Christmas
 })
 
@@ -84,6 +96,20 @@ def _init_nse_holiday_checker():
         logger.info("NSE holiday calendar loaded from exchange_calendars (dynamic, via XBSE)")
 
         def _check(d: date) -> bool:
+            # Fixed 2026-11-10 (live incident): XBSE's own calendar data
+            # missed a real, officially-announced 2026 NSE holiday (Nov 10,
+            # Diwali Balipratipada) -- is_session() returned True (a trading
+            # day) when the real exchange was closed, so the whole signal
+            # cycle ran all day as if the market were open, closing 2 real
+            # paper positions off whatever stale/estimated pricing was
+            # available. exchange_calendars has ALSO previously been the one
+            # source proven right when the hardcoded list was wrong
+            # (2026-08-27, Janmashtami, see this function's own docstring) --
+            # neither source is reliable alone for India's lunar-calendar-
+            # dependent holidays, so this is now the UNION of both: a holiday
+            # if EITHER says so, not an exclusive preference for one.
+            if d in _NSE_HOLIDAYS_FALLBACK:
+                return True
             try:
                 return not cal.is_session(pd.Timestamp(d))
             except Exception:
