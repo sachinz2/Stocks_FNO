@@ -11,6 +11,7 @@ from src.core.constants import (
     FIVE_MIN_ATR_DAILY_SCALE,
     FNO_SECTORS,
     FNO_SYMBOLS,
+    INDEX_FNO_SYMBOLS,
     MAX_SECTOR_POSITIONS,
     REDIS_LOT_SIZE_PREFIX,
     REDIS_TICK_PREFIX,
@@ -21,14 +22,18 @@ from src.core.constants import (
     REDIS_TOP_SYMBOLS_MOMENTUM_BULL,
     REDIS_TOP_SYMBOLS_MOMENTUM_BEAR,
     STRATEGY_LOT_MULTIPLIER,
+    WEEKLY_EXPIRY_INDEX_SYMBOLS,
 )
 from src.core.enums import SignalType, TradingMode
 from src.core.utils import (
     build_option_symbol,
+    build_weekly_option_symbol,
     estimate_option_premium,
     get_atm_strike,
     get_entry_expiry,
     get_near_month_expiry,
+    get_near_weekly_expiry,
+    get_weekly_entry_expiry,
     is_market_open,
     is_square_off_time,
     now_ist,
@@ -44,7 +49,10 @@ from src.strategies.base import StrategyRegistry
 
 logger = logging.getLogger(__name__)
 
-_FNO_SYMBOLS_BY_LEN = sorted(FNO_SYMBOLS, key=len, reverse=True)
+# INDEX_FNO_SYMBOLS included (2026-11-11) so _get_underlying_from_contract()
+# can recognize NIFTY/BANKNIFTY option tradingsymbols too -- without this, a
+# position on either would resolve to no underlying at all.
+_FNO_SYMBOLS_BY_LEN = sorted(FNO_SYMBOLS + INDEX_FNO_SYMBOLS, key=len, reverse=True)
 
 # atr_to_annualised_vol() assumes daily ATR — see FIVE_MIN_ATR_DAILY_SCALE in
 # core/constants.py for why 5-min ATR must be scaled before use here. Without this
@@ -3346,32 +3354,56 @@ class LiveTradingEngine:
             )
             return
 
-        expiry   = get_near_month_expiry()
-        dte      = (expiry - now_ist().replace(tzinfo=None)).days
+        # Added 2026-11-11 (NIFTY/BANKNIFTY added as extra ema_crossover_v1/
+        # momentum_v1 candidates, explicit user instruction): NIFTY is the
+        # only WEEKLY-expiry instrument in this system (BANKNIFTY lost its
+        # weekly expiry in SEBI's November 2024 rule and reuses the monthly
+        # path below unchanged, same as every stock) -- see
+        # WEEKLY_EXPIRY_INDEX_SYMBOLS' docstring in core/constants.py.
+        _is_weekly = symbol in WEEKLY_EXPIRY_INDEX_SYMBOLS
+        if _is_weekly:
+            # Deliberately a SEPARATE, much smaller setting than min_dte
+            # below (tuned for a ~30-day monthly cycle) -- see
+            # get_weekly_entry_expiry()'s own docstring for why reusing
+            # min_dte=10 here would force skipping every near-week contract.
+            min_dte = getattr(strategy, "weekly_min_dte", 1)
+            max_dte = getattr(strategy, "max_dte", 999)
+            expiry  = get_near_weekly_expiry()
+            dte     = (expiry - now_ist().replace(tzinfo=None)).days
+            if dte < min_dte:
+                expiry = get_weekly_entry_expiry(min_dte)
+                dte    = (expiry - now_ist().replace(tzinfo=None)).days
+                logger.info(
+                    f"[{strategy.name}] {symbol} near-week DTE < {min_dte} — "
+                    f"rolling fresh entry to next week's expiry (DTE={dte})"
+                )
+        else:
+            expiry   = get_near_month_expiry()
+            dte      = (expiry - now_ist().replace(tzinfo=None)).days
 
-        # DTE range filter — keeps us in the liquid, balanced-theta window
-        min_dte = getattr(strategy, "min_dte", 0)
-        max_dte = getattr(strategy, "max_dte", 999)
+            # DTE range filter — keeps us in the liquid, balanced-theta window
+            min_dte = getattr(strategy, "min_dte", 0)
+            max_dte = getattr(strategy, "max_dte", 999)
 
-        # Fixed 2026-09-04 (live incident): single-leg entries used to
-        # resolve expiry via get_near_month_expiry() alone, which only rolls
-        # to next month once near-month DTE < 7 -- but fresh entries require
-        # DTE >= min_dte (10 for both ema_crossover_v1/momentum_v1). For DTE
-        # 7/8/9 every month, the near-month contract is still "current"
-        # (>=7) but too close for a new position (<10), and nothing rolls it
-        # forward -- a genuine ~3-trading-day dead zone every month where
-        # neither strategy can open any new position, distinct from the
-        # already-fixed max_dte-too-high symptom right AFTER a roll (see
-        # test_single_leg_dte_dead_zone_2026_08_20.py). credit_spread_v1/
-        # iron_condor_v1 already avoid this via get_entry_expiry(min_dte) --
-        # applying the same fix here, matching that exact pattern.
-        if dte < min_dte:
-            expiry = get_entry_expiry(min_dte)
-            dte    = (expiry - now_ist().replace(tzinfo=None)).days
-            logger.info(
-                f"[{strategy.name}] {symbol} near-month DTE < {min_dte} — "
-                f"rolling fresh entry to next month's expiry (DTE={dte})"
-            )
+            # Fixed 2026-09-04 (live incident): single-leg entries used to
+            # resolve expiry via get_near_month_expiry() alone, which only rolls
+            # to next month once near-month DTE < 7 -- but fresh entries require
+            # DTE >= min_dte (10 for both ema_crossover_v1/momentum_v1). For DTE
+            # 7/8/9 every month, the near-month contract is still "current"
+            # (>=7) but too close for a new position (<10), and nothing rolls it
+            # forward -- a genuine ~3-trading-day dead zone every month where
+            # neither strategy can open any new position, distinct from the
+            # already-fixed max_dte-too-high symptom right AFTER a roll (see
+            # test_single_leg_dte_dead_zone_2026_08_20.py). credit_spread_v1/
+            # iron_condor_v1 already avoid this via get_entry_expiry(min_dte) --
+            # applying the same fix here, matching that exact pattern.
+            if dte < min_dte:
+                expiry = get_entry_expiry(min_dte)
+                dte    = (expiry - now_ist().replace(tzinfo=None)).days
+                logger.info(
+                    f"[{strategy.name}] {symbol} near-month DTE < {min_dte} — "
+                    f"rolling fresh entry to next month's expiry (DTE={dte})"
+                )
 
         if not (min_dte <= dte <= max_dte):
             logger.info(
@@ -3576,7 +3608,17 @@ class LiveTradingEngine:
         # skip the filter altogether. RSRanker now publishes a bottom-N
         # (weakest-vs-NIFTY) list (see rs_ranker.py's rank()); SELL checks
         # against that instead of top-N, same fail-closed handling either way.
-        if signal_str in ("BUY", "SELL") and self.rs_ranker and getattr(strategy, "require_rs", True):
+        # Added 2026-11-11: RS ranks a stock's strength RELATIVE TO NIFTY --
+        # meaningless for NIFTY itself ("NIFTY's RS vs NIFTY") and not a
+        # concept RSRanker computes for BANKNIFTY either (it only ranks
+        # FNO_SYMBOLS stocks). Skipped entirely for index symbols rather than
+        # failing closed on "symbol not found in ranks" -- this is a gate
+        # that doesn't apply here, not a filter whose data is missing.
+        if (
+            signal_str in ("BUY", "SELL") and self.rs_ranker
+            and getattr(strategy, "require_rs", True)
+            and symbol not in INDEX_FNO_SYMBOLS
+        ):
             try:
                 _rs_ranks = await self.rs_ranker.get_ranks()
             except Exception as _rs_exc:

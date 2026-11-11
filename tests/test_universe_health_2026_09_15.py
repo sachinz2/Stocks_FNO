@@ -66,10 +66,14 @@ async def test_universe_health_reports_full_coverage_when_everything_is_healthy(
     await poller.poll()
 
     health = json.loads(redis.store["market:universe_health"])
-    assert health["universe_size"] == 3
-    assert health["history_valid"] == 3
-    assert health["live_data_valid"] == 3
-    assert health["candidate_count"] == 3  # EMA scores every symbol with valid history
+    # Fixed 2026-11-11: NIFTY/BANKNIFTY are now unconditionally polled (see
+    # LTPPoller._index_set's docstring) -- these fakes apply generically to
+    # every symbol by name, so the two indices are "healthy" here too,
+    # adding 2 to every count.
+    assert health["universe_size"] == 5
+    assert health["history_valid"] == 5
+    assert health["live_data_valid"] == 5
+    assert health["candidate_count"] == 5  # EMA scores every symbol with valid history
 
 
 @pytest.mark.asyncio
@@ -101,7 +105,10 @@ async def test_universe_health_reflects_a_partial_history_fetch_outage(monkeypat
     await poller.poll()
 
     health = json.loads(redis.store["market:universe_health"])
-    assert health["universe_size"] == 3
+    # Fixed 2026-11-11: universe_size now includes NIFTY/BANKNIFTY (always
+    # polled); history_valid/candidate_count stay at 1 since the fake's
+    # "only GOOD has valid history" branch applies to the indices too.
+    assert health["universe_size"] == 5
     assert health["history_valid"] == 1
     assert health["candidate_count"] == 1
 
@@ -135,6 +142,10 @@ async def test_universe_health_reflects_symbols_stuck_on_bootstrap_fallback(monk
     await poller.poll()
 
     health = json.loads(redis.store["market:universe_health"])
-    assert health["universe_size"] == 3
-    assert health["history_valid"] == 3       # history is fine for all 3
+    # Fixed 2026-11-11: universe_size/history_valid now include NIFTY/
+    # BANKNIFTY (always polled, and the fake's unconditional hist.copy()
+    # gives them valid history too); live_data_valid stays at 1 since the
+    # fake's "only LIVE has real tick data" branch applies to indices too.
+    assert health["universe_size"] == 5
+    assert health["history_valid"] == 5       # history is fine for all 5
     assert health["live_data_valid"] == 1     # only LIVE has real tick data

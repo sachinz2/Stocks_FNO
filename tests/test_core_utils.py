@@ -102,7 +102,14 @@ def test_all_lot_sizes_are_positive_and_have_no_dead_entries():
     # FNO_SYMBOLS grew to 132 the same day without every new symbol needing
     # a manual entry here. What still matters: no entry should reference a
     # symbol that isn't traded at all (a genuinely dead/stale config value).
-    assert set(FNO_LOT_SIZES.keys()) <= set(FNO_SYMBOLS), (
+    #
+    # Fixed 2026-11-11: NIFTY/BANKNIFTY added as extra ema_crossover_v1/
+    # momentum_v1 candidates (explicit user instruction) -- deliberately
+    # NOT in FNO_SYMBOLS (that list drives stock-only liquidity-universe
+    # machinery), so they're a real, intentional exception here, not a dead
+    # entry. See INDEX_FNO_SYMBOLS in core/constants.py.
+    from src.core.constants import INDEX_FNO_SYMBOLS
+    assert set(FNO_LOT_SIZES.keys()) <= set(FNO_SYMBOLS) | set(INDEX_FNO_SYMBOLS), (
         "FNO_LOT_SIZES has an entry for a symbol no longer in FNO_SYMBOLS -- dead config"
     )
     for symbol, lot in FNO_LOT_SIZES.items():

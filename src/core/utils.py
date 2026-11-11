@@ -219,6 +219,51 @@ def get_entry_expiry(min_dte: int) -> datetime:
     return expiry
 
 
+# Added 2026-11-11 (NIFTY/BANKNIFTY added as extra ema_crossover_v1/
+# momentum_v1 candidates, explicit user instruction): BANKNIFTY lost its
+# weekly expiry in SEBI's November 2024 one-weekly-index-per-exchange rule
+# (NSE kept it on NIFTY only) and reuses get_near_month_expiry()/
+# get_entry_expiry() above unchanged -- these two functions exist for NIFTY
+# only. NIFTY's weekly expiry day itself also moved, Thursday -> Tuesday,
+# effective 2026-09-01 -- same weekday its monthly expiry already uses, so
+# only the roll INCREMENT differs (7 days, not "next calendar month").
+_WEEKLY_EXPIRY_WEEKDAY = 1  # Tuesday, same as _last_expiry_weekday's monthly one
+
+
+def get_near_weekly_expiry() -> datetime:
+    """
+    Return the nearest NSE weekly-expiry Tuesday (NIFTY only -- see module
+    comment above). Unlike get_near_month_expiry()'s 7-day roll buffer
+    (meaningful against a ~30-day cycle), a weekly cycle's DTE is ALWAYS
+    under 7 days by construction, so there is no equivalent "too close,
+    roll forward" case here -- that's exactly what get_weekly_entry_expiry()
+    below exists to apply, with its own much smaller, weekly-appropriate
+    minimum. This function only finds "the nearest Tuesday on/after today."
+    """
+    today = datetime.now(IST).replace(tzinfo=None)
+    days_ahead = (_WEEKLY_EXPIRY_WEEKDAY - today.weekday()) % 7
+    return today + timedelta(days=days_ahead)
+
+
+def get_weekly_entry_expiry(min_dte: int) -> datetime:
+    """
+    Return the weekly expiry to use for a *fresh* NIFTY entry -- rolls
+    forward week-by-week (not to "next month") until DTE >= min_dte.
+
+    min_dte here is deliberately a SEPARATE, much smaller setting than
+    credit-spread/iron-condor's (typically 21) or even single-leg stocks'
+    own min_dte (10, tuned for a ~30-day monthly cycle) -- applying either
+    of those to a 7-day cycle would force skipping every near-week
+    contract, always landing on the 2nd-or-3rd-nearest expiry instead of
+    the most liquid, nearest one. See ema_crossover_v1's/momentum_v1's
+    weekly_min_dte config in src/api/main.py.
+    """
+    expiry = get_near_weekly_expiry()
+    while (expiry - datetime.now(IST).replace(tzinfo=None)).days < min_dte:
+        expiry += timedelta(days=7)
+    return expiry
+
+
 def get_capital_period_bounds(for_date) -> "tuple[date, date]":
     """
     Return (period_start, period_end) for the expiry-to-expiry capital
@@ -266,6 +311,43 @@ def build_option_symbol(symbol: str, strike: float, option_type: str, expiry: da
     mon = _MONTH_ABBR[expiry.month]
     strike_str = str(int(strike)) if float(strike) == int(strike) else str(float(strike))
     return f"{symbol}{yy}{mon}{strike_str}{option_type}"
+
+
+# Single-character month code for NSE/Zerodha's WEEKLY option tradingsymbol
+# format (distinct from build_option_symbol()'s 3-letter monthly format,
+# which only works because a monthly contract is the ONE expiry that month --
+# a weekly contract needs the exact day encoded too, so the month itself is
+# compressed to one character to keep the string length sane). Verified via
+# WebSearch against Kite Connect's own documented examples (2026-11-11), not
+# guessed: e.g. a Dec 17 weekly 13600 CE is "NIFTY20D1713600CE".
+_WEEKLY_MONTH_CODE = {
+    1: "1", 2: "2", 3: "3", 4: "4", 5: "5", 6: "6",
+    7: "7", 8: "8", 9: "9", 10: "O", 11: "N", 12: "D",
+}
+
+
+def build_weekly_option_symbol(symbol: str, strike: float, option_type: str, expiry: datetime) -> str:
+    """
+    Build the NSE/Zerodha tradingsymbol for a WEEKLY index option (NIFTY
+    only -- see WEEKLY_EXPIRY_INDEX_SYMBOLS in core/constants.py).
+    Format: SYMBOL + YY + MONTHCODE(1 char) + DD + STRIKE + TYPE
+    Example: NIFTY26N1725000CE (2026, November, 17th, strike 25000, call).
+
+    Same fallback-only status as build_option_symbol(): get_real_contract()
+    validates/corrects against the real daily-refreshed instrument cache
+    first, keyed by (symbol, expiry date, strike, option_type) -- NOT by
+    matching this string -- so an exact-format mismatch here degrades to
+    "slightly less optimal candidate selection," not a broken order.
+    option_type must be 'CE' or 'PE'. expiry is required (no default, unlike
+    the monthly version) -- always call get_near_weekly_expiry()/
+    get_weekly_entry_expiry() explicitly, never silently assume "near month"
+    semantics apply to a weekly instrument.
+    """
+    yy = expiry.strftime("%y")
+    month_code = _WEEKLY_MONTH_CODE[expiry.month]
+    dd = expiry.strftime("%d")
+    strike_str = str(int(strike)) if float(strike) == int(strike) else str(float(strike))
+    return f"{symbol}{yy}{month_code}{dd}{strike_str}{option_type}"
 
 
 def estimate_option_premium(

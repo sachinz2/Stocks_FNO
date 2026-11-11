@@ -61,6 +61,45 @@ FNO_SYMBOLS = [
     "ZYDUSLIFE",
 ]
 
+# NIFTY 50 / BANKNIFTY index options, added 2026-11-11 as EXTRA candidates for
+# ema_crossover_v1/momentum_v1 only -- deliberately NOT merged into FNO_SYMBOLS
+# above, since that list drives the stock-liquidity-universe machinery
+# (ADTV ranking, weekly active-universe recompute) indices don't belong in.
+# Kept as its own list so every piece of stock-only logic that iterates
+# FNO_SYMBOLS is unaffected by this addition.
+#
+# Scope decision (explicit user instruction, 2026-11-11): credit_spread_v1/
+# iron_condor_v1 do NOT get these -- see LTPPoller's _index_set (ltp_poller.py)
+# for where this is kept out of those two strategies' candidate pools.
+#
+# Lot sizes/strike intervals below are FALLBACK ONLY, same convention as
+# FNO_LOT_SIZES/FNO_STRIKE_INTERVALS -- the live daily-refreshed cache
+# (scripts/zerodha_auto_auth.py, widened 2026-11-11 to include these two
+# specifically) is authoritative. Verified via WebSearch against NSE's
+# 2026-01 lot-size revision circular (confirmed live by multiple sources,
+# not guessed from training data): NIFTY 65 (was 75), BANKNIFTY 30 (was 35),
+# effective the January 2026 contract series.
+INDEX_FNO_SYMBOLS = ["NIFTY", "BANKNIFTY"]
+
+# NSE spot index tradingsymbol (Zerodha's "NSE" instrument-dump convention,
+# with a space) for each F&O "name" key above -- used to resolve the live
+# index spot token the same way resolve_nifty_token() already does for the
+# regime detector's own NIFTY subscription (see fno_universe.py).
+INDEX_SPOT_TRADINGSYMBOLS = {
+    "NIFTY": "NIFTY 50",
+    "BANKNIFTY": "NIFTY BANK",
+}
+
+# Which of the two index symbols still has a WEEKLY expiry cycle. Verified
+# via WebSearch (2026-11-11), not assumed: SEBI's November 2024 rule limited
+# each exchange to one weekly-expiry index; NSE kept it on NIFTY only --
+# BANKNIFTY (along with FINNIFTY/MIDCPNIFTY) has been MONTHLY-ONLY since
+# then, same cycle as every stock. NIFTY's own weekly expiry day also
+# changed, Thursday -> Tuesday, effective 2026-09-01 (its monthly expiry is
+# also the last Tuesday of the month) -- see get_near_weekly_expiry()/
+# get_weekly_entry_expiry() in core/utils.py.
+WEEKLY_EXPIRY_INDEX_SYMBOLS = frozenset({"NIFTY"})
+
 # Hardcoded lot sizes -- fallback ONLY. Unlike FNO_STRIKE_INTERVALS above
 # (confirmed no live refresh exists anywhere), _get_lot_size() in
 # live_trading_engine.py DOES check Redis first (REDIS_LOT_SIZE_PREFIX,
@@ -96,6 +135,8 @@ FNO_LOT_SIZES = {
     "TECHM":       600,   "BPCL":       1975,   "ONGC":       2250,
     "NTPC":       1500,   "POWERGRID":  1900,   "ULTRACEMCO":   50,
     "TATASTEEL":  2750,   "COALINDIA":  1350,
+    # Index lot sizes -- see INDEX_FNO_SYMBOLS' comment above for sourcing.
+    "NIFTY":        65,   "BANKNIFTY":    30,
 }
 
 # Gap between consecutive strikes on NSE for each symbol.
@@ -133,6 +174,10 @@ FNO_STRIKE_INTERVALS = {
     "TECHM":       16,   "BPCL":         5,   "ONGC":       2.5,
     "NTPC":         5,   "POWERGRID":  2.5,   "ULTRACEMCO":  40,
     "TATASTEEL":  2.5,   "COALINDIA":    5,
+    # Index strike intervals -- stable, well-established conventions (unlike
+    # lot sizes, these rarely change). get_real_strike_interval() is still
+    # authoritative; this is the cache-miss fallback only.
+    "NIFTY":       50,   "BANKNIFTY":  100,
 }
 
 # How many stocks to trade at a time per strategy regime
@@ -368,6 +413,10 @@ FNO_SECTORS = {
     "WAAREEENER":  "Power",
     "YESBANK":     "Banking",
     "ZYDUSLIFE":   "Pharma",
+    # Indices -- their own bucket so they never contribute to (or get
+    # blocked by) a stock sector's concentration cap.
+    "NIFTY":       "Index",
+    "BANKNIFTY":   "Index",
 }
 
 # Capital fraction allocated to each strategy (must sum to <= 1.0).

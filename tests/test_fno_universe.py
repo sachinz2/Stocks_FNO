@@ -58,6 +58,33 @@ def test_resolve_nifty_token_handles_empty_dump():
     assert resolve_nifty_token([]) is None
 
 
+# ── resolve_index_trading_tokens() (2026-11-11, NIFTY/BANKNIFTY added as ───
+# extra ema_crossover_v1/momentum_v1 candidates) ────────────────────────────
+
+from src.market_data.fno_universe import resolve_index_trading_tokens
+
+
+def test_resolve_index_trading_tokens_keys_by_fno_name_not_raw_tradingsymbol():
+    nse_dump = [
+        {"tradingsymbol": "RELIANCE", "instrument_token": 111},
+        {"tradingsymbol": "NIFTY 50", "instrument_token": 256265},
+        {"tradingsymbol": "NIFTY BANK", "instrument_token": 260105},
+    ]
+    tokens = resolve_index_trading_tokens(nse_dump)
+    assert tokens == {"NIFTY": 256265, "BANKNIFTY": 260105}
+
+
+def test_resolve_index_trading_tokens_omits_missing_entries_rather_than_raising():
+    nse_dump = [{"tradingsymbol": "NIFTY 50", "instrument_token": 256265}]
+    tokens = resolve_index_trading_tokens(nse_dump)
+    assert tokens == {"NIFTY": 256265}
+    assert "BANKNIFTY" not in tokens
+
+
+def test_resolve_index_trading_tokens_handles_empty_dump():
+    assert resolve_index_trading_tokens([]) == {}
+
+
 def test_compute_liquidity_turnover_averages_volume_times_close():
     class _FakeKite:
         def historical_data(self, token, from_date, to_date, interval, continuous, oi):

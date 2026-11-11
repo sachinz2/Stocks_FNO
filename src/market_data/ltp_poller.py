@@ -67,6 +67,7 @@ from src.core.constants import (
     ACTIVE_TRADING_SYMBOLS,
     FIVE_MIN_ATR_DAILY_SCALE,
     FNO_SYMBOLS,
+    INDEX_FNO_SYMBOLS,
     REDIS_TICK_PREFIX,
     REDIS_TOP_SYMBOLS_KEY,
     REDIS_TOP_SYMBOLS_CREDIT_SPREAD,
@@ -184,6 +185,15 @@ class LTPPoller:
         # non-dynamic callers (tests, any future fixed-list caller) keep
         # their original all-symbols-eligible behavior.
         self._active_set: Optional[set] = None
+        # Added 2026-11-11 (NIFTY/BANKNIFTY added as extra ema_crossover_v1/
+        # momentum_v1 candidates, explicit user instruction): fixed, not
+        # recomputed by the liquidity-based weekly recompute -- indices
+        # don't participate in the ADTV ranking that drives _active_set.
+        # Always unioned into self.symbols (see _refresh_active_symbols())
+        # and always eligible for scoring, but explicitly excluded from
+        # spread_scores/condor_scores in the scoring loop below -- these two
+        # symbols are scoped to ema_crossover_v1/momentum_v1 only.
+        self._index_set: set = set(INDEX_FNO_SYMBOLS)
         self._history: Dict[str, pd.DataFrame] = {}
         self._history_loaded_at: Dict[str, datetime] = {}
         self._history_15m: Dict[str, pd.DataFrame] = {}
@@ -231,7 +241,9 @@ class LTPPoller:
         from src.market_data.option_chain import get_active_fno_symbols
         active = await get_active_fno_symbols(self._redis)
         self._active_set = set(active)
-        self.symbols = sorted(self._active_set | self._must_track)
+        # self._index_set unioned in unconditionally -- see its own
+        # docstring in __init__ for why it's fixed, not liquidity-ranked.
+        self.symbols = sorted(self._active_set | self._must_track | self._index_set)
 
     def set_kite(self, kite, instrument_tokens: Dict[str, int]) -> None:
         """
@@ -430,11 +442,23 @@ class LTPPoller:
                 # must not compete for a new-entry candidate pool. Market
                 # data (the Redis tick/tick15 writes above) is still kept
                 # current for it either way, for exit management.
-                if self._active_set is None or symbol in self._active_set:
+                #
+                # Added 2026-11-11: self._index_set symbols are ALSO eligible
+                # here (NIFTY/BANKNIFTY aren't liquidity-ranked into
+                # _active_set, but must still compete for ema_crossover_v1/
+                # momentum_v1's pools) -- see the spread/condor exclusion
+                # just below for why they're scoped to those two only.
+                if self._active_set is None or symbol in self._active_set or symbol in self._index_set:
+                    _is_index = symbol in self._index_set
                     ema_scores[symbol] = e
-                    if s > 0:
+                    # Explicit user instruction (2026-11-11): NIFTY/BANKNIFTY
+                    # are extra candidates for ema_crossover_v1/momentum_v1
+                    # ONLY -- credit_spread_v1/iron_condor_v1 must never see
+                    # them in their own pools, regardless of what _score_all()
+                    # itself would compute for an index's premium-selling thesis.
+                    if s > 0 and not _is_index:
                         spread_scores[symbol] = s
-                    if c > 0:
+                    if c > 0 and not _is_index:
                         condor_scores[symbol] = c
                     if m > 0:
                         momentum_scores[symbol] = m

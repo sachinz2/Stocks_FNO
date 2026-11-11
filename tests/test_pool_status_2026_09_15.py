@@ -71,11 +71,21 @@ async def test_pool_status_is_ready_when_candidates_found(monkeypatch):
 
     await poller.poll()
 
-    for key in (REDIS_TOP_SYMBOLS_KEY, REDIS_TOP_SYMBOLS_CREDIT_SPREAD,
-                REDIS_TOP_SYMBOLS_IRON_CONDOR, REDIS_TOP_SYMBOLS_MOMENTUM):
+    # Fixed 2026-11-11: NIFTY/BANKNIFTY are now unconditionally eligible for
+    # EMA/momentum scoring (ema_crossover_v1/momentum_v1 candidates, see
+    # LTPPoller._index_set's docstring) but explicitly excluded from
+    # credit_spread/iron_condor's pools -- so those two keys legitimately
+    # gain 2 extra symbols here, while credit_spread/iron_condor stay at 1.
+    expected_counts = {
+        REDIS_TOP_SYMBOLS_KEY: 3,
+        REDIS_TOP_SYMBOLS_CREDIT_SPREAD: 1,
+        REDIS_TOP_SYMBOLS_IRON_CONDOR: 1,
+        REDIS_TOP_SYMBOLS_MOMENTUM: 3,
+    }
+    for key, expected in expected_counts.items():
         status = json.loads(redis.store[f"{key}:status"])
         assert status["status"] == "READY"
-        assert status["symbols_count"] == 1
+        assert status["symbols_count"] == expected, f"{key}: expected {expected}"
 
 
 @pytest.mark.asyncio

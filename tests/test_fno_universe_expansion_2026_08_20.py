@@ -52,7 +52,12 @@ def test_fno_lot_sizes_has_no_dead_entries_for_untraded_symbols():
     # test_core_utils.py's updated invariant) and doesn't need to cover the
     # new 91 -- but every entry it DOES have must still reference an
     # actually-traded symbol, not a stale leftover.
-    assert set(FNO_LOT_SIZES.keys()) <= set(FNO_SYMBOLS)
+    #
+    # Fixed 2026-11-11: NIFTY/BANKNIFTY added as extra ema_crossover_v1/
+    # momentum_v1 candidates -- see INDEX_FNO_SYMBOLS in core/constants.py
+    # for why they're a real, intentional exception here, not a dead entry.
+    from src.core.constants import INDEX_FNO_SYMBOLS
+    assert set(FNO_LOT_SIZES.keys()) <= set(FNO_SYMBOLS) | set(INDEX_FNO_SYMBOLS)
 
 
 def test_new_symbols_include_expected_high_liquidity_names_not_in_original_list():

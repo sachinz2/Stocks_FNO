@@ -134,7 +134,9 @@ async def lifespan(app: FastAPI):
             # to re-cover it. Resolve against the full real F&O stock
             # universe instead, a superset that always covers whatever the
             # dynamic active list currently contains.
-            from src.market_data.fno_universe import extract_stock_underlyings, resolve_nifty_token
+            from src.market_data.fno_universe import (
+                extract_stock_underlyings, resolve_nifty_token, resolve_index_trading_tokens,
+            )
             nfo_instruments = await loop.run_in_executor(None, kite.instruments, "NFO")
             full_universe = set(extract_stock_underlyings(nfo_instruments))
             nse_instruments = await loop.run_in_executor(None, kite.instruments, "NSE")
@@ -143,6 +145,21 @@ async def lifespan(app: FastAPI):
                 if sym in full_universe:
                     tokens[sym] = inst["instrument_token"]
             logger.info(f"Instrument tokens loaded: {len(tokens)}/{len(full_universe)} F&O stock symbols.")
+            # Fixed 2026-11-11 (NIFTY/BANKNIFTY added as extra
+            # ema_crossover_v1/momentum_v1 candidates): same already-fetched
+            # NSE dump, no extra API call -- adds their spot tokens into the
+            # SAME tokens dict stocks use, keyed by the F&O "name" convention
+            # ("NIFTY"/"BANKNIFTY"), so LTPPoller's existing token-lookup
+            # path (self._tokens[symbol]) needs no index-specific branch.
+            index_tokens = resolve_index_trading_tokens(nse_instruments)
+            tokens.update(index_tokens)
+            from src.core.constants import INDEX_FNO_SYMBOLS
+            _missing_index = [s for s in INDEX_FNO_SYMBOLS if s not in index_tokens]
+            if _missing_index:
+                logger.warning(
+                    f"Index instrument token(s) not found in NSE dump: {_missing_index} "
+                    "-- these symbols will fail closed (no token) until this resolves."
+                )
             # Fixed 2026-09-15 (external review, global-regime NIFTY
             # subscription): resolved from this SAME already-fetched NSE
             # dump, no extra API call. Stored on app.state (not returned --

@@ -285,7 +285,7 @@ def fetch_and_cache_lot_sizes(instruments: list) -> int:
     on a freshly-activated symbol until the NEXT day's auth run happened to
     also cover it.
     """
-    from src.core.constants import REDIS_LOT_SIZE_PREFIX
+    from src.core.constants import REDIS_LOT_SIZE_PREFIX, INDEX_FNO_SYMBOLS
     from src.market_data.fno_universe import INDEX_NAMES
 
     r = get_redis_client()
@@ -293,7 +293,14 @@ def fetch_and_cache_lot_sizes(instruments: list) -> int:
 
     for inst in instruments:
         name = inst.get("name", "")
-        if name and name not in INDEX_NAMES and name not in seen:
+        # Fixed 2026-11-11 (NIFTY/BANKNIFTY added as extra ema_crossover_v1/
+        # momentum_v1 candidates): INDEX_NAMES excludes every index (correct
+        # for the stock-universe machinery this was originally for), but
+        # INDEX_FNO_SYMBOLS' two chosen indices now need real, live-refreshed
+        # lot sizes too -- same reasoning as every other symbol here (the
+        # fallback table drifts; NSE revised both index lot sizes as
+        # recently as January 2026).
+        if name and (name not in INDEX_NAMES or name in INDEX_FNO_SYMBOLS) and name not in seen:
             lot_size = inst.get("lot_size", 0)
             if lot_size > 0:
                 r.set(f"{REDIS_LOT_SIZE_PREFIX}{name}", str(lot_size), ex=86400 * 7)
@@ -326,7 +333,7 @@ def fetch_and_cache_real_contracts(instruments: list) -> int:
     contract data cached instead of failing closed for a day.
     """
     import json as _json
-    from src.core.constants import REDIS_CONTRACT_PREFIX
+    from src.core.constants import REDIS_CONTRACT_PREFIX, INDEX_FNO_SYMBOLS
     from src.market_data.fno_universe import INDEX_NAMES
 
     r = get_redis_client()
@@ -336,7 +343,10 @@ def fetch_and_cache_real_contracts(instruments: list) -> int:
     for inst in instruments:
         name = inst.get("name", "")
         itype = inst.get("instrument_type", "")
-        if not name or name in INDEX_NAMES or itype not in ("CE", "PE"):
+        # Fixed 2026-11-11: same INDEX_FNO_SYMBOLS carve-out as
+        # fetch_and_cache_lot_sizes() above -- NIFTY/BANKNIFTY's real listed
+        # option contracts need caching too, every other index stays excluded.
+        if not name or (name in INDEX_NAMES and name not in INDEX_FNO_SYMBOLS) or itype not in ("CE", "PE"):
             continue
         expiry = inst.get("expiry")
         strike = inst.get("strike")

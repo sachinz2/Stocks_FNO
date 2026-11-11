@@ -81,6 +81,39 @@ def resolve_nifty_token(nse_instruments: list) -> Optional[int]:
     return None
 
 
+def resolve_index_trading_tokens(nse_instruments: list) -> Dict[str, int]:
+    """
+    Added 2026-11-11 (NIFTY/BANKNIFTY added as extra ema_crossover_v1/
+    momentum_v1 candidates, explicit user instruction): resolve instrument
+    tokens for the full INDEX_FNO_SYMBOLS set (currently NIFTY, BANKNIFTY),
+    keyed by the F&O "name" convention used everywhere else in this
+    codebase (FNO_LOT_SIZES/FNO_STRIKE_INTERVALS/FNO_SECTORS/order
+    construction) -- NOT by the raw NSE tradingsymbol
+    (INDEX_SPOT_TRADINGSYMBOLS' values, e.g. "NIFTY 50"/"NIFTY BANK").
+
+    Deliberately separate from resolve_nifty_token() above: that one feeds
+    the global-regime subscription specifically and must keep its own
+    narrow, single-purpose contract; this one feeds the strategy-tradeable
+    symbol pipeline (LTPPoller's self.symbols/_tokens) and is meant to grow
+    if more indices are ever added to INDEX_FNO_SYMBOLS. Same input dump,
+    no extra API call -- same tradingsymbol the regime subscription already
+    resolves "NIFTY 50" from is reused here under the "NIFTY" key.
+
+    Missing entries are simply omitted (not raised) -- caller's existing
+    fail-closed conventions (no token -> _get_history()'s "no kite/token"
+    skip, same as any stock) already handle a symbol with no token safely.
+    """
+    from src.core.constants import INDEX_FNO_SYMBOLS, INDEX_SPOT_TRADINGSYMBOLS
+
+    wanted = {INDEX_SPOT_TRADINGSYMBOLS[name]: name for name in INDEX_FNO_SYMBOLS}
+    tokens: Dict[str, int] = {}
+    for inst in nse_instruments:
+        tsym = inst.get("tradingsymbol")
+        if tsym in wanted:
+            tokens[wanted[tsym]] = inst.get("instrument_token")
+    return tokens
+
+
 def compute_liquidity_turnover(kite, tokens: Dict[str, int], lookback_days: int = 30) -> Dict[str, float]:
     """
     Blocking (real kite.historical_data() calls) -- average daily turnover

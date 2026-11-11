@@ -7,8 +7,8 @@ correction of our own computed strikes and hand-formatted symbol strings.
 import json
 from datetime import date
 
-from scripts.zerodha_auto_auth import fetch_and_cache_real_contracts
-from src.core.constants import REDIS_CONTRACT_PREFIX
+from scripts.zerodha_auto_auth import fetch_and_cache_real_contracts, fetch_and_cache_lot_sizes
+from src.core.constants import REDIS_CONTRACT_PREFIX, REDIS_LOT_SIZE_PREFIX
 
 
 class _FakeSyncRedis:
@@ -92,18 +92,52 @@ def test_stocks_not_in_the_static_fno_symbols_list_are_still_cached(monkeypatch)
     assert f"{REDIS_CONTRACT_PREFIX}SOME_STOCK_NOT_YET_ACTIVE" in fake_redis.store
 
 
-def test_index_options_are_not_cached_as_stocks(monkeypatch):
+def test_nifty_and_banknifty_are_now_cached_other_indices_are_not(monkeypatch):
+    # Fixed 2026-11-11 (NIFTY/BANKNIFTY added as extra ema_crossover_v1/
+    # momentum_v1 candidates, explicit user instruction): this test used to
+    # assert the OPPOSITE for NIFTY/BANKNIFTY -- see INDEX_FNO_SYMBOLS'
+    # comment in core/constants.py. Every OTHER index (FINNIFTY here as the
+    # representative case) must still be excluded -- this isn't a blanket
+    # "cache all indices" change, just these two specific, deliberately
+    # chosen ones.
     fake_redis = _FakeSyncRedis()
     monkeypatch.setattr("scripts.zerodha_auto_auth.get_redis_client", lambda: fake_redis)
 
     instruments = _bajfinance_instruments() + [
         _mock_instrument("NIFTY", date(2026, 9, 29), 25000, "CE", "NIFTY26SEP25000CE"),
         _mock_instrument("BANKNIFTY", date(2026, 9, 29), 55000, "PE", "BANKNIFTY26SEP55000PE"),
+        _mock_instrument("FINNIFTY", date(2026, 9, 29), 20000, "CE", "FINNIFTY26SEP20000CE"),
     ]
     fetch_and_cache_real_contracts(instruments)
 
-    assert f"{REDIS_CONTRACT_PREFIX}NIFTY" not in fake_redis.store
-    assert f"{REDIS_CONTRACT_PREFIX}BANKNIFTY" not in fake_redis.store
+    assert f"{REDIS_CONTRACT_PREFIX}NIFTY" in fake_redis.store
+    assert f"{REDIS_CONTRACT_PREFIX}BANKNIFTY" in fake_redis.store
+    assert f"{REDIS_CONTRACT_PREFIX}FINNIFTY" not in fake_redis.store
+
+    nifty_data = json.loads(fake_redis.store[f"{REDIS_CONTRACT_PREFIX}NIFTY"])
+    assert nifty_data["2026-09-29"]["25000"]["CE"] == "NIFTY26SEP25000CE"
+
+
+def test_fetch_and_cache_lot_sizes_includes_nifty_and_banknifty_excludes_others(monkeypatch):
+    # Same carve-out as fetch_and_cache_real_contracts() above, for the
+    # sibling caching function -- see INDEX_FNO_SYMBOLS' comment in
+    # core/constants.py.
+    fake_redis = _FakeSyncRedis()
+    monkeypatch.setattr("scripts.zerodha_auto_auth.get_redis_client", lambda: fake_redis)
+
+    instruments = [
+        {"name": "BAJFINANCE", "lot_size": 750},
+        {"name": "NIFTY", "lot_size": 65},
+        {"name": "BANKNIFTY", "lot_size": 30},
+        {"name": "FINNIFTY", "lot_size": 60},
+    ]
+    count = fetch_and_cache_lot_sizes(instruments)
+
+    assert count == 3
+    assert fake_redis.store[f"{REDIS_LOT_SIZE_PREFIX}BAJFINANCE"] == "750"
+    assert fake_redis.store[f"{REDIS_LOT_SIZE_PREFIX}NIFTY"] == "65"
+    assert fake_redis.store[f"{REDIS_LOT_SIZE_PREFIX}BANKNIFTY"] == "30"
+    assert f"{REDIS_LOT_SIZE_PREFIX}FINNIFTY" not in fake_redis.store
 
 
 def test_futures_and_non_option_rows_are_ignored(monkeypatch):

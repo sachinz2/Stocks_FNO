@@ -14,10 +14,20 @@ import pytest
 
 from src.market_data.ltp_poller import LTPPoller
 from src.core.constants import (
+    INDEX_FNO_SYMBOLS,
     REDIS_ACTIVE_FNO_SYMBOLS,
     REDIS_TOP_SYMBOLS_EMA_BULL, REDIS_TOP_SYMBOLS_EMA_BEAR,
     REDIS_TOP_SYMBOLS_MOMENTUM_BULL, REDIS_TOP_SYMBOLS_MOMENTUM_BEAR,
 )
+
+# Fixed 2026-11-11: NIFTY/BANKNIFTY are now unconditionally eligible for
+# ema/momentum scoring (see LTPPoller._index_set's docstring), so these
+# fakes' simplistic "everyone not named BEAR*/startswith checks" logic
+# bullishly classifies them too, landing them in whichever pool this test
+# is asserting an exact list for. Filtered out before each assertion --
+# this file tests the STOCK bull/bear split specifically.
+def _without_indices(symbols):
+    return [s for s in symbols if s not in INDEX_FNO_SYMBOLS]
 
 
 class _FakePollRedis:
@@ -90,8 +100,8 @@ async def test_a_strongly_one_sided_day_fills_both_dedicated_pools_not_just_one(
 
     await poller.poll()
 
-    bull_pool = json.loads(redis.store[REDIS_TOP_SYMBOLS_MOMENTUM_BULL])
-    bear_pool = json.loads(redis.store[REDIS_TOP_SYMBOLS_MOMENTUM_BEAR])
+    bull_pool = _without_indices(json.loads(redis.store[REDIS_TOP_SYMBOLS_MOMENTUM_BULL]))
+    bear_pool = _without_indices(json.loads(redis.store[REDIS_TOP_SYMBOLS_MOMENTUM_BEAR]))
     assert bull_pool == ["BULL1"]
     assert sorted(bear_pool) == ["BEAR1", "BEAR2", "BEAR3", "BEAR4"], (
         "all 4 bearish candidates must get their own pool, not compete "
@@ -135,8 +145,8 @@ async def test_ema_pool_also_splits_by_current_ema_relationship(monkeypatch):
 
     await poller.poll()
 
-    assert json.loads(redis.store[REDIS_TOP_SYMBOLS_EMA_BULL]) == ["UP"]
-    assert json.loads(redis.store[REDIS_TOP_SYMBOLS_EMA_BEAR]) == ["DOWN"]
+    assert _without_indices(json.loads(redis.store[REDIS_TOP_SYMBOLS_EMA_BULL])) == ["UP"]
+    assert _without_indices(json.loads(redis.store[REDIS_TOP_SYMBOLS_EMA_BEAR])) == ["DOWN"]
 
 
 # ── LiveTradingEngine._get_active_symbols() reads the union of both sides ──

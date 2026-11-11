@@ -12,7 +12,12 @@ import json
 import pytest
 
 from src.market_data.ltp_poller import LTPPoller
-from src.core.constants import FNO_SYMBOLS, REDIS_ACTIVE_FNO_SYMBOLS
+from src.core.constants import FNO_SYMBOLS, INDEX_FNO_SYMBOLS, REDIS_ACTIVE_FNO_SYMBOLS
+
+# Fixed 2026-11-11: NIFTY/BANKNIFTY are now unconditionally unioned into
+# self.symbols by _refresh_active_symbols() (see LTPPoller._index_set's
+# docstring) -- every exact-set assertion in this file needs them added.
+_INDEX_SET = set(INDEX_FNO_SYMBOLS)
 
 
 class _FakeRedis:
@@ -30,7 +35,7 @@ async def test_refresh_pulls_the_dynamic_active_list_by_default():
 
     await poller._refresh_active_symbols()
 
-    assert poller.symbols == ["A", "B"]
+    assert set(poller.symbols) == {"A", "B"} | _INDEX_SET
 
 
 @pytest.mark.asyncio
@@ -41,7 +46,7 @@ async def test_refresh_unions_with_force_tracked_underlyings():
 
     await poller._refresh_active_symbols()
 
-    assert set(poller.symbols) == {"A", "B", "ZZZTHIN"}
+    assert set(poller.symbols) == {"A", "B", "ZZZTHIN"} | _INDEX_SET
 
 
 @pytest.mark.asyncio
@@ -76,7 +81,7 @@ async def test_explicit_symbols_at_construction_are_never_overwritten():
 async def test_falls_back_to_static_fno_symbols_when_redis_has_nothing_cached():
     poller = LTPPoller(redis_client=_FakeRedis({}))
     await poller._refresh_active_symbols()
-    assert set(poller.symbols) == set(FNO_SYMBOLS)
+    assert set(poller.symbols) == set(FNO_SYMBOLS) | _INDEX_SET
 
 
 @pytest.mark.asyncio
@@ -90,7 +95,10 @@ async def test_refresh_tracks_active_set_separately_from_the_polled_union():
 
     await poller._refresh_active_symbols()
 
-    assert set(poller.symbols) == {"A", "B", "ZZZTHIN"}
+    assert set(poller.symbols) == {"A", "B", "ZZZTHIN"} | _INDEX_SET
+    # _active_set itself is unaffected -- indices aren't liquidity-ranked
+    # into it, they're unioned into self.symbols separately (see
+    # LTPPoller._index_set's docstring).
     assert poller._active_set == {"A", "B"}
     assert "ZZZTHIN" not in poller._active_set
 
@@ -167,7 +175,7 @@ async def test_force_tracked_but_inactive_symbol_never_enters_a_published_pool(m
     await poller.poll()
 
     assert poller._active_set == {"ACTIVE_SYM"}
-    assert set(poller.symbols) == {"ACTIVE_SYM", "THIN_SYM"}, "THIN_SYM must still be polled"
+    assert set(poller.symbols) == {"ACTIVE_SYM", "THIN_SYM"} | _INDEX_SET, "THIN_SYM must still be polled"
 
     top_ema = json.loads(redis.store[REDIS_TOP_SYMBOLS_KEY])
     top_momentum = json.loads(redis.store[REDIS_TOP_SYMBOLS_MOMENTUM])
