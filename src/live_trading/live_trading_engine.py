@@ -237,6 +237,25 @@ class LiveTradingEngine:
         # human notices a prolonged data outage well before it does real
         # damage, not a trading decision in itself).
         self._STALE_DATA_ALERT_SECONDS = 120
+        # Added 2026-11-12 (live incident: ONGC's open credit_spread found
+        # trading on strikes 222.5/215, neither of which is a real listed
+        # NSE contract -- _resolve_contract()'s fail-closed validation is
+        # only ever consulted at ENTRY time; nothing re-checks an
+        # already-open position against the real-contract cache
+        # afterward, so a transient cache-staleness window at entry (the
+        # cache self-corrects daily, but the position it let through
+        # doesn't) went unnoticed until a human spotted a stuck
+        # market_price=0.0 on the dashboard. Tracks, per underlying, whether
+        # this one-time alert has already fired -- unlike _stale_data_*
+        # above, this never "clears" on its own (a wrong contract doesn't
+        # become right again), so there is no since/duration component, just
+        # a fire-once set checked each cycle in _check_spread_exits()/
+        # _check_condor_exits(). Purely a visibility alert, same philosophy
+        # as the staleness one: never force-closes or otherwise acts on the
+        # mismatch itself, since closing a possibly-still-profitable
+        # position automatically on a metadata mismatch is a bigger,
+        # separate decision than just surfacing it to a human.
+        self._contract_mismatch_alerted: set = set()
         self._kite = None        # attached in live mode for real quotes + VIX
         self._ltp_poller = None  # ZerodhaLTPPoller — registers active option contracts
         # Prevents concurrent exit checks from 1-min signal cycle + 10-s exit-only job (F)
@@ -4951,6 +4970,56 @@ class LiveTradingEngine:
             return "resolved_bad", order
         return "resolved_ok", order
 
+    async def _check_contract_still_real(
+        self, underlying: str, expiry: datetime, legs: List[Tuple[str, float, str]],
+    ) -> None:
+        """
+        Added 2026-11-12 (live incident: ONGC's open credit_spread found
+        trading on strikes 222.5/215, neither a real listed NSE contract --
+        see self._contract_mismatch_alerted's docstring in __init__ for the
+        full incident and why this only alerts, never force-closes).
+
+        legs: (leg_label, stored_strike, option_type) tuples, e.g.
+        [("short", spread["short_strike"], opt), ("long", spread["long_strike"], opt)].
+        Reuses get_real_contract() -- the SAME validation entries are
+        supposed to pass at entry time -- rather than inventing new
+        matching logic: if it now resolves a DIFFERENT strike than what's
+        stored, the stored one was never real (or stopped being real,
+        though NSE strikes are not actually removed mid-contract-life in
+        practice -- "never was" is the realistic case). A cache miss (no
+        data for this symbol/expiry at all) is inconclusive, not a
+        mismatch -- skipped, not alerted.
+        """
+        if underlying in self._contract_mismatch_alerted:
+            return
+        redis = getattr(self, "_redis", None)
+        if not redis:
+            return
+        from src.market_data.option_chain import get_real_contract
+        for leg_label, stored_strike, option_type in legs:
+            try:
+                real = await get_real_contract(underlying, expiry, stored_strike, option_type, redis)
+            except Exception:
+                continue
+            if real is None:
+                continue
+            _, real_strike = real
+            if real_strike != stored_strike:
+                self._contract_mismatch_alerted.add(underlying)
+                logger.critical(
+                    f"CONTRACT MISMATCH: {underlying} {leg_label} leg's stored strike "
+                    f"{stored_strike} is not a real listed NSE strike -- the real-contract "
+                    f"cache resolves this expiry/option-type to {real_strike} instead."
+                )
+                await self._notify(
+                    f"CONTRACT MISMATCH ALERT\n{underlying} ({leg_label} leg): stored strike "
+                    f"{stored_strike} isn't a real NSE-listed contract -- real cache says "
+                    f"{real_strike}. This position will still exit via normal stop-loss/"
+                    "DTE logic (premium estimated from the underlying, since no real quote "
+                    "exists for it), but its final P&L will be theoretical, not market-real."
+                )
+                return
+
     async def _check_spread_exits(self, active_strategies: Dict[str, Any]) -> None:
         if not self._active_spreads:
             return
@@ -5030,6 +5099,11 @@ class LiveTradingEngine:
                 current_price = float(market_data.get("close", 0))
                 atr = float(market_data.get("atr14", 0))
                 opt = spread["option_type"]
+
+                await self._check_contract_still_real(
+                    underlying, spread_expiry,
+                    [("short", spread["short_strike"], opt), ("long", spread["long_strike"], opt)],
+                )
 
                 # Try real Kite LTP first (same source as entry pricing via get_entry_prices_for_spread).
                 # BS fallback uses 5-min ATR which underestimates annualised vol by ~8×, causing
@@ -6143,6 +6217,16 @@ class LiveTradingEngine:
 
                 current_price = float(market_data.get("close", 0))
                 atr = float(market_data.get("atr14", 0))
+
+                await self._check_contract_still_real(
+                    underlying, condor_expiry,
+                    [
+                        ("put_short",  c["put_short_strike"],  "PE"),
+                        ("put_long",   c["put_long_strike"],   "PE"),
+                        ("call_short", c["call_short_strike"], "CE"),
+                        ("call_long",  c["call_long_strike"],  "CE"),
+                    ],
+                )
 
                 # Try real Kite LTPs first — same fix as _check_spread_exits.
                 from src.market_data.option_chain import get_option_quote

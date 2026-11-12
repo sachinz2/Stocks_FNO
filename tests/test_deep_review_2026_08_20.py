@@ -6,6 +6,7 @@ pipeline, all five strategies, and api/main.py's lifespan+scheduling), each
 verified against the actual code before fixing. Covers the highest-severity
 confirmed findings; see docs/LIVE_TRADING_CHECKLIST.md for the full list.
 """
+import functools
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -321,6 +322,7 @@ async def test_spread_exit_retry_does_not_resend_order_for_already_closed_leg(mo
         _real_fill=LiveTradingEngine._real_fill,
         _leg_round_trip_fees=LiveTradingEngine._leg_round_trip_fees,
         _stale_data_since={}, _stale_data_alerted=set(), _STALE_DATA_ALERT_SECONDS=120,
+        _contract_mismatch_alerted=set(),
         order_manager=SimpleNamespace(place_order=_fake_place_order),
         risk_manager=_FakeRiskMgr(),
         _active_spreads={"TITAN": spread}, _active_condors={},
@@ -335,6 +337,11 @@ async def test_spread_exit_retry_does_not_resend_order_for_already_closed_leg(mo
             {"symbol": "TITAN26SEP4400PE", "quantity": 175, "avg_price": 13.0},
         ]),
     )
+    # _check_contract_still_real is a genuine instance method (unlike the
+    # staticmethods above) -- SimpleNamespace doesn't auto-bind `self`, so
+    # it's attached via functools.partial after construction instead of as
+    # a plain kwarg (which would call it with `self` missing).
+    fake._check_contract_still_real = functools.partial(LiveTradingEngine._check_contract_still_real, fake)
     monkeypatch.setattr(
         "src.live_trading.live_trading_engine.get_near_month_expiry",
         lambda: now_ist().replace(tzinfo=None) + timedelta(days=11),

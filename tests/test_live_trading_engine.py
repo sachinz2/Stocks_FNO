@@ -1482,6 +1482,7 @@ class _FakeSpreadExitEngine:
 
     _real_fill = staticmethod(LiveTradingEngine._real_fill)
     _leg_round_trip_fees = staticmethod(LiveTradingEngine._leg_round_trip_fees)
+    _check_contract_still_real = LiveTradingEngine._check_contract_still_real
 
     def __init__(self):
         self.order_manager = _FakeSpreadOrderManager({
@@ -1492,6 +1493,7 @@ class _FakeSpreadExitEngine:
         self._stale_data_since = {}
         self._stale_data_alerted = set()
         self._STALE_DATA_ALERT_SECONDS = 120
+        self._contract_mismatch_alerted = set()
         self._active_spreads = {
             "TITAN": {
                 "short_contract": "TITAN26SEP4650PE", "long_contract": "TITAN26SEP4400PE",
@@ -1727,6 +1729,7 @@ class _FakeCondorExitEngine:
 
     _real_fill = staticmethod(LiveTradingEngine._real_fill)
     _leg_round_trip_fees = staticmethod(LiveTradingEngine._leg_round_trip_fees)
+    _check_contract_still_real = LiveTradingEngine._check_contract_still_real
 
     def __init__(self):
         # Quote-side prices (what the exit DECISION and old buggy pnl used):
@@ -1743,6 +1746,7 @@ class _FakeCondorExitEngine:
         self._stale_data_since = {}
         self._stale_data_alerted = set()
         self._STALE_DATA_ALERT_SECONDS = 120
+        self._contract_mismatch_alerted = set()
         self._active_spreads = {}
         self._active_condors = {
             "SBIN": {
