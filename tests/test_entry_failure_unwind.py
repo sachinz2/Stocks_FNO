@@ -57,4 +57,4 @@ def test_credit_spread_short_leg_rejected_by_risk_stops_retrying_today():
     src = inspect.getsource(LiveTradingEngine._process_credit_spread)
     idx = src.index("Short leg rejected")
     nearby = src[idx:idx + 300]
-    assert '_exited_today.add(symbol)' in nearby
+    assert '_exited_today.add((strategy.name, symbol))' in nearby

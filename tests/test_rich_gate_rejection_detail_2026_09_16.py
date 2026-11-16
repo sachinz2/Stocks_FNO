@@ -321,7 +321,7 @@ async def test_single_leg_entry_blocked_when_symbol_already_exited_today():
         "rvol": 2.0, "rvol_valid": True,
         "adx14": 30.0, "adx_valid": True,
     })
-    fake._exited_today = {"SBIN"}
+    fake._exited_today = {("momentum_v1", "SBIN")}
     strategy = SimpleNamespace(
         name="momentum_v1", is_active=True, min_dte=0, max_dte=999,
         generate_signal=lambda market_data: SignalType.BUY,

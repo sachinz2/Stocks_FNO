@@ -137,7 +137,7 @@ async def test_exit_all_options_for_pnl_and_capital_release_use_the_pre_close_qu
         _notify=AsyncMock(),
     )
 
-    await LiveTradingEngine._exit_all_options_for(fake, "RELIANCE")
+    await LiveTradingEngine._exit_all_options_for(fake, "RELIANCE", "momentum_v1")
 
     assert fake._log_trade_close.await_count == 1
     kwargs = fake._log_trade_close.call_args.kwargs

@@ -156,7 +156,7 @@ async def test_exit_all_options_for_does_not_journal_close_when_broker_rejects(m
         return [{"symbol": "CIPLA26AUG1500CE", "quantity": 50, "avg_price": 30.0}]
     fake._safe_get_positions = _safe_get_positions
 
-    await LiveTradingEngine._exit_all_options_for(fake, "CIPLA")
+    await LiveTradingEngine._exit_all_options_for(fake, "CIPLA", "ema_crossover_v1")
 
     assert "CIPLA26AUG1500CE" in fake._single_leg_journals
     fake._log_trade_close.assert_not_called()

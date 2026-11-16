@@ -357,14 +357,14 @@ async def test_exit_all_options_for_no_longer_silently_drops_active_spread_track
     spread_state = {"symbol": "CIPLA", "type": "BULL_PUT_SPREAD"}
     fake = _FakeExitAllTrackingEngine(active_spreads={"CIPLA": spread_state})
 
-    await LiveTradingEngine._exit_all_options_for(fake, "CIPLA")
+    await LiveTradingEngine._exit_all_options_for(fake, "CIPLA", "ema_crossover_v1")
 
     assert fake._active_spreads.get("CIPLA") == spread_state, (
         "an active spread on this underlying must stay tracked -- this "
         "function only closes single-leg longs, it must not discard "
         "multi-leg state it never actually closed"
     )
-    assert "CIPLA" in fake._exited_today
+    assert ("ema_crossover_v1", "CIPLA") in fake._exited_today
 
 
 @pytest.mark.asyncio
@@ -372,7 +372,7 @@ async def test_exit_all_options_for_no_longer_silently_drops_active_condor_track
     condor_state = {"symbol": "CIPLA", "put_wing": {}, "call_wing": {}}
     fake = _FakeExitAllTrackingEngine(active_condors={"CIPLA": condor_state})
 
-    await LiveTradingEngine._exit_all_options_for(fake, "CIPLA")
+    await LiveTradingEngine._exit_all_options_for(fake, "CIPLA", "ema_crossover_v1")
 
     assert fake._active_condors.get("CIPLA") == condor_state
 
@@ -383,8 +383,8 @@ async def test_exit_all_options_for_still_clears_when_nothing_active():
     # must behave exactly as before -- both dicts stay empty, no crash.
     fake = _FakeExitAllTrackingEngine()
 
-    await LiveTradingEngine._exit_all_options_for(fake, "CIPLA")
+    await LiveTradingEngine._exit_all_options_for(fake, "CIPLA", "ema_crossover_v1")
 
     assert fake._active_spreads == {}
     assert fake._active_condors == {}
-    assert "CIPLA" in fake._exited_today
+    assert ("ema_crossover_v1", "CIPLA") in fake._exited_today

@@ -834,7 +834,7 @@ async def test_adverse_single_leg_exit_adds_underlying_to_exited_today():
         fake, "POWERGRID26AUG270PE", 1900, 5.29, 5.05, "stop loss",
     )
 
-    assert "POWERGRID" in fake._exited_today
+    assert ("momentum_v1", "POWERGRID") in fake._exited_today
 
 
 @pytest.mark.asyncio
@@ -1273,7 +1273,7 @@ async def test_exit_all_options_for_writes_trade_journal_with_real_fill():
     real_exit_fill = 25.50
 
     fake = _FakeExitAllEngine(fill_price=real_exit_fill)
-    await LiveTradingEngine._exit_all_options_for(fake, "CIPLA")
+    await LiveTradingEngine._exit_all_options_for(fake, "CIPLA", "ema_crossover_v1")
 
     assert "CIPLA26AUG1250CE" not in fake._single_leg_journals, "journal entry must be popped on close"
     assert len(fake._closed_journals) == 1, "must write to trade_journal, not leave it permanently open"
@@ -1282,13 +1282,13 @@ async def test_exit_all_options_for_writes_trade_journal_with_real_fill():
     entry_p, qty = 22.00, 650
     assert exit_price == real_exit_fill
     assert abs(pnl - ((real_exit_fill - entry_p) * qty - LiveTradingEngine._leg_round_trip_fees(qty, entry_p, real_exit_fill))) < 0.01
-    assert "CIPLA" in fake._exited_today
+    assert ("ema_crossover_v1", "CIPLA") in fake._exited_today
 
 
 @pytest.mark.asyncio
 async def test_exit_all_options_for_falls_back_when_fill_unavailable():
     fake = _FakeExitAllEngine(fill_price=None)
-    await LiveTradingEngine._exit_all_options_for(fake, "CIPLA")
+    await LiveTradingEngine._exit_all_options_for(fake, "CIPLA", "ema_crossover_v1")
 
     assert len(fake._closed_journals) == 1
     journal_id, exit_price, pnl, exit_reason = fake._closed_journals[0]

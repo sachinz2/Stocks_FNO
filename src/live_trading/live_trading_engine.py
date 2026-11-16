@@ -186,7 +186,18 @@ class LiveTradingEngine:
         self._PROFIT_BOOKING_GIVEBACK_PCT:  float = getattr(settings, "PROFIT_BOOKING_GIVEBACK_PCT", 0.35)
         self._active_spreads:       Dict[str, Dict[str, Any]] = {}
         self._active_condors:       Dict[str, Dict[str, Any]] = {}
-        self._exited_today:         set = set()   # adverse exits today — blocks same-day re-entry
+        # Fixed 2026-11-16 (live incident): was a plain set of bare symbol
+        # strings, shared across ALL 4 strategies -- iron_condor_v1's own
+        # sector-concentration rejection on RELIANCE added "RELIANCE" here
+        # to stop ITSELF retrying every cycle, but that ALSO silently
+        # blocked ema_crossover_v1's own, completely unrelated, genuinely
+        # confirmed BUY signal on RELIANCE later the same day ("already
+        # exited today, no re-entry" on a symbol ema_crossover_v1 never
+        # exited at all). Now keyed by (strategy_name, symbol) tuples so a
+        # rejection/adverse-exit only blocks re-entry for the SAME strategy
+        # that triggered it -- two strategies trading the same underlying
+        # are economically independent positions, not one shared slot.
+        self._exited_today:         set = set()   # {(strategy_name, symbol)} -- adverse exits/risk-rejections today, blocks same-day re-entry for THAT strategy only
         self._profit_closed_today:  set = set()   # profit exits today — allows re-entry with lower DTE floor
         # is_square_off_time() is true for the whole 15:20-15:30 window, and
         # run_signal_cycle() calls _square_off_all() every minute in that window —
@@ -1302,7 +1313,16 @@ class LiveTradingEngine:
             if exited_raw:
                 exited_data = json.loads(exited_raw)
                 if exited_data.get("date") == today:
-                    self._exited_today = set(exited_data.get("symbols", []))
+                    # JSON round-trips a tuple as a 2-element list -- restore
+                    # as tuples to match the (strategy_name, symbol) keys
+                    # _exited_today now uses (see its __init__ comment).
+                    # Old-format entries (bare strings, pre-2026-11-16) are
+                    # dropped rather than guessed at -- a missed same-day
+                    # re-entry block for one leftover day is harmless; a
+                    # wrongly-reconstructed strategy name is not.
+                    self._exited_today = {
+                        tuple(x) for x in exited_data.get("symbols", []) if isinstance(x, list) and len(x) == 2
+                    }
                     logger.info(f"Restored _exited_today: {self._exited_today}")
             profit_closed_raw = await redis.get(_REDIS_PROFIT_CLOSED)
             if profit_closed_raw:
@@ -2393,7 +2413,7 @@ class LiveTradingEngine:
             # (see matching comment in _check_spread_exits), not by scanning
             # exit_reason text.
             if pnl < 0:
-                self._exited_today.add(info["underlying"])
+                self._exited_today.add((info.get("strategy_name", "ema_crossover_v1"), info["underlying"]))
             await self._persist_state()
 
         await self._notify(
@@ -3221,7 +3241,7 @@ class LiveTradingEngine:
             await self._process_iron_condor(strategy, symbol, market_data, vix=vix, regime=regime)
             return
         if signal_str == "EXIT":
-            await self._exit_all_options_for(symbol)
+            await self._exit_all_options_for(symbol, strategy.name)
             return
         if signal_str not in ("BUY", "SELL"):
             return
@@ -3346,7 +3366,7 @@ class LiveTradingEngine:
         # (-Rs26,843 combined, overall 34.3%) -- not a threshold tuned from
         # a statistical pattern, a documented existing guard that simply
         # never got connected to half the strategies that could use it.
-        if symbol in self._exited_today:
+        if (strategy.name, symbol) in self._exited_today:
             logger.info(
                 f"[{strategy.name}] {symbol} skipped — already exited today, "
                 "no re-entry (same-day re-entry block)."
@@ -4154,7 +4174,7 @@ class LiveTradingEngine:
                 "contract-collision guard)."
             )
             return
-        if symbol in self._exited_today:
+        if (strategy.name, symbol) in self._exited_today:
             logger.debug(f"[CreditSpread] {symbol} skipped — already exited today, no re-entry.")
             return
         if self._max_daily_orders > 0 and self._today_order_count >= self._max_daily_orders:
@@ -4733,7 +4753,7 @@ class LiveTradingEngine:
         if not short_order or short_order.order_status != "OPEN":
             logger.warning(f"[CreditSpread] Short leg rejected: {short_contract}")
             if short_order and short_order.order_status == "REJECTED_BY_RISK":
-                self._exited_today.add(symbol)  # stop retrying every minute
+                self._exited_today.add((strategy.name, symbol))  # stop retrying every minute
             return
 
         long_order = await self.order_manager.place_order(
@@ -4761,7 +4781,7 @@ class LiveTradingEngine:
                 )
                 # Do NOT add to _exited_today so operator can investigate
             else:
-                self._exited_today.add(symbol)
+                self._exited_today.add((strategy.name, symbol))
             return
         self._audit_gate(strategy.name, "trade_placed")
 
@@ -5466,8 +5486,9 @@ class LiveTradingEngine:
                 continue
 
         for sym in adverse_closes:
+            _strat = self._active_spreads[sym].get("strategy_name", "credit_spread_v1")
             del self._active_spreads[sym]
-            self._exited_today.add(sym)
+            self._exited_today.add((_strat, sym))
         for sym in profit_closes:
             del self._active_spreads[sym]
             self._profit_closed_today.add(sym)   # allow same-day re-entry with lower DTE floor
@@ -5496,7 +5517,7 @@ class LiveTradingEngine:
                 "contract-collision guard)."
             )
             return
-        if symbol in self._exited_today:
+        if (strategy.name, symbol) in self._exited_today:
             logger.debug(f"[IronCondor] {symbol} skipped — already exited today, no re-entry.")
             return
         if self._max_daily_orders > 0 and self._today_order_count >= self._max_daily_orders:
@@ -5990,7 +6011,7 @@ class LiveTradingEngine:
             if not order or order.order_status != "OPEN":
                 logger.error(f"[IronCondor] Leg failed: {side} {contract}. Unwinding {len(placed)} leg(s).")
                 if order and order.order_status == "REJECTED_BY_RISK":
-                    self._exited_today.add(symbol)  # risk manager blocked it — stop retrying today
+                    self._exited_today.add((strategy.name, symbol))  # risk manager blocked it — stop retrying today
                 from src.market_data.option_chain import get_option_quote as _gq
                 _bad_uw = {"REJECTED", "REJECTED_BY_RISK", "CANCELLED", "FAILED"}
                 # Fixed 2026-08-28 (code review): PENDING_VERIFICATION was
@@ -6628,8 +6649,9 @@ class LiveTradingEngine:
                 continue
 
         for sym in to_close_adverse_c:
+            _strat = self._active_condors[sym].get("strategy_name", "iron_condor_v1")
             del self._active_condors[sym]
-            self._exited_today.add(sym)
+            self._exited_today.add((_strat, sym))
         for sym in to_close_profit_c:
             del self._active_condors[sym]
             self._profit_closed_today.add(sym)
@@ -6637,7 +6659,7 @@ class LiveTradingEngine:
         if to_close_adverse_c or to_close_profit_c:
             await self._persist_state()
 
-    async def _exit_all_options_for(self, underlying: str) -> None:
+    async def _exit_all_options_for(self, underlying: str, strategy_name: str) -> None:
         """
         Closes every open single-leg position on `underlying`. Reachable via
         _process_signal() when a strategy's generate_signal() returns
@@ -6658,6 +6680,12 @@ class LiveTradingEngine:
         silently dropped from tracking (no close order, no journal, no
         capital release) at the bottom of this function. Now left tracked
         instead of discarded; see the comment there.
+
+        `strategy_name` is the strategy whose generate_signal() returned
+        EXIT (see _process_signal()'s call site) -- it, not whatever
+        strategy's journal happens to own the closed position(s), is what
+        _exited_today is scoped to below (see __init__'s comment on why
+        _exited_today is per-strategy).
         """
         from src.market_data.option_chain import get_option_quote
         positions = await self._safe_get_positions()
@@ -6774,7 +6802,7 @@ class LiveTradingEngine:
                 "exit checks; force-close it manually if the EXIT signal was meant to "
                 "cover it too."
             )
-        self._exited_today.add(underlying)
+        self._exited_today.add((strategy_name, underlying))
         await self._persist_state()
 
     async def _square_off_all(self) -> None:
