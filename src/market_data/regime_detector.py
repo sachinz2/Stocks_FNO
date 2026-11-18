@@ -158,6 +158,21 @@ REGIME_STRATEGY_MAP: Dict[str, list] = {
     # of volume/loss that was never supposed to be eligible in the first
     # place. See _DISABLED_ORIGINAL_MAP_FOR_REFERENCE_ONLY below -- this
     # restores exactly momentum_v1's original single-regime entry.
+    # REVIEWED 2026-11-18 (data-driven, part of the pre-2027-01-02-go-live
+    # fine-tuning pass), STRATEGY_EMA's entry here left UNTOUCHED, unlike
+    # the momentum_v1/iron_condor_v1 restorations above/below -- this was
+    # the one entry in this whole map with no dated rationale ever written
+    # for it (every other change here has one), carried over unreviewed
+    # since the 2026-10-08 "every regime" experiment. Checked whether it
+    # should be removed the same way: lifetime, RANGE_BOUND is actually
+    # ema_crossover_v1's BETTER-performing regime (29.6% win, 240 trades)
+    # vs TRENDING (14.3% win, 21 trades) -- both are net losers, so unlike
+    # momentum_v1/iron_condor_v1 this isn't a regime-eligibility bug, and
+    # removing it would leave the strategy in its historically WORSE
+    # regime. The real, more recent problem (a 13.3%-win streak over its
+    # last 15 closed trades, all RANGE_BOUND) is addressed instead at the
+    # strategy's own ADX gate -- see EMACrossoverStrategy.generate_signal()'s
+    # matching 2026-11-18 comment.
     "RANGE_BOUND": [STRATEGY_CONDOR, STRATEGY_SPREAD, STRATEGY_EMA],
     "VOLATILE":    [STRATEGY_SPREAD, STRATEGY_EMA],
     # RESTORED 2026-10-29 (user-prompted review, direct consequence of

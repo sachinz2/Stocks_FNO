@@ -93,6 +93,59 @@ def test_adx_not_rising_and_below_threshold_keeps_holding():
     assert strat._pending_signal.get("RELIANCE") == "BUY"
 
 
+# ── Regime-aware ADX gate (2026-11-18, data-driven) ──────────────────────────
+# The "OR rising" bypass above exists for a genuinely trending tape; it must
+# not apply when the regime itself is already classified RANGE_BOUND (see
+# ema_crossover.py's matching 2026-11-18 comment for the real trade data).
+
+def test_rising_adx_bypass_disabled_in_range_bound():
+    strat = _ema(signal_confirm_bars=1)
+    strat.generate_signal({**_bar(fast=99.0, slow=100.0, adx=10.0, bar_key="live:t0"), "regime": "RANGE_BOUND"})
+    signal = strat.generate_signal({**_bar(fast=101.0, slow=100.0, adx=10.0, bar_key="live:t1"), "regime": "RANGE_BOUND"})
+    assert signal == "HOLD"
+    # Same rising-ADX sequence that fires in TRENDING (see
+    # test_low_but_rising_adx_still_fires_once_confirmed) must NOT fire here.
+    signal = strat.generate_signal({**_bar(fast=101.0, slow=100.0, adx=14.0, bar_key="live:t2"), "regime": "RANGE_BOUND"})
+    assert signal == "HOLD"
+    assert strat._pending_signal.get("RELIANCE") == "BUY"
+
+
+def test_rising_adx_bypass_still_works_outside_range_bound():
+    # Regression guard: TRENDING/VOLATILE/missing-regime behavior must be
+    # byte-for-byte unchanged from test_low_but_rising_adx_still_fires_once_confirmed.
+    for regime in ("TRENDING", "VOLATILE", None):
+        strat = _ema(signal_confirm_bars=1)
+        bar0 = _bar(fast=99.0, slow=100.0, adx=10.0, bar_key="live:t0")
+        bar1 = _bar(fast=101.0, slow=100.0, adx=10.0, bar_key="live:t1")
+        bar2 = _bar(fast=101.0, slow=100.0, adx=14.0, bar_key="live:t2")
+        if regime is not None:
+            bar0, bar1, bar2 = ({**b, "regime": regime} for b in (bar0, bar1, bar2))
+        strat.generate_signal(bar0)
+        assert strat.generate_signal(bar1) == "HOLD"
+        assert strat.generate_signal(bar2) == "BUY", f"failed for regime={regime!r}"
+
+
+def test_flat_adx_threshold_alone_still_fires_in_range_bound():
+    # Guard against over-fixing: RANGE_BOUND doesn't block crossovers
+    # outright -- a genuinely-confirmed ADX>=threshold still fires, only the
+    # rising-ADX bypass is disabled.
+    strat = _ema(signal_confirm_bars=1)
+    strat.generate_signal({**_bar(fast=99.0, slow=100.0, adx=24.0, bar_key="live:t0"), "regime": "RANGE_BOUND"})
+    signal = strat.generate_signal({**_bar(fast=101.0, slow=100.0, adx=24.0, bar_key="live:t1"), "regime": "RANGE_BOUND"})
+    assert signal == "BUY"
+
+
+def test_missing_adx_still_does_not_block_firing_in_range_bound():
+    strat = _ema(signal_confirm_bars=1)
+    bar0 = {**_bar(fast=99.0, slow=100.0, bar_key="live:t0"), "regime": "RANGE_BOUND"}
+    bar1 = {**_bar(fast=101.0, slow=100.0, bar_key="live:t1"), "regime": "RANGE_BOUND"}
+    del bar0["adx14"]
+    del bar1["adx14"]
+    strat.generate_signal(bar0)
+    signal = strat.generate_signal(bar1)
+    assert signal == "BUY"
+
+
 def test_missing_adx_does_not_block_firing():
     """Guard against over-fixing -- adx14 absent from market_data must not
     silently block every crossover; the engine's separate adx_valid check
@@ -298,6 +351,19 @@ def test_process_signal_calls_audit_gate_at_the_expected_checkpoints():
         "rs_passed", "mtf_passed", "lot_passed", "contract_resolved", "trade_placed",
     ]:
         assert f'"{gate}"' in src, f"missing audit checkpoint: {gate}"
+
+
+def test_process_signal_threads_regime_into_market_data_before_generate_signal():
+    # 2026-11-18: ema_crossover_v1's own generate_signal() needs to know the
+    # current regime (see its regime-aware ADX gate) -- market_data is a
+    # fresh per-cycle dict (see _get_market_data()'s docstring), so adding
+    # this key here is safe.
+    src = inspect.getsource(LiveTradingEngine._process_signal)
+    idx_set = src.index('market_data["regime"] = regime')
+    idx_call = src.index("strategy.generate_signal(market_data)")
+    assert idx_set < idx_call, (
+        "market_data['regime'] must be set BEFORE generate_signal() is called"
+    )
 
 
 # ── Production wiring must carry the new params ──────────────────────────────

@@ -66,6 +66,7 @@ def test_iron_condor_sets_rejection_detail_at_every_gate():
     expected = {
         "VIX_UNAVAILABLE", "VIX_TOO_LOW",
         "IV_RANK_UNAVAILABLE", "IV_RANK_TOO_LOW",
+        "MARKET_DIRECTION_UNAVAILABLE", "MARKET_DIRECTION_BEARISH",
         "PCR_TOO_DIRECTIONAL",
         "ADX_UNAVAILABLE", "ADX_TOO_HIGH_TRENDING",
         "EVENT_WITHIN_5_DAYS",

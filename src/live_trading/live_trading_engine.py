@@ -2302,6 +2302,16 @@ class LiveTradingEngine:
                             f"{owner_strategy.name} entry=Rs{entry_p:.2f} "
                             f"now=Rs{current_p:.2f} ({pnl_pct:+.1f}%)"
                         )
+                        # 2026-11-18: which specific manage_position() EXIT
+                        # branch fired -- momentum_v1 only for now (see its
+                        # matching comment); absent/None for strategies that
+                        # don't set it (e.g. ema_crossover_v1), so this is a
+                        # no-op append there. Appended, not a replacement --
+                        # nothing that already parses this string's existing
+                        # "{strategy} entry=... now=..." prefix breaks.
+                        _exit_tag = getattr(owner_strategy, "_last_exit_tag", None)
+                        if _exit_tag:
+                            exit_reason += f" [{_exit_tag}]"
 
                 if exit_reason:
                     await self._execute_single_leg_exit(contract, qty, entry_p, current_p, exit_reason)
@@ -3189,6 +3199,14 @@ class LiveTradingEngine:
         # previous value instead of a stale frozen one.
         if market_data.get("ltp_source") == "zerodha_historical":
             return
+
+        # EXPERIMENT (2026-11-18, data-driven): ema_crossover_v1's own ADX
+        # gate needs to know the current regime to tighten in RANGE_BOUND --
+        # see its "OR ADX rising" bypass's docstring for why. `market_data`
+        # is a fresh dict from this cycle's Redis read (see
+        # _get_market_data()), not a cached/shared reference, so adding this
+        # key here is safe and doesn't leak into any other consumer.
+        market_data["regime"] = regime
 
         signal = strategy.generate_signal(market_data)
 
@@ -5682,6 +5700,53 @@ class LiveTradingEngine:
                 }
             return
         self._audit_gate(strategy.name, "iv_rank_passed")
+
+        # EXPERIMENT (2026-11-18, data-driven, explicit user instruction):
+        # iron_condor_v1 is a market-NEUTRAL structure, but RANGE_BOUND
+        # classification (ATR%/EMA-spread% only) doesn't rule out the
+        # broader market already having a directional lean -- 44% of this
+        # strategy's 27 lifetime closed trades (12) exited via "Regime
+        # shift: TRENDING post-entry", and PUT-wing failures lost 6.4x more
+        # per trade than CALL-wing failures (avg -Rs12,402 vs -Rs1,925).
+        # Strike selection itself is confirmed symmetric (same delta
+        # targets/crowded-strike handling for both wings, see below) --
+        # this isn't a code asymmetry, it's condors being sold into a market
+        # that was already leaning bearish. market_direction is already
+        # computed and Redis-cached every cycle by MarketRegimeDetector (the
+        # same cheap read _maybe_record_paused_signal_outcome() already
+        # uses) -- reusing it, not adding a new indicator. Fails closed on
+        # missing data, matching this file's established convention for
+        # every other explicitly-chosen entry-blocking filter (lot size,
+        # contract resolution, margin, VIX/IV rank above).
+        _regime_detector_ic = getattr(self, "regime_detector", None)
+        _market_direction_ic = None
+        if _regime_detector_ic:
+            try:
+                _market_direction_ic = await _regime_detector_ic.get_cached_market_direction()
+            except Exception:
+                pass
+        if _market_direction_ic is None:
+            logger.info(
+                f"[IronCondor] {symbol} skipped — market_direction unavailable "
+                "(fail-closed, can't confirm the market is genuinely neutral)."
+            )
+            self._last_gate_rejection = {
+                "gate": "market_direction_passed", "value": None,
+                "threshold": "not BEARISH", "reason": "MARKET_DIRECTION_UNAVAILABLE",
+            }
+            return
+        if _market_direction_ic == "BEARISH":
+            logger.info(
+                f"[IronCondor] {symbol} skipped — market_direction=BEARISH "
+                "(data-driven: condors sold into an already-bearish-leaning "
+                "market account for most of this strategy's regime-shift losses)."
+            )
+            self._last_gate_rejection = {
+                "gate": "market_direction_passed", "value": _market_direction_ic,
+                "threshold": "not BEARISH", "reason": "MARKET_DIRECTION_BEARISH",
+            }
+            return
+        self._audit_gate(strategy.name, "market_direction_passed")
 
         # OI/PCR neutrality check — iron condors need a non-directional market.
         # Fixed 2026-08-07: consolidated redundant neutrality-confirmation gates

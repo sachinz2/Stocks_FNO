@@ -72,6 +72,11 @@ class MomentumStrategy(StrategyBase):
     """
 
     def initialize(self):
+        # 2026-11-18: which specific manage_position() EXIT branch fired
+        # last -- see that method's matching comment. Re-set every call,
+        # this default only matters before manage_position() is ever
+        # called for the first time.
+        self._last_exit_tag = None
         self.fast_period = self.parameters.get("fast_period", 20)
         self.slow_period = self.parameters.get("slow_period", 50)
 
@@ -1085,6 +1090,21 @@ class MomentumStrategy(StrategyBase):
                                   does, there's no reason to keep holding even
                                   if SL/TP haven't been hit yet.
         """
+        # EXPERIMENT (2026-11-18, data-driven, part of the pre-2027-01-02-
+        # go-live fine-tuning pass): losers show very low favorable
+        # excursion (option_mfe_pct avg +1.7%) and real adverse excursion
+        # (option_mae_pct avg -6.1%) -- "wrong almost immediately" -- but
+        # every one of this method's ~11 distinct EXIT branches collapsed
+        # to the same generic exit_reason string built once in
+        # live_trading_engine.py's _check_open_option_exits()
+        # ("{strategy} entry=Rs{X} now=Rs{Y} ({pct}%)"), making it
+        # impossible to tell from trade_journal which specific check fired
+        # (e.g. the underlying stop at 1.0x ATR firing before a pullback-
+        # confirmed move even develops, vs a genuine hard stop). Pure
+        # observability, zero behavior change -- reset each call so a
+        # position that HOLDs this cycle can't carry a stale tag from a
+        # previous cycle's call.
+        self._last_exit_tag = None
         entry_premium = float(current_position.get("avg_price") or 0)
         if entry_premium <= 0 or current_premium <= 0:
             return "HOLD"
@@ -1122,6 +1142,7 @@ class MomentumStrategy(StrategyBase):
                     f"({self.profit_booking_giveback_pct:.0%} given back from "
                     f"peak Rs{_pb_peak_rs:.0f}) -- exiting."
                 )
+                self._last_exit_tag = "PROFIT_BOOKING_GIVEBACK"
                 return "EXIT"
 
         # EXPERIMENT (2026-10-21, data-driven): stall exit -- see
@@ -1148,6 +1169,7 @@ class MomentumStrategy(StrategyBase):
                 f"entry, premium has never traded above entry (mfe={_mfe_option_pct:.2f}%) "
                 f"-- exiting before this becomes a larger loss."
             )
+            self._last_exit_tag = "STALL_EXIT"
             return "EXIT"
 
         # Fixed 2026-08-21 (external review, round 2 -- sections 20-21):
@@ -1182,6 +1204,7 @@ class MomentumStrategy(StrategyBase):
                     f"{'-' if is_call else '+'} {self.underlying_stop_atr_mult}x "
                     f"ATR({entry_atr:.2f})) -- exiting."
                 )
+                self._last_exit_tag = "UNDERLYING_STOP"
                 return "EXIT"
             if hit_target:
                 logger.info(
@@ -1190,6 +1213,7 @@ class MomentumStrategy(StrategyBase):
                     f"{'+' if is_call else '-'} {self.underlying_target_atr_mult}x "
                     f"ATR({entry_atr:.2f})) -- exiting."
                 )
+                self._last_exit_tag = "UNDERLYING_TARGET"
                 return "EXIT"
 
         # Fixed 2026-09-10 (user request): a bigger bet gets a tighter hard
@@ -1211,6 +1235,7 @@ class MomentumStrategy(StrategyBase):
                 f"[stop={_effective_stop_loss_pct:.0%}"
                 f"{' -- large position' if _effective_stop_loss_pct != self.stop_loss_pct else ''}]"
             )
+            self._last_exit_tag = "HARD_STOP_LOSS"
             return "EXIT"
 
         if (
@@ -1225,6 +1250,7 @@ class MomentumStrategy(StrategyBase):
                 f"{pnl_pct:.1%} (>= {self.weakening_stop_loss_pct:.0%}) -- exiting "
                 "before the full hard stop since the trend no longer reconfirms."
             )
+            self._last_exit_tag = "WEAKENING_TREND_STOP"
             return "EXIT"
 
         # Fixed 2026-08-20 (external review integration): underlying-based
@@ -1251,6 +1277,7 @@ class MomentumStrategy(StrategyBase):
                         f"below EMA20 ({current_close:.2f} < {current_ema_fast:.2f}) "
                         "-- uptrend thesis broken, exiting."
                     )
+                    self._last_exit_tag = "STRUCTURAL_INVALIDATION"
                     return "EXIT"
                 if is_call is False and current_close > current_ema_fast:
                     logger.info(
@@ -1258,6 +1285,7 @@ class MomentumStrategy(StrategyBase):
                         f"above EMA20 ({current_close:.2f} > {current_ema_fast:.2f}) "
                         "-- downtrend thesis broken, exiting."
                     )
+                    self._last_exit_tag = "STRUCTURAL_INVALIDATION"
                     return "EXIT"
 
         if pnl_pct >= self.target_pct:
@@ -1265,6 +1293,7 @@ class MomentumStrategy(StrategyBase):
                 f"[{self.name}] Profit target hit: entry={entry_premium:.2f} "
                 f"current={current_premium:.2f} ({pnl_pct:.1%})"
             )
+            self._last_exit_tag = "PROFIT_TARGET"
             return "EXIT"
 
         peak = float(current_position.get("peak_premium") or entry_premium)
@@ -1275,6 +1304,7 @@ class MomentumStrategy(StrategyBase):
                     f"[{self.name}] Trailing stop hit: peak={peak:.2f} "
                     f"current={current_premium:.2f} ({drawdown_from_peak:.1%} off peak)"
                 )
+                self._last_exit_tag = "TRAILING_STOP"
                 return "EXIT"
 
         # Breakeven stop (added 2026-08-13) -- trailing_stop_pct above is
@@ -1298,6 +1328,7 @@ class MomentumStrategy(StrategyBase):
                 f"(entry {entry_premium:.2f}), now back to {current_premium:.2f} -- "
                 "exiting to avoid a profitable trade becoming a loss."
             )
+            self._last_exit_tag = "BREAKEVEN_STOP"
             return "EXIT"
 
         # VOLATILE-entered positions (see REGIME_STRATEGY_MAP /
@@ -1316,6 +1347,7 @@ class MomentumStrategy(StrategyBase):
                 f"[{self.name}] Trend exhausted: ADX={float(current_adx):.1f} "
                 f"< {adx_exit} — exiting regardless of premium P&L."
             )
+            self._last_exit_tag = "TREND_EXHAUSTED"
             return "EXIT"
 
         return "HOLD"

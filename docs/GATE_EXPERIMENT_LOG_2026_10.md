@@ -713,3 +713,107 @@ User asked for a status check and specifically "what is happening with index tra
 **Fix**: `_exited_today` now holds `(strategy_name, symbol)` tuples. Every add/check site updated to match: the single-leg reversal-exit adverse path, `_process_signal()`'s/`_process_credit_spread()`'s/`_process_iron_condor()`'s own entry-time re-entry checks, both `REJECTED_BY_RISK` stop-retrying sites in `_process_credit_spread()`, the adverse-close loops in `_check_spread_exits()`/`_check_condor_exits()` (strategy read off the closing spread/condor's own stored `strategy_name`), and `_exit_all_options_for()` (confirmed dead code today — no active strategy's `generate_signal()` returns `SignalType.EXIT` — but fixed anyway since it's part of the formal signal contract; now takes the issuing strategy's name as an explicit parameter from its one call site in `_process_signal()`, rather than inferring it per-closed-position, since an EXIT signal with zero open positions to close still needs a strategy to scope the block to). The Redis persistence round-trip (`json.dumps`/`loads`) and the EOD `.clear()` reset needed no changes — tuples survive the JSON round-trip as 2-element lists and are reconstructed back into tuples on restore; old-format (pre-fix) bare-string entries from a restart mid-day are dropped rather than guessed at, since a one-day missed re-entry block is harmless but a wrongly-reconstructed strategy name is not.
 
 **Tests touched**: new `test_exited_today_cross_strategy_scoping_2026_11_16.py` (2 tests: reproduces the exact RELIANCE incident shape — one strategy's own prior rejection no longer blocks a different strategy's entry on the same symbol — plus a guard-against-over-fixing counterpart confirming the same strategy's own prior rejection still blocks its own re-entry). 6 existing tests updated for the new tuple shape across `test_entry_failure_unwind.py`, `test_live_trading_engine.py` (2 tests), `test_rich_gate_rejection_detail_2026_09_16.py`, and `test_deep_review_2026_09_16.py` (2 tests); 4 more `_exit_all_options_for()` call sites across `test_deep_review_2026_08_20.py`/`test_deep_review_2026_09_16.py`/`test_live_trading_engine.py`/`test_square_off_pnl_uses_pre_close_entry_price_2026_10_09.py` updated for its new required `strategy_name` parameter. Full suite: 1173 passed, 3 skipped, 0 failed. `verify_invariants.py`: 57 passed, 3 warnings (pre-existing, unrelated), 0 skipped, 0 failed.
+
+## 39. iron_condor_v1 — new entry-time market-direction filter (fine-tuning pass, target go-live 2027-01-02)
+
+User set a new go-live target (2027-01-02), explicitly conditional on fixing the 3
+currently-losing strategies first. `iron_condor_v1` was the clearest case: 44% of its 27
+lifetime closed trades (12) exit via `"Regime shift: TRENDING post-entry"`, and PUT-wing
+failures lose 6.4x more per trade than CALL-wing failures (avg −₹12,402 vs −₹1,925).
+
+**Investigated whether this is a code bug first**: read the strike-selection logic
+(`_process_iron_condor()`) — both wings use the same ±0.20/0.10 delta targets and the same
+crowded-strike handling. No asymmetry found. The 6.4x gap is market-driven, not a code bug:
+`/analytics/market-regime` has shown a persistent `market_direction: BEARISH` for weeks
+even while classified RANGE_BOUND — i.e. a "neutral" condor was being sold into a market
+that already had a directional lean, and when it then trended (down), the put wing is what
+blew out.
+
+**Fix**: new entry-time gate — skip the entry when `MarketRegimeDetector`'s already-cached
+`market_direction` (same cheap Redis read `_maybe_record_paused_signal_outcome()` already
+uses, no new indicator) is `BEARISH`, or unavailable (fails closed, matching every other
+explicitly-chosen entry-blocking filter in this file). New `market_direction_passed` audit
+checkpoint, distinct from the existing PCR-based `direction_passed` gate (market-wide
+direction vs this stock's own options positioning are different questions). Mirrors the
+existing precedent in this exact file: `ema_crossover_v1` already gets a direction-aware
+restriction (PE-only) during VOLATILE for the identical reason.
+
+**Tests touched**: new `test_iron_condor_market_direction_gate_2026_11_18.py` (6 tests:
+BEARISH blocks, unavailable fails closed, reuses the cached read not a fresh computation,
+the new gate is distinct from and ordered before the PCR gate, BULLISH/NEUTRAL don't block,
+`credit_spread_v1` is untouched). `test_spread_condor_rejection_detail_2026_10_01.py`
+updated (`MARKET_DIRECTION_BEARISH`/`MARKET_DIRECTION_UNAVAILABLE` added to the expected
+rejection-reason set). Full suite: 1179 passed, 3 skipped, 0 failed. `verify_invariants.py`:
+58 passed, 1 warning, 1 skipped (outside market hours), 0 failed.
+
+## 40. ema_crossover_v1 — regime-aware ADX gate for RANGE_BOUND entries (fine-tuning pass)
+
+Same fine-tuning pass as entry 39. `ema_crossover_v1` has been eligible in RANGE_BOUND
+since the 2026-10-08 "every strategy in every regime" experiment and — unlike `momentum_v1`
+(reviewed/restored 2026-10-22) and `iron_condor_v1` (reviewed/restored 2026-10-23) — was
+never reviewed; that comment block explicitly flags the experiment as still-open.
+
+**Checked whether the same fix (remove from RANGE_BOUND) applies here first** — it doesn't:
+lifetime, RANGE_BOUND is actually `ema_crossover_v1`'s *better*-performing regime (29.6%
+win, 240 trades) vs TRENDING (14.3% win, 21 trades). Both are net losers, so this isn't a
+regime-eligibility bug the way it was for the other two, and removing it would leave the
+strategy in its historically worse regime. What IS real: its most recent 15 closed trades
+(all RANGE_BOUND) won only 13.3% of the time — worse than even its own already-bad
+lifetime RANGE_BOUND average — and the strategy has **zero** regime-aware branching
+anywhere in `generate_signal()`/`manage_position()` (confirmed by reading both in full).
+A sampled real loser (CHOLAFIN, 2026-11-18, −₹2,787) entered at ADX=14.54 in RANGE_BOUND,
+passing only via the "ADX≥threshold **OR** rising" bypass — a weak, barely-rising ADX in a
+classified-flat regime is close to the textbook whipsaw case for a crossover strategy.
+
+**Fix**: the "OR rising" bypass now only applies outside RANGE_BOUND. A RANGE_BOUND entry
+must clear the flat `adx_entry_threshold` outright; TRENDING/VOLATILE entries keep the
+existing looser logic unchanged. `regime` is threaded into `market_data` (a fresh per-
+cycle dict, safe to mutate) right before `generate_signal()` is called, so the strategy's
+own code reads it the same way it already reads every other `market_data` field — no new
+engine-side config surface. Also added the missing dated rationale comment to
+`REGIME_STRATEGY_MAP`'s RANGE_BOUND entry (every other entry already had one; this was the
+one gap).
+
+**Tests touched**: `test_ema_crossover_v1_redesign_2026_08_21.py` — 5 new tests (rising-ADX
+bypass disabled in RANGE_BOUND; same bypass still works unchanged in TRENDING/VOLATILE/no-
+regime; flat threshold alone still fires in RANGE_BOUND; missing ADX still doesn't block in
+RANGE_BOUND; `market_data["regime"]` is set before `generate_signal()` is called). Full
+suite: 1184 passed, 3 skipped, 0 failed. `verify_invariants.py`: 58 passed, 1 warning, 1
+skipped (outside market hours), 0 failed.
+
+## 41. momentum_v1 — exit-path attribution, observability only (fine-tuning pass)
+
+Same fine-tuning pass as entries 39/40. momentum_v1's losers show very low favorable
+excursion (`option_mfe_pct` avg +1.7%) and real adverse excursion (`option_mae_pct` avg
+−6.1%) — "wrong almost immediately" — despite two prior redesign rounds (2026-08-20/21)
+already targeting late-entry problems. The underlying stop (`underlying_stop_atr_mult=1.0`)
+is a strong suspect for firing before a pullback-confirmed move develops — but that's a
+hypothesis, not yet evidence: every one of `manage_position()`'s ~11 distinct EXIT branches
+(stall, underlying-stop, underlying-target, hard stop, weakening-trend stop, structural
+invalidation, profit target, trailing stop, breakeven stop, trend exhaustion, profit-
+booking giveback) collapsed to the same generic `exit_reason` string built once in
+`_check_open_option_exits()`, so `trade_journal` can't currently say which one fired.
+
+**Deliberately no parameter change this round** — touching `underlying_stop_atr_mult` (or
+any other lever) now, on data that can't even confirm which exit path is the real culprit,
+would repeat exactly the "guess on a small sample" mistake this whole fine-tuning pass is
+trying to avoid.
+
+**Fix (pure observability, zero behavior change)**: new `self._last_exit_tag`, reset to
+`None` at the top of every `manage_position()` call and set to a distinct string (e.g.
+`"UNDERLYING_STOP"`, `"HARD_STOP_LOSS"`, `"STRUCTURAL_INVALIDATION"`) right before each of
+the 11 `return "EXIT"` sites. The engine reads it via `getattr(owner_strategy,
+"_last_exit_tag", None)` and appends `" [TAG]"` to the existing generic `exit_reason` string
+— additive, not a replacement, so nothing that already parses the old format breaks.
+Generic on purpose (reads an attribute, doesn't special-case momentum_v1 by name), but only
+momentum_v1 currently sets it — `ema_crossover_v1`'s exits stay exactly as before. Same
+"collect the data first, don't gate on it yet" pattern already used for `daily_atr_pct`/
+`credit_to_max_loss_pct`/`wing_failed` (2026-08-21 review). Decision on
+`underlying_stop_atr_mult` (or any other lever) deferred to the Week 5-6 review of this
+fine-tuning pass, once 2-3 weeks of properly-attributed exit data exists.
+
+**Tests touched**: new `test_momentum_exit_attribution_2026_11_18.py` (15 tests: each of
+the 11 EXIT branches sets its own distinct tag, HOLD leaves it `None`, the tag resets every
+call, the engine appends it to `exit_reason` generically via `getattr(..., None)` rather
+than a momentum_v1-specific special case). Full suite: 1199 passed, 3 skipped, 0 failed.
+`verify_invariants.py`: 58 passed, 1 warning, 1 skipped (outside market hours), 0 failed.

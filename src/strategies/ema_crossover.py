@@ -343,6 +343,7 @@ class EMACrossoverStrategy(StrategyBase):
         adx       = data.get("adx14")
         adx_valid = data.get("adx_valid")
         close     = data.get("close")
+        regime    = data.get("regime")
 
         if fast_ema is None or slow_ema is None:
             logger.warning(f"Strategy {self.name}: Missing EMA data.")
@@ -495,6 +496,27 @@ class EMACrossoverStrategy(StrategyBase):
                     # initialize(). Unconditional: a rising ADX already past
                     # the ceiling is the worst case in the data, not exempt.
                     adx_ok = False
+                elif regime == "RANGE_BOUND":
+                    # EXPERIMENT (2026-11-18, data-driven): the "OR ADX
+                    # rising" bypass below exists to let a fresh,
+                    # strengthening cross through quickly in a genuinely
+                    # trending tape -- it should not apply when the regime
+                    # itself is already classified flat. This strategy has
+                    # been eligible to enter RANGE_BOUND since the
+                    # 2026-10-08 "every strategy in every regime"
+                    # experiment and was never reviewed the way momentum_v1
+                    # (2026-10-22) and iron_condor_v1 (2026-10-23) were.
+                    # Its most recent 15 closed trades (all RANGE_BOUND)
+                    # won only 13.3% of the time -- worse than even its own
+                    # already-bad lifetime RANGE_BOUND average (29.6%). A
+                    # sampled loser entered at ADX=14.54, passing only via
+                    # the rising-ADX bypass -- a weak, barely-rising ADX in
+                    # a classified-flat regime is close to the textbook
+                    # whipsaw case for a crossover strategy. Require the
+                    # flat threshold outright here; TRENDING/VOLATILE
+                    # entries keep the existing looser OR-rising logic
+                    # below, unchanged.
+                    adx_ok = adx >= self.adx_entry_threshold
                 else:
                     hist_adx = self._adx_history.get(symbol, [])
                     adx_ok = adx >= self.adx_entry_threshold or (len(hist_adx) >= 2 and adx > hist_adx[-2])
