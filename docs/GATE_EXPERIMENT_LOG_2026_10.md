@@ -817,3 +817,79 @@ the 11 EXIT branches sets its own distinct tag, HOLD leaves it `None`, the tag r
 call, the engine appends it to `exit_reason` generically via `getattr(..., None)` rather
 than a momentum_v1-specific special case). Full suite: 1199 passed, 3 skipped, 0 failed.
 `verify_invariants.py`: 58 passed, 1 warning, 1 skipped (outside market hours), 0 failed.
+
+## 42. momentum_v1 — paused-signal replay queue (user asked "are you sure there are no bugs?")
+
+User pushed back on the earlier "momentum_v1/index trading is just regime gating" status
+answer, asking directly whether there might be real bugs instead. Investigation (not a
+blind reassertion) traced the full regime timeline on 2026-11-11, the one substantial
+TRENDING window (09:15-10:04 IST) in the preceding 10 days (50/2861 cycles were TRENDING,
+~1.7%). Confirmed `on_pause()` DOES wipe momentum_v1's pullback-tracking dicts at the pause
+transition (`_trend_state`/`_pullback_ref`/etc., added 2026-08-21) — so the ~20 real "BUY/
+SELL pullback+breakout confirmed — firing" log lines seen between 11:35-13:21 that same day
+were NOT setups interrupted mid-confirmation by the pause (regime had already reverted to
+RANGE_BOUND continuously since 10:05). They were brand-new setups fully tracked AND
+confirmed entirely while already paused — `generate_signal()` runs every cycle regardless
+of pause state (the 2026-09-03 fix, for state continuity), so momentum_v1 kept finding and
+confirming genuine candidates (CANBK, TRENT, RADICO, etc.) throughout the pause; every one
+was recorded as a "paused signal" observation and never became a real trade. **Zero
+momentum_v1 trades that entire day**, despite real, valid, fully-confirmed setups — because
+momentum_v1 is regime-paused ~98% of cycles, and its multi-bar pullback+breakout
+confirmation routinely completes well after whatever TRENDING window triggered it has
+already ended.
+
+**Fix**: new `_paused_confirmed_signals` replay queue, keyed by `(strategy_name, symbol)`.
+When a strategy confirms a real BUY/SELL while regime-paused (`paused_by == "regime"`
+specifically — a StrategyMonitor circuit-breaker or manual pause is a deliberate "stop
+trading" decision, not a timing race, and must not queue), the signal is queued instead of
+silently discarded. The next time that strategy is active again for that symbol, the queued
+signal is popped (consumed exactly once) and, if still within a 15-minute grace window AND
+the underlying hasn't drifted more than 2% since confirmation (a basic staleness sanity
+check — `generate_signal()` itself already fully re-confirmed the current bar; this only
+governs whether to ALSO act on the queued one), it's acted on as if freshly generated this
+cycle. Stale or too-drifted entries are dropped, same as today. Deliberately generic (reads
+`paused_by`/`is_active`, not hardcoded to momentum_v1 by name) since the mechanism applies
+to any regime-paused strategy, though momentum_v1 is the primary beneficiary given its
+multi-bar confirmation delay — ema_crossover_v1's 2-bar confirmation rarely outlives a
+TRENDING window. In-memory only, not persisted across restarts — deliberately low-stakes (a
+restart mid-grace-window loses at most one replay opportunity, same cost as the status quo
+before this fix).
+
+**Tests touched**: new `test_momentum_paused_signal_replay_2026_11_20.py` (7 tests: queues
+on a regime pause, doesn't queue on a monitor/manual pause, replays within the grace window,
+drops when stale, drops when price drifted too far, a fresh same-cycle signal takes
+priority over a queued one, degrades gracefully when a fake-engine fixture doesn't
+construct the dict). `getattr(self, "_paused_confirmed_signals", None)` used at both the
+write and read site so ~8 pre-existing fake-engine fixtures across the suite that don't
+construct this dict don't need touching. Full suite: 1199 passed, 3 skipped, 0 failed (after
+the defensive getattr fix; an earlier non-defensive version broke 40 pre-existing tests).
+
+## 43. momentum_v1 excluded from the NIFTY/BANKNIFTY index pool (same investigation)
+
+Same investigation as entry 42, second half: checked whether "zero index trades since
+launch" was really just "no crossover yet" (as answered on 2026-11-16) or hiding a bug.
+Pulled NIFTY/BANKNIFTY's live tick cache directly — confirmed EMA20/50/ADX/VWAP all
+populated normally (`ema_crossover_v1` has no real data bug). But both showed `rvol_valid:
+false, rvol: 0.0` **permanently**, not "insufficient history yet" like a stock mid-warmup.
+An index's spot value carries no meaningful traded-volume figure the way a stock's does, so
+RVOL is structurally never computable for NIFTY/BANKNIFTY.
+
+That's harmless for `ema_crossover_v1` (RVOL is a non-blocking confidence note for it,
+`rvol_hard_gate=False`), but `momentum_v1`'s own pullback+breakout confirmation logic
+*requires* a genuine RVOL reading (contraction `< 0.8` then expansion `>= 1.3`, or `>= 0.3`
+flat) to confirm a breakout — meaning momentum_v1 could never actually fire on either index
+regardless of regime, ADX, or EMA spread. Listing them in momentum_v1's candidate pool was
+pure wasted cycles on candidates that structurally can't ever confirm.
+
+**Fix**: `LTPPoller.poll()`'s index-exclusion guard (already used for `spread_scores`/
+`condor_scores`, added 2026-11-11) extended to `momentum_scores`/`momentum_bull_scores`/
+`momentum_bear_scores` too. `ema_crossover_v1`'s pool is unaffected — NIFTY/BANKNIFTY stay
+eligible there.
+
+**Tests touched**: `test_index_support_2026_11_11.py`'s
+`test_index_symbols_compete_for_ema_and_momentum_pools_only` renamed to
+`test_index_symbols_compete_for_ema_pool_only` and updated (indices must no longer appear in
+`momentum_pool`, a real stock still does — proving the exclusion is real, not an accident of
+an empty pool). `test_pool_status_2026_09_15.py`'s momentum pool count expectation corrected
+3 → 1. Full suite: 1206 passed, 3 skipped, 0 failed. `verify_invariants.py`: 57 passed, 3
+warnings (pre-existing/environmental, unrelated), 0 failed.

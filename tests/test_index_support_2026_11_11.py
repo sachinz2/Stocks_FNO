@@ -171,14 +171,17 @@ async def test_index_symbols_are_always_polled_regardless_of_liquidity_universe(
 
 
 @_pytest.mark.asyncio
-async def test_index_symbols_compete_for_ema_and_momentum_pools_only(monkeypatch):
+async def test_index_symbols_compete_for_ema_pool_only(monkeypatch):
     """The core scoping guarantee: a real score for ALL four strategies'
-    theses must still only land an index symbol in ema/momentum, never
-    credit_spread/iron_condor -- credit_spread_v1/iron_condor_v1 were
-    explicitly excluded from this feature. A real stock (SOME_STOCK) shares
-    the exact same score profile, so its presence in every pool confirms
-    the scoring/publishing pipeline genuinely ran, not that the pools were
-    empty for an unrelated reason."""
+    theses must still only land an index symbol in ema_crossover_v1's pool
+    -- never credit_spread/iron_condor (explicitly excluded from this
+    feature from the start), and, as of 2026-11-20, never momentum_v1
+    either (its pullback+breakout confirmation needs a real RVOL reading,
+    permanently unavailable for an index's spot tick -- see ltp_poller.py's
+    matching comment). A real stock (SOME_STOCK) shares the exact same
+    score profile, so its presence in every pool confirms the scoring/
+    publishing pipeline genuinely ran, not that the pools were empty for an
+    unrelated reason."""
     monkeypatch.setattr("src.core.utils.is_market_open", lambda: True)
     redis = _FakePollRedis({REDIS_ACTIVE_FNO_SYMBOLS: json.dumps(["SOME_STOCK"])})
     poller = LTPPoller(
@@ -212,16 +215,19 @@ async def test_index_symbols_compete_for_ema_and_momentum_pools_only(monkeypatch
     ema_pool = json.loads(redis.store[REDIS_TOP_SYMBOLS_KEY])
     momentum_pool = json.loads(redis.store[REDIS_TOP_SYMBOLS_MOMENTUM])
     assert "NIFTY" in ema_pool and "BANKNIFTY" in ema_pool
-    assert "NIFTY" in momentum_pool and "BANKNIFTY" in momentum_pool
 
     # credit_spread/iron_condor pools must contain the real stock (proving
     # the pipeline ran and scored everyone) but NEVER the two index symbols.
+    # momentum_v1's pool must contain the real stock too, but never the
+    # indices either (2026-11-20 -- RVOL permanently unavailable for them).
     spread_pool = json.loads(redis.store[REDIS_TOP_SYMBOLS_CREDIT_SPREAD])
     condor_pool = json.loads(redis.store[REDIS_TOP_SYMBOLS_IRON_CONDOR])
     assert "SOME_STOCK" in spread_pool
     assert "SOME_STOCK" in condor_pool
+    assert "SOME_STOCK" in momentum_pool
     assert "NIFTY" not in spread_pool and "BANKNIFTY" not in spread_pool
     assert "NIFTY" not in condor_pool and "BANKNIFTY" not in condor_pool
+    assert "NIFTY" not in momentum_pool and "BANKNIFTY" not in momentum_pool
 
 
 # ── _process_signal(): weekly expiry for NIFTY, monthly (unchanged) for ────

@@ -460,14 +460,33 @@ class LTPPoller:
                         spread_scores[symbol] = s
                     if c > 0 and not _is_index:
                         condor_scores[symbol] = c
-                    if m > 0:
+                    # EXPERIMENT (2026-11-20, data-driven): momentum_v1
+                    # excluded from the index pool too, same as spread/
+                    # condor above -- unlike spread_scores/condor_scores,
+                    # this exclusion is NOT about the thesis being wrong for
+                    # indices (momentum_v1 was deliberately added here on
+                    # 2026-11-11). It's that momentum_v1's own pullback+
+                    # breakout confirmation requires a genuine RVOL reading
+                    # (contraction < 0.8 then expansion >= 1.3, or >= 0.3
+                    # flat -- see momentum.py's _pullback_continuation_signal()),
+                    # and an index's spot tick carries no meaningful traded-
+                    # volume figure the way a stock's does -- confirmed live:
+                    # NIFTY/BANKNIFTY's cached ticks show rvol_valid=False,
+                    # rvol=0.0 PERMANENTLY, not "insufficient history yet."
+                    # momentum_v1 could never actually confirm a breakout on
+                    # either index regardless of regime/ADX/EMA-spread, so
+                    # listing them here only wastes cycles on candidates that
+                    # structurally can't fire. ema_crossover_v1 is unaffected
+                    # (RVOL is a non-blocking confidence note for it, not a
+                    # hard requirement -- see its rvol_hard_gate=False).
+                    if m > 0 and not _is_index:
                         momentum_scores[symbol] = m
                     # Fixed 2026-09-15 (external review, "separate bull/bear
                     # candidate pools") -- current EMA20-vs-EMA50 sign, same
                     # classifier both strategies' pools use.
                     _is_bullish = tick.get("ema20", 0) > tick.get("ema50", 0)
                     (ema_bull_scores if _is_bullish else ema_bear_scores)[symbol] = e
-                    if m > 0:
+                    if m > 0 and not _is_index:
                         (momentum_bull_scores if _is_bullish else momentum_bear_scores)[symbol] = m
                     # Fixed 2026-09-15 (external review, "EMA event
                     # watchlist"): refresh (not just add) on every cycle the

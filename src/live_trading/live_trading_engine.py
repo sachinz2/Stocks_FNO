@@ -223,6 +223,25 @@ class LiveTradingEngine:
         # DTE-window incident (a silent logic bug in generate_signal() that
         # blocked every entry for 3 full trading days with nothing watching).
         self._last_signal_date:     Dict[str, str] = {}
+        # EXPERIMENT (2026-11-20, data-driven): a regime-paused strategy's
+        # generate_signal() keeps running every cycle (see the 2026-09-03 fix
+        # comment below) and can genuinely CONFIRM a fresh BUY/SELL while
+        # still paused -- confirmed live 2026-11-11: momentum_v1's pullback+
+        # breakout model (multi-bar confirmation, can take many minutes)
+        # fully tracked and confirmed ~20 real setups (CANBK, TRENT, RADICO,
+        # etc.) during a single sustained RANGE_BOUND stretch, every one
+        # discarded as a mere "paused signal" observation -- not a setup
+        # interrupted mid-confirmation by the pause (on_pause() already
+        # wipes in-flight tracking at the pause transition), but a brand-new
+        # one fully built AND confirmed entirely while already paused. Keyed
+        # by (strategy_name, symbol); holds at most the latest confirmed-
+        # while-paused signal per key, consumed (popped) the first time this
+        # strategy is active again for that symbol, whether or not it's
+        # still fresh enough to act on -- see its matching comment in
+        # _process_signal(). In-memory only, not persisted across restarts
+        # -- deliberately low-stakes (a restart mid-grace-window loses at
+        # most one replay opportunity, same cost as the status quo).
+        self._paused_confirmed_signals: Dict[tuple, Dict[str, Any]] = {}
         # Fixed 2026-08-21 (external review of ema_crossover_v1, section 20
         # -- "signal audit"): per-strategy, per-gate counters showing how
         # many candidate signals reached each entry gate in _process_signal
@@ -3246,7 +3265,49 @@ class LiveTradingEngine:
         if not strategy.is_active:
             await self._maybe_record_shadow_candidate(strategy, symbol, signal, regime)
             await self._maybe_record_paused_signal_outcome(strategy, symbol, signal_str, market_data, regime)
+            # 2026-11-20: see _paused_confirmed_signals' __init__ comment.
+            # Only regime pauses (not a StrategyMonitor circuit-breaker or a
+            # manual pause -- those are deliberate "stop trading" decisions,
+            # not a timing race) queue a replay candidate, and only a real
+            # confirmed BUY/SELL (not HOLD). getattr(..., None) so fake-
+            # engine test fixtures that don't construct this dict (it's not
+            # part of any gate's contract, purely an internal optimization)
+            # degrade to "no replay queue" instead of AttributeError.
+            _replay_queue = getattr(self, "_paused_confirmed_signals", None)
+            if _replay_queue is not None and signal_str in ("BUY", "SELL") and getattr(strategy, "paused_by", None) == "regime":
+                _replay_queue[(strategy.name, symbol)] = {
+                    "signal": signal_str, "timestamp": now_ist(),
+                    "close": market_data.get("close"),
+                }
             return
+        # 2026-11-20: consume (pop, one-shot) any signal this strategy
+        # confirmed for this symbol while it was last paused -- see
+        # _paused_confirmed_signals' __init__ comment. Only promoted if
+        # still within the grace window AND the underlying hasn't moved far
+        # enough since confirmation to make the setup questionable (a basic
+        # staleness sanity check, not a full re-validation -- generate_
+        # signal() itself already re-confirmed everything about the CURRENT
+        # bar; this only governs whether to ALSO act on the queued one).
+        _MOMENTUM_SIGNAL_REPLAY_GRACE_MINUTES = 15
+        _MOMENTUM_SIGNAL_REPLAY_MAX_DRIFT_PCT = 0.02
+        _replay_queue = getattr(self, "_paused_confirmed_signals", None)
+        _queued = _replay_queue.pop((strategy.name, symbol), None) if _replay_queue is not None else None
+        if _queued and (not signal or signal == SignalType.HOLD):
+            _age_min = (now_ist() - _queued["timestamp"]).total_seconds() / 60.0
+            _queued_close = _queued.get("close")
+            _current_close = market_data.get("close")
+            _drift_ok = (
+                _queued_close and _current_close and _queued_close > 0
+                and abs(_current_close - _queued_close) / _queued_close <= _MOMENTUM_SIGNAL_REPLAY_MAX_DRIFT_PCT
+            )
+            if _age_min <= _MOMENTUM_SIGNAL_REPLAY_GRACE_MINUTES and _drift_ok:
+                logger.info(
+                    f"[{strategy.name}] {symbol} replaying a {_queued['signal']} "
+                    f"confirmed {_age_min:.1f} min ago while paused, now that "
+                    "the strategy is active again."
+                )
+                signal = _queued["signal"]
+                signal_str = _queued["signal"]
         if not signal or signal == SignalType.HOLD:
             return
 
